@@ -13,6 +13,15 @@ import requests
 
 warnings.filterwarnings("ignore")
 
+# ========================= V11 交易质量主逻辑重构说明 =========================
+# 本文件基于V10.1完整版本继续做“手术式增量优化”，原则是：
+# 1）原有推送、缓存、Telegram、BaoStock、候选JSON、artifact上传等基础功能不删除；
+# 2）原有倍量、承接、台阶、凹口、圆弧底、破底翻、月线BBI/BOLL、雷区等模块保留；
+# 3）新增V11主逻辑：先看大周期位置与空间，再看结构边界，再看买点质量/风险收益比，最后用量能确认；
+# 4）倍量从“主导分”降为“结构确认分”：结构位倍量高价值，远离结构/高位压力倍量降权；
+# 5）新增基础层轻量交易质量闸门和深度层精算交易优先级，避免选出“强但不敢买”的票。
+# ===========================================================================
+
 # ========================= V9.1 追高闸门增量优化说明 =========================
 # 本文件基于用户提供的V8/V9源码继续做“手术式增量优化”，原则是：
 # 1）BaoStock数据源、主流程、Telegram变量、缓存、基础评分底座不动；
@@ -30,7 +39,7 @@ CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
 
 N = 20
-CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V10.1：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
+CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V11：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
 
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "20"))
@@ -1602,8 +1611,8 @@ def detect_break_bottom_reclaim_structure(hist):
 
 def calc_base_rows(df):
     """
-    V10基础候选评分：把原模型、标准倍量、突破、大阳强收盘等同源信号整合成
-    干净的基础入口模型，并前移一部分低成本深度因子。
+    V11基础候选评分：在V10整合原模型、标准倍量、突破、大阳强收盘等同源信号的基础上，
+    新增“大周期位置/买点质量/粗略风险收益比”轻量闸门。
 
     V10.1细化：
     1）MA5金叉MA10倍量启动必须是金叉形成当日、标准倍量、实体涨幅≥3%同日共振才高分；
@@ -2042,6 +2051,38 @@ def calc_base_rows(df):
     df.loc[(df["long_pos_250"] > 0.85) & ((df["vr1"] > 3.0) | (df["entity_pct"] > 6)), "base_long_cycle_potential_score"] -= 4
     df["base_long_cycle_potential_score"] = df["base_long_cycle_potential_score"].clip(-5, 10)
 
+    # V11：大周期高度与买点质量轻量闸门。
+    # 这里只做全市场低成本粗筛：不跑完整月线闭环，只识别“月线/年内偏高、远离防守位、空间不足”的不敢买问题。
+    df["base_defense_level"] = df[["key_level_base", "ma20", "ma60", "ma120"]].max(axis=1).fillna(0)
+    df["base_defense_dist"] = (df["close"] / df["base_defense_level"].replace(0, pd.NA) - 1).fillna(0)
+    df.loc[df["base_defense_dist"] < 0, "base_defense_dist"] = 0
+    df["base_target_dist"] = df["near_pressure_dist"].where(df["near_pressure_dist"] > 0, df["mid_pressure_dist"]).fillna(0)
+    df.loc[df["base_target_dist"] <= 0, "base_target_dist"] = df["overhead_pressure_dist"]
+    df["base_risk_reward_ratio"] = (df["base_target_dist"] / df["base_defense_dist"].replace(0, pd.NA)).fillna(0)
+
+    df["base_monthly_height_proxy_score"] = 0.0
+    df.loc[df["long_pos_250"] <= 0.35, "base_monthly_height_proxy_score"] += 8
+    df.loc[(df["long_pos_250"] > 0.35) & (df["long_pos_250"] <= 0.55), "base_monthly_height_proxy_score"] += 5
+    df.loc[(df["long_pos_250"] > 0.55) & (df["long_pos_250"] <= 0.70), "base_monthly_height_proxy_score"] += 2
+    df.loc[df["long_pos_250"] > 0.75, "base_monthly_height_proxy_score"] -= 4
+    df.loc[df["long_pos_250"] > 0.85, "base_monthly_height_proxy_score"] -= 6
+    df.loc[(df["bias20"] <= 0.10) & (df["bias60"] <= 0.12), "base_monthly_height_proxy_score"] += 3
+    df.loc[(df["bias20"] > 0.18) | (df["bias60"] > 0.20), "base_monthly_height_proxy_score"] -= 4
+    df.loc[(df["near_pressure_dist"] > 0) & (df["near_pressure_dist"] < 0.08), "base_monthly_height_proxy_score"] -= 4
+    df["base_monthly_height_proxy_score"] = df["base_monthly_height_proxy_score"].clip(-10, 12)
+
+    df["base_trade_quality_score"] = 0.0
+    df.loc[(df["base_defense_dist"] >= 0.005) & (df["base_defense_dist"] <= 0.05), "base_trade_quality_score"] += 7
+    df.loc[(df["base_defense_dist"] > 0.05) & (df["base_defense_dist"] <= 0.08), "base_trade_quality_score"] += 4
+    df.loc[df["base_defense_dist"] > 0.10, "base_trade_quality_score"] -= 5
+    df.loc[df["base_target_dist"] >= 0.15, "base_trade_quality_score"] += 5
+    df.loc[(df["base_target_dist"] >= 0.08) & (df["base_target_dist"] < 0.15), "base_trade_quality_score"] += 2
+    df.loc[(df["base_target_dist"] > 0) & (df["base_target_dist"] < 0.06), "base_trade_quality_score"] -= 5
+    df.loc[df["base_risk_reward_ratio"] >= 2.0, "base_trade_quality_score"] += 6
+    df.loc[(df["base_risk_reward_ratio"] >= 1.5) & (df["base_risk_reward_ratio"] < 2.0), "base_trade_quality_score"] += 3
+    df.loc[(df["base_risk_reward_ratio"] > 0) & (df["base_risk_reward_ratio"] < 1.2), "base_trade_quality_score"] -= 8
+    df["base_trade_quality_score"] = df["base_trade_quality_score"].clip(-12, 18)
+
     # 初级风险与追高闸门 -20~0。
     df["base_risk_penalty"] = 0.0
     df.loc[(df["vr1"] > 5.0) & (df["volr"] > 5.0), "base_risk_penalty"] -= 8
@@ -2054,14 +2095,23 @@ def calc_base_rows(df):
     df.loc[df["limit_volume_mode"].eq("涨停分歧爆量"), "base_risk_penalty"] -= 5
     df["base_risk_penalty"] = df["base_risk_penalty"].clip(-25, 0)
 
+    # V11基础总分：不再让攻击/倍量主导。
+    # 大周期位置 + 结构潜力 + 买点质量为主，量能和攻击质量只做确认。
     df["base_total_score"] = (
-        df["base_attack_quality_score"]
-        + df["base_position_reward_score"]
-        + df["base_volume_carry_score"]
-        + df["base_structure_potential_score"]
-        + df["base_long_cycle_potential_score"]
-        + df["base_risk_penalty"]
+        df["base_attack_quality_score"] * 0.55
+        + df["base_position_reward_score"] * 0.85
+        + df["base_volume_carry_score"] * 0.80
+        + df["base_structure_potential_score"] * 1.20
+        + df["base_long_cycle_potential_score"] * 1.00
+        + df["base_monthly_height_proxy_score"] * 1.20
+        + df["base_trade_quality_score"] * 1.10
+        + df["base_risk_penalty"] * 1.20
     ).clip(0, 100)
+
+    # 强势但交易质量差的票只能进入观察，不让其仅凭倍量/强阳挤占前排。
+    poor_trade_quality_base = (df["base_trade_quality_score"] < 0) | ((df["base_risk_reward_ratio"] > 0) & (df["base_risk_reward_ratio"] < 1.2))
+    high_attack_without_structure_base = (df["base_attack_quality_score"] >= 26) & (df["base_structure_potential_score"] < 6) & (df["base_monthly_height_proxy_score"] < 2)
+    df.loc[poor_trade_quality_base & high_attack_without_structure_base, "base_total_score"] = df.loc[poor_trade_quality_base & high_attack_without_structure_base, "base_total_score"].clip(upper=62)
 
     # 兼容旧字段：base_score 改为V10基础总分；原模型折算另存 score_base_model_legacy。
     df["base_score"] = df["base_total_score"]
@@ -2071,14 +2121,16 @@ def calc_base_rows(df):
     df.loc[(df["long_pos_250"] <= 0.55) & ((df["just_cross_ma120"] | df["just_cross_ma250"]) | (df["base_long_cycle_potential_score"] >= 5)), "base_bucket"] = "低位修复"
     df.loc[(df["base_volume_carry_score"] >= 8) & (df["base_attack_quality_score"] < 28), "base_bucket"] = "量价承接"
     df.loc[((df["base_structure_potential_score"] >= 8) | (df["base_fibo_second_confirm_score"] >= 6)) & (df["base_risk_penalty"] > -12), "base_bucket"] = "结构潜力"
-    strong_watch_cond = ((df["pct_chg"] >= 7) | df["limit_up_base"] | (df["entity_pct"] >= 7)) & (df["base_risk_penalty"] <= -4)
+    df.loc[(df["base_trade_quality_score"] >= 10) & (df["base_monthly_height_proxy_score"] >= 3) & (df["base_structure_potential_score"] >= 4), "base_bucket"] = "交易质量"
+    strong_watch_cond = ((df["pct_chg"] >= 7) | df["limit_up_base"] | (df["entity_pct"] >= 7)) & ((df["base_risk_penalty"] <= -4) | (df["base_trade_quality_score"] < 0))
     df.loc[strong_watch_cond, "base_bucket"] = "强势观察"
 
     df["base_bucket_rank_score"] = df["base_total_score"].copy()
     df.loc[df["base_bucket"].eq("低位修复"), "base_bucket_rank_score"] += 3
     df.loc[df["base_bucket"].eq("量价承接"), "base_bucket_rank_score"] += 2
     df.loc[df["base_bucket"].eq("结构潜力"), "base_bucket_rank_score"] += 2
-    df.loc[df["base_bucket"].eq("强势观察"), "base_bucket_rank_score"] -= 5
+    df.loc[df["base_bucket"].eq("交易质量"), "base_bucket_rank_score"] += 4
+    df.loc[df["base_bucket"].eq("强势观察"), "base_bucket_rank_score"] -= 7
     df.loc[df["short_ma_volume_entity_start"] & (df["long_pos_250"] <= 0.60) & (df["bias20"] <= 0.15), "base_bucket_rank_score"] += 4
     df.loc[df["base_fibo_second_confirm_score"] >= 8, "base_bucket_rank_score"] += 5
     df.loc[(df["base_risk_penalty"] <= -12), "base_bucket_rank_score"] -= 8
@@ -2961,6 +3013,52 @@ def calc_deep_rows(df, code):
     extra["monthly_volume_score"] = float(monthly_ctx.get("volume_score", 0.0))
     extra["monthly_detail"] = str(monthly_ctx.get("detail", ""))
 
+    # V11：月线高度/大周期空间风险。月线修复本身加分，但如果已经远离中轨、年内偏高、压力贴脸，要降级。
+    extra["score_monthly_height_space"] = 0.0
+    extra.loc[df["long_pos_250"] <= 0.35, "score_monthly_height_space"] += 8
+    extra.loc[(df["long_pos_250"] > 0.35) & (df["long_pos_250"] <= 0.55), "score_monthly_height_space"] += 5
+    extra.loc[(df["long_pos_250"] > 0.55) & (df["long_pos_250"] <= 0.70), "score_monthly_height_space"] += 2
+    extra.loc[df["long_pos_250"] > 0.75, "score_monthly_height_space"] -= 5
+    extra.loc[df["long_pos_250"] > 0.85, "score_monthly_height_space"] -= 7
+    extra.loc[(df["bias20"] <= 0.10) & (df["bias60"] <= 0.12), "score_monthly_height_space"] += 3
+    extra.loc[(df["bias20"] > 0.18) | (df["bias60"] > 0.20), "score_monthly_height_space"] -= 5
+    extra.loc[(df["near_pressure_dist"] > 0) & (df["near_pressure_dist"] < 0.08), "score_monthly_height_space"] -= 4
+    extra.loc[(extra["score_monthly_cycle"] >= 8) & (df["long_pos_250"] <= 0.60) & (df["bias20"] <= 0.12), "score_monthly_height_space"] += 3
+    extra["score_monthly_height_space"] = extra["score_monthly_height_space"].clip(-12, 15)
+
+    # V11：买点质量/风险收益比。核心是防守位、第一压力、风险收益比。
+    defense_candidates = pd.concat([
+        df["prehigh"].fillna(0),
+        df.get("ma20", pd.Series(0, index=df.index)).fillna(0),
+        df.get("ma60", pd.Series(0, index=df.index)).fillna(0),
+        df.get("ma120", pd.Series(0, index=df.index)).fillna(0),
+    ], axis=1)
+    extra["defense_level"] = defense_candidates.max(axis=1)
+    # 结构颈线/首次倍量100%位如果存在，优先作为更强防守边界。
+    extra.loc[extra["structure_neckline"] > 0, "defense_level"] = extra.loc[extra["structure_neckline"] > 0, "structure_neckline"]
+    extra.loc[extra["fibo_level_100"] > 0, "defense_level"] = extra.loc[extra["fibo_level_100"] > 0, "fibo_level_100"]
+    extra["defense_dist"] = (df["close"] / extra["defense_level"].replace(0, pd.NA) - 1).fillna(0)
+    extra.loc[extra["defense_dist"] < 0, "defense_dist"] = 0
+    extra["target_dist"] = df["near_pressure_dist"].where(df["near_pressure_dist"] > 0, df["mid_pressure_dist"]).fillna(0)
+    extra.loc[extra["target_dist"] <= 0, "target_dist"] = df["overhead_pressure_dist"]
+    # 黄金扩展150%如果还在上方，也可作为第一目标；若比近端压力更近，则取更保守目标。
+    fibo_target_dist = (extra["fibo_level_150"] / df["close"].replace(0, pd.NA) - 1).fillna(0)
+    extra.loc[(fibo_target_dist > 0) & ((extra["target_dist"] <= 0) | (fibo_target_dist < extra["target_dist"])), "target_dist"] = fibo_target_dist
+    extra["risk_reward_ratio"] = (extra["target_dist"] / extra["defense_dist"].replace(0, pd.NA)).fillna(0)
+
+    extra["score_trade_quality"] = 0.0
+    extra.loc[(extra["defense_dist"] >= 0.005) & (extra["defense_dist"] <= 0.05), "score_trade_quality"] += 7
+    extra.loc[(extra["defense_dist"] > 0.05) & (extra["defense_dist"] <= 0.08), "score_trade_quality"] += 4
+    extra.loc[extra["defense_dist"] > 0.10, "score_trade_quality"] -= 6
+    extra.loc[extra["target_dist"] >= 0.15, "score_trade_quality"] += 5
+    extra.loc[(extra["target_dist"] >= 0.08) & (extra["target_dist"] < 0.15), "score_trade_quality"] += 2
+    extra.loc[(extra["target_dist"] > 0) & (extra["target_dist"] < 0.06), "score_trade_quality"] -= 6
+    extra.loc[extra["risk_reward_ratio"] >= 2.0, "score_trade_quality"] += 6
+    extra.loc[(extra["risk_reward_ratio"] >= 1.5) & (extra["risk_reward_ratio"] < 2.0), "score_trade_quality"] += 3
+    extra.loc[(extra["risk_reward_ratio"] > 0) & (extra["risk_reward_ratio"] < 1.2), "score_trade_quality"] -= 9
+    extra.loc[(extra["score_structure_core"] >= 8) | (extra["score_fibo_reclaim"] >= 7) | (extra["score_advanced_ao_kou"] >= 8), "score_trade_quality"] += 2
+    extra["score_trade_quality"] = extra["score_trade_quality"].clip(-15, 20)
+
     attack_signal_count = (
         extra["strong_yang"].astype(int)
         + extra["key_break_strong_yang"].astype(int)
@@ -3050,6 +3148,35 @@ def calc_deep_rows(df, code):
         + extra["score_overlap_adjustment"]
     )
 
+    # V11：交易质量加权调整。保留原有所有因子，但用大周期空间、买点质量、风险收益比重新排序。
+    # 量能/强阳若没有结构和买点质量支撑，不再允许单独把总分推到前排。
+    structure_strength_v11 = (
+        extra["score_structure_core"]
+        + extra["score_advanced_ao_kou"]
+        + extra["score_fibo_reclaim"]
+        + extra["score_monthly_cycle"] * 0.8
+        + extra["score_carry_structure"] * 0.6
+    )
+    extra["trade_priority_score"] = (
+        structure_strength_v11 * 0.35
+        + extra["score_trade_quality"] * 1.20
+        + extra["score_monthly_height_space"] * 1.10
+        + extra["score_volume_structure"] * 0.45
+        + extra["score_yang_yin_volume"] * 0.50
+        + extra["score_indicator"] * 0.40
+        + extra["score_penalty"] * 0.80
+    ).clip(-30, 40)
+    extra["total_score"] = extra["total_score"] + extra["score_trade_quality"] + extra["score_monthly_height_space"] + extra["trade_priority_score"] * 0.35
+
+    poor_rr = (extra["risk_reward_ratio"] > 0) & (extra["risk_reward_ratio"] < 1.2)
+    poor_trade_quality = (extra["score_trade_quality"] < 0) | poor_rr
+    monthly_high_risk = (df["long_pos_250"] > 0.75) & ((df["bias20"] > 0.15) | ((df["near_pressure_dist"] > 0) & (df["near_pressure_dist"] < 0.08)))
+    volume_without_structure = (extra["score_volume_structure"] >= 10) & (extra["score_structure_core"] < 6) & (extra["score_fibo_reclaim"] < 6) & (extra["score_advanced_ao_kou"] < 7) & (extra["score_monthly_cycle"] < 8)
+    extra.loc[poor_trade_quality & volume_without_structure, "total_score"] = extra.loc[poor_trade_quality & volume_without_structure, "total_score"].clip(upper=76.0)
+    extra.loc[monthly_high_risk & (extra["score_trade_quality"] < 6), "total_score"] = extra.loc[monthly_high_risk & (extra["score_trade_quality"] < 6), "total_score"].clip(upper=79.0)
+    extra.loc[poor_rr, "total_score"] = extra.loc[poor_rr, "total_score"].clip(upper=78.0)
+    extra.loc[(extra["score_trade_quality"] >= 12) & (extra["score_monthly_height_space"] >= 5) & (structure_strength_v11 >= 12), "total_score"] += 4.0
+
     # V9：高扩展位回落后回抽100%压力位，不能当作二次突破买点高分。
     fibo_pullback_pressure = extra["fibo_reclaim_type"].astype(str).str.contains("高扩展位回落", na=False)
     extra.loc[fibo_pullback_pressure, "total_score"] = extra.loc[fibo_pullback_pressure, "total_score"].clip(upper=78.0)
@@ -3068,6 +3195,11 @@ def calc_deep_rows(df, code):
 
     merged = pd.concat([df, extra], axis=1)
     merged = apply_chase_risk_gate(merged)
+    # V11：优先候选池必须同时满足交易质量与风险收益比，不再只看综合分。
+    if "candidate_pool" in merged.columns:
+        poor_v11 = (merged.get("score_trade_quality", 0) < 0) | ((merged.get("risk_reward_ratio", 0) > 0) & (merged.get("risk_reward_ratio", 0) < 1.2)) | (merged.get("score_monthly_height_space", 0) < -5)
+        merged.loc[poor_v11 & (merged["candidate_pool"].astype(str).eq("优先候选池")), "candidate_pool"] = "交易质量观察池"
+        merged.loc[poor_v11, "candidate_pool_reason"] = (merged.loc[poor_v11, "candidate_pool_reason"].astype(str) + "；V11交易质量/风险收益比不足").str.strip("；")
     return merged.tail(CHECK_DAYS)
 
 
@@ -3204,6 +3336,11 @@ def process_stock_base(row):
             "base_structure_potential_score": float(r.get("base_structure_potential_score", 0)) if pd.notna(r.get("base_structure_potential_score", 0)) else 0,
             "base_long_cycle_potential_score": float(r.get("base_long_cycle_potential_score", 0)) if pd.notna(r.get("base_long_cycle_potential_score", 0)) else 0,
             "base_risk_penalty": float(r.get("base_risk_penalty", 0)) if pd.notna(r.get("base_risk_penalty", 0)) else 0,
+            "base_monthly_height_proxy_score": float(r.get("base_monthly_height_proxy_score", 0)) if pd.notna(r.get("base_monthly_height_proxy_score", 0)) else 0,
+            "base_trade_quality_score": float(r.get("base_trade_quality_score", 0)) if pd.notna(r.get("base_trade_quality_score", 0)) else 0,
+            "base_defense_dist": float(r.get("base_defense_dist", 0)) if pd.notna(r.get("base_defense_dist", 0)) else 0,
+            "base_target_dist": float(r.get("base_target_dist", 0)) if pd.notna(r.get("base_target_dist", 0)) else 0,
+            "base_risk_reward_ratio": float(r.get("base_risk_reward_ratio", 0)) if pd.notna(r.get("base_risk_reward_ratio", 0)) else 0,
             "base_bucket": str(r.get("base_bucket", "")) if pd.notna(r.get("base_bucket", "")) else "",
             "base_bucket_rank_score": float(r.get("base_bucket_rank_score", 0)) if pd.notna(r.get("base_bucket_rank_score", 0)) else 0,
             "score_base_model_legacy": float(r.get("score_base_model_legacy", 0)) if pd.notna(r.get("score_base_model_legacy", 0)) else 0,
@@ -3322,6 +3459,13 @@ def process_stock_deep(row):
             "score_stage_adjustment": float(r["score_stage_adjustment"]) if pd.notna(r["score_stage_adjustment"]) else 0,
             "trade_stage": str(r["trade_stage"]) if pd.notna(r["trade_stage"]) else "",
             "score_penalty": float(r["score_penalty"]) if pd.notna(r["score_penalty"]) else 0,
+            "score_monthly_height_space": float(r.get("score_monthly_height_space", 0)) if pd.notna(r.get("score_monthly_height_space", 0)) else 0,
+            "score_trade_quality": float(r.get("score_trade_quality", 0)) if pd.notna(r.get("score_trade_quality", 0)) else 0,
+            "trade_priority_score": float(r.get("trade_priority_score", 0)) if pd.notna(r.get("trade_priority_score", 0)) else 0,
+            "defense_level": float(r.get("defense_level", 0)) if pd.notna(r.get("defense_level", 0)) else 0,
+            "defense_dist": float(r.get("defense_dist", 0)) if pd.notna(r.get("defense_dist", 0)) else 0,
+            "target_dist": float(r.get("target_dist", 0)) if pd.notna(r.get("target_dist", 0)) else 0,
+            "risk_reward_ratio": float(r.get("risk_reward_ratio", 0)) if pd.notna(r.get("risk_reward_ratio", 0)) else 0,
             "total_score": float(r["total_score"]) if pd.notna(r["total_score"]) else 0,
             "candidate_pool": str(r.get("candidate_pool", "优先候选池")) if pd.notna(r.get("candidate_pool", "")) else "优先候选池",
             "candidate_pool_reason": str(r.get("candidate_pool_reason", "")) if pd.notna(r.get("candidate_pool_reason", "")) else "",
@@ -3410,8 +3554,9 @@ def select_deep_targets_v10(base_rows, limit):
         ("健康攻击", 0.27),
         ("低位修复", 0.20),
         ("量价承接", 0.18),
-        ("结构潜力", 0.25),
-        ("强势观察", 0.10),
+        ("结构潜力", 0.22),
+        ("交易质量", 0.12),
+        ("强势观察", 0.08),
     ]
     quotas = {name: max(3, int(round(limit * ratio))) for name, ratio in quota_plan}
     # 修正四舍五入误差。
@@ -3500,6 +3645,10 @@ def build_reason(s):
     reasons.append(
         f"位置/压力：年内位置{s['long_pos_250']:.2%}，近端压力{s.get('near_pressure_dist', 0):.2%}，中层压力{s.get('mid_pressure_dist', 0):.2%}，远端压力{s.get('overhead_pressure_dist', 0):.2%}，"
         f"压力空间分{s.get('score_pressure_space', 0):.1f}，离关键位{s.get('distance_to_key', 0):.2%}/舒适度{s.get('score_key_distance', 0):.1f}，20日乖离{s['bias20']:.2%}，60日乖离{s['bias60']:.2%}"
+    )
+    reasons.append(
+        f"V11交易质量：防守位{s.get('defense_level', 0):.2f}，离防守{s.get('defense_dist', 0):.2%}，第一目标/压力空间{s.get('target_dist', 0):.2%}，"
+        f"风险收益比{s.get('risk_reward_ratio', 0):.2f}，买点质量分{s.get('score_trade_quality', 0):.1f}，月线高度/空间分{s.get('score_monthly_height_space', 0):.1f}，交易优先级{s.get('trade_priority_score', 0):.1f}"
     )
     if s.get("chase_risk_flags"):
         cap_text = f"，封顶{s.get('chase_score_cap', 0):.1f}" if s.get("chase_score_cap", 0) else ""
@@ -3604,7 +3753,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"评分阈值：综合分 ≥ {FINAL_SCORE_THRESHOLD:.0f}；80分以下不推送，不固定凑满数量。")
-    lines.append("V9.1追高闸门：默认只推送优先候选池；短线涨停/大阳强攻票进入强势观察池，仅保存在候选JSON里供复盘。")
+    lines.append("V11交易质量闸门：默认优先结构清楚、位置合理、防守明确、风险收益比合格的候选；强但不敢买的票降级观察。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -3633,7 +3782,8 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
             f"承接：{s.get('score_carry_structure', 0):.1f} | 台阶：{s.get('score_stepwise_push', 0):.1f} | "
             f"形态：{s['score_pattern']:.1f} | 日线结构：{s['score_structure_core']:.1f} | 高级凹口：{s.get('score_advanced_ao_kou', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | "
             f"趋势：{s['score_trend_stage']:.1f} | 阳阴量价：{s.get('score_yang_yin_volume', 0):.1f} | 压力空间：{s.get('score_pressure_space', 0):.1f} | 关键位舒适度：{s.get('score_key_distance', 0):.1f} | 频次：{s['score_count']:.1f} | 指标：{s['score_indicator']:.1f} | "
-            f"长周期：{s['score_long_cycle']:.1f} | 阶段调整：{s.get('score_stage_adjustment', 0):.1f} | 风险：{s['score_penalty']:.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f} | 重复降权：{s['score_overlap_adjustment']:.1f}"
+            f"长周期：{s['score_long_cycle']:.1f} | 月线空间：{s.get('score_monthly_height_space', 0):.1f} | 买点质量：{s.get('score_trade_quality', 0):.1f} | 交易优先：{s.get('trade_priority_score', 0):.1f} | "
+            f"阶段调整：{s.get('score_stage_adjustment', 0):.1f} | 风险：{s['score_penalty']:.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f} | 重复降权：{s['score_overlap_adjustment']:.1f}"
         )
         lines.append("诊断：" + build_reason(s))
 
@@ -3687,7 +3837,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V10分桶加速版：全市场基础重构评分，分桶选取深度候选，阶段/结构/风险调整后综合排名。")
+        print("V11交易质量版：全市场轻量闸门，分桶选取深度候选，按大周期空间/结构边界/买点质量/风险收益比/量能确认综合排名。")
 
         base_rows = []
         all_dates = set()
@@ -3759,8 +3909,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V10基础分桶后进入深度评分：{len(deep_targets)}条")
-        print("V10基础候选分桶统计：")
+        print(f"V11基础分桶后进入深度评分：{len(deep_targets)}条")
+        print("V11基础候选分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
@@ -3800,6 +3950,8 @@ def main():
             deep_rows,
             key=lambda x: (
                 x["date"],
+                safe_float(x.get("trade_priority_score", 0)),
+                safe_float(x.get("score_trade_quality", 0)),
                 x["total_score"],
                 x["base_score"],
                 x["score"],
