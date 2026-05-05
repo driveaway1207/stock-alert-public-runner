@@ -30,7 +30,7 @@ CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
 
 N = 20
-CHECK_DAYS = 3
+CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V10.1：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
 
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "20"))
@@ -3850,7 +3850,7 @@ def main():
             if len(final_signals) >= RESULT_LIMIT:
                 break
 
-        print(f"近{CHECK_DAYS}个交易日排查完成：{dates}")
+        print(f"近{CHECK_DAYS}个交易日排查完成：{dates}（默认仅最新有行情日；可用CHECK_DAYS调整）")
         print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
         print(f"基础评分数量：{len(base_rows)} 条")
         print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
