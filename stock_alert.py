@@ -22,6 +22,21 @@ warnings.filterwarnings("ignore")
 # 5）新增基础层轻量交易质量闸门和深度层精算交易优先级，避免选出“强但不敢买”的票。
 # ===========================================================================
 
+
+# ========================= V11.2 双阳夹阴/分歧反包增量优化说明 =========================
+# 1）新增“双阳夹阴”量价承接模型：第一阳启动，第二阴有威慑但不有效破第一阳实底，第三阳拼量反包；
+# 2）中间阴线允许跌破第一阳实体中位，收盘最多允许略破第一阳实底约0.3%，以体现威慑力；
+# 3）中间阴线不能极端爆量，第三阳必须收复阴线实体顶部/高点且量能不弱；
+# 4）该模型定位为“结构位附近的短线分歧反包承接确认”，轻中度加分，不替代凹口/破底翻/黄金倍量等主结构。
+# ===========================================================================
+
+# ========================= V11.3 次日执行分类/前10精简推送增量优化说明 =========================
+# 1）最终推送默认强制精简为前10只，避免报告过长；即使 workflow 仍传 RESULT_LIMIT=20，也由 TOP_PUSH_LIMIT=10 封顶；
+# 2）新增“次日执行策略分类”：可低吸候选、回踩确认候选、强势接力候选、禁止追高候选、雷区剔除候选；
+# 3）每只票输出禁止追高线、回踩观察区、确认条件、放弃条件，明确候选≠开盘追；
+# 4）该模块不预测必涨停，只提供条件触发式执行规则，给三号员工/人工盘中确认使用。
+# ===========================================================================
+
 # ========================= V9.1 追高闸门增量优化说明 =========================
 # 本文件基于用户提供的V8/V9源码继续做“手术式增量优化”，原则是：
 # 1）BaoStock数据源、主流程、Telegram变量、缓存、基础评分底座不动；
@@ -39,10 +54,13 @@ CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
 
 N = 20
-CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V11：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
+CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V11.1：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
 
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0"))
-RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "20"))
+RESULT_LIMIT_RAW = int(os.environ.get("RESULT_LIMIT", "20"))
+# V11.3：一号员工报告默认只推前10只，避免报告太长；workflow 仍传20也会被这里封顶。
+TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "10"))
+RESULT_LIMIT = min(RESULT_LIMIT_RAW, TOP_PUSH_LIMIT) if TOP_PUSH_LIMIT > 0 else RESULT_LIMIT_RAW
 DEEP_SCORE_LIMIT_RAW = int(os.environ.get("DEEP_SCORE_LIMIT", "500"))
 # V10：深度评分硬上限。即使 workflow 仍传 500，也默认只取基础分桶后的前150条深评，
 # 避免 GitHub Actions 深度评分跑不完；如确需恢复500，可设置 DEEP_SCORE_HARD_CAP=0 或 500。
@@ -425,8 +443,15 @@ def evaluate_regulatory_risk(code, name=""):
         "立案", "证监会", "调查", "信披违规", "资金占用", "违规担保", "重大处罚",
         "行政处罚", "非标", "无法表示", "保留意见", "否定意见", "退市", "ST", "债务违约",
     ]
-    medium_keywords = ["监管措施", "警示函", "高质押", "强调事项", "诉讼", "冻结", "高管处罚"]
-    financial_keywords = ["亏损", "连续亏损", "亏损扩大", "经营现金流", "现金流为负", "应收", "坏账", "减值", "合同资产", "财务风险", "回款"]
+    medium_keywords = [
+        "监管措施", "警示函", "高质押", "质押", "冻结", "司法拍卖", "诉讼", "高管处罚",
+        "股权分散", "高管长期空缺", "高管人员偏少", "股东大会议案被否", "会计师事务所变动", "频繁更名",
+    ]
+    financial_keywords = [
+        "亏损", "连续亏损", "亏损扩大", "扣非亏损", "财报亏损", "经营现金流", "现金流为负",
+        "应收", "坏账", "减值", "合同资产", "财务风险", "回款", "高商誉", "商誉",
+        "负债率", "负债率逐年递增", "客户占营收比过高", "供应商采购占比高", "客户集中", "供应商集中",
+    ]
 
     major_hits = sum(1 for k in major_keywords if k in joined)
     medium_hits = sum(1 for k in medium_keywords if k in joined)
@@ -444,10 +469,13 @@ def evaluate_regulatory_risk(code, name=""):
         return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note}
 
     if financial_hits > 0:
-        # 财报亏损、应收账款/合同资产坏账、现金流恶化属于财务质量风险。
-        # 它不同于立案/非标等重大雷区，不默认扣40，但要明显压分。
-        penalty = -12.0 - min(18.0, 6.0 * max(0, financial_hits - 1))
-        return {"penalty": penalty, "hard_exclude": False, "flags": flags, "note": note}
+        # V11.1：财报/治理/集中度/商誉等雷区必须在一号员工阶段严格处理。
+        # 单项财务风险明显压分；多项财务风险或财务+治理风险叠加，直接降级/剔除优先池。
+        penalty = -15.0 - min(35.0, 7.0 * max(0, financial_hits - 1) + 4.0 * medium_hits)
+        hard = (financial_hits >= 3) or (financial_hits >= 2 and medium_hits >= 1)
+        if hard:
+            penalty = min(penalty, -40.0)
+        return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note}
 
     return {"penalty": -10.0, "hard_exclude": False, "flags": flags, "note": note}
 
@@ -1193,15 +1221,14 @@ def detect_advanced_ao_kou_second_volume(hist):
 
 def detect_first_volume_fibo_reclaim_model(hist):
     """
-    V9：首次倍量凹口黄金扩展模型。
+    V11.1：严格黄金倍量模型。
 
-    两套体系必须区分：
-    A类：首次倍量高点形成100%位后，尚未充分到达150%/200%扩展压力，回落整理后再次标准倍量突破100%，
-        这是二次确认买点，可加分，并把150%/200%作为后续目标/压力。
-    B类：已经冲到150%/200%后高位回落，跌破100%，甚至回到75%附近，再弱量回抽100%，
-        这是高扩展位回落后的100%压力位回抽，不是同等买点，应降权或压分。
-
-    该模型只提供加减分与报告解释，不替代原平台/凹口/破底翻基础模型。
+    用户最新口径：
+    1）第一个倍量必须发生在明显凹口/平台结构位；
+    2）第一次标准倍量必须干净突破凹口/平台上沿，不能只是靠近普通前高；
+    3）第一次突破后必须有调整承接，不破坏首倍K实体中位/实底或平台上沿；
+    4）第二个倍量也必须是合理标准倍量，并且干净突破第一次倍量高点/确认位；
+    5）必须区分低位二次确认与高位回抽100%压力位。
     """
     empty = {
         "hit": False,
@@ -1217,17 +1244,17 @@ def detect_first_volume_fibo_reclaim_model(hist):
         "dist_to_100": 0.0,
         "dist_to_150": 0.0,
     }
-    if hist is None or len(hist) < 80:
+    if hist is None or len(hist) < 100:
         return empty
 
-    w = hist.tail(180).copy().reset_index(drop=True)
-    required = ["open", "high", "low", "close", "volume", "vr1", "pct_chg", "pos"]
+    w = hist.tail(220).copy().reset_index(drop=True)
+    required = ["open", "high", "low", "close", "volume", "vr1", "pct_chg", "pos", "long_pos_250"]
     for col in required:
         if col not in w.columns:
             return empty
         w[col] = pd.to_numeric(w[col], errors="coerce")
     w = w.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
-    if len(w) < 80:
+    if len(w) < 100:
         return empty
 
     cur_idx = len(w) - 1
@@ -1236,10 +1263,17 @@ def detect_first_volume_fibo_reclaim_model(hist):
     cur_vr1 = safe_float(current["vr1"])
     cur_pct = safe_float(current["pct_chg"])
     cur_pos = safe_float(current["pos"])
+    cur_long_pos = safe_float(current.get("long_pos_250", 0.0))
     if cur_close <= 0:
         return empty
 
-    # 本波段低点：优先取当前以前一段右侧启动的最低点，避免把极远古低点拿来画线。
+    # 第二次确认必须是合理标准倍量、阳线、强收盘，且不能只是长上影试探。
+    second_standard = 1.8 < cur_vr1 < 2.5
+    second_clean_k = (safe_float(current["close"]) > safe_float(current["open"])) and cur_pos >= 0.70 and cur_pct >= 2.0
+    if not (second_standard and second_clean_k):
+        return empty
+
+    # 本波段低点：取当前前120日较近波段低点，避免极远古低点导致扩展位失真。
     low_search = w.iloc[max(0, cur_idx - 120):max(1, cur_idx - 8)]
     if low_search.empty:
         return empty
@@ -1248,110 +1282,145 @@ def detect_first_volume_fibo_reclaim_model(hist):
     if wave_low <= 0:
         return empty
 
-    # 首次倍量高点：低点之后第一次标准倍量/强阳倍量，且需要具备一定结构攻击性。
-    first_idx = None
-    rolling_high_20 = w["high"].rolling(20).max().shift(1)
-    for i in range(low_idx + 3, cur_idx):
-        vr = safe_float(w.loc[i, "vr1"])
-        is_standard = 1.8 < vr < 2.5
-        is_up = safe_float(w.loc[i, "close"]) > safe_float(w.loc[i, "open"])
-        strong = safe_float(w.loc[i, "pct_chg"]) >= 3 or safe_float(w.loc[i, "pos"]) >= 0.70
-        near_or_break_prev = True
-        if pd.notna(rolling_high_20.iloc[i]) and safe_float(rolling_high_20.iloc[i]) > 0:
-            near_or_break_prev = safe_float(w.loc[i, "close"]) >= safe_float(rolling_high_20.iloc[i]) * 0.96
-        if is_standard and is_up and strong and near_or_break_prev:
-            first_idx = i
-            break
-    if first_idx is None:
-        return empty
+    best = None
+    # 首次倍量不能太近也不能太远：需要有调整承接窗口。
+    for first_idx in range(low_idx + 5, cur_idx - 3):
+        first = w.iloc[first_idx]
+        first_vr = safe_float(first["vr1"])
+        first_close = safe_float(first["close"])
+        first_open = safe_float(first["open"])
+        first_high = safe_float(first["high"])
+        first_pos = safe_float(first["pos"])
+        first_pct = safe_float(first["pct_chg"])
+        if not (1.8 < first_vr < 2.5):
+            continue
+        if not (first_close > first_open and first_pos >= 0.70 and first_pct >= 2.0):
+            continue
 
-    first_high = safe_float(w.loc[first_idx, "high"])
-    if first_high <= wave_low:
-        return empty
-    amp = first_high - wave_low
-    level_75 = wave_low + amp * 0.75
-    level_100 = first_high
-    level_150 = wave_low + amp * 1.5
-    level_200 = wave_low + amp * 2.0
+        # 明显凹口/平台：第一次倍量前至少40日形成左侧/平台，上沿有多次触碰，且曾有有效下探/回落。
+        left = w.iloc[max(0, first_idx - 120):first_idx]
+        if len(left) < 45:
+            continue
+        platform = evaluate_platform_quality(left.tail(80))
+        platform_score = safe_float(platform.get("score", 0.0))
+        platform_top = safe_float(platform.get("top", 0.0))
+        top_touches = int(platform.get("top_touches", 0) or 0)
+        if platform_score < 3.5 or platform_top <= 0 or top_touches < 2:
+            continue
 
-    after_first = w.iloc[first_idx + 1:cur_idx]
-    if after_first.empty:
-        return empty
-    max_after = safe_float(after_first["high"].max())
-    min_close_after = safe_float(after_first["close"].min())
-    reached_150 = max_after >= level_150 * 0.985
-    reached_200 = max_after >= level_200 * 0.985
-    broke_100 = min_close_after < level_100 * 0.985
-    touched_75_area = min_close_after <= level_75 * 1.03
-    near_100_now = abs(cur_close / level_100 - 1) <= 0.035
-    effective_break_100 = cur_close >= level_100 * 1.008
-    healthy_volume = (1.8 < cur_vr1 < 2.5) or (1.5 <= cur_vr1 <= 3.0 and cur_pct >= 5 and cur_pos >= 0.70)
+        # 凹口/平台必须有“回落-再突破”的结构，不接受普通前高附近放量。
+        pullback_low = safe_float(left.tail(80)["low"].min())
+        had_clear_dip = pullback_low <= platform_top * 0.90
+        if not had_clear_dip:
+            continue
 
-    dist_to_100 = cur_close / level_100 - 1
-    dist_to_150 = level_150 / cur_close - 1 if cur_close > 0 else 0.0
+        # 第一次倍量必须干净突破平台/凹口上沿：收盘确认、不过度拉离、非长上影。
+        first_break_rate = first_close / platform_top - 1
+        if first_break_rate < 0.008 or first_break_rate > 0.08:
+            continue
+        if first_high > platform_top * 1.12:
+            continue
 
-    # A类：首次100%后整理，再次倍量突破100%。如果已经先到过150/200，则不按A类高分。
-    if (not reached_150) and effective_break_100 and healthy_volume:
-        score = 5.0
-        if 1.8 < cur_vr1 < 2.5:
-            score += 1.5
-        if cur_pos >= 0.85:
-            score += 0.8
-        if dist_to_150 >= 0.12:
-            score += 1.0
-        elif dist_to_150 >= 0.06:
-            score += 0.5
-        score = min(8.0, score)
-        return {
-            "hit": True,
-            "score": float(score),
-            "type": "A类：再次倍量突破100%二次确认",
-            "reason": (
-                f"首次倍量高点{level_100:.2f}形成100%位，尚未充分触达150%/200%扩展压力；"
-                f"当前以健康放量重新突破100%位，150%目标{level_150:.2f}、200%目标{level_200:.2f}"
-            ),
-            "first_high": float(first_high),
-            "wave_low": float(wave_low),
-            "level_75": float(level_75),
-            "level_100": float(level_100),
-            "level_150": float(level_150),
-            "level_200": float(level_200),
-            "dist_to_100": float(dist_to_100),
-            "dist_to_150": float(dist_to_150),
-        }
+        first_top_body = max(first_open, first_close)
+        first_bottom_body = min(first_open, first_close)
+        first_mid = (first_top_body + first_bottom_body) / 2
+        hold = w.iloc[first_idx + 1:cur_idx]
+        if hold.empty or len(hold) < 3 or len(hold) > 30:
+            continue
+        min_hold_close = safe_float(hold["close"].min())
+        min_hold_low = safe_float(hold["low"].min())
+        # 承接优先收盘不破首倍实体中位；至少不能有效跌破实体实底/平台上沿。
+        hold_score = 0.0
+        hold_text = ""
+        if first_mid > 0 and min_hold_close >= first_mid:
+            hold_score = 3.0
+            hold_text = "调整收盘不破首倍实体中位"
+        elif first_bottom_body > 0 and min_hold_low >= first_bottom_body * 0.99 and min_hold_close >= platform_top * 0.985:
+            hold_score = 2.0
+            hold_text = "调整守住首倍实体实底/凹口上沿"
+        else:
+            continue
 
-    # B类：已经到达150/200后回落，跌破100，再从75附近或下方回抽100。弱量回抽应降权。
-    if (reached_150 or reached_200) and broke_100 and near_100_now:
-        score = -4.0
-        if reached_200:
-            score -= 1.5
-        if touched_75_area:
-            score -= 1.0
-        if not healthy_volume:
-            score -= 1.0
-        # 如果确实重新倍量有效站上100，仍不能按A类重奖，只解除部分风险，等待回踩确认。
-        if effective_break_100 and healthy_volume:
-            score = min(1.5, score + 4.0)
-        score = max(-8.0, min(2.0, score))
-        return {
-            "hit": True,
-            "score": float(score),
-            "type": "B类：高扩展位回落后回抽100%压力位",
-            "reason": (
-                f"此前已触达{'200%' if reached_200 else '150%'}扩展压力，随后跌破100%位{level_100:.2f}；"
-                f"当前回抽100%附近，性质偏压力位验证而非首次二次突破买点，75%位{level_75:.2f}、150%位{level_150:.2f}、200%位{level_200:.2f}"
-            ),
-            "first_high": float(first_high),
-            "wave_low": float(wave_low),
-            "level_75": float(level_75),
-            "level_100": float(level_100),
-            "level_150": float(level_150),
-            "level_200": float(level_200),
-            "dist_to_100": float(dist_to_100),
-            "dist_to_150": float(dist_to_150),
-        }
+        # 第二次倍量必须干净突破第一次倍量高点，不能只是站回100%附近。
+        if cur_close < first_high * 1.008:
+            continue
+        if cur_close / first_high - 1 > 0.10:
+            # 突破太远，属于强攻后再看承接，不是舒服二次确认买点。
+            continue
 
-    return empty
+        amp = first_high - wave_low
+        if amp <= 0:
+            continue
+        level_75 = wave_low + amp * 0.75
+        level_100 = first_high
+        level_150 = wave_low + amp * 1.5
+        level_200 = wave_low + amp * 2.0
+        max_after = safe_float(hold["high"].max())
+        min_close_after = safe_float(hold["close"].min())
+        reached_150 = max_after >= level_150 * 0.985
+        reached_200 = max_after >= level_200 * 0.985
+        broke_100 = min_close_after < level_100 * 0.985
+        dist_to_100 = cur_close / level_100 - 1
+        dist_to_150 = level_150 / cur_close - 1 if cur_close > 0 else 0.0
+
+        # 已经打到150/200后再回抽100，不能算A类；这种通常是高位回抽压力。
+        if reached_150 or reached_200:
+            score = -5.0 - (2.0 if reached_200 else 0.0) - (1.0 if broke_100 else 0.0)
+            candidate = {
+                "hit": True,
+                "score": float(max(-9.0, min(1.0, score))),
+                "type": "B类：高扩展位回落后回抽100%压力位",
+                "reason": (
+                    f"首次倍量虽突破平台/凹口上沿{platform_top:.2f}，但之后已触达{'200%' if reached_200 else '150%'}扩展压力；"
+                    f"当前再回抽100%位{level_100:.2f}，性质偏中高位修复/压力验证，不按黄金倍量高分"
+                ),
+                "first_high": float(first_high),
+                "wave_low": float(wave_low),
+                "level_75": float(level_75),
+                "level_100": float(level_100),
+                "level_150": float(level_150),
+                "level_200": float(level_200),
+                "dist_to_100": float(dist_to_100),
+                "dist_to_150": float(dist_to_150),
+            }
+        else:
+            score = 7.0 + hold_score
+            if first_break_rate <= 0.05:
+                score += 1.0
+            if cur_pos >= 0.85:
+                score += 0.8
+            if dist_to_150 >= 0.12:
+                score += 1.2
+            elif dist_to_150 >= 0.06:
+                score += 0.6
+            else:
+                score -= 1.5
+            if cur_long_pos > 0.70:
+                score -= 2.0
+            if cur_long_pos > 0.80:
+                score -= 2.5
+            score = max(0.0, min(11.0, score))
+            candidate = {
+                "hit": score >= 7.0,
+                "score": float(score if score >= 7.0 else 0.0),
+                "type": "A类：严格黄金倍量二次确认",
+                "reason": (
+                    f"明显平台/凹口上沿{platform_top:.2f}，第一次标准倍量干净突破；{hold_text}；"
+                    f"当前第二次标准倍量干净突破首倍高点{level_100:.2f}，150%目标{level_150:.2f}、200%目标{level_200:.2f}"
+                ),
+                "first_high": float(first_high),
+                "wave_low": float(wave_low),
+                "level_75": float(level_75),
+                "level_100": float(level_100),
+                "level_150": float(level_150),
+                "level_200": float(level_200),
+                "dist_to_100": float(dist_to_100),
+                "dist_to_150": float(dist_to_150),
+            }
+        if best is None or safe_float(candidate.get("score", 0.0)) > safe_float(best.get("score", -99.0)):
+            best = candidate
+
+    return best if best is not None else empty
 
 def detect_ao_kou_structure(hist):
     """
@@ -1789,9 +1858,9 @@ def calc_base_rows(df):
     df["key_level_base"] = df["high_40_prev"].where(df["platform40_break_base"], df["prehigh"])
     df["distance_to_key_base"] = (df["close"] / df["key_level_base"].replace(0, pd.NA) - 1).fillna(0)
 
-    # V10.1 基础版首次倍量高点二次确认/黄金扩展入口模型：
-    # 不在基础层做复杂高级凹口，只识别“左侧明显高点附近第一次倍量试盘 -> 回调承接 -> 第二次倍量突破第一次高点”。
-    # 该模型放入结构潜力初筛，高权重送入深度评分；深度层再做黄金扩展A/B类精细判断。
+    # V11.1 基础版黄金倍量入口模型：
+    # 第一倍量必须在明显平台/凹口上沿干净突破，不能只用“左侧高点±5%”宽松识别；
+    # 调整后第二倍量还要干净突破首倍高点。基础层只给入口，深度层再精确分类。
     fibo_scores = []
     fibo_descs = []
     fibo_first_highs = []
@@ -1829,22 +1898,25 @@ def calc_base_rows(df):
             if first_close <= 0 or first_high <= 0 or first_pos < 0.55:
                 continue
 
-            # 左侧明显高点：过去60~120日内有阶段高点，第一次倍量回到该高点±5%附近；
-            # 并要求左侧高点之后曾有至少约8%的回落，避免把普通新高误认为凹口/压力回抽。
+            # V11.1：第一倍量必须是明显平台/凹口上沿的干净突破，不再接受普通前高附近试盘。
             left_start = max(0, _j - 120)
             left = df.iloc[left_start:_j]
-            if len(left) < 40:
+            if len(left) < 45:
                 continue
-            left_high = safe_float(left["high"].max())
-            if left_high <= 0:
+            platform = evaluate_platform_quality(left.tail(80))
+            platform_score = safe_float(platform.get("score", 0.0))
+            platform_top = safe_float(platform.get("top", 0.0))
+            top_touches = int(platform.get("top_touches", 0) or 0)
+            if platform_score < 3.5 or platform_top <= 0 or top_touches < 2:
                 continue
-            near_left_high = (first_close >= left_high * 0.95) and (first_close <= left_high * 1.05)
-            if not near_left_high:
+            left_high = platform_top
+            first_break_rate = first_close / platform_top - 1 if platform_top > 0 else 0.0
+            if first_break_rate < 0.008 or first_break_rate > 0.08 or first_pos < 0.70:
                 continue
-            left_high_pos = int(left["high"].values.argmax()) + left_start
+            left_high_pos = left_start + int(left.tail(80)["high"].values.argmax())
             post_high_seg = df.iloc[left_high_pos:_j + 1]
             post_high_low = safe_float(post_high_seg["low"].min()) if not post_high_seg.empty else 0.0
-            had_clear_pullback = post_high_low <= left_high * 0.92
+            had_clear_pullback = post_high_low <= platform_top * 0.90
             if not had_clear_pullback:
                 continue
 
@@ -2051,7 +2123,7 @@ def calc_base_rows(df):
     df.loc[(df["long_pos_250"] > 0.85) & ((df["vr1"] > 3.0) | (df["entity_pct"] > 6)), "base_long_cycle_potential_score"] -= 4
     df["base_long_cycle_potential_score"] = df["base_long_cycle_potential_score"].clip(-5, 10)
 
-    # V11：大周期高度与买点质量轻量闸门。
+    # V11.1：大周期高度与买点质量轻量闸门。
     # 这里只做全市场低成本粗筛：不跑完整月线闭环，只识别“月线/年内偏高、远离防守位、空间不足”的不敢买问题。
     df["base_defense_level"] = df[["key_level_base", "ma20", "ma60", "ma120"]].max(axis=1).fillna(0)
     df["base_defense_dist"] = (df["close"] / df["base_defense_level"].replace(0, pd.NA) - 1).fillna(0)
@@ -2567,6 +2639,66 @@ def calc_deep_rows(df, code):
         & (df["close"] > df["high"].shift(1))
     )
 
+    # V11.2 双阳夹阴 / 分歧反包承接模型：
+    # 第一阳先启动，第二阴制造威慑但不有效破坏第一阳实底，第三阳拼量反包重新夺回主动权。
+    # 该模型不是独立主结构，只作为关键位附近的量价承接/短线行为确认。
+    first_yang = df["close"].shift(2) > df["open"].shift(2)
+    middle_yin = df["close"].shift(1) < df["open"].shift(1)
+    third_yang = df["close"] > df["open"]
+    first_real_bottom = pd.concat([df["open"].shift(2), df["close"].shift(2)], axis=1).min(axis=1)
+    first_real_top = pd.concat([df["open"].shift(2), df["close"].shift(2)], axis=1).max(axis=1)
+    first_real_mid = (first_real_bottom + first_real_top) / 2
+    middle_entity_top = pd.concat([df["open"].shift(1), df["close"].shift(1)], axis=1).max(axis=1)
+    middle_entity_bottom = pd.concat([df["open"].shift(1), df["close"].shift(1)], axis=1).min(axis=1)
+    middle_body_pct = ((df["open"].shift(1) - df["close"].shift(1)) / df["close"].shift(2).replace(0, pd.NA) * 100).fillna(0)
+
+    # 威慑：允许跌破第一阳实体中位；若第二阴实体较大，也视为有威慑。
+    middle_has_threat = (df["close"].shift(1) < first_real_mid) | (df["low"].shift(1) < first_real_mid) | (middle_body_pct >= 1.2)
+    # 破坏控制：第二阴收盘不应有效跌破第一阳实底，最多允许约0.3%的假破。
+    middle_not_broken = df["close"].shift(1) >= first_real_bottom * 0.997
+    # 中间阴线量能不能极端爆量。超过第一阳1.6倍或20日均量2.2倍，视为分歧过大，不给高质量分。
+    middle_vol_not_extreme = (df["volume"].shift(1) <= df["volume"].shift(2) * 1.60) & (df["volume"].shift(1) <= df["vol_ma"].shift(1) * 2.20)
+    # 第三阳必须拼量反包：至少收复阴线实体顶部；更强是突破阴线高点。
+    third_recover_body = df["close"] >= middle_entity_top
+    third_recover_high = df["close"] >= df["high"].shift(1)
+    third_volume_match = df["volume"] >= df["volume"].shift(1) * 0.90
+    third_volume_strong = df["volume"] >= df["volume"].shift(1) * 1.05
+    third_close_strong = df["pos"] >= 0.70
+    # 背景：低/中位、靠近关键位、或前面已有资金/结构迹象；避免高位普通震荡被重奖。
+    double_yang_context = (
+        (df["long_pos_250"] <= 0.70)
+        | (extra.get("score_key_pullback_hold", pd.Series(0, index=df.index)) > 0)
+        | (extra.get("scattered_beiliang_count_60", pd.Series(0, index=df.index)) >= 2)
+        | (extra.get("flat_volume_count_60", pd.Series(0, index=df.index)) >= 1)
+    )
+    extra["double_yang_sandwich_yin"] = (
+        first_yang
+        & middle_yin
+        & third_yang
+        & middle_has_threat
+        & middle_not_broken
+        & middle_vol_not_extreme
+        & third_recover_body
+        & third_volume_match
+        & third_close_strong
+        & double_yang_context
+    )
+    extra["score_double_yang_sandwich"] = 0.0
+    extra.loc[extra["double_yang_sandwich_yin"], "score_double_yang_sandwich"] += 2.0
+    extra.loc[extra["double_yang_sandwich_yin"] & third_recover_high, "score_double_yang_sandwich"] += 1.2
+    extra.loc[extra["double_yang_sandwich_yin"] & third_volume_strong, "score_double_yang_sandwich"] += 0.8
+    extra.loc[extra["double_yang_sandwich_yin"] & (df["pos"] >= 0.85), "score_double_yang_sandwich"] += 0.5
+    # 若第二阴虽未有效破坏，但收盘略破第一阳实底，第三阳必须更强，未突破阴线高点则降档。
+    slight_break_first_bottom = (df["close"].shift(1) < first_real_bottom) & (df["close"].shift(1) >= first_real_bottom * 0.997)
+    extra.loc[extra["double_yang_sandwich_yin"] & slight_break_first_bottom & (~third_recover_high), "score_double_yang_sandwich"] -= 0.8
+    # 高位、乖离大、压力位附近的双阳夹阴不能重奖。
+    extra.loc[extra["double_yang_sandwich_yin"] & ((df["long_pos_250"] > 0.75) | (df["bias20"] > 0.15)), "score_double_yang_sandwich"] -= 1.5
+    extra["score_double_yang_sandwich"] = extra["score_double_yang_sandwich"].clip(0, 5.5)
+    extra["double_yang_sandwich_desc"] = ""
+    extra.loc[extra["double_yang_sandwich_yin"], "double_yang_sandwich_desc"] = "双阳夹阴：第二阴有威慑但未有效破第一阳实底，第三阳拼量收复阴线实体顶部"
+    extra.loc[extra["double_yang_sandwich_yin"] & third_recover_high, "double_yang_sandwich_desc"] = "双阳夹阴：第二阴有威慑但未有效破第一阳实底，第三阳拼量反包阴线高点"
+    extra.loc[extra["double_yang_sandwich_yin"] & slight_break_first_bottom, "double_yang_sandwich_desc"] = extra.loc[extra["double_yang_sandwich_yin"] & slight_break_first_bottom, "double_yang_sandwich_desc"] + "；第二阴略破第一阳实底约0.3%以内，需看第三阳强度"
+
     extra["score_behavior"] = 0
     extra.loc[extra["hold_limit_bottom"], "score_behavior"] += 3
     extra.loc[extra["hold_limit_mid"], "score_behavior"] += 5
@@ -2575,6 +2707,7 @@ def calc_deep_rows(df, code):
     extra.loc[extra["breakup_line"], "score_behavior"] += 6
     extra.loc[extra["three_yin_tactic"], "score_behavior"] += 1.5
     extra.loc[extra["three_down_gap_reversal"], "score_behavior"] += 3
+    extra["score_behavior"] += extra["score_double_yang_sandwich"].fillna(0)
     # 涨停后三日实体承接是独立承接模型，加入行为承接分，但后续有总承接封顶。
     extra["score_behavior"] += extra["score_limitup_hold_3d"].clip(0, 8)
     extra["score_behavior"] = extra["score_behavior"].clip(0, 18)
@@ -3013,7 +3146,7 @@ def calc_deep_rows(df, code):
     extra["monthly_volume_score"] = float(monthly_ctx.get("volume_score", 0.0))
     extra["monthly_detail"] = str(monthly_ctx.get("detail", ""))
 
-    # V11：月线高度/大周期空间风险。月线修复本身加分，但如果已经远离中轨、年内偏高、压力贴脸，要降级。
+    # V11.1：月线高度/大周期空间风险。月线修复本身加分，但如果已经远离中轨、年内偏高、压力贴脸，要降级。
     extra["score_monthly_height_space"] = 0.0
     extra.loc[df["long_pos_250"] <= 0.35, "score_monthly_height_space"] += 8
     extra.loc[(df["long_pos_250"] > 0.35) & (df["long_pos_250"] <= 0.55), "score_monthly_height_space"] += 5
@@ -3026,18 +3159,33 @@ def calc_deep_rows(df, code):
     extra.loc[(extra["score_monthly_cycle"] >= 8) & (df["long_pos_250"] <= 0.60) & (df["bias20"] <= 0.12), "score_monthly_height_space"] += 3
     extra["score_monthly_height_space"] = extra["score_monthly_height_space"].clip(-12, 15)
 
-    # V11：买点质量/风险收益比。核心是防守位、第一压力、风险收益比。
+    # V11.1：买点质量/风险收益比。必须区分“结构关键位”和“真实交易防守位”。
     defense_candidates = pd.concat([
         df["prehigh"].fillna(0),
         df.get("ma20", pd.Series(0, index=df.index)).fillna(0),
         df.get("ma60", pd.Series(0, index=df.index)).fillna(0),
         df.get("ma120", pd.Series(0, index=df.index)).fillna(0),
     ], axis=1)
-    extra["defense_level"] = defense_candidates.max(axis=1)
-    # 结构颈线/首次倍量100%位如果存在，优先作为更强防守边界。
-    extra.loc[extra["structure_neckline"] > 0, "defense_level"] = extra.loc[extra["structure_neckline"] > 0, "structure_neckline"]
-    extra.loc[extra["fibo_level_100"] > 0, "defense_level"] = extra.loc[extra["fibo_level_100"] > 0, "fibo_level_100"]
-    extra["defense_dist"] = (df["close"] / extra["defense_level"].replace(0, pd.NA) - 1).fillna(0)
+    extra["structure_key_level"] = defense_candidates.max(axis=1)
+    extra["defense_source"] = "均线/前高粗防守"
+    # 结构颈线/首次倍量100%位是结构关键位；真实交易防守位必须给缓冲。
+    mask_struct = extra["structure_neckline"] > 0
+    extra.loc[mask_struct, "structure_key_level"] = extra.loc[mask_struct, "structure_neckline"]
+    extra.loc[mask_struct, "defense_source"] = "结构颈线/平台边界"
+    mask_fibo = extra["fibo_level_100"] > 0
+    extra.loc[mask_fibo, "structure_key_level"] = extra.loc[mask_fibo, "fibo_level_100"]
+    extra.loc[mask_fibo, "defense_source"] = "首次倍量100%位"
+
+    extra["defense_buffer_pct"] = 0.015
+    extra.loc[mask_fibo, "defense_buffer_pct"] = 0.020
+    extra.loc[mask_struct, "defense_buffer_pct"] = 0.018
+    extra.loc[extra["score_advanced_ao_kou"] >= 8, "defense_buffer_pct"] = 0.020
+    extra.loc[extra["limit_up"], "defense_buffer_pct"] = 0.018
+
+    extra["real_defense_level"] = extra["structure_key_level"] * (1 - extra["defense_buffer_pct"])
+    # 兼容原字段：defense_level现在代表真实交易防守位；structure_key_level单独输出。
+    extra["defense_level"] = extra["real_defense_level"]
+    extra["defense_dist"] = (df["close"] / extra["real_defense_level"].replace(0, pd.NA) - 1).fillna(0)
     extra.loc[extra["defense_dist"] < 0, "defense_dist"] = 0
     extra["target_dist"] = df["near_pressure_dist"].where(df["near_pressure_dist"] > 0, df["mid_pressure_dist"]).fillna(0)
     extra.loc[extra["target_dist"] <= 0, "target_dist"] = df["overhead_pressure_dist"]
@@ -3167,6 +3315,15 @@ def calc_deep_rows(df, code):
         + extra["score_penalty"] * 0.80
     ).clip(-30, 40)
     extra["total_score"] = extra["total_score"] + extra["score_trade_quality"] + extra["score_monthly_height_space"] + extra["trade_priority_score"] * 0.35
+
+    # V11.1：交易优先级不能轻易打满。高位回抽100%、月线高位、真实防守过远必须封顶。
+    fibo_pullback_pressure_v111 = extra["fibo_reclaim_type"].astype(str).str.contains("高扩展位回落", na=False)
+    high_monthly_retrace_v111 = (df["long_pos_250"] > 0.70) & ((df["bias20"] > 0.10) | ((df["near_pressure_dist"] > 0) & (df["near_pressure_dist"] < 0.12)))
+    far_real_defense_v111 = extra["defense_dist"] > 0.08
+    extra.loc[fibo_pullback_pressure_v111, "trade_priority_score"] = extra.loc[fibo_pullback_pressure_v111, "trade_priority_score"].clip(upper=18.0)
+    extra.loc[high_monthly_retrace_v111, "trade_priority_score"] = extra.loc[high_monthly_retrace_v111, "trade_priority_score"].clip(upper=24.0)
+    extra.loc[far_real_defense_v111, "trade_priority_score"] = extra.loc[far_real_defense_v111, "trade_priority_score"].clip(upper=26.0)
+    extra.loc[fibo_pullback_pressure_v111 | high_monthly_retrace_v111, "total_score"] = extra.loc[fibo_pullback_pressure_v111 | high_monthly_retrace_v111, "total_score"].clip(upper=82.0)
 
     poor_rr = (extra["risk_reward_ratio"] > 0) & (extra["risk_reward_ratio"] < 1.2)
     poor_trade_quality = (extra["score_trade_quality"] < 0) | poor_rr
@@ -3419,6 +3576,9 @@ def process_stock_deep(row):
             "score_stepwise_push": float(r.get("score_stepwise_push", 0)) if pd.notna(r.get("score_stepwise_push", 0)) else 0,
             "stepwise_desc": str(r.get("stepwise_desc", "")) if pd.notna(r.get("stepwise_desc", "")) else "",
             "three_yin_tactic": bool(r.get("three_yin_tactic", False)),
+            "double_yang_sandwich_yin": bool(r.get("double_yang_sandwich_yin", False)),
+            "score_double_yang_sandwich": float(r.get("score_double_yang_sandwich", 0)) if pd.notna(r.get("score_double_yang_sandwich", 0)) else 0,
+            "double_yang_sandwich_desc": str(r.get("double_yang_sandwich_desc", "")) if pd.notna(r.get("double_yang_sandwich_desc", "")) else "",
             "beibeiliang_short_pullback_risk": bool(r.get("beibeiliang_short_pullback_risk", False)),
             "beibeiliang_shrink_rate_after": float(r.get("beibeiliang_shrink_rate_after", 0)) if pd.notna(r.get("beibeiliang_shrink_rate_after", 0)) else 0,
             "score_pattern": float(r["score_pattern"]) if pd.notna(r["score_pattern"]) else 0,
@@ -3462,7 +3622,10 @@ def process_stock_deep(row):
             "score_monthly_height_space": float(r.get("score_monthly_height_space", 0)) if pd.notna(r.get("score_monthly_height_space", 0)) else 0,
             "score_trade_quality": float(r.get("score_trade_quality", 0)) if pd.notna(r.get("score_trade_quality", 0)) else 0,
             "trade_priority_score": float(r.get("trade_priority_score", 0)) if pd.notna(r.get("trade_priority_score", 0)) else 0,
+            "structure_key_level": float(r.get("structure_key_level", 0)) if pd.notna(r.get("structure_key_level", 0)) else 0,
             "defense_level": float(r.get("defense_level", 0)) if pd.notna(r.get("defense_level", 0)) else 0,
+            "defense_source": str(r.get("defense_source", "")) if pd.notna(r.get("defense_source", "")) else "",
+            "defense_buffer_pct": float(r.get("defense_buffer_pct", 0)) if pd.notna(r.get("defense_buffer_pct", 0)) else 0,
             "defense_dist": float(r.get("defense_dist", 0)) if pd.notna(r.get("defense_dist", 0)) else 0,
             "target_dist": float(r.get("target_dist", 0)) if pd.notna(r.get("target_dist", 0)) else 0,
             "risk_reward_ratio": float(r.get("risk_reward_ratio", 0)) if pd.notna(r.get("risk_reward_ratio", 0)) else 0,
@@ -3514,6 +3677,7 @@ def process_stock_deep(row):
         rr["total_score"] = float(rr.get("total_score", 0.0)) + rr["score_regulatory_risk"]
         if rr["risk_hard_exclude"]:
             rr["total_score"] = min(rr["total_score"], 59.0)
+        rr.update(classify_next_day_strategy(rr))
 
     return rows
 
@@ -3616,6 +3780,138 @@ def select_deep_targets_v10(base_rows, limit):
     bucket_stats["合计"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
+
+def calc_no_chase_line(close, strategy_type):
+    """V11.3：根据策略类型给出次日禁止追高线。"""
+    close = safe_float(close)
+    if close <= 0:
+        return 0.0
+    if "可低吸" in strategy_type:
+        pct = 0.015
+    elif "回踩" in strategy_type:
+        pct = 0.025
+    elif "强势接力" in strategy_type:
+        pct = 0.045
+    else:
+        pct = 0.020
+    return round(close * (1 + pct), 2)
+
+
+def classify_next_day_strategy(s):
+    """
+    V11.3 次日执行策略分类。
+    目的不是预测一定涨停，而是把一号员工候选转化为条件式执行建议：
+    哪些可低吸、哪些等回踩、哪些只做强势接力确认、哪些禁止追高。
+    """
+    close = safe_float(s.get("close", 0))
+    pct_chg = safe_float(s.get("pct_chg", 0))
+    defense = safe_float(s.get("defense_level", 0))
+    structure_key = safe_float(s.get("structure_key_level", 0))
+    defense_dist = safe_float(s.get("defense_dist", 0))
+    target_dist = safe_float(s.get("target_dist", 0))
+    rr = safe_float(s.get("risk_reward_ratio", 0))
+    near_pressure = safe_float(s.get("near_pressure_dist", 0))
+    bias20 = safe_float(s.get("bias20", 0))
+    bias60 = safe_float(s.get("bias60", 0))
+    long_pos = safe_float(s.get("long_pos_250", 0))
+    score_trade_quality = safe_float(s.get("score_trade_quality", 0))
+    trade_priority = safe_float(s.get("trade_priority_score", 0))
+    score_structure = safe_float(s.get("score_structure_core", 0)) + safe_float(s.get("score_advanced_ao_kou", 0)) + safe_float(s.get("score_fibo_reclaim", 0))
+    score_limitup_hold = safe_float(s.get("score_limitup_hold_3d", 0))
+    score_double_yang = safe_float(s.get("score_double_yang_sandwich", 0))
+    candidate_pool = str(s.get("candidate_pool", "优先候选池"))
+    chase_flags = str(s.get("chase_risk_flags", ""))
+    risk_flags = str(s.get("risk_flags", ""))
+    fibo_type = str(s.get("fibo_reclaim_type", ""))
+
+    if bool(s.get("risk_hard_exclude", False)) or risk_flags:
+        return {
+            "next_day_strategy": "E类：雷区剔除候选",
+            "no_chase_line": 0.0,
+            "pullback_zone": "不参与交易",
+            "confirm_rule": "命中基本面/监管/治理雷区，一号员工阶段直接剔除优先池；技术形态不抵消重大雷区。",
+            "abandon_rule": "不进入三号员工可交易候选。",
+            "strategy_note": f"雷区标签：{risk_flags}" if risk_flags else "命中硬排雷规则",
+        }
+
+    high_chase_risk = (
+        (candidate_pool != "优先候选池")
+        or (pct_chg >= 6.5 and defense_dist > 0.045)
+        or (pct_chg >= 4.0 and target_dist < 0.10)
+        or (near_pressure > 0 and near_pressure < 0.055)
+        or (defense_dist > 0.075)
+        or (bias20 > 0.13)
+        or (bias60 > 0.16)
+        or ("高位" in chase_flags)
+        or ("追高" in chase_flags)
+        or ("回抽100" in fibo_type)
+        or ("高位回抽" in fibo_type)
+    )
+
+    strong_relay = (
+        (pct_chg >= 8.5 or safe_float(s.get("score_limitup_activity", 0)) > 0 or score_limitup_hold > 0)
+        and not high_chase_risk
+        and target_dist >= 0.08
+        and defense_dist <= 0.065
+        and long_pos < 0.75
+    )
+
+    low_absorb = (
+        defense > 0
+        and defense_dist <= 0.035
+        and target_dist >= 0.12
+        and rr >= 2.0
+        and pct_chg <= 4.5
+        and long_pos <= 0.65
+        and score_trade_quality >= 12
+    )
+
+    pullback_confirm = (
+        not high_chase_risk
+        and not low_absorb
+        and (score_structure >= 6 or score_double_yang >= 2 or score_trade_quality >= 10 or trade_priority >= 18)
+    )
+
+    if strong_relay:
+        strategy_type = "C类：强势接力候选"
+        key = structure_key if structure_key > 0 else defense
+        observe_zone = f"强势确认为主；若开板/回落，优先看{key:.2f}附近承接" if key > 0 else "强势确认为主"
+        confirm_rule = "只在开盘后快速转强、封板稳定、不开板或开板后快速回封、分时不破均线时确认；不能只因高开就追。"
+        abandon_rule = "高开冲高回落、跌破昨收或跌破分时均线后不能快速收回，放弃接力。"
+        note = "强势接力难度最高，只给三号员工盘中确认，不等于开盘追涨。"
+    elif low_absorb:
+        strategy_type = "A类：可低吸候选"
+        key = structure_key if structure_key > 0 else defense
+        low = defense
+        high = key if key > 0 else close
+        observe_zone = f"{min(low, high):.2f}-{max(low, high):.2f}附近" if low > 0 and high > 0 else "真实防守位附近"
+        confirm_rule = "平开/小高开更优；回踩结构关键位或真实防守位附近不破，缩量承接后重新放量站上分时均线，再交给三号员工确认。"
+        abandon_rule = f"有效跌破真实交易防守位{defense:.2f}，或高开超过禁止追高线后冲高回落，放弃。"
+        note = "买点核心是靠近防守位和风险收益比，不追高。"
+    elif pullback_confirm:
+        strategy_type = "B类：回踩确认候选"
+        key = structure_key if structure_key > 0 else defense
+        observe_zone = f"{key:.2f}附近回踩承接" if key > 0 else "突破位/昨收附近回踩承接"
+        confirm_rule = "不直接追；只等回踩昨日突破位、结构关键位、涨停实体位或首次倍量高点不破，并重新放量上穿分时均线。"
+        abandon_rule = "不回踩不买；高开冲高回落跌破昨收，或跌破真实交易防守位，放弃。"
+        note = "有结构或资金迹象，但需要次日回踩确认。"
+    else:
+        strategy_type = "D类：禁止追高候选"
+        key = structure_key if structure_key > 0 else defense
+        observe_zone = f"只看{key:.2f}附近是否重新承接" if key > 0 else "只观察，不主动买"
+        confirm_rule = "仅在明显回踩关键位不破、量能恢复、分时重新转强后，才允许三号员工重新评估。"
+        abandon_rule = "高开超过2%-3%、开到压力/扩展位附近、冲高回落跌破昨收，直接放弃。"
+        note = "强势不等于可追；当前买点不舒服或赔率不足。"
+
+    return {
+        "next_day_strategy": strategy_type,
+        "no_chase_line": calc_no_chase_line(close, strategy_type),
+        "pullback_zone": observe_zone,
+        "confirm_rule": confirm_rule,
+        "abandon_rule": abandon_rule,
+        "strategy_note": note,
+    }
+
 def build_reason(s):
     reasons = []
     reasons.append(f"原模型评分{s['score']:.1f}，基础初筛分{s['base_score']:.1f}；原模型折算{s.get('score_base_model', 0):.1f}分")
@@ -3647,8 +3943,15 @@ def build_reason(s):
         f"压力空间分{s.get('score_pressure_space', 0):.1f}，离关键位{s.get('distance_to_key', 0):.2%}/舒适度{s.get('score_key_distance', 0):.1f}，20日乖离{s['bias20']:.2%}，60日乖离{s['bias60']:.2%}"
     )
     reasons.append(
-        f"V11交易质量：防守位{s.get('defense_level', 0):.2f}，离防守{s.get('defense_dist', 0):.2%}，第一目标/压力空间{s.get('target_dist', 0):.2%}，"
+        f"V11.1交易质量：结构关键位{s.get('structure_key_level', 0):.2f}（{s.get('defense_source', '')}），真实交易防守位{s.get('defense_level', 0):.2f}，"
+        f"缓冲{s.get('defense_buffer_pct', 0):.1%}，离真实防守{s.get('defense_dist', 0):.2%}，第一目标/压力空间{s.get('target_dist', 0):.2%}，"
         f"风险收益比{s.get('risk_reward_ratio', 0):.2f}，买点质量分{s.get('score_trade_quality', 0):.1f}，月线高度/空间分{s.get('score_monthly_height_space', 0):.1f}，交易优先级{s.get('trade_priority_score', 0):.1f}"
+    )
+    if not s.get('next_day_strategy'):
+        s.update(classify_next_day_strategy(s))
+    reasons.append(
+        f"V11.3次日策略：{s.get('next_day_strategy', '')}；禁止追高线{s.get('no_chase_line', 0):.2f}；"
+        f"回踩观察区：{s.get('pullback_zone', '')}；确认条件：{s.get('confirm_rule', '')}；放弃条件：{s.get('abandon_rule', '')}"
     )
     if s.get("chase_risk_flags"):
         cap_text = f"，封顶{s.get('chase_score_cap', 0):.1f}" if s.get("chase_score_cap", 0) else ""
@@ -3670,6 +3973,10 @@ def build_reason(s):
         reasons.append(f"台阶式资金推进：{s.get('stepwise_desc', '')}")
     if s.get("three_yin_tactic"):
         reasons.append("三阴战法：已识别，属于回撤中的轻度结构提示，需结合关键位与后续大阳修复")
+    if s.get("double_yang_sandwich_yin"):
+        reasons.append(
+            f"双阳夹阴/分歧反包：{s.get('double_yang_sandwich_desc', '')}，得分{s.get('score_double_yang_sandwich', 0):.1f}；该项定位为短线承接确认，不替代主结构"
+        )
     if s.get("beibeiliang_short_pullback_risk"):
         reasons.append(f"连续倍倍量后承接：后续量能缩量{s.get('beibeiliang_shrink_rate_after', 0):.1%}，仅提示短线承接风险，不代表中长期结构变坏")
 
@@ -3739,9 +4046,10 @@ def build_reason(s):
     reasons.append(f"指标状态：MA20斜率{slope:.2%}，RSI{rsi:.1f}({rsi_tag})，CCI{cci:.1f}({cci_tag})，指标分{s.get('score_indicator', 0):.1f}")
 
     if s.get("risk_flags"):
-        reasons.append(f"重大雷区：{s.get('risk_flags')}，雷区扣分{s.get('score_regulatory_risk', 0):.1f}，普通候选降级")
+        hard_text = "，硬剔除/降级" if s.get("risk_hard_exclude") else "，大幅降权"
+        reasons.append(f"雷区筛查：命中{s.get('risk_flags')}，雷区扣分{s.get('score_regulatory_risk', 0):.1f}{hard_text}")
     else:
-        reasons.append("重大雷区：未在risk_flags.json中命中")
+        reasons.append("雷区筛查：risk_flags.json未命中；一号员工仍按技术候选处理，后续建议持续扩充雷区库")
 
     return "；".join(reasons) + "。"
 
@@ -3753,7 +4061,8 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"评分阈值：综合分 ≥ {FINAL_SCORE_THRESHOLD:.0f}；80分以下不推送，不固定凑满数量。")
-    lines.append("V11交易质量闸门：默认优先结构清楚、位置合理、防守明确、风险收益比合格的候选；强但不敢买的票降级观察。")
+    lines.append(f"V11.3精简推送：默认只推前{RESULT_LIMIT}只；每只给出次日策略分类，候选≠开盘追。")
+    lines.append("V11.1交易质量闸门：严格区分结构关键位/真实交易防守位；黄金倍量必须明显凹口干净突破；雷区筛查前置，强但不敢买或有雷的票降级观察。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -3776,6 +4085,11 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         lines.append(f"{i}. <b>{html.escape(s['name'])}</b> ({html.escape(s['code'])})")
         lines.append(f"日期：{s['date']}")
         lines.append(f"收盘：{s['close']:.2f} | 涨幅：{s['pct_chg']:.2f}% | 成交额：{s['amount'] / 100000000:.2f}亿")
+        if not s.get('next_day_strategy'):
+            s.update(classify_next_day_strategy(s))
+        lines.append(
+            f"次日策略：{html.escape(str(s.get('next_day_strategy', '')))} | 禁止追高线：{s.get('no_chase_line', 0):.2f} | 回踩观察区：{html.escape(str(s.get('pullback_zone', '')))}"
+        )
         lines.append(
             f"综合分：{s['total_score']:.2f} | 阶段：{html.escape(str(s.get('trade_stage', '未知')))} | 池：{html.escape(str(s.get('candidate_pool', '优先候选池')))} | "
             f"原模型：{s['score_base_model']:.1f} | 量能：{s['score_volume_structure']:.1f} | 行为：{s['score_behavior']:.1f} | "
@@ -3803,7 +4117,9 @@ def main():
     start_ts = time.time()
 
     print(f"ENABLE_TELEGRAM={ENABLE_TELEGRAM}")
-    print(f"RESULT_LIMIT={RESULT_LIMIT}")
+    print(f"RESULT_LIMIT_RAW={RESULT_LIMIT_RAW}")
+    print(f"TOP_PUSH_LIMIT={TOP_PUSH_LIMIT}")
+    print(f"RESULT_LIMIT_EFFECTIVE={RESULT_LIMIT}")
     print(f"FINAL_SCORE_THRESHOLD={FINAL_SCORE_THRESHOLD}")
     print(f"ONLY_PUSH_PRIORITY_POOL={ONLY_PUSH_PRIORITY_POOL}")
     print(f"SAVE_STRONG_WATCH_POOL={SAVE_STRONG_WATCH_POOL}")
