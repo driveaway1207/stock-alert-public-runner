@@ -12,6 +12,11 @@ import baostock as bs
 import pandas as pd
 import requests
 
+try:
+    import akshare as ak
+except Exception:
+    ak = None
+
 warnings.filterwarnings("ignore")
 
 # ========================= V11 交易质量主逻辑重构说明 =========================
@@ -44,6 +49,14 @@ warnings.filterwarnings("ignore")
 # 3）基础扫描后如成功样本不足，先对失败股票做一轮补拉，避免偶发断流导致全市场样本过低；
 # 4）若数据源持续异常，提前进入诊断模式，不推正式选股结果，避免小样本误判；
 # 5）日志从“逐条刷屏”改为汇总式诊断，明确 source=baostock、stage=fetch_kline、retry、success/fail/coverage。
+# ===========================================================================
+
+# ========================= V11.5 股票池获取超时/备用通道增量优化说明 =========================
+# 1）针对“抓取A股列表/使用股票池日期”阶段卡住的问题，新增股票池获取超时保护；
+# 2）BaoStock query_all_stock 超时或失败时自动重试、重登；
+# 3）BaoStock 股票列表持续异常时，自动切换 AkShare A股实时列表作为备用股票池；
+# 4）股票池阶段不再无限等待，失败会发送诊断或走备用通道，避免 GitHub Actions 空转数十分钟；
+# 5）不改变原有评分、推送、V11.4 K线稳定性保护和候选输出逻辑。
 # ===========================================================================
 
 # ========================= V9.1 追高闸门增量优化说明 =========================
@@ -100,6 +113,12 @@ RETRY_FAILED_KLINE_AFTER_SCAN = os.environ.get("RETRY_FAILED_KLINE_AFTER_SCAN", 
 RETRY_FAILED_KLINE_LIMIT = int(os.environ.get("RETRY_FAILED_KLINE_LIMIT", "1200"))
 MIN_FORMAL_COVERAGE_RATE = float(os.environ.get("MIN_FORMAL_COVERAGE_RATE", "0.80"))
 
+# V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
+STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
+STOCK_LIST_MAX_RETRIES = int(os.environ.get("STOCK_LIST_MAX_RETRIES", "2"))
+STOCK_LIST_FALLBACK_AKSHARE = os.environ.get("STOCK_LIST_FALLBACK_AKSHARE", "1")
+STOCK_LIST_RELOGIN_ON_FAIL = os.environ.get("STOCK_LIST_RELOGIN_ON_FAIL", "1")
+
 SCORE_LIMIT = 75
 # 最终推送阈值：新评分体系下，80分以下不再推送；基础初筛仍沿用原SCORE_LIMIT，不改原模型。
 FINAL_SCORE_THRESHOLD = float(os.environ.get("FINAL_SCORE_THRESHOLD", "80"))
@@ -128,6 +147,8 @@ KLINE_SOURCE_STATS = {
     "consecutive_fail": 0,
     "pause_count": 0,
     "relogin_count": 0,
+    "stock_list_timeout": 0,
+    "stock_list_fallback": 0,
 }
 
 class StockDataTimeout(Exception):
@@ -364,8 +385,87 @@ def summarize_kline_source_stats():
     return (
         f"数据源诊断：BrokenPipe={KLINE_SOURCE_STATS.get('broken_pipe', 0)}，"
         f"timeout={KLINE_SOURCE_STATS.get('timeout', 0)}，other={KLINE_SOURCE_STATS.get('other_error', 0)}，"
-        f"pause={KLINE_SOURCE_STATS.get('pause_count', 0)}，relogin={KLINE_SOURCE_STATS.get('relogin_count', 0)}"
+        f"pause={KLINE_SOURCE_STATS.get('pause_count', 0)}，relogin={KLINE_SOURCE_STATS.get('relogin_count', 0)}，"
+        f"stockListTimeout={KLINE_SOURCE_STATS.get('stock_list_timeout', 0)}，stockListFallback={KLINE_SOURCE_STATS.get('stock_list_fallback', 0)}"
     )
+
+
+def _normalize_stock_list_df(df, source="baostock"):
+    """
+    V11.5：统一 BaoStock / AkShare 股票池字段，输出：代码、名称、bs_code。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+    d = df.copy()
+
+    if source == "baostock":
+        if "code" not in d.columns:
+            print("BaoStock股票列表字段异常")
+            print(d.head())
+            return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+        name_col = "code_name" if "code_name" in d.columns else None
+        if name_col is None:
+            d["code_name"] = ""
+            name_col = "code_name"
+        d = d[["code", name_col]].copy()
+        d = d.rename(columns={"code": "bs_code", name_col: "名称"})
+        d["bs_code"] = d["bs_code"].astype(str)
+        d["代码"] = d["bs_code"].str.split(".").str[-1]
+    else:
+        # AkShare stock_zh_a_spot_em 常见字段：代码、名称；不同版本可能略有差异。
+        code_col = None
+        name_col = None
+        for c in ["代码", "code", "symbol"]:
+            if c in d.columns:
+                code_col = c
+                break
+        for c in ["名称", "name", "股票简称"]:
+            if c in d.columns:
+                name_col = c
+                break
+        if code_col is None:
+            print("AkShare股票列表字段异常：未找到代码列")
+            print(d.head())
+            return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+        if name_col is None:
+            d["名称"] = ""
+            name_col = "名称"
+        d = d[[code_col, name_col]].copy()
+        d = d.rename(columns={code_col: "代码", name_col: "名称"})
+        d["代码"] = d["代码"].astype(str).str.extract(r"(\d{6})", expand=False)
+        d = d.dropna(subset=["代码"])
+
+        def to_bs_code(code):
+            code = str(code).zfill(6)
+            if code.startswith(("600", "601", "603", "605", "688")):
+                return "sh." + code
+            if code.startswith(("000", "001", "002", "003", "300", "301")):
+                return "sz." + code
+            return ""
+
+        d["bs_code"] = d["代码"].apply(to_bs_code)
+
+    d["代码"] = d["代码"].astype(str).str.zfill(6)
+    d["名称"] = d["名称"].astype(str)
+    d["bs_code"] = d["bs_code"].astype(str)
+    d = d[d["bs_code"].str.startswith(VALID_STOCK_PREFIXES)]
+    d = d[~d["名称"].astype(str).str.contains("ST|\\*ST|退", regex=True, na=False)]
+    d = d.drop_duplicates(subset=["代码"])
+
+    if MAX_STOCKS > 0:
+        d = d.head(MAX_STOCKS)
+
+    return d[["代码", "名称", "bs_code"]]
+
+
+def _query_all_stock_with_timeout(day, label="stock_list"):
+    """
+    V11.5：BaoStock query_all_stock 也加超时，避免卡在“抓取A股列表”。
+    """
+    with stock_query_timeout(STOCK_LIST_QUERY_TIMEOUT_SECONDS, f"{label}:{day}"):
+        rs = bs.query_all_stock(day)
+        return rs.get_data()
 
 
 def get_last_trade_day():
@@ -373,13 +473,73 @@ def get_last_trade_day():
 
     for i in range(10):
         day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-        rs = bs.query_all_stock(day)
-        df = rs.get_data()
+        for attempt in range(1, STOCK_LIST_MAX_RETRIES + 1):
+            try:
+                df = _query_all_stock_with_timeout(day, label=f"last_trade_day_attempt{attempt}")
+                if df is not None and not df.empty:
+                    return day
+            except StockDataTimeout as e:
+                KLINE_SOURCE_STATS["stock_list_timeout"] = KLINE_SOURCE_STATS.get("stock_list_timeout", 0) + 1
+                print(f"股票池交易日查询超时：source=baostock stage=query_trade_day day={day} retry={attempt} timeout={STOCK_LIST_QUERY_TIMEOUT_SECONDS}s")
+                if STOCK_LIST_RELOGIN_ON_FAIL == "1":
+                    baostock_relogin("stock_list_trade_day_timeout")
+            except Exception as e:
+                print(f"股票池交易日查询失败：source=baostock stage=query_trade_day day={day} retry={attempt} error={str(e)[:120]}")
+                if STOCK_LIST_RELOGIN_ON_FAIL == "1":
+                    baostock_relogin("stock_list_trade_day_error")
+            time.sleep(0.8)
 
-        if df is not None and not df.empty:
-            return day
+    # 如果 BaoStock 交易日查询持续失败，不在这里无限等待；返回今天，后续股票池可走 AkShare 备用。
+    fallback_day = today.strftime("%Y-%m-%d")
+    print(f"BaoStock交易日查询持续异常，暂用当前日期作为股票池日期：{fallback_day}")
+    return fallback_day
 
-    return today.strftime("%Y-%m-%d")
+
+def get_a_stock_list_from_baostock(trade_day):
+    for attempt in range(1, STOCK_LIST_MAX_RETRIES + 1):
+        try:
+            print(f"股票池获取：source=baostock stage=query_all_stock day={trade_day} retry={attempt}/{STOCK_LIST_MAX_RETRIES}")
+            df = _query_all_stock_with_timeout(trade_day, label=f"stock_list_attempt{attempt}")
+            out = _normalize_stock_list_df(df, source="baostock")
+            if not out.empty:
+                return out
+            print("BaoStock股票列表为空或字段异常")
+        except StockDataTimeout:
+            KLINE_SOURCE_STATS["stock_list_timeout"] = KLINE_SOURCE_STATS.get("stock_list_timeout", 0) + 1
+            print(f"股票池获取超时：source=baostock stage=query_all_stock day={trade_day} retry={attempt} timeout={STOCK_LIST_QUERY_TIMEOUT_SECONDS}s")
+        except Exception as e:
+            print(f"股票池获取失败：source=baostock stage=query_all_stock day={trade_day} retry={attempt} error={str(e)[:160]}")
+
+        if STOCK_LIST_RELOGIN_ON_FAIL == "1":
+            baostock_relogin("stock_list_query_fail")
+        time.sleep(1.5 * attempt)
+
+    return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+
+def get_a_stock_list_from_akshare():
+    if STOCK_LIST_FALLBACK_AKSHARE != "1":
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+    if ak is None:
+        print("AkShare未成功导入，无法使用股票池备用通道")
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+    try:
+        print("股票池获取：source=akshare stage=stock_zh_a_spot_em fallback=1")
+        with stock_query_timeout(STOCK_LIST_QUERY_TIMEOUT_SECONDS, "akshare_stock_list"):
+            df = ak.stock_zh_a_spot_em()
+        out = _normalize_stock_list_df(df, source="akshare")
+        if not out.empty:
+            KLINE_SOURCE_STATS["stock_list_fallback"] = KLINE_SOURCE_STATS.get("stock_list_fallback", 0) + 1
+            print(f"AkShare备用股票池获取成功：{len(out)} 只")
+        return out
+    except StockDataTimeout:
+        KLINE_SOURCE_STATS["stock_list_timeout"] = KLINE_SOURCE_STATS.get("stock_list_timeout", 0) + 1
+        print(f"AkShare备用股票池获取超时：timeout={STOCK_LIST_QUERY_TIMEOUT_SECONDS}s")
+    except Exception as e:
+        print(f"AkShare备用股票池获取失败：error={str(e)[:160]}")
+
+    return pd.DataFrame(columns=["代码", "名称", "bs_code"])
 
 
 def get_a_stock_list():
@@ -390,39 +550,19 @@ def get_a_stock_list():
 
     print(f"使用股票池日期：{trade_day}")
 
-    rs = bs.query_all_stock(trade_day)
-    df = rs.get_data()
+    df = get_a_stock_list_from_baostock(trade_day)
+    source_used = "baostock"
 
-    if df is None or df.empty:
-        print("BaoStock股票列表为空")
+    if df.empty:
+        print("BaoStock股票池获取失败，准备切换备用 AkShare 股票池。")
+        df = get_a_stock_list_from_akshare()
+        source_used = "akshare" if not df.empty else "none"
+
+    if df.empty:
+        print("股票池获取失败：BaoStock 与 AkShare 均未返回有效A股列表")
         return pd.DataFrame(columns=["代码", "名称", "bs_code"])
 
-    if "code" not in df.columns:
-        print("BaoStock股票列表字段异常")
-        print(df.head())
-        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
-
-    name_col = "code_name" if "code_name" in df.columns else None
-
-    if name_col is None:
-        df["code_name"] = ""
-        name_col = "code_name"
-
-    df = df[["code", name_col]].copy()
-    df = df.rename(columns={"code": "bs_code", name_col: "名称"})
-
-    df["bs_code"] = df["bs_code"].astype(str)
-    df["代码"] = df["bs_code"].str.split(".").str[-1]
-    df["名称"] = df["名称"].astype(str)
-
-    df = df[df["bs_code"].str.startswith(VALID_STOCK_PREFIXES)]
-    df = df[~df["名称"].astype(str).str.contains("ST|\\*ST|退", regex=True, na=False)]
-    df = df.drop_duplicates(subset=["代码"])
-
-    if MAX_STOCKS > 0:
-        df = df.head(MAX_STOCKS)
-
-    print(f"A股个股列表获取成功：{len(df)} 只")
+    print(f"A股个股列表获取成功：{len(df)} 只，source={source_used}")
     print("股票池前20只：")
     print(df[["代码", "名称", "bs_code"]].head(20).to_string(index=False))
 
@@ -4268,6 +4408,9 @@ def main():
     print(f"RETRY_FAILED_KLINE_LIMIT={RETRY_FAILED_KLINE_LIMIT}")
     print(f"MIN_FORMAL_COVERAGE_RATE={MIN_FORMAL_COVERAGE_RATE}")
     print(f"KLINE_LOOKBACK_DAYS={KLINE_LOOKBACK_DAYS}")
+    print(f"STOCK_LIST_QUERY_TIMEOUT_SECONDS={STOCK_LIST_QUERY_TIMEOUT_SECONDS}")
+    print(f"STOCK_LIST_MAX_RETRIES={STOCK_LIST_MAX_RETRIES}")
+    print(f"STOCK_LIST_FALLBACK_AKSHARE={STOCK_LIST_FALLBACK_AKSHARE}")
     print(f"北京时间：{bj_time_str()}")
 
     if not baostock_login():
