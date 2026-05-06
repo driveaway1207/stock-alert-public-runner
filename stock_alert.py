@@ -4,7 +4,8 @@ import time
 import html
 import warnings
 import signal
-from contextlib import contextmanager
+import io
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta
 
 import baostock as bs
@@ -35,6 +36,14 @@ warnings.filterwarnings("ignore")
 # 2）新增“次日执行策略分类”：可低吸候选、回踩确认候选、强势接力候选、禁止追高候选、雷区剔除候选；
 # 3）每只票输出禁止追高线、回踩观察区、确认条件、放弃条件，明确候选≠开盘追；
 # 4）该模块不预测必涨停，只提供条件触发式执行规则，给三号员工/人工盘中确认使用。
+# ===========================================================================
+
+# ========================= V11.4 数据源稳定性/失败保护增量优化说明 =========================
+# 1）针对 GitHub Actions 上 BaoStock / 公开行情源频繁 Broken pipe 的问题，新增数据源健康监控；
+# 2）单只K线失败自动多次重试，连续 Broken pipe 达阈值后自动暂停、重登 BaoStock，再继续扫描；
+# 3）基础扫描后如成功样本不足，先对失败股票做一轮补拉，避免偶发断流导致全市场样本过低；
+# 4）若数据源持续异常，提前进入诊断模式，不推正式选股结果，避免小样本误判；
+# 5）日志从“逐条刷屏”改为汇总式诊断，明确 source=baostock、stage=fetch_kline、retry、success/fail/coverage。
 # ===========================================================================
 
 # ========================= V9.1 追高闸门增量优化说明 =========================
@@ -78,6 +87,19 @@ MIN_VALID_KLINE = int(os.environ.get("MIN_VALID_KLINE", "1000"))
 PROGRESS_INTERVAL = int(os.environ.get("PROGRESS_INTERVAL", "100"))
 SINGLE_STOCK_TIMEOUT_SECONDS = int(os.environ.get("SINGLE_STOCK_TIMEOUT_SECONDS", "35"))
 
+# V11.4：数据源稳定性保护。公开行情源偶发 Broken pipe / 接收异常时，先暂停重登，再补拉失败样本。
+KLINE_MAX_RETRIES = int(os.environ.get("KLINE_MAX_RETRIES", "3"))
+BROKEN_PIPE_PAUSE_THRESHOLD = int(os.environ.get("BROKEN_PIPE_PAUSE_THRESHOLD", "20"))
+BROKEN_PIPE_PAUSE_SECONDS = int(os.environ.get("BROKEN_PIPE_PAUSE_SECONDS", "90"))
+BAOSTOCK_RELOGIN_ON_BROKEN_PIPE = os.environ.get("BAOSTOCK_RELOGIN_ON_BROKEN_PIPE", "1")
+SUPPRESS_BAOSTOCK_VERBOSE = os.environ.get("SUPPRESS_BAOSTOCK_VERBOSE", "1")
+DATA_SOURCE_FAIL_FAST_AFTER = int(os.environ.get("DATA_SOURCE_FAIL_FAST_AFTER", "900"))
+DATA_SOURCE_MIN_SUCCESS_RATE = float(os.environ.get("DATA_SOURCE_MIN_SUCCESS_RATE", "0.20"))
+DATA_SOURCE_CONSECUTIVE_FAIL_LIMIT = int(os.environ.get("DATA_SOURCE_CONSECUTIVE_FAIL_LIMIT", "300"))
+RETRY_FAILED_KLINE_AFTER_SCAN = os.environ.get("RETRY_FAILED_KLINE_AFTER_SCAN", "1")
+RETRY_FAILED_KLINE_LIMIT = int(os.environ.get("RETRY_FAILED_KLINE_LIMIT", "1200"))
+MIN_FORMAL_COVERAGE_RATE = float(os.environ.get("MIN_FORMAL_COVERAGE_RATE", "0.80"))
+
 SCORE_LIMIT = 75
 # 最终推送阈值：新评分体系下，80分以下不再推送；基础初筛仍沿用原SCORE_LIMIT，不改原模型。
 FINAL_SCORE_THRESHOLD = float(os.environ.get("FINAL_SCORE_THRESHOLD", "80"))
@@ -97,6 +119,16 @@ VALID_STOCK_PREFIXES = (
 )
 
 LAST_TRADE_DAY = ""
+
+KLINE_SOURCE_STATS = {
+    "broken_pipe": 0,
+    "timeout": 0,
+    "other_error": 0,
+    "consecutive_broken_pipe": 0,
+    "consecutive_fail": 0,
+    "pause_count": 0,
+    "relogin_count": 0,
+}
 
 class StockDataTimeout(Exception):
     pass
@@ -254,6 +286,86 @@ def baostock_logout():
         bs.logout()
     except Exception:
         pass
+
+
+def baostock_relogin(reason=""):
+    """V11.4：数据源连续异常时，主动重登 BaoStock，尽量恢复连接。"""
+    try:
+        baostock_logout()
+        time.sleep(2)
+        ok = baostock_login()
+        KLINE_SOURCE_STATS["relogin_count"] += 1
+        print(f"数据源重登：source=baostock reason={reason} ok={ok} relogin_count={KLINE_SOURCE_STATS['relogin_count']}")
+        return ok
+    except Exception as e:
+        print(f"数据源重登失败：source=baostock reason={reason} error={e}")
+        return False
+
+
+def is_broken_pipe_error(err):
+    text = str(err).lower()
+    return ("broken pipe" in text) or ("errno 32" in text) or ("接收数据异常" in text)
+
+
+def handle_kline_source_error(bs_code, retry_index, err):
+    """
+    V11.4：统一处理K线数据源异常。
+    Broken pipe 连续出现时，暂停并重登，避免后续几千只股票全部白白失败。
+    """
+    if is_broken_pipe_error(err):
+        KLINE_SOURCE_STATS["broken_pipe"] += 1
+        KLINE_SOURCE_STATS["consecutive_broken_pipe"] += 1
+        KLINE_SOURCE_STATS["consecutive_fail"] += 1
+        bp = KLINE_SOURCE_STATS["broken_pipe"]
+        cbp = KLINE_SOURCE_STATS["consecutive_broken_pipe"]
+        if bp <= 5 or bp % 20 == 0:
+            print(f"K线数据源异常：source=baostock stage=fetch_kline symbol={bs_code} retry={retry_index} type=broken_pipe total={bp} consecutive={cbp}")
+        if BROKEN_PIPE_PAUSE_THRESHOLD > 0 and cbp >= BROKEN_PIPE_PAUSE_THRESHOLD:
+            KLINE_SOURCE_STATS["pause_count"] += 1
+            print(
+                f"数据源连续Broken pipe达到阈值：source=baostock consecutive={cbp} "
+                f"pause={BROKEN_PIPE_PAUSE_SECONDS}s pause_count={KLINE_SOURCE_STATS['pause_count']}"
+            )
+            time.sleep(max(1, BROKEN_PIPE_PAUSE_SECONDS))
+            if BAOSTOCK_RELOGIN_ON_BROKEN_PIPE == "1":
+                baostock_relogin("consecutive_broken_pipe")
+            KLINE_SOURCE_STATS["consecutive_broken_pipe"] = 0
+    else:
+        KLINE_SOURCE_STATS["other_error"] += 1
+        KLINE_SOURCE_STATS["consecutive_fail"] += 1
+        total = KLINE_SOURCE_STATS["other_error"]
+        if total <= 5 or total % 50 == 0:
+            print(f"K线获取失败：source=baostock stage=fetch_kline symbol={bs_code} retry={retry_index} error={str(err)[:120]}")
+
+
+def reset_kline_success_streak():
+    KLINE_SOURCE_STATS["consecutive_broken_pipe"] = 0
+    KLINE_SOURCE_STATS["consecutive_fail"] = 0
+
+
+def should_abort_for_data_source(processed, success, fail):
+    """
+    V11.4：如果数据源已经大面积失效，提前停止基础扫描，避免跑完整个市场仍然只有极少样本。
+    """
+    if processed < DATA_SOURCE_FAIL_FAST_AFTER:
+        return False
+    total = max(1, success + fail)
+    success_rate = success / total
+    if success_rate < DATA_SOURCE_MIN_SUCCESS_RATE and KLINE_SOURCE_STATS.get("consecutive_fail", 0) >= DATA_SOURCE_CONSECUTIVE_FAIL_LIMIT:
+        print(
+            f"数据源疑似大面积异常，提前进入诊断保护：processed={processed}, success={success}, fail={fail}, "
+            f"success_rate={success_rate:.1%}, consecutive_fail={KLINE_SOURCE_STATS.get('consecutive_fail', 0)}"
+        )
+        return True
+    return False
+
+
+def summarize_kline_source_stats():
+    return (
+        f"数据源诊断：BrokenPipe={KLINE_SOURCE_STATS.get('broken_pipe', 0)}，"
+        f"timeout={KLINE_SOURCE_STATS.get('timeout', 0)}，other={KLINE_SOURCE_STATS.get('other_error', 0)}，"
+        f"pause={KLINE_SOURCE_STATS.get('pause_count', 0)}，relogin={KLINE_SOURCE_STATS.get('relogin_count', 0)}"
+    )
 
 
 def get_last_trade_day():
@@ -747,22 +859,35 @@ def get_daily_kline(bs_code):
 
     fields = "date,open,high,low,close,volume,amount,pctChg,turn,tradestatus"
 
-    for i in range(2):
+    max_retries = max(1, KLINE_MAX_RETRIES)
+    for i in range(max_retries):
         try:
             with stock_query_timeout(SINGLE_STOCK_TIMEOUT_SECONDS, bs_code):
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    fields,
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2"
-                )
+                if SUPPRESS_BAOSTOCK_VERBOSE == "1":
+                    # BaoStock 在 Broken pipe 时会大量向stdout打印“接收数据异常”，这里抑制刷屏，由我们统一汇总诊断。
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        rs = bs.query_history_k_data_plus(
+                            bs_code,
+                            fields,
+                            start_date=start_date,
+                            end_date=end_date,
+                            frequency="d",
+                            adjustflag="2"
+                        )
+                else:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        fields,
+                        start_date=start_date,
+                        end_date=end_date,
+                        frequency="d",
+                        adjustflag="2"
+                    )
 
                 df = rs.get_data()
 
             if df is None or df.empty:
-                time.sleep(0.2)
+                time.sleep(0.2 + 0.2 * i)
                 continue
 
             df = df[df["tradestatus"] == "1"].copy()
@@ -802,17 +927,21 @@ def get_daily_kline(bs_code):
 
             write_cached_kline(bs_code, df)
             time.sleep(REQUEST_SLEEP)
+            reset_kline_success_streak()
 
             return df
 
         except StockDataTimeout as e:
-            print(f"K线获取超时 {bs_code} 第{i + 1}次：{e}")
-            time.sleep(0.5)
+            KLINE_SOURCE_STATS["timeout"] += 1
+            KLINE_SOURCE_STATS["consecutive_fail"] += 1
+            if KLINE_SOURCE_STATS["timeout"] <= 5 or KLINE_SOURCE_STATS["timeout"] % 20 == 0:
+                print(f"K线获取超时：source=baostock stage=fetch_kline symbol={bs_code} retry={i + 1}/{max_retries} error={e}")
+            time.sleep(0.8 + 0.4 * i)
             continue
 
         except Exception as e:
-            print(f"K线获取失败 {bs_code} 第{i + 1}次：{e}")
-            time.sleep(0.5)
+            handle_kline_source_error(bs_code, f"{i + 1}/{max_retries}", e)
+            time.sleep(0.8 + 0.4 * i)
 
     return None
 
@@ -4132,6 +4261,12 @@ def main():
     print(f"MIN_VALID_KLINE={MIN_VALID_KLINE}")
     print(f"PROGRESS_INTERVAL={PROGRESS_INTERVAL}")
     print(f"SINGLE_STOCK_TIMEOUT_SECONDS={SINGLE_STOCK_TIMEOUT_SECONDS}")
+    print(f"KLINE_MAX_RETRIES={KLINE_MAX_RETRIES}")
+    print(f"BROKEN_PIPE_PAUSE_THRESHOLD={BROKEN_PIPE_PAUSE_THRESHOLD}")
+    print(f"BROKEN_PIPE_PAUSE_SECONDS={BROKEN_PIPE_PAUSE_SECONDS}")
+    print(f"RETRY_FAILED_KLINE_AFTER_SCAN={RETRY_FAILED_KLINE_AFTER_SCAN}")
+    print(f"RETRY_FAILED_KLINE_LIMIT={RETRY_FAILED_KLINE_LIMIT}")
+    print(f"MIN_FORMAL_COVERAGE_RATE={MIN_FORMAL_COVERAGE_RATE}")
     print(f"KLINE_LOOKBACK_DAYS={KLINE_LOOKBACK_DAYS}")
     print(f"北京时间：{bj_time_str()}")
 
@@ -4190,9 +4325,57 @@ def main():
                 failed_symbols.append({"code": row.get("代码", ""), "name": row.get("名称", ""), "bs_code": row.get("bs_code", ""), "stage": "base_exception", "error": str(e)[:200]})
                 print(f"基础处理失败: {row.get('代码', '')} {row.get('名称', '')} {e}")
 
+            if should_abort_for_data_source(processed_count, kline_success, kline_fail):
+                break
+
+        # V11.4：若数据源中途断流导致样本不足，先暂停重登并补拉部分失败股票，避免偶发网络问题直接废掉整次运行。
+        if (
+            RETRY_FAILED_KLINE_AFTER_SCAN == "1"
+            and kline_success < MIN_VALID_KLINE
+            and failed_symbols
+            and MAX_STOCKS == 0
+            and time.time() - start_ts < max(60, BASIC_RUNTIME_SECONDS - 600)
+        ):
+            retry_limit = min(RETRY_FAILED_KLINE_LIMIT, len(failed_symbols))
+            print(f"样本不足，启动失败K线补拉：retry_limit={retry_limit}，当前成功={kline_success}，失败={kline_fail}")
+            time.sleep(max(5, min(BROKEN_PIPE_PAUSE_SECONDS, 120)))
+            if BAOSTOCK_RELOGIN_ON_BROKEN_PIPE == "1":
+                baostock_relogin("retry_failed_kline_after_scan")
+            retried_bs_codes = set()
+            retry_success = 0
+            retry_rows_added = 0
+            for item in failed_symbols[:retry_limit]:
+                bs_code_retry = item.get("bs_code", "")
+                if not bs_code_retry or bs_code_retry in retried_bs_codes:
+                    continue
+                retried_bs_codes.add(bs_code_retry)
+                matched = stock_list[stock_list["bs_code"] == bs_code_retry]
+                if matched.empty:
+                    continue
+                try:
+                    rows_retry = process_stock_base(matched.iloc[0])
+                    if rows_retry:
+                        retry_success += 1
+                        kline_success += 1
+                        kline_fail = max(0, kline_fail - 1)
+                        for rr in rows_retry:
+                            base_rows.append(rr)
+                            all_dates.add(rr["date"])
+                            retry_rows_added += 1
+                    if retry_success >= MIN_VALID_KLINE:
+                        break
+                    if retry_success > 0 and retry_success % 100 == 0:
+                        print(f"失败K线补拉进度：成功补拉{retry_success}只，新增基础记录{retry_rows_added}条")
+                except Exception as e:
+                    if retry_success <= 5:
+                        print(f"失败K线补拉仍失败: {bs_code_retry} {e}")
+            print(f"失败K线补拉完成：成功补拉{retry_success}只，新增基础记录{retry_rows_added}条，当前K线成功={kline_success}，失败={kline_fail}")
+
         dates = sorted(list(all_dates), reverse=True)[:CHECK_DAYS]
 
         progress_line("基础评分完成", processed_count, len(stock_list), start_ts, kline_success, kline_fail)
+        coverage_rate = kline_success / max(1, kline_success + kline_fail)
+        print(f"{summarize_kline_source_stats()}，覆盖率={coverage_rate:.1%}")
         if failed_symbols:
             save_json_file(FAILED_KLINE_FILE, {"generated_at_bj": bj_time_str(), "failed": failed_symbols})
             print(f"K线失败清单已保存：{FAILED_KLINE_FILE}")
@@ -4200,7 +4383,8 @@ def main():
         if kline_success < MIN_VALID_KLINE and MAX_STOCKS == 0:
             warning = (
                 f"样本不足：本次K线成功仅{kline_success}只，低于最低有效样本{MIN_VALID_KLINE}只。"
-                f"为避免小样本误判，本次不推送正式选股结果。"
+                f"为避免小样本误判，本次不推送正式选股结果。\n"
+                f"{summarize_kline_source_stats()}"
             )
             print(warning)
             send_telegram(build_error_message(warning))
