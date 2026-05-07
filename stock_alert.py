@@ -59,6 +59,40 @@ warnings.filterwarnings("ignore")
 # 5）不改变原有评分、推送、V11.4 K线稳定性保护和候选输出逻辑。
 # ===========================================================================
 
+
+# ========================= V12 统一多周期关键结构/舒服买点/活跃度/硬排雷说明 =========================
+# 1）正式推送从“突破当天”改为“突破后回踩确认”：弱突破和强突破都先入后台跟踪池，
+#    只有回踩 BBIBOLL/BBI、MA5/MA10、突破大阳线实体中位/实底、结构关键位并出现承接时才正式推送；
+# 2）重构交易优先级：不能只看离防守位近和风险收益比，必须先判断关键位动作是否坚决、是否已有回踩承接；
+# 3）新增100日活跃度/松散度模块：100日涨停次数、大阳/大阴、跳空、振幅弹性、K线黏密度共同评分；
+# 4）报告改为交易语言：为什么能看、为什么不能追、等什么买点、什么情况放弃；
+# 5）强化财务/审计雷区：审计报告保留意见、无法表示、否定意见、非标审计等一律硬剔除或重大扣分；
+# 6）V12统一多周期关键结构位：凹口/平台/最大量阳K实底/最大量阳K高点/箱体边界，
+#    不再按日线、周线、月线、季线重复打分，而是先统一识别关键位，再做突破质量、回踩承接和同源封顶；
+# 7）最大量K必须是有效阳K：阳线、有实体、实体长度不小于上下影线总和的一半，才能取实底线/高点作为关键箱体边界；
+# 8）回踩确认按“回踩段”动态识别，不写死1个月/2个月/3个月；第一次、第二次多为后台记录，第三次及以后成熟回踩段叠加日线转强才更适合正式推送。
+# ===========================================================================
+
+# ========================= V12.1 机构级框架重构/同源合并说明 =========================
+# 本版不是删减交易逻辑，而是把前面讨论过的有效逻辑重新放进更清晰的机构级分层框架：
+# 1）风险硬过滤层：先处理审计/财务/监管雷区，重大风险不再浪费深度算力；
+# 2）共享特征层：均线、量能、涨停、活跃度、长周期位置只算一次，多模块复用；
+# 3）多周期结构种子层：日/周/月/季的凹口、平台、箱体、最大量阳K实底/高点统一生成关键位；
+# 4）突破质量层：所有关键位突破统一判断实体质量、跳空、收盘位置、上影线、量能健康度；
+# 5）回踩承接层：所有BBIBOLL/BBI/均线/强阳实体/涨停实体/大量阳K实底回踩统一判断承接质量；
+# 6）量能确认层：标准倍量、倍量后平量、分散健康倍量、阳梯量、极端爆量统一归类，避免重复加分；
+# 7）活跃度弹性层：100日涨停、大阳/大阴、跳空、ATR、K线黏密度统一输出活跃度等级；
+# 8）同源信号合并层：结构类、量能类、承接类、活跃度类、风险类分组封顶，只取最强项+少量共振；
+# 9）交易决策层：大周期负责是否值得跟踪，日线回踩承接负责是否正式推送，最终只推前5只。
+# ===========================================================================
+
+
+# ========================= V12.2 标准版：机构级计算路径重构说明 =========================
+# 本版不是删减交易逻辑，而是重排计算路径：风险先行、基础特征一次计算、多周期关键位统一、
+# 突破/回踩/量能/活跃度统一归类、同源信号合并封顶、深度评分只给真正有种子或触发的股票。
+# 核心目标：保留此前所有有效逻辑，但减少重复遍历、重复打分和无效深算，让正式推送更少更准。
+# ===========================================================================
+
 # ========================= V9.1 追高闸门增量优化说明 =========================
 # 本文件基于用户提供的V8/V9源码继续做“手术式增量优化”，原则是：
 # 1）BaoStock数据源、主流程、Telegram变量、缓存、基础评分底座不动；
@@ -74,20 +108,30 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
+MODEL_VERSION = "V12.3标准版"
+SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
+
 
 N = 20
 CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V11.1：默认只扫描最新有行情交易日；如需回看可在workflow设置为3
 
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0"))
 RESULT_LIMIT_RAW = int(os.environ.get("RESULT_LIMIT", "20"))
-# V11.3：一号员工报告默认只推前10只，避免报告太长；workflow 仍传20也会被这里封顶。
-TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "10"))
+# V12：一号员工正式报告默认只推前5只；后台候选池/跟踪池仍保留更多记录。
+TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "5"))
 RESULT_LIMIT = min(RESULT_LIMIT_RAW, TOP_PUSH_LIMIT) if TOP_PUSH_LIMIT > 0 else RESULT_LIMIT_RAW
 DEEP_SCORE_LIMIT_RAW = int(os.environ.get("DEEP_SCORE_LIMIT", "500"))
 # V10：深度评分硬上限。即使 workflow 仍传 500，也默认只取基础分桶后的前150条深评，
 # 避免 GitHub Actions 深度评分跑不完；如确需恢复500，可设置 DEEP_SCORE_HARD_CAP=0 或 500。
-DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "150"))
+DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "120"))
 DEEP_SCORE_LIMIT = min(DEEP_SCORE_LIMIT_RAW, DEEP_SCORE_HARD_CAP) if DEEP_SCORE_HARD_CAP > 0 else DEEP_SCORE_LIMIT_RAW
+
+# V12.2：标准版默认启用“先过滤、后深算”。这不是减少逻辑，而是避免对明显无效股票重复跑昂贵模型。
+ENABLE_V122_BASE_GATE = os.environ.get("ENABLE_V122_BASE_GATE", "1")
+ENABLE_RISK_EARLY_EXIT = os.environ.get("ENABLE_RISK_EARLY_EXIT", "1")
+V122_MIN_BASE_SCORE_FOR_DEEP = float(os.environ.get("V122_MIN_BASE_SCORE_FOR_DEEP", "42"))
+V122_STRONG_SEED_SCORE = float(os.environ.get("V122_STRONG_SEED_SCORE", "10"))
+V122_STRONG_TRIGGER_SCORE = float(os.environ.get("V122_STRONG_TRIGGER_SCORE", "12"))
 
 REQUEST_SLEEP = float(os.environ.get("REQUEST_SLEEP", "0.03"))
 # V9：为月线BBI/BOLL缩口与多次中轨修复提供足够样本；默认约6年，仍可通过环境变量调小以节省时间。
@@ -693,7 +737,9 @@ def evaluate_regulatory_risk(code, name=""):
     # 重大雷区至少-40；多项命中时可更重，但不无限相加。
     major_keywords = [
         "立案", "证监会", "调查", "信披违规", "资金占用", "违规担保", "重大处罚",
-        "行政处罚", "非标", "无法表示", "保留意见", "否定意见", "退市", "ST", "债务违约",
+        "行政处罚", "非标", "非标准审计", "非标审计", "无法表示", "无法表示意见",
+        "保留意见", "审计保留意见", "审计报告保留意见", "出具保留意见", "带保留意见",
+        "否定意见", "审计报告否定意见", "退市", "ST", "债务违约",
     ]
     medium_keywords = [
         "监管措施", "警示函", "高质押", "质押", "冻结", "司法拍卖", "诉讼", "高管处罚",
@@ -1965,6 +2011,10 @@ def calc_base_rows(df):
 
     df = df.copy()
 
+    # V12.3：基础层只返回最近CHECK_DAYS，昂贵的历史回看型入口模型只对最终可返回的尾部K线计算。
+    # 这不是删逻辑，而是避免对每只股票的上千根历史K线重复跑同一类“当前候选”判断。
+    _active_base_indices = set(range(max(0, len(df) - max(1, CHECK_DAYS)), len(df)))
+
     # ===== 原模型底座字段保留：用于诊断，也用于V10基础攻击质量的子项 =====
     df["vol_ma"] = df["volume"].rolling(N).mean()
     df["volr"] = df["volume"] / df["vol_ma"].replace(0, pd.NA)
@@ -2086,6 +2136,9 @@ def calc_base_rows(df):
     # 简版涨停后三日承接：基础层只做入口评分，深度层再细化。
     limit_hold_base_scores = []
     for _i in range(len(df)):
+        if _i not in _active_base_indices:
+            limit_hold_base_scores.append(0.0)
+            continue
         best = 0.0
         for _j in range(max(0, _i - 3), _i):
             if not bool(df["limit_up_base"].iloc[_j]):
@@ -2136,6 +2189,13 @@ def calc_base_rows(df):
     fibo_level_150s = []
     fibo_target_dists = []
     for _i in range(len(df)):
+        if _i not in _active_base_indices:
+            fibo_scores.append(0.0)
+            fibo_descs.append("")
+            fibo_first_highs.append(0.0)
+            fibo_level_150s.append(0.0)
+            fibo_target_dists.append(0.0)
+            continue
         cur_score = 0.0
         cur_desc = ""
         cur_first_high = 0.0
@@ -2650,11 +2710,358 @@ def apply_chase_risk_gate(merged):
 
     return merged
 
+
+def _resample_ohlcv(df, rule):
+    """把日线聚合成周/月/季K。只在深度层对候选股调用，避免全市场重复慢扫。"""
+    if df is None or df.empty or "date" not in df.columns:
+        return pd.DataFrame()
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date")
+    if d.empty:
+        return pd.DataFrame()
+    d = d.set_index("date")
+    out = pd.DataFrame()
+    out["open"] = d["open"].resample(rule).first()
+    out["high"] = d["high"].resample(rule).max()
+    out["low"] = d["low"].resample(rule).min()
+    out["close"] = d["close"].resample(rule).last()
+    out["volume"] = d["volume"].resample(rule).sum()
+    out["amount"] = d["amount"].resample(rule).sum() if "amount" in d.columns else 0
+    out = out.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index()
+    if not out.empty:
+        out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    return out
+
+
+def _is_valid_max_volume_bull_candle(row):
+    """
+    最大量关键K必须是有效阳K：
+    1）收盘大于开盘；2）必须有实体；3）实体长度不小于上下影线总和的一半。
+    符合后，实体实底才可作为箱体底部，最高点才可作为箱体上沿/突破线。
+    """
+    op = safe_float(row.get("open", 0))
+    cl = safe_float(row.get("close", 0))
+    hi = safe_float(row.get("high", 0))
+    lo = safe_float(row.get("low", 0))
+    if op <= 0 or cl <= 0 or hi <= 0 or lo <= 0:
+        return False
+    if cl <= op:
+        return False
+    body = abs(cl - op)
+    upper = max(0.0, hi - max(op, cl))
+    lower = max(0.0, min(op, cl) - lo)
+    shadows = upper + lower
+    if body <= 0:
+        return False
+    # 实体不能太小：至少达到影线总长度的一半；极端长影小实体不画关键黄线。
+    if shadows > 0 and body < shadows * 0.50:
+        return False
+    return True
+
+
+def _find_valid_max_volume_bull_levels(period_df, tf_name, lookback=80):
+    """在指定周期内寻找有效最大量阳K，并返回实底线和最高点。"""
+    empty = {
+        "valid": False,
+        "timeframe": tf_name,
+        "date": "",
+        "floor": 0.0,
+        "high": 0.0,
+        "body_mid": 0.0,
+        "body_top": 0.0,
+        "volume": 0.0,
+        "reason": "无有效最大量阳K",
+    }
+    if period_df is None or period_df.empty or len(period_df) < 8:
+        return empty
+    w = period_df.tail(lookback).copy().reset_index(drop=True)
+    if w.empty or "volume" not in w.columns:
+        return empty
+    w["volume"] = pd.to_numeric(w["volume"], errors="coerce")
+    w = w.dropna(subset=["volume", "open", "high", "low", "close"])
+    if w.empty:
+        return empty
+    # 按成交量从大到小找第一根有效阳K，避免最大量是阴线/小实体长影时误画线。
+    for _, row in w.sort_values("volume", ascending=False).iterrows():
+        if not _is_valid_max_volume_bull_candle(row):
+            continue
+        op = safe_float(row.get("open", 0))
+        cl = safe_float(row.get("close", 0))
+        hi = safe_float(row.get("high", 0))
+        floor = min(op, cl)
+        top = max(op, cl)
+        return {
+            "valid": True,
+            "timeframe": tf_name,
+            "date": str(row.get("date", "")),
+            "floor": float(floor),
+            "high": float(hi),
+            "body_mid": float((floor + top) / 2),
+            "body_top": float(top),
+            "volume": safe_float(row.get("volume", 0)),
+            "reason": f"{tf_name}有效最大量阳K：实底{floor:.2f}，高点{hi:.2f}",
+        }
+    return empty
+
+
+def _count_dynamic_pullback_segments(period_df, level, near_pct=0.055, reclaim_pct=0.985, leave_pct=0.07):
+    """
+    按“回踩段”统计，而不是写死回踩几根K。
+    先站上线，再明显离开，再回到线附近并守住，算一次有效回踩段。
+    连续贴线的多根K只算同一段。
+    """
+    if period_df is None or period_df.empty or level <= 0:
+        return {"count": 0, "dates": [], "last_quality": "", "last_near": False, "failed": False}
+    w = period_df.copy().reset_index(drop=True)
+    required = ["open", "high", "low", "close", "volume"]
+    for c in required:
+        if c not in w.columns:
+            return {"count": 0, "dates": [], "last_quality": "", "last_near": False, "failed": False}
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    w = w.dropna(subset=required).reset_index(drop=True)
+    if w.empty:
+        return {"count": 0, "dates": [], "last_quality": "", "last_near": False, "failed": False}
+
+    above_seen = False
+    left_zone = False
+    in_test = False
+    dates = []
+    last_quality = ""
+    failed = False
+    vol_ma = w["volume"].rolling(5).mean()
+
+    for i, row in w.iterrows():
+        cl = safe_float(row["close"])
+        lo = safe_float(row["low"])
+        op = safe_float(row["open"])
+        vol = safe_float(row["volume"])
+        if cl >= level:
+            above_seen = True
+        if not above_seen:
+            continue
+        if cl >= level * (1 + leave_pct):
+            left_zone = True
+            in_test = False
+        near = (lo <= level * (1 + near_pct)) and (cl >= level * reclaim_pct)
+        hard_break = cl < level * 0.970
+        big_down = (cl < op) and ((op - cl) / max(level, 1e-9) >= 0.04) and (pd.notna(vol_ma.iloc[i]) and vol > safe_float(vol_ma.iloc[i]) * 1.35)
+        if hard_break and big_down:
+            failed = True
+            in_test = False
+        if left_zone and near and not in_test and not (hard_break and big_down):
+            dates.append(str(row.get("date", "")))
+            in_test = True
+            if cl >= level:
+                last_quality = "收盘守住关键线"
+            else:
+                last_quality = "轻微跌破后收回观察"
+        if not near and cl >= level * (1 + leave_pct * 0.6):
+            in_test = False
+    current = w.iloc[-1]
+    last_near = bool((safe_float(current["low"]) <= level * (1 + near_pct)) and (safe_float(current["close"]) >= level * reclaim_pct))
+    return {"count": len(dates), "dates": dates[-5:], "last_quality": last_quality, "last_near": last_near, "failed": failed}
+
+
+def _daily_break_quality_against_level(df, level):
+    """
+    日线突破多周期关键高点的质量判断：影线突破不算。
+    有效突破必须实体漂亮站上，或直接跳空越过，并且强收盘、上影短、量能健康。
+    """
+    if df is None or df.empty or level <= 0:
+        return {"score": 0.0, "valid": False, "label": "无关键突破", "desc": ""}
+    cur = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else cur
+    op = safe_float(cur.get("open", 0))
+    cl = safe_float(cur.get("close", 0))
+    hi = safe_float(cur.get("high", 0))
+    lo = safe_float(cur.get("low", 0))
+    vol = safe_float(cur.get("volume", 0))
+    prev_vol = safe_float(prev.get("volume", 0))
+    if min(op, cl, hi, lo) <= 0:
+        return {"score": 0.0, "valid": False, "label": "无效K线", "desc": ""}
+    rng = max(hi - lo, 1e-9)
+    body_bottom = min(op, cl)
+    body_top = max(op, cl)
+    body_len = max(body_top - body_bottom, 1e-9)
+    close_pos = (cl - lo) / rng
+    upper_shadow_ratio = (hi - body_top) / rng
+    body_above_ratio = max(0.0, body_top - max(body_bottom, level)) / body_len
+    vr1 = vol / prev_vol if prev_vol > 0 else 0.0
+    vol_ma20 = safe_float(df["volume"].tail(20).mean()) if "volume" in df.columns and len(df) >= 20 else 0.0
+    volr = vol / vol_ma20 if vol_ma20 > 0 else 0.0
+    volume_ok = (vr1 >= 1.5 or volr >= 1.3) and (vr1 <= 3.5) and (volr <= 5.5)
+    gap_break = op >= level * 1.003 and lo >= level * 0.995 and cl >= level * 1.003 and close_pos >= 0.70 and upper_shadow_ratio <= 0.28 and volume_ok
+    entity_break = cl >= level * 1.005 and body_above_ratio >= 0.50 and close_pos >= 0.78 and upper_shadow_ratio <= 0.25 and volume_ok and cl > op
+    strong_entity = entity_break and body_above_ratio >= 0.70 and close_pos >= 0.85 and upper_shadow_ratio <= 0.18
+    wick_probe = hi >= level and (cl < level or body_above_ratio < 0.50 or upper_shadow_ratio > 0.32)
+    score = 0.0
+    label = "未突破"
+    desc = ""
+    valid = False
+    if gap_break:
+        score = 10.0
+        label = "跳空越过关键高点"
+        desc = f"日线跳空越过{level:.2f}，收盘仍站稳，量能健康"
+        valid = True
+    elif strong_entity:
+        score = 11.0
+        label = "实体漂亮突破关键高点"
+        desc = f"日线实体大半站上{level:.2f}，收盘接近最高，量能健康"
+        valid = True
+    elif entity_break:
+        score = 8.0
+        label = "实体有效突破关键高点"
+        desc = f"日线实体至少一半站上{level:.2f}，不是影线试探"
+        valid = True
+    elif wick_probe:
+        score = -2.0
+        label = "影线试探/假突破风险"
+        desc = f"盘中摸到{level:.2f}但实体/收盘/上影不达标，不能按有效突破高分"
+    return {"score": float(score), "valid": bool(valid), "label": label, "desc": desc}
+
+
+def detect_multi_timeframe_key_structure(df, code=""):
+    """
+    V12统一多周期关键结构位系统。
+    目的：保留凹口、最大量阳K实底/高点、箱体边界、回踩承接等逻辑，
+    但把日/周/月/季同类关键位合并，避免重复扫描、重复打分。
+    """
+    empty = {
+        "score_multi_tf_key_structure": 0.0,
+        "score_multi_tf_break_quality": 0.0,
+        "multi_tf_key_desc": "",
+        "multi_tf_best_floor": 0.0,
+        "multi_tf_best_high": 0.0,
+        "multi_tf_best_timeframe": "",
+        "multi_tf_pullback_count": 0,
+        "multi_tf_pullback_stage": "",
+        "multi_tf_high_break_label": "",
+        "multi_tf_high_break_desc": "",
+        "multi_tf_levels_json": "[]",
+    }
+    if df is None or len(df) < 120:
+        return empty
+    contexts = []
+    tf_defs = [
+        ("日线", df.copy().reset_index(drop=True), 250, 1.0),
+        ("周线", _resample_ohlcv(df, "W-FRI"), 180, 1.5),
+        ("月线", _resample_ohlcv(df, "M"), 80, 2.2),
+        ("季线", _resample_ohlcv(df, "Q"), 40, 2.8),
+    ]
+    cur_close = safe_float(df.iloc[-1].get("close", 0))
+    for tf_name, pdf, lookback, weight in tf_defs:
+        level = _find_valid_max_volume_bull_levels(pdf, tf_name, lookback=lookback)
+        if not level.get("valid"):
+            continue
+        floor = safe_float(level.get("floor", 0))
+        high = safe_float(level.get("high", 0))
+        pull = _count_dynamic_pullback_segments(pdf, floor)
+        brk = _daily_break_quality_against_level(df, high)
+        floor_status_score = 0.0
+        if floor > 0 and cur_close > 0:
+            dist_floor = cur_close / floor - 1
+            if cur_close >= floor and dist_floor <= 0.12:
+                floor_status_score += 2.0 * weight
+            elif -0.02 <= dist_floor < 0:
+                floor_status_score += 1.0 * weight
+            if pull.get("count", 0) >= 1:
+                floor_status_score += min(4.0 * weight, (1.2 + 0.9 * pull.get("count", 0)) * weight)
+            if pull.get("count", 0) >= 3 and pull.get("last_near", False):
+                floor_status_score += 2.0 * weight
+            if pull.get("failed", False):
+                floor_status_score -= 2.0 * weight
+        break_score = safe_float(brk.get("score", 0)) * weight
+        total = max(0.0, floor_status_score + max(0.0, break_score))
+        contexts.append({
+            "timeframe": tf_name,
+            "date": level.get("date", ""),
+            "floor": floor,
+            "high": high,
+            "pullback_count": int(pull.get("count", 0)),
+            "pullback_dates": pull.get("dates", []),
+            "pullback_stage": "成熟回踩段" if pull.get("count", 0) >= 3 else ("二次跟踪" if pull.get("count", 0) == 2 else ("首次记录" if pull.get("count", 0) == 1 else "等待回踩")),
+            "break_label": brk.get("label", ""),
+            "break_desc": brk.get("desc", ""),
+            "break_score": float(break_score),
+            "score": float(total),
+            "reason": level.get("reason", ""),
+        })
+    if not contexts:
+        return empty
+    contexts = sorted(contexts, key=lambda x: x.get("score", 0), reverse=True)
+    best = contexts[0]
+    # 同源合并：取最高级别关键结构为主，其他周期只给少量共振，不重复叠加。
+    base_score = min(16.0, safe_float(best.get("score", 0)))
+    resonance_count = sum(1 for x in contexts[1:] if safe_float(x.get("score", 0)) >= 3.0)
+    resonance_bonus = min(4.0, resonance_count * 1.2)
+    total_score = min(20.0, base_score + resonance_bonus)
+    desc_parts = []
+    for x in contexts[:3]:
+        desc_parts.append(
+            f"{x['timeframe']}最大量阳K实底{x['floor']:.2f}/高点{x['high']:.2f}，{x['pullback_stage']}，{x['break_label']}"
+        )
+    return {
+        "score_multi_tf_key_structure": float(total_score),
+        "score_multi_tf_break_quality": float(max([safe_float(x.get("break_score", 0)) for x in contexts] or [0.0])),
+        "multi_tf_key_desc": "；".join(desc_parts),
+        "multi_tf_best_floor": float(best.get("floor", 0.0)),
+        "multi_tf_best_high": float(best.get("high", 0.0)),
+        "multi_tf_best_timeframe": str(best.get("timeframe", "")),
+        "multi_tf_pullback_count": int(best.get("pullback_count", 0)),
+        "multi_tf_pullback_stage": str(best.get("pullback_stage", "")),
+        "multi_tf_high_break_label": str(best.get("break_label", "")),
+        "multi_tf_high_break_desc": str(best.get("break_desc", "")),
+        "multi_tf_levels_json": json.dumps(contexts[:6], ensure_ascii=False),
+    }
+
+def _v12_latest_prior_event_value(df, event_mask, value_series, lookback=10, default=0.0):
+    """
+    V12：找到当前日前lookback天内最近一次事件对应的值。
+    用于“突破大阳线实体中位/实底”“突破日量能”等回踩确认。
+    """
+    out = []
+    ev = list(event_mask.fillna(False).astype(bool).values)
+    vals = list(pd.to_numeric(value_series, errors="coerce").fillna(default).values)
+    for i in range(len(df)):
+        found = default
+        start = max(0, i - lookback)
+        for j in range(i - 1, start - 1, -1):
+            if ev[j]:
+                found = vals[j]
+                break
+        out.append(found)
+    return pd.Series(out, index=df.index)
+
+
+def _v12_count_recent_event(event_mask, lookback=8):
+    return event_mask.fillna(False).astype(int).shift(1).rolling(lookback).sum().fillna(0)
+
+
+def _v12_bool_recent_event(event_mask, lookback=8):
+    return _v12_count_recent_event(event_mask, lookback) > 0
+
+
+def _v12_human_level(value, low_text="偏弱", mid_text="一般", high_text="较好", top_text="很好"):
+    v = safe_float(value)
+    if v >= 10:
+        return top_text
+    if v >= 6:
+        return high_text
+    if v >= 2:
+        return mid_text
+    return low_text
+
+
 def calc_deep_rows(df, code):
     if df is None or len(df) < 260:
         return pd.DataFrame()
 
     df = calc_base_full(df)
+
+    # V12.3：深度层最终只输出最近CHECK_DAYS，所有“逐K回看型”昂贵逻辑只对尾部有效候选K线计算。
+    # 向量化基础指标仍完整保留；减少的是无效历史行重复跑凹口/平台/黄金倍量/台阶等候选判断。
+    _active_deep_indices = set(range(max(0, len(df) - max(1, CHECK_DAYS)), len(df)))
 
     monthly_ctx = detect_monthly_midline_reclaim(df)
 
@@ -2799,6 +3206,11 @@ def calc_deep_rows(df, code):
     limit_hold_levels = []
     limit_hold_ref_dates = []
     for _i in range(len(df)):
+        if _i not in _active_deep_indices:
+            limit_hold_scores.append(0.0)
+            limit_hold_levels.append("非当前候选K线，跳过昂贵承接回看")
+            limit_hold_ref_dates.append("")
+            continue
         best_score = 0.0
         best_level = "无涨停后三日承接"
         best_date = ""
@@ -3042,6 +3454,8 @@ def calc_deep_rows(df, code):
     extra["fibo_level_200"] = 0.0
 
     for idx in range(len(df)):
+        if idx not in _active_deep_indices:
+            continue
         hist = df.iloc[:idx + 1]
 
         ao = detect_ao_kou_structure(hist)
@@ -3120,6 +3534,10 @@ def calc_deep_rows(df, code):
     key_pullback_scores = []
     key_pullback_descs = []
     for _i in range(len(df)):
+        if _i not in _active_deep_indices:
+            key_pullback_scores.append(0.0)
+            key_pullback_descs.append("非当前候选K线，跳过关键位回踩精算")
+            continue
         key = safe_float(extra["structure_neckline"].iloc[_i])
         if key <= 0:
             key = safe_float(df["prehigh"].iloc[_i]) if "prehigh" in df.columns else 0.0
@@ -3149,6 +3567,134 @@ def calc_deep_rows(df, code):
     extra["score_key_pullback_hold"] = key_pullback_scores
     extra["key_pullback_desc"] = key_pullback_descs
 
+    # ========================= V12：突破后舒服买点确认模型 =========================
+    # 用户偏好：不在突破当天正式推送；无论弱突破/强突破，先后台跟踪，等回踩中轨/均线/强阳实体位/关键位有承接时再推送。
+    extra["daily_bbi"] = (
+        df["close"].rolling(3).mean()
+        + df["close"].rolling(6).mean()
+        + df["close"].rolling(12).mean()
+        + df["close"].rolling(24).mean()
+    ) / 4
+    extra["daily_bbiboll_mid"] = extra["daily_bbi"].where(extra["daily_bbi"].notna(), df.get("ma20", pd.Series(0, index=df.index)))
+    extra["daily_boll_mid"] = df.get("ma20", pd.Series(0, index=df.index))
+    extra["v12_break_today_weak"] = (
+        (df["close"] >= df["prehigh"] * 1.003)
+        | ((extra["structure_neckline"] > 0) & (df["close"] >= extra["structure_neckline"] * 1.003))
+        | extra["platform_break_vol"]
+    )
+    extra["v12_break_today_strong"] = (
+        extra["v12_break_today_weak"]
+        & (df["close"] > df["open"])
+        & ((df["pct_chg"] >= 3.0) | (df["entity_pct"] >= 3.0))
+        & (df["pos"] >= 0.70)
+        & ((extra["is_beiliang"]) | (df["volr"] >= 1.5))
+        & (df["long_pos_250"] <= 0.65)
+    )
+    extra["v12_recent_break_event"] = _v12_bool_recent_event(
+        extra["v12_break_today_weak"] | extra["v12_break_today_strong"] | (extra["score_structure_core"] > 0) | (extra["score_fibo_reclaim"] >= 6) | (extra["score_advanced_ao_kou"] >= 7),
+        lookback=10
+    )
+    extra["v12_prior_break_days"] = _v12_count_recent_event(
+        extra["v12_break_today_weak"] | extra["v12_break_today_strong"] | (extra["score_structure_core"] > 0),
+        lookback=10
+    )
+
+    prior_attack_event = (
+        extra["v12_break_today_weak"]
+        | extra["v12_break_today_strong"]
+        | extra["strong_yang"]
+        | extra["limit_up"]
+        | (extra["score_structure_core"] > 0)
+    )
+    prior_body_top = pd.concat([df["open"], df["close"]], axis=1).max(axis=1)
+    prior_body_bottom = pd.concat([df["open"], df["close"]], axis=1).min(axis=1)
+    prior_body_mid = (prior_body_top + prior_body_bottom) / 2
+    extra["v12_prior_attack_mid"] = _v12_latest_prior_event_value(df, prior_attack_event, prior_body_mid, lookback=10, default=0.0)
+    extra["v12_prior_attack_bottom"] = _v12_latest_prior_event_value(df, prior_attack_event, prior_body_bottom, lookback=10, default=0.0)
+    extra["v12_prior_attack_volume"] = _v12_latest_prior_event_value(df, prior_attack_event, df["volume"], lookback=10, default=0.0)
+
+    low = df["low"]
+    close = df["close"]
+    openp = df["open"]
+    volume = df["volume"]
+    bbi_mid = extra["daily_bbiboll_mid"]
+    ma5 = df.get("ma5", pd.Series(0, index=df.index))
+    ma10 = df.get("ma10", pd.Series(0, index=df.index))
+    struct_key = extra["structure_neckline"].where(extra["structure_neckline"] > 0, df["prehigh"])
+
+    # ========================= V12：统一多周期关键结构位系统 =========================
+    # 将日/周/月/季的凹口、箱体、大量阳K实底、高点突破统一成关键结构位，
+    # 避免同类逻辑重复扫描、重复打分。正式推送仍必须叠加日线舒服买点。
+    multi_tf_ctx = detect_multi_timeframe_key_structure(df, code)
+    for _k, _v in multi_tf_ctx.items():
+        extra[_k] = _v
+    multi_tf_floor = pd.Series(float(multi_tf_ctx.get("multi_tf_best_floor", 0.0)), index=df.index)
+    multi_tf_high = pd.Series(float(multi_tf_ctx.get("multi_tf_best_high", 0.0)), index=df.index)
+    # 若多周期关键实底线存在，将它纳入“回踩关键位”体系，但只作为同源关键位之一，后面有封顶。
+    struct_key = pd.concat([struct_key, multi_tf_floor.where(multi_tf_floor > 0, 0)], axis=1).max(axis=1)
+
+    extra["v12_pullback_to_bbiboll"] = (bbi_mid > 0) & (low <= bbi_mid * 1.018) & (close >= bbi_mid * 0.992)
+    extra["v12_pullback_to_ma5_ma10"] = (
+        ((ma5 > 0) & (low <= ma5 * 1.012) & (close >= ma5 * 0.992))
+        | ((ma10 > 0) & (low <= ma10 * 1.015) & (close >= ma10 * 0.992))
+    )
+    extra["v12_pullback_to_prior_mid"] = (
+        (extra["v12_prior_attack_mid"] > 0)
+        & (low <= extra["v12_prior_attack_mid"] * 1.018)
+        & (close >= extra["v12_prior_attack_mid"] * 0.992)
+    )
+    extra["v12_pullback_to_prior_bottom"] = (
+        (extra["v12_prior_attack_bottom"] > 0)
+        & (low <= extra["v12_prior_attack_bottom"] * 1.018)
+        & (close >= extra["v12_prior_attack_bottom"] * 0.990)
+    )
+    extra["v12_pullback_to_structure_key"] = (
+        (struct_key > 0)
+        & (low <= struct_key * 1.025)
+        & (close >= struct_key * 0.990)
+    )
+    extra["v12_pullback_shrink_volume"] = (
+        (extra["v12_prior_attack_volume"] > 0)
+        & (volume <= extra["v12_prior_attack_volume"] * 0.82)
+    )
+    extra["v12_pullback_small_body"] = (
+        ((df["high"] - df["low"]) > 0)
+        & ((df["close"] - df["open"]).abs() / (df["high"] - df["low"]).replace(0, pd.NA) <= 0.55)
+    ).fillna(False)
+    extra["v12_pullback_turning"] = (close >= openp) | (df["pos"] >= 0.58) | (close >= close.shift(1) * 0.995)
+
+    extra["score_v12_pullback_entry"] = 0.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_to_bbiboll"], "score_v12_pullback_entry"] += 5.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_to_ma5_ma10"], "score_v12_pullback_entry"] += 3.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_to_prior_mid"], "score_v12_pullback_entry"] += 3.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_to_prior_bottom"], "score_v12_pullback_entry"] += 2.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_to_structure_key"], "score_v12_pullback_entry"] += 2.0
+    extra.loc[extra["v12_recent_break_event"] & (multi_tf_floor > 0) & (low <= multi_tf_floor * 1.025) & (close >= multi_tf_floor * 0.990), "score_v12_pullback_entry"] += 2.5
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_shrink_volume"], "score_v12_pullback_entry"] += 2.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_small_body"], "score_v12_pullback_entry"] += 1.0
+    extra.loc[extra["v12_recent_break_event"] & extra["v12_pullback_turning"], "score_v12_pullback_entry"] += 1.5
+    # 回踩有效但放量长阴/明显破中轨，不给高交易优先级。
+    extra.loc[extra["v12_recent_break_event"] & (close < bbi_mid * 0.985) & (volume > df["vol_ma"] * 1.4), "score_v12_pullback_entry"] -= 5.0
+    extra.loc[extra["v12_break_today_weak"] & (~extra["v12_recent_break_event"]), "score_v12_pullback_entry"] -= 3.0
+    extra["score_v12_pullback_entry"] = extra["score_v12_pullback_entry"].clip(-6, 16)
+
+    extra["v12_entry_label"] = "未到舒服买点"
+    extra.loc[extra["v12_break_today_weak"], "v12_entry_label"] = "突破当天/刚摸关键位，后台跟踪，不正式推送"
+    extra.loc[extra["score_v12_pullback_entry"] >= 8, "v12_entry_label"] = "突破后回踩确认，符合舒服买点"
+    extra.loc[(extra["score_v12_pullback_entry"] >= 5) & (extra["score_v12_pullback_entry"] < 8), "v12_entry_label"] = "回踩承接初现，还需确认"
+    extra["v12_entry_desc"] = ""
+    extra.loc[extra["v12_pullback_to_bbiboll"], "v12_entry_desc"] += "回踩BBIBOLL/BBI中轨；"
+    extra.loc[extra["v12_pullback_to_ma5_ma10"], "v12_entry_desc"] += "回踩MA5/MA10；"
+    extra.loc[extra["v12_pullback_to_prior_mid"], "v12_entry_desc"] += "守住前突破阳线实体中部；"
+    extra.loc[extra["v12_pullback_to_prior_bottom"], "v12_entry_desc"] += "守住前突破阳线实体底部；"
+    extra.loc[extra["v12_pullback_to_structure_key"], "v12_entry_desc"] += "回踩结构关键位；"
+    extra.loc[(multi_tf_floor > 0) & (low <= multi_tf_floor * 1.025) & (close >= multi_tf_floor * 0.990), "v12_entry_desc"] += "回踩多周期关键实底线；"
+    extra.loc[extra["v12_pullback_shrink_volume"], "v12_entry_desc"] += "回踩缩量；"
+    extra["v12_formal_push_ok"] = extra["score_v12_pullback_entry"] >= 8
+    # 多周期关键实底线已形成成熟回踩段时，日线回踩确认分略低也可进入正式候选，但必须有日线承接。
+    extra.loc[(extra["score_multi_tf_key_structure"] >= 10) & (extra["multi_tf_pullback_count"] >= 3) & (extra["score_v12_pullback_entry"] >= 6), "v12_formal_push_ok"] = True
+
+
     # 承接结构总分：涨停后三日实体承接 + 普通关键位回踩承接。
     # 如果两者来自同一阶段，普通关键位回踩按60%权重，最终封顶10分，避免一根涨停重复堆分。
     extra["score_carry_structure"] = (
@@ -3161,6 +3707,10 @@ def calc_deep_rows(df, code):
     step_scores = []
     step_descs = []
     for _i in range(len(df)):
+        if _i not in _active_deep_indices:
+            step_scores.append(0.0)
+            step_descs.append("非当前候选K线，跳过台阶结构精算")
+            continue
         start = max(0, _i - 59)
         event_idxs = []
         last_event = -999
@@ -3341,6 +3891,46 @@ def calc_deep_rows(df, code):
     extra.loc[extra["limit_up_count_50"] <= 0, "score_limitup_activity"] -= 1.5
     extra.loc[extra["limit_up_count_50"] >= 2, "score_limitup_activity"] += 0.8
     extra["score_limitup_activity"] = extra["score_limitup_activity"].clip(-2, 1)
+
+    # ========================= V12：100日活跃度/松散度模块 =========================
+    # 100日涨停次数是市场辨识度/攻击性的重要指标；同时用大阳/大阴、跳空、振幅、K线黏密度判断松散度。
+    extra["limit_up_count_100"] = extra["limit_up"].rolling(100).sum()
+    extra["big_yang_count_100"] = ((df["pct_chg"] >= 5.0) & (df["close"] > df["open"])).rolling(100).sum()
+    extra["big_yin_count_100"] = ((df["pct_chg"] <= -5.0) & (df["close"] < df["open"])).rolling(100).sum()
+    extra["gap_down"] = df["open"] < df["low"].shift(1)
+    extra["gap_total_count_100"] = (extra["gap_up"] | extra["gap_down"]).rolling(100).sum()
+    true_range = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    extra["atr_pct_20"] = (true_range.rolling(20).mean() / df["close"].replace(0, pd.NA)).fillna(0)
+    body_pct_abs = ((df["close"] - df["open"]).abs() / df["close"].replace(0, pd.NA)).fillna(0)
+    extra["small_body_ratio_60"] = (body_pct_abs <= 0.012).rolling(60).mean().fillna(0)
+    extra["score_v12_activity"] = 0.0
+
+    extra.loc[extra["limit_up_count_100"] <= 0, "score_v12_activity"] -= 4.0
+    extra.loc[extra["limit_up_count_100"] == 1, "score_v12_activity"] -= 1.5
+    extra.loc[extra["limit_up_count_100"] == 2, "score_v12_activity"] += 0.5
+    extra.loc[extra["limit_up_count_100"].between(3, 4), "score_v12_activity"] += 2.5
+    extra.loc[extra["limit_up_count_100"] >= 5, "score_v12_activity"] += 4.0
+
+    extra.loc[extra["big_yang_count_100"] >= 4, "score_v12_activity"] += 1.5
+    extra.loc[extra["big_yang_count_100"] >= 7, "score_v12_activity"] += 1.5
+    extra.loc[extra["gap_total_count_100"] >= 4, "score_v12_activity"] += 1.0
+    extra.loc[extra["atr_pct_20"].between(0.025, 0.055), "score_v12_activity"] += 1.5
+    extra.loc[(extra["atr_pct_20"] < 0.018) & (extra["small_body_ratio_60"] >= 0.55), "score_v12_activity"] -= 3.0
+    extra.loc[(extra["small_body_ratio_60"] >= 0.70), "score_v12_activity"] -= 2.0
+    # 大阴线明显多于大阳线，或高位剧烈波动，不把活跃误判成好事。
+    extra.loc[(extra["big_yin_count_100"] >= extra["big_yang_count_100"] + 2) & (extra["big_yin_count_100"] >= 4), "score_v12_activity"] -= 2.5
+    extra.loc[(df["long_pos_250"] > 0.75) & (extra["limit_up_count_100"] >= 5), "score_v12_activity"] -= 2.0
+    extra.loc[(df["long_pos_250"] > 0.80) & (extra["atr_pct_20"] > 0.065), "score_v12_activity"] -= 2.5
+    extra["score_v12_activity"] = extra["score_v12_activity"].clip(-8, 8)
+
+    extra["v12_activity_label"] = "活跃度一般"
+    extra.loc[extra["score_v12_activity"] >= 4, "v12_activity_label"] = "活跃度较好，有资金攻击记忆"
+    extra.loc[extra["score_v12_activity"] <= -3, "v12_activity_label"] = "活跃度偏低，K线偏黏/攻击性不足"
+    extra.loc[(df["long_pos_250"] > 0.75) & (extra["score_v12_activity"] > 0), "v12_activity_label"] = "活跃但位置偏高，防高位乱震"
 
     # 位置/压力空间正向评分：近端压力远是大优点，近端压力太近是风险收益比问题。
     extra["score_pressure_space"] = 0.0
@@ -3540,29 +4130,111 @@ def calc_deep_rows(df, code):
     weak_bottom_confirm = (extra["trade_stage"] == "底部一买") & ((df["break_rate"] <= 0) | (~extra["is_beiliang"]))
     extra.loc[weak_bottom_confirm, "score_stage_adjustment"] = extra.loc[weak_bottom_confirm, "score_stage_adjustment"].clip(upper=3.0)
 
+    # ========================= V12：同源结构合并与封顶 =========================
+    # 凹口/平台/黄金倍量/月线最大量阳K高点/大量阳K实底，本质都属于“关键结构位”。
+    # 保留所有原逻辑，但用负向调整避免同一类行为重复堆分。
+    _structure_raw_sum = (
+        extra["score_structure_core"].clip(lower=0)
+        + extra["score_advanced_ao_kou"].clip(lower=0)
+        + extra["score_fibo_reclaim"].clip(lower=0)
+        + extra["score_multi_tf_key_structure"].clip(lower=0)
+        + extra["score_break_k_quality"].clip(lower=0)
+    )
+    _structure_max = pd.concat([
+        extra["score_structure_core"].clip(lower=0),
+        extra["score_advanced_ao_kou"].clip(lower=0),
+        extra["score_fibo_reclaim"].clip(lower=0),
+        extra["score_multi_tf_key_structure"].clip(lower=0),
+        extra["score_break_k_quality"].clip(lower=0) * 1.5,
+    ], axis=1).max(axis=1)
+    _structure_hits = (pd.concat([
+        extra["score_structure_core"].clip(lower=0),
+        extra["score_advanced_ao_kou"].clip(lower=0),
+        extra["score_fibo_reclaim"].clip(lower=0),
+        extra["score_multi_tf_key_structure"].clip(lower=0),
+    ], axis=1) >= 4).sum(axis=1)
+    _structure_merged_allowance = (_structure_max + (_structure_hits - 1).clip(lower=0) * 2.0).clip(upper=26.0)
+    extra["score_v12_same_source_adjustment"] = (_structure_merged_allowance - _structure_raw_sum).clip(lower=-18.0, upper=0.0)
+
+    # ========================= V12.1：机构级分层打分框架 =========================
+    # 目标：不删逻辑，但把同源信号合并成“结构、突破、承接、量能、活跃度、交易质量、风险”七个块，
+    # 避免凹口/平台/最大量阳K高点/关键位突破等同一类行为重复堆分。
+    extra["score_v121_risk_gate_block"] = (
+        extra["score_penalty"].fillna(0)
+        + extra["score_overlap_adjustment"].fillna(0) * 0.60
+    ).clip(-32.0, 0.0)
+
+    # 结构种子块：大周期、凹口/平台、最大量阳K实底/高点、黄金倍量等统一到关键结构位，不再逐项相加。
+    extra["score_v121_structure_seed_block"] = (
+        _structure_merged_allowance.fillna(0)
+        + extra["score_monthly_cycle"].fillna(0) * 0.60
+        + extra["score_long_cycle"].fillna(0) * 0.45
+    ).clip(0.0, 34.0)
+
+    # 突破质量块：所有关键位突破只判断一次突破质量。影线试探/假突破不得因为多个模块重复加分。
+    _breakout_candidates = pd.concat([
+        extra["score_break_k_quality"].fillna(0) * 1.50,
+        extra["score_multi_tf_break_quality"].fillna(0) * 0.85,
+        extra["score_pattern"].fillna(0) * 0.65,
+    ], axis=1)
+    extra["score_v121_breakout_quality_block"] = _breakout_candidates.max(axis=1).clip(0.0, 16.0)
+
+    # 回踩承接块：BBIBOLL/BBI/均线/强阳实体/涨停实体/大量阳K实底/结构关键位回踩统一归为承接。
+    extra["score_v121_pullback_confirm_block"] = (
+        extra["score_v12_pullback_entry"].fillna(0) * 1.25
+        + extra["score_carry_structure"].fillna(0) * 0.80
+        + extra["score_stepwise_push"].fillna(0) * 0.45
+        + extra["score_behavior"].fillna(0) * 0.20
+    ).clip(0.0, 26.0)
+
+    # 量能确认块：标准倍量、倍量后平量、分散健康倍量、阳梯量、阳阴量价统一归类。
+    extra["score_v121_volume_confirm_block"] = (
+        extra["score_volume_structure"].fillna(0) * 0.70
+        + extra["score_yang_yin_volume"].fillna(0) * 0.55
+        + extra["score_count"].fillna(0) * 0.35
+    ).clip(-5.0, 22.0)
+
+    # 活跃度弹性块：100日涨停/大阳/大阴/跳空/ATR/黏密度统一输出，避免和量能、频次重复。
+    extra["score_v121_activity_elasticity_block"] = (
+        extra["score_v12_activity"].fillna(0)
+        + extra["score_limitup_activity"].fillna(0)
+    ).clip(-8.0, 12.0)
+
+    # 交易质量块：防守位、空间、压力、指标、阶段统一排序；不再让盈亏比单独打满交易优先级。
+    extra["score_v121_trade_quality_block"] = (
+        extra["score_trade_quality"].fillna(0) * 0.85
+        + extra["score_monthly_height_space"].fillna(0) * 0.60
+        + extra["score_pressure_space"].fillna(0) * 0.50
+        + extra["score_key_distance"].fillna(0) * 0.50
+        + extra["score_indicator"].fillna(0) * 0.35
+        + extra["score_stage_adjustment"].fillna(0) * 0.55
+    ).clip(-32.0, 36.0)
+
+    # V12.1总分：由七个机构级块组成。旧逻辑仍然计算并保留，但不再重复线性堆加。
     extra["total_score"] = (
-        extra["score_base_model"]
-        + extra["score_volume_structure"]
-        + extra["score_behavior"]
-        + extra["score_pattern"]
-        + extra["score_structure_core"]
-        + extra["score_advanced_ao_kou"]
-        + extra["score_fibo_reclaim"]
-        + extra["score_break_k_quality"]
-        + extra["score_trend_stage"]
-        + extra["score_count"]
-        + extra["score_limitup_activity"]
-        + extra["score_carry_structure"]
-        + extra["score_stepwise_push"]
-        + extra["score_yang_yin_volume"]
-        + extra["score_pressure_space"]
-        + extra["score_key_distance"]
-        + extra["score_indicator"]
-        + extra["score_long_cycle"]
-        + extra["score_monthly_cycle"]
-        + extra["score_stage_adjustment"]
-        + extra["score_penalty"]
-        + extra["score_overlap_adjustment"]
+        extra["score_base_model"].fillna(0)
+        + extra["score_v121_structure_seed_block"]
+        + extra["score_v121_breakout_quality_block"]
+        + extra["score_v121_pullback_confirm_block"]
+        + extra["score_v121_volume_confirm_block"]
+        + extra["score_v121_activity_elasticity_block"]
+        + extra["score_v121_trade_quality_block"]
+        + extra["score_v121_risk_gate_block"]
+    )
+
+    extra["v121_framework_label"] = "后台跟踪"
+    extra.loc[extra["score_v121_structure_seed_block"] >= 18, "v121_framework_label"] = "大周期种子"
+    extra.loc[extra["score_v121_pullback_confirm_block"] >= 12, "v121_framework_label"] = "回踩确认"
+    extra.loc[extra["v12_formal_push_ok"].fillna(False), "v121_framework_label"] = "正式推送候选"
+    extra.loc[extra["score_v121_risk_gate_block"] <= -18, "v121_framework_label"] = "风险降级"
+    extra["v121_framework_desc"] = (
+        "结构" + extra["score_v121_structure_seed_block"].round(1).astype(str)
+        + "/突破" + extra["score_v121_breakout_quality_block"].round(1).astype(str)
+        + "/承接" + extra["score_v121_pullback_confirm_block"].round(1).astype(str)
+        + "/量能" + extra["score_v121_volume_confirm_block"].round(1).astype(str)
+        + "/活跃" + extra["score_v121_activity_elasticity_block"].round(1).astype(str)
+        + "/交易" + extra["score_v121_trade_quality_block"].round(1).astype(str)
+        + "/风险" + extra["score_v121_risk_gate_block"].round(1).astype(str)
     )
 
     # V11：交易质量加权调整。保留原有所有因子，但用大周期空间、买点质量、风险收益比重新排序。
@@ -3571,17 +4243,25 @@ def calc_deep_rows(df, code):
         extra["score_structure_core"]
         + extra["score_advanced_ao_kou"]
         + extra["score_fibo_reclaim"]
+        + extra["score_multi_tf_key_structure"] * 0.75
         + extra["score_monthly_cycle"] * 0.8
         + extra["score_carry_structure"] * 0.6
     )
+    # V12：交易优先级不能只看盈亏比。必须以“突破后回踩承接”或明确承接确认作为核心。
+    key_action_quality_v12 = (
+        extra["score_v12_pullback_entry"] * 1.60
+        + extra["score_carry_structure"] * 0.80
+        + extra["score_break_k_quality"] * 0.60
+        + extra["score_v12_activity"] * 0.35
+    )
     extra["trade_priority_score"] = (
-        structure_strength_v11 * 0.35
-        + extra["score_trade_quality"] * 1.20
-        + extra["score_monthly_height_space"] * 1.10
-        + extra["score_volume_structure"] * 0.45
-        + extra["score_yang_yin_volume"] * 0.50
-        + extra["score_indicator"] * 0.40
-        + extra["score_penalty"] * 0.80
+        structure_strength_v11 * 0.22
+        + extra["score_trade_quality"] * 0.75
+        + extra["score_monthly_height_space"] * 0.55
+        + key_action_quality_v12
+        + extra["score_yang_yin_volume"] * 0.35
+        + extra["score_indicator"] * 0.25
+        + extra["score_penalty"] * 0.90
     ).clip(-30, 40)
     extra["total_score"] = extra["total_score"] + extra["score_trade_quality"] + extra["score_monthly_height_space"] + extra["trade_priority_score"] * 0.35
 
@@ -3619,8 +4299,34 @@ def calc_deep_rows(df, code):
     if str(code).startswith(("300", "301", "688")):
         extra.loc[no_structure_attack, "total_score"] = extra.loc[no_structure_attack, "total_score"].clip(upper=76.0)
 
+
+    # V12：正式推送必须偏向“突破后回踩确认/舒服买点”。
+    # 突破当天（无论弱突破还是强突破）只进入后台跟踪池，除非已经同时出现明确回踩承接。
+    breakthrough_today_no_pullback = extra["v12_break_today_weak"] & (~extra["v12_formal_push_ok"])
+    extra.loc[breakthrough_today_no_pullback, "total_score"] = extra.loc[breakthrough_today_no_pullback, "total_score"].clip(upper=79.0)
+    extra.loc[breakthrough_today_no_pullback, "trade_priority_score"] = extra.loc[breakthrough_today_no_pullback, "trade_priority_score"].clip(upper=18.0)
+    # 月线/盈亏比很好但买点没到，也不能正式推成A类。
+    good_structure_but_no_entry = (
+        (structure_strength_v11 >= 8)
+        & (extra["score_v12_pullback_entry"] < 5)
+        & (~extra["v12_formal_push_ok"])
+        & (~extra["limit_up"])
+    )
+    extra.loc[good_structure_but_no_entry, "total_score"] = extra.loc[good_structure_but_no_entry, "total_score"].clip(upper=79.0)
+    extra.loc[extra["v12_formal_push_ok"] & (df["long_pos_250"] <= 0.70) & (extra["score_v12_activity"] >= -3), "total_score"] += 3.0
+
     merged = pd.concat([df, extra], axis=1)
     merged = apply_chase_risk_gate(merged)
+
+    # V12：突破当天/买点未到的票进入后台跟踪池，不作为正式推送；舒服买点才保留优先候选。
+    if "candidate_pool" in merged.columns:
+        v12_no_entry = (~merged.get("v12_formal_push_ok", False)) & (merged.get("v12_break_today_weak", False) | ((merged.get("score_structure_core", 0) + merged.get("score_monthly_cycle", 0) + merged.get("score_multi_tf_key_structure", 0)) >= 8))
+        merged.loc[v12_no_entry, "candidate_pool"] = "后台跟踪池"
+        merged.loc[v12_no_entry, "candidate_pool_reason"] = (merged.loc[v12_no_entry, "candidate_pool_reason"].astype(str) + "；V12买点未到：突破当天或尚未回踩确认").str.strip("；")
+        merged.loc[v12_no_entry, "total_score"] = merged.loc[v12_no_entry, "total_score"].clip(upper=79.0)
+        v12_entry_ok = merged.get("v12_formal_push_ok", False) & (merged.get("score_v12_activity", 0) > -6)
+        merged.loc[v12_entry_ok & merged["candidate_pool"].astype(str).isin(["后台跟踪池", "结构观察池", "交易质量观察池"]), "candidate_pool"] = "优先候选池"
+        merged.loc[v12_entry_ok, "candidate_pool_reason"] = "V12舒服买点：突破后回踩确认，位置比突破当天更适合观察"
     # V11：优先候选池必须同时满足交易质量与风险收益比，不再只看综合分。
     if "candidate_pool" in merged.columns:
         poor_v11 = (merged.get("score_trade_quality", 0) < 0) | ((merged.get("risk_reward_ratio", 0) > 0) & (merged.get("risk_reward_ratio", 0) < 1.2)) | (merged.get("score_monthly_height_space", 0) < -5)
@@ -3731,10 +4437,88 @@ def calc_base_full(df):
     return merged
 
 
+
+def v122_base_candidate_gate(row):
+    """
+    V12.2标准版基础候选闸门：
+    只决定是否值得进入昂贵深度评分，不删除交易逻辑。
+    机构思路：先看是否有“结构种子/量价触发/交易质量/低位修复”之一；
+    对明显高位、极端过热、基础分过低且无结构种子的股票 early exit。
+    """
+    if ENABLE_V122_BASE_GATE != "1":
+        return True, "gate_disabled"
+
+    base_total = safe_float(row.get("base_total_score", row.get("base_score", 0)))
+    attack = safe_float(row.get("base_attack_quality_score", 0))
+    structure = safe_float(row.get("base_structure_potential_score", 0))
+    long_cycle = safe_float(row.get("base_long_cycle_potential_score", 0))
+    volume_carry = safe_float(row.get("base_volume_carry_score", 0))
+    trade_quality = safe_float(row.get("base_trade_quality_score", 0))
+    monthly_proxy = safe_float(row.get("base_monthly_height_proxy_score", 0))
+    fibo = safe_float(row.get("base_fibo_second_confirm_score", 0))
+    limit_hold = safe_float(row.get("base_limitup_hold_score", 0))
+    risk_penalty = safe_float(row.get("base_risk_penalty", 0))
+    long_pos = safe_float(row.get("long_pos_250", 0))
+    bias20 = safe_float(row.get("bias20", 0))
+    bias60 = safe_float(row.get("bias60", 0))
+    near_pressure = safe_float(row.get("near_pressure_dist", 0))
+    rsi = safe_float(row.get("base_rsi", 50))
+    cci = safe_float(row.get("base_cci", 0))
+    bucket = str(row.get("base_bucket", ""))
+
+    seed_score = structure + long_cycle + monthly_proxy + fibo + limit_hold
+    trigger_score = attack * 0.40 + volume_carry + trade_quality + fibo
+
+    if risk_penalty <= -18 and base_total < 78 and seed_score < V122_STRONG_SEED_SCORE:
+        return False, "基础风险过重且无强结构种子"
+    if base_total < V122_MIN_BASE_SCORE_FOR_DEEP and seed_score < V122_STRONG_SEED_SCORE and trigger_score < V122_STRONG_TRIGGER_SCORE:
+        return False, "基础分低且无结构/触发种子"
+    if long_pos >= 0.88 and bias20 >= 0.18 and seed_score < 14:
+        return False, "高位高乖离且结构种子不足"
+    if near_pressure > 0 and near_pressure < 0.035 and bias20 >= 0.12 and trigger_score < 16:
+        return False, "贴近压力且触发质量不足"
+    if rsi >= 86 and cci >= 300 and seed_score < 14:
+        return False, "指标重度过热且缺少大结构支撑"
+    if bucket == "强势观察" and trade_quality < 0 and seed_score < 16:
+        return False, "强势观察但交易质量不足"
+
+    return True, "通过V12.2基础闸门"
+
+
+def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
+    """保存后台种子/跟踪池快照，减少后续人工从Telegram反推。"""
+    try:
+        if not rows:
+            return
+        seeds = []
+        for r in rows[:300]:
+            seeds.append({
+                "code": r.get("code", ""),
+                "name": r.get("name", ""),
+                "date": r.get("date", ""),
+                "base_bucket": r.get("base_bucket", ""),
+                "base_total_score": safe_float(r.get("base_total_score", r.get("base_score", 0))),
+                "base_structure_potential_score": safe_float(r.get("base_structure_potential_score", 0)),
+                "base_long_cycle_potential_score": safe_float(r.get("base_long_cycle_potential_score", 0)),
+                "base_volume_carry_score": safe_float(r.get("base_volume_carry_score", 0)),
+                "base_trade_quality_score": safe_float(r.get("base_trade_quality_score", 0)),
+                "note": "V12.2后台种子池：正式推送仍需日线回踩/承接触发",
+            })
+        save_json_file(path, {"generated_at_bj": bj_time_str(), "seeds": seeds})
+        print(f"V12.2后台种子池已保存：{path}，记录{len(seeds)}条")
+    except Exception as e:
+        print(f"V12.2后台种子池保存失败：{e}")
+
 def process_stock_base(row):
     code = row["代码"]
     name = row["名称"]
     bs_code = row["bs_code"]
+
+    if ENABLE_RISK_EARLY_EXIT == "1":
+        risk = evaluate_regulatory_risk(code, name)
+        if risk.get("hard_exclude"):
+            print(f"V12.2风险硬过滤：{code} {name} 命中重大雷区，跳过K线深算：{'；'.join(risk.get('flags', []))[:80]}")
+            return []
 
     df = get_daily_kline(bs_code)
     recent = calc_base_rows(df)
@@ -3871,6 +4655,26 @@ def process_stock_deep(row):
             "limit_up_count_50": float(r.get("limit_up_count_50", 0)) if pd.notna(r.get("limit_up_count_50", 0)) else 0,
             "structure_flags": str(r["structure_flags"]) if pd.notna(r["structure_flags"]) else "",
             "structure_neckline": float(r["structure_neckline"]) if pd.notna(r["structure_neckline"]) else 0,
+            "score_multi_tf_key_structure": float(r.get("score_multi_tf_key_structure", 0)) if pd.notna(r.get("score_multi_tf_key_structure", 0)) else 0,
+            "score_multi_tf_break_quality": float(r.get("score_multi_tf_break_quality", 0)) if pd.notna(r.get("score_multi_tf_break_quality", 0)) else 0,
+            "multi_tf_key_desc": str(r.get("multi_tf_key_desc", "")) if pd.notna(r.get("multi_tf_key_desc", "")) else "",
+            "multi_tf_best_floor": float(r.get("multi_tf_best_floor", 0)) if pd.notna(r.get("multi_tf_best_floor", 0)) else 0,
+            "multi_tf_best_high": float(r.get("multi_tf_best_high", 0)) if pd.notna(r.get("multi_tf_best_high", 0)) else 0,
+            "multi_tf_best_timeframe": str(r.get("multi_tf_best_timeframe", "")) if pd.notna(r.get("multi_tf_best_timeframe", "")) else "",
+            "multi_tf_pullback_count": float(r.get("multi_tf_pullback_count", 0)) if pd.notna(r.get("multi_tf_pullback_count", 0)) else 0,
+            "multi_tf_pullback_stage": str(r.get("multi_tf_pullback_stage", "")) if pd.notna(r.get("multi_tf_pullback_stage", "")) else "",
+            "multi_tf_high_break_label": str(r.get("multi_tf_high_break_label", "")) if pd.notna(r.get("multi_tf_high_break_label", "")) else "",
+            "multi_tf_high_break_desc": str(r.get("multi_tf_high_break_desc", "")) if pd.notna(r.get("multi_tf_high_break_desc", "")) else "",
+            "score_v12_same_source_adjustment": float(r.get("score_v12_same_source_adjustment", 0)) if pd.notna(r.get("score_v12_same_source_adjustment", 0)) else 0,
+            "score_v121_risk_gate_block": float(r.get("score_v121_risk_gate_block", 0)) if pd.notna(r.get("score_v121_risk_gate_block", 0)) else 0,
+            "score_v121_structure_seed_block": float(r.get("score_v121_structure_seed_block", 0)) if pd.notna(r.get("score_v121_structure_seed_block", 0)) else 0,
+            "score_v121_breakout_quality_block": float(r.get("score_v121_breakout_quality_block", 0)) if pd.notna(r.get("score_v121_breakout_quality_block", 0)) else 0,
+            "score_v121_pullback_confirm_block": float(r.get("score_v121_pullback_confirm_block", 0)) if pd.notna(r.get("score_v121_pullback_confirm_block", 0)) else 0,
+            "score_v121_volume_confirm_block": float(r.get("score_v121_volume_confirm_block", 0)) if pd.notna(r.get("score_v121_volume_confirm_block", 0)) else 0,
+            "score_v121_activity_elasticity_block": float(r.get("score_v121_activity_elasticity_block", 0)) if pd.notna(r.get("score_v121_activity_elasticity_block", 0)) else 0,
+            "score_v121_trade_quality_block": float(r.get("score_v121_trade_quality_block", 0)) if pd.notna(r.get("score_v121_trade_quality_block", 0)) else 0,
+            "v121_framework_label": str(r.get("v121_framework_label", "")) if pd.notna(r.get("v121_framework_label", "")) else "",
+            "v121_framework_desc": str(r.get("v121_framework_desc", "")) if pd.notna(r.get("v121_framework_desc", "")) else "",
             "score_overlap_adjustment": float(r["score_overlap_adjustment"]) if pd.notna(r["score_overlap_adjustment"]) else 0,
             "score_trend_stage": float(r["score_trend_stage"]) if pd.notna(r["score_trend_stage"]) else 0,
             "score_count": float(r["score_count"]) if pd.notna(r["score_count"]) else 0,
@@ -3982,6 +4786,22 @@ def select_deep_targets_v10(base_rows, limit):
         seen_codes.add(code)
         dedup.append(r)
 
+    # V12.2：基础闸门先过滤明显无种子/无触发/高风险候选，避免对全市场重复深算。
+    gated = []
+    gated_out = []
+    for r in dedup:
+        ok, reason = v122_base_candidate_gate(r)
+        if ok:
+            gated.append(r)
+        else:
+            rr = dict(r)
+            rr["v122_gate_reason"] = reason
+            gated_out.append(rr)
+    if gated:
+        dedup = gated
+    print(f"V12.2基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
+    append_seed_pool_snapshot(dedup)
+
     # 配额：健康攻击保留原模型优势，低位修复/量价承接/结构潜力保证入口，强势观察限量。
     quota_plan = [
         ("健康攻击", 0.27),
@@ -4047,6 +4867,7 @@ def select_deep_targets_v10(base_rows, limit):
     )[:limit]
 
     bucket_stats["合计"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
+    bucket_stats["V12.2基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
 
@@ -4092,6 +4913,9 @@ def classify_next_day_strategy(s):
     chase_flags = str(s.get("chase_risk_flags", ""))
     risk_flags = str(s.get("risk_flags", ""))
     fibo_type = str(s.get("fibo_reclaim_type", ""))
+    v12_entry_score = safe_float(s.get("score_v12_pullback_entry", 0))
+    v12_formal_ok = bool(s.get("v12_formal_push_ok", False))
+    v12_break_today = bool(s.get("v12_break_today_weak", False))
 
     if bool(s.get("risk_hard_exclude", False)) or risk_flags:
         return {
@@ -4101,6 +4925,17 @@ def classify_next_day_strategy(s):
             "confirm_rule": "命中基本面/监管/治理雷区，一号员工阶段直接剔除优先池；技术形态不抵消重大雷区。",
             "abandon_rule": "不进入三号员工可交易候选。",
             "strategy_note": f"雷区标签：{risk_flags}" if risk_flags else "命中硬排雷规则",
+        }
+
+    if v12_break_today and not v12_formal_ok:
+        key = structure_key if structure_key > 0 else defense
+        return {
+            "next_day_strategy": "T类：后台跟踪，等回踩确认",
+            "no_chase_line": 0.0,
+            "pullback_zone": f"等回踩BBIBOLL/BBI、MA5/MA10、强阳实体中部或关键位{key:.2f}附近" if key > 0 else "等回踩中轨/均线/突破阳线实体位",
+            "confirm_rule": "突破当天不正式推送；只有后续回踩不破、缩量小阴小阳或重新转强，才进入正式候选。",
+            "abandon_rule": "跌回关键位下方且收不回，或回踩放量长阴破中轨，放弃。",
+            "strategy_note": "大结构可跟踪，但今天不是舒服买点。",
         }
 
     high_chase_risk = (
@@ -4118,7 +4953,8 @@ def classify_next_day_strategy(s):
     )
 
     strong_relay = (
-        (pct_chg >= 8.5 or safe_float(s.get("score_limitup_activity", 0)) > 0 or score_limitup_hold > 0)
+        v12_formal_ok
+        and (pct_chg >= 8.5 or safe_float(s.get("score_limitup_activity", 0)) > 0 or score_limitup_hold > 0)
         and not high_chase_risk
         and target_dist >= 0.08
         and defense_dist <= 0.065
@@ -4126,8 +4962,9 @@ def classify_next_day_strategy(s):
     )
 
     low_absorb = (
-        defense > 0
-        and defense_dist <= 0.035
+        v12_formal_ok
+        and defense > 0
+        and defense_dist <= 0.055
         and target_dist >= 0.12
         and rr >= 2.0
         and pct_chg <= 4.5
@@ -4136,7 +4973,8 @@ def classify_next_day_strategy(s):
     )
 
     pullback_confirm = (
-        not high_chase_risk
+        v12_formal_ok
+        and not high_chase_risk
         and not low_absorb
         and (score_structure >= 6 or score_double_yang >= 2 or score_trade_quality >= 10 or trade_priority >= 18)
     )
@@ -4322,16 +5160,103 @@ def build_reason(s):
 
     return "；".join(reasons) + "。"
 
+def build_reason_v12(s):
+    """
+    V12报告：减少分项堆砌，改用交易语言说明。
+    """
+    parts = []
+
+    strategy = s.get("next_day_strategy", "")
+    if not strategy:
+        s.update(classify_next_day_strategy(s))
+        strategy = s.get("next_day_strategy", "")
+
+    # 结论
+    if bool(s.get("risk_hard_exclude", False)) or s.get("risk_flags"):
+        conclusion = "结论：命中财务/审计/监管雷区，技术形态再好也不参与。"
+    elif bool(s.get("v12_formal_push_ok", False)):
+        conclusion = "结论：突破后已经回踩确认，属于相对舒服的观察点。"
+    elif bool(s.get("v12_break_today_weak", False)):
+        conclusion = "结论：结构可跟踪，但今天只是突破/摸关键位，不是正式买点。"
+    else:
+        conclusion = "结论：可观察，但需要继续等更清楚的承接。"
+    parts.append(conclusion)
+
+    # 为什么能看
+    watch = []
+    if s.get("structure_flags"):
+        watch.append(f"日线有{s.get('structure_flags')}，关键位约{s.get('structure_neckline', 0):.2f}")
+    elif safe_float(s.get("structure_neckline", 0)) > 0:
+        watch.append(f"日线接近结构关键位{s.get('structure_neckline', 0):.2f}")
+    if safe_float(s.get("score_monthly_cycle", 0)) >= 8:
+        watch.append("月线有缩口/中轨修复，大周期有修复基础")
+    if safe_float(s.get("score_multi_tf_key_structure", 0)) >= 6:
+        watch.append("多周期关键位有记录：" + str(s.get("multi_tf_key_desc", "")))
+    if safe_float(s.get("score_multi_tf_break_quality", 0)) >= 8:
+        watch.append(str(s.get("multi_tf_high_break_desc", "日线高质量突破多周期关键高点")))
+    if safe_float(s.get("score_v12_activity", 0)) >= 2:
+        watch.append(str(s.get("v12_activity_label", "活跃度较好")))
+    if safe_float(s.get("score_v12_pullback_entry", 0)) >= 5:
+        watch.append(f"已经出现{s.get('v12_entry_desc', '').strip('；')}")
+    if watch:
+        parts.append("为什么能看：" + "；".join(watch) + "。")
+
+    # 问题
+    problems = []
+    if safe_float(s.get("score_v12_pullback_entry", 0)) < 8:
+        problems.append("买点还没完全到，不能把跟踪票当成今天可买")
+    if bool(s.get("v12_break_today_weak", False)) and not bool(s.get("v12_formal_push_ok", False)):
+        problems.append("今天属于突破当天/弱突破阶段，容易假突破或次日回落")
+    if safe_float(s.get("entity_pct", 0)) < 1.0 and safe_float(s.get("break_rate", 0)) > 0:
+        problems.append("突破实体偏小，资金态度不够坚决")
+    if "假突破" in str(s.get("multi_tf_high_break_label", "")) or "影线试探" in str(s.get("multi_tf_high_break_label", "")):
+        problems.append("多周期关键高点只是影线试探，不能按有效突破处理")
+    if not (1.8 < safe_float(s.get("vr1", 0)) < 2.5) and safe_float(s.get("score_limitup_hold_3d", 0)) <= 0:
+        problems.append("当日不是标准倍量，量能确认一般")
+    if safe_float(s.get("score_v12_activity", 0)) <= -3:
+        problems.append(str(s.get("v12_activity_label", "活跃度偏低")))
+    if safe_float(s.get("near_pressure_dist", 0)) > 0 and safe_float(s.get("near_pressure_dist", 0)) < 0.08:
+        problems.append("上方近端压力偏近")
+    if safe_float(s.get("rsi", 0)) >= 80 or safe_float(s.get("cci", 0)) >= 250:
+        problems.append("指标偏热，不能追")
+    if s.get("risk_flags"):
+        problems.append("雷区：" + str(s.get("risk_flags", "")))
+    if problems:
+        parts.append("问题在哪里：" + "；".join(problems) + "。")
+
+    # 明天怎么确认
+    confirm = str(s.get("confirm_rule", ""))
+    abandon = str(s.get("abandon_rule", ""))
+    zone = str(s.get("pullback_zone", ""))
+    if confirm or abandon:
+        parts.append(f"明天怎么确认：{confirm}")
+        parts.append(f"什么情况放弃：{abandon}")
+    if zone:
+        parts.append(f"重点观察区：{zone}")
+
+    # 简明后台摘要
+    v121_desc = str(s.get("v121_framework_desc", ""))
+    if v121_desc:
+        parts.append(f"V12.2框架摘要：{v121_desc}，状态={s.get('v121_framework_label', '')}。")
+    parts.append(
+        f"后台摘要：总分{s.get('total_score', 0):.1f}，买点{s.get('score_v12_pullback_entry', 0):.1f}，"
+        f"多周期关键位{s.get('score_multi_tf_key_structure', 0):.1f}，同源合并{s.get('score_v12_same_source_adjustment', 0):.1f}，"
+        f"活跃度{s.get('score_v12_activity', 0):.1f}，交易优先{s.get('trade_priority_score', 0):.1f}，池={s.get('candidate_pool', '')}。"
+    )
+    return " ".join(parts)
+
+
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0):
     lines = []
-    lines.append("📊 <b>一号员工-结构选股分析报告</b>")
+    lines.append("📊 <b>一号员工V12.3标准版-去重计算路径选股体系报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"评分阈值：综合分 ≥ {FINAL_SCORE_THRESHOLD:.0f}；80分以下不推送，不固定凑满数量。")
-    lines.append(f"V11.3精简推送：默认只推前{RESULT_LIMIT}只；每只给出次日策略分类，候选≠开盘追。")
-    lines.append("V11.1交易质量闸门：严格区分结构关键位/真实交易防守位；黄金倍量必须明显凹口干净突破；雷区筛查前置，强但不敢买或有雷的票降级观察。")
+    lines.append(f"V12.3标准版：同类逻辑只计算一次、同源信号合并封顶；正式推送前{RESULT_LIMIT}只，偏向回踩确认/舒服买点。")
+    lines.append("V12.3规则：风险硬过滤→共享特征→多周期关键位→统一突破/回踩/量能/活跃度→同源合并→前5正式推送；审计保留意见/非标审计/无法表示/否定意见等硬排雷。")
+    lines.append("V12.3统一框架：减少重复遍历，凹口/平台/大量阳K/前高等统一为关键位；突破、回踩、量能确认只走统一评价。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -4361,14 +5286,11 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         )
         lines.append(
             f"综合分：{s['total_score']:.2f} | 阶段：{html.escape(str(s.get('trade_stage', '未知')))} | 池：{html.escape(str(s.get('candidate_pool', '优先候选池')))} | "
-            f"原模型：{s['score_base_model']:.1f} | 量能：{s['score_volume_structure']:.1f} | 行为：{s['score_behavior']:.1f} | "
-            f"承接：{s.get('score_carry_structure', 0):.1f} | 台阶：{s.get('score_stepwise_push', 0):.1f} | "
-            f"形态：{s['score_pattern']:.1f} | 日线结构：{s['score_structure_core']:.1f} | 高级凹口：{s.get('score_advanced_ao_kou', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | "
-            f"趋势：{s['score_trend_stage']:.1f} | 阳阴量价：{s.get('score_yang_yin_volume', 0):.1f} | 压力空间：{s.get('score_pressure_space', 0):.1f} | 关键位舒适度：{s.get('score_key_distance', 0):.1f} | 频次：{s['score_count']:.1f} | 指标：{s['score_indicator']:.1f} | "
-            f"长周期：{s['score_long_cycle']:.1f} | 月线空间：{s.get('score_monthly_height_space', 0):.1f} | 买点质量：{s.get('score_trade_quality', 0):.1f} | 交易优先：{s.get('trade_priority_score', 0):.1f} | "
-            f"阶段调整：{s.get('score_stage_adjustment', 0):.1f} | 风险：{s['score_penalty']:.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f} | 重复降权：{s['score_overlap_adjustment']:.1f}"
+            f"V12.2状态：{html.escape(str(s.get('v121_framework_label', '')))} | 买点：{s.get('score_v12_pullback_entry', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
+            f"日线结构：{s.get('score_structure_core', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | "
+            f"量价：{s.get('score_volume_structure', 0):.1f} | 交易优先：{s.get('trade_priority_score', 0):.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f}"
         )
-        lines.append("诊断：" + build_reason(s))
+        lines.append("诊断：" + build_reason_v12(s))
 
     return "\n".join(lines)
 
@@ -4431,7 +5353,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V11交易质量版：全市场轻量闸门，分桶选取深度候选，按大周期空间/结构边界/买点质量/风险收益比/量能确认综合排名。")
+        print("V12.3标准版：风险硬过滤→共享特征→尾部候选精算→多周期关键位统一→突破/回踩/量能统一评价→同源合并→前5只正式推送。")
 
         base_rows = []
         all_dates = set()
@@ -4552,8 +5474,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V11基础分桶后进入深度评分：{len(deep_targets)}条")
-        print("V11基础候选分桶统计：")
+        print(f"V12.2基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
+        print("V12.2基础候选分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
