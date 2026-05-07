@@ -87,7 +87,7 @@ warnings.filterwarnings("ignore")
 # ===========================================================================
 
 
-# ========================= V12.2 标准版：机构级计算路径重构说明 =========================
+# ========================= V12.4 标准版：机构级计算路径重构说明 =========================
 # 本版不是删减交易逻辑，而是重排计算路径：风险先行、基础特征一次计算、多周期关键位统一、
 # 突破/回踩/量能/活跃度统一归类、同源信号合并封顶、深度评分只给真正有种子或触发的股票。
 # 核心目标：保留此前所有有效逻辑，但减少重复遍历、重复打分和无效深算，让正式推送更少更准。
@@ -108,7 +108,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V12.3标准版"
+MODEL_VERSION = "V12.4提速标准版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -123,10 +123,10 @@ RESULT_LIMIT = min(RESULT_LIMIT_RAW, TOP_PUSH_LIMIT) if TOP_PUSH_LIMIT > 0 else 
 DEEP_SCORE_LIMIT_RAW = int(os.environ.get("DEEP_SCORE_LIMIT", "500"))
 # V10：深度评分硬上限。即使 workflow 仍传 500，也默认只取基础分桶后的前150条深评，
 # 避免 GitHub Actions 深度评分跑不完；如确需恢复500，可设置 DEEP_SCORE_HARD_CAP=0 或 500。
-DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "120"))
+DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "80"))
 DEEP_SCORE_LIMIT = min(DEEP_SCORE_LIMIT_RAW, DEEP_SCORE_HARD_CAP) if DEEP_SCORE_HARD_CAP > 0 else DEEP_SCORE_LIMIT_RAW
 
-# V12.2：标准版默认启用“先过滤、后深算”。这不是减少逻辑，而是避免对明显无效股票重复跑昂贵模型。
+# V12.4：标准版默认启用“先过滤、后深算”。这不是减少逻辑，而是避免对明显无效股票重复跑昂贵模型。
 ENABLE_V122_BASE_GATE = os.environ.get("ENABLE_V122_BASE_GATE", "1")
 ENABLE_RISK_EARLY_EXIT = os.environ.get("ENABLE_RISK_EARLY_EXIT", "1")
 V122_MIN_BASE_SCORE_FOR_DEEP = float(os.environ.get("V122_MIN_BASE_SCORE_FOR_DEEP", "42"))
@@ -135,7 +135,14 @@ V122_STRONG_TRIGGER_SCORE = float(os.environ.get("V122_STRONG_TRIGGER_SCORE", "1
 
 REQUEST_SLEEP = float(os.environ.get("REQUEST_SLEEP", "0.03"))
 # V9：为月线BBI/BOLL缩口与多次中轨修复提供足够样本；默认约6年，仍可通过环境变量调小以节省时间。
-KLINE_LOOKBACK_DAYS = int(os.environ.get("KLINE_LOOKBACK_DAYS", "2200"))
+# V12.4：基础/深度分层取数。全市场基础轻扫只取较短日线，候选深算再补长周期，避免4937只全量拉2200天。
+BASE_KLINE_LOOKBACK_DAYS = int(os.environ.get("BASE_KLINE_LOOKBACK_DAYS", "520"))
+DEEP_KLINE_LOOKBACK_DAYS = int(os.environ.get("DEEP_KLINE_LOOKBACK_DAYS", os.environ.get("KLINE_LOOKBACK_DAYS", "2200")))
+KLINE_LOOKBACK_DAYS = DEEP_KLINE_LOOKBACK_DAYS
+MONTHLY_STRUCT_LOOKBACK_MONTHS = int(os.environ.get("MONTHLY_STRUCT_LOOKBACK_MONTHS", "100"))
+SEED_POOL_MAX_STOCKS = int(os.environ.get("SEED_POOL_MAX_STOCKS", "300"))
+SEED_POOL_DAILY_CHECK_LIMIT = int(os.environ.get("SEED_POOL_DAILY_CHECK_LIMIT", "120"))
+ENABLE_V124_ACCELERATED_PIPELINE = os.environ.get("ENABLE_V124_ACCELERATED_PIPELINE", "1")
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "5400"))
 # 分阶段限时：避免基础评分耗尽全部时间后，深度评分被误杀。
 BASIC_RUNTIME_SECONDS = int(os.environ.get("BASIC_RUNTIME_SECONDS", str(max(1800, MAX_RUNTIME_SECONDS - 3600))))
@@ -613,9 +620,12 @@ def get_a_stock_list():
     return df[["代码", "名称", "bs_code"]]
 
 
-def cache_path(bs_code):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{bs_code.replace('.', '_')}.csv")
+def cache_path(bs_code, cache_scope="deep"):
+    """V12.4：基础/深度缓存分开。基础轻扫不污染深度长周期缓存。"""
+    scope = "base" if str(cache_scope).lower() == "base" else "deep"
+    subdir = os.path.join(CACHE_DIR, scope)
+    os.makedirs(subdir, exist_ok=True)
+    return os.path.join(subdir, f"{bs_code.replace('.', '_')}.csv")
 
 
 def normalize_kline_df(df):
@@ -637,8 +647,8 @@ def normalize_kline_df(df):
     return df
 
 
-def read_cached_kline(bs_code):
-    path = cache_path(bs_code)
+def read_cached_kline(bs_code, cache_scope="deep", min_rows=0):
+    path = cache_path(bs_code, cache_scope=cache_scope)
 
     if not os.path.exists(path):
         return None
@@ -650,6 +660,9 @@ def read_cached_kline(bs_code):
         if df is None or df.empty or "date" not in df.columns:
             return None
 
+        if min_rows and len(df) < int(min_rows):
+            return None
+
         last_date = str(df["date"].max())
 
         if LAST_TRADE_DAY and last_date >= LAST_TRADE_DAY:
@@ -658,16 +671,16 @@ def read_cached_kline(bs_code):
         return None
 
     except Exception as e:
-        print(f"读取缓存失败 {bs_code}: {e}")
+        print(f"读取缓存失败 {bs_code} scope={cache_scope}: {e}")
         return None
 
 
-def write_cached_kline(bs_code, df):
+def write_cached_kline(bs_code, df, cache_scope="deep"):
     try:
-        path = cache_path(bs_code)
+        path = cache_path(bs_code, cache_scope=cache_scope)
         df.to_csv(path, index=False, encoding="utf-8")
     except Exception as e:
-        print(f"写入缓存失败 {bs_code}: {e}")
+        print(f"写入缓存失败 {bs_code} scope={cache_scope}: {e}")
 
 
 def safe_float(value, default=0.0):
@@ -1034,14 +1047,18 @@ def save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_po
         print(f"候选池保存失败：{e}")
 
 
-def get_daily_kline(bs_code):
-    cached = read_cached_kline(bs_code)
+def get_daily_kline(bs_code, lookback_days=None, cache_scope="deep"):
+    """V12.4：支持基础轻扫短周期、深度精算长周期。"""
+    if lookback_days is None:
+        lookback_days = DEEP_KLINE_LOOKBACK_DAYS if cache_scope == "deep" else BASE_KLINE_LOOKBACK_DAYS
+    min_rows = 180 if cache_scope == "base" else 700
+    cached = read_cached_kline(bs_code, cache_scope=cache_scope, min_rows=min_rows)
 
     if cached is not None:
         return cached
 
     end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=KLINE_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
 
     fields = "date,open,high,low,close,volume,amount,pctChg,turn,tradestatus"
 
@@ -1111,7 +1128,7 @@ def get_daily_kline(bs_code):
             if df is None or df.empty:
                 return None
 
-            write_cached_kline(bs_code, df)
+            write_cached_kline(bs_code, df, cache_scope=cache_scope)
             time.sleep(REQUEST_SLEEP)
             reset_kline_success_streak()
 
@@ -2011,7 +2028,7 @@ def calc_base_rows(df):
 
     df = df.copy()
 
-    # V12.3：基础层只返回最近CHECK_DAYS，昂贵的历史回看型入口模型只对最终可返回的尾部K线计算。
+    # V12.4：基础层只返回最近CHECK_DAYS，昂贵的历史回看型入口模型只对最终可返回的尾部K线计算。
     # 这不是删逻辑，而是避免对每只股票的上千根历史K线重复跑同一类“当前候选”判断。
     _active_base_indices = set(range(max(0, len(df) - max(1, CHECK_DAYS)), len(df)))
 
@@ -2946,7 +2963,7 @@ def detect_multi_timeframe_key_structure(df, code=""):
     tf_defs = [
         ("日线", df.copy().reset_index(drop=True), 250, 1.0),
         ("周线", _resample_ohlcv(df, "W-FRI"), 180, 1.5),
-        ("月线", _resample_ohlcv(df, "M"), 80, 2.2),
+        ("月线", _resample_ohlcv(df, "M"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.2),
         ("季线", _resample_ohlcv(df, "Q"), 40, 2.8),
     ]
     cur_close = safe_float(df.iloc[-1].get("close", 0))
@@ -3015,6 +3032,211 @@ def detect_multi_timeframe_key_structure(df, code=""):
         "multi_tf_levels_json": json.dumps(contexts[:6], ensure_ascii=False),
     }
 
+
+
+def _find_valid_max_volume_bull_row(period_df, lookback=100):
+    """V12.4：返回指定窗口内有效最大量阳K及其位置，用于远期绿线模型。"""
+    if period_df is None or period_df.empty:
+        return None
+    w = period_df.tail(int(lookback)).copy().reset_index(drop=True)
+    if len(w) < 12:
+        return None
+    for c in ["open", "high", "low", "close", "volume"]:
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    w = w.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if w.empty:
+        return None
+    for idx, row in w.sort_values("volume", ascending=False).iterrows():
+        if _is_valid_max_volume_bull_candle(row):
+            return idx, row, w
+    return None
+
+
+def _probe_k_quality(row, green_high, green_volume):
+    """9号试盘K质量：创绿线更高高点，量价不能差。"""
+    op = safe_float(row.get("open", 0))
+    cl = safe_float(row.get("close", 0))
+    hi = safe_float(row.get("high", 0))
+    lo = safe_float(row.get("low", 0))
+    vol = safe_float(row.get("volume", 0))
+    if min(op, cl, hi, lo) <= 0 or green_high <= 0:
+        return 0.0, "试盘K无效"
+    rng = max(hi - lo, 1e-9)
+    body = abs(cl - op)
+    upper = hi - max(op, cl)
+    close_pos = (cl - lo) / rng
+    vol_ratio = vol / green_volume if green_volume > 0 else 0.0
+    score = 0.0
+    parts = []
+    if hi >= green_high * 1.003:
+        score += 2.0
+        parts.append("高点突破绿线")
+    if vol_ratio >= 0.45:
+        score += 1.2
+        parts.append(f"量能/绿线{vol_ratio:.2f}")
+    if vol_ratio >= 0.65:
+        score += 0.8
+    if body >= rng * 0.35:
+        score += 1.0
+        parts.append("实体不弱")
+    if close_pos >= 0.45:
+        score += 0.8
+    if upper / rng <= 0.45:
+        score += 0.7
+    if body < rng * 0.18 or upper / rng > 0.60 or vol_ratio < 0.35:
+        score -= 2.0
+        parts.append("试盘质量偏弱")
+    return max(0.0, min(6.0, score)), "、".join(parts)
+
+
+def _time_ratio_score(n, m):
+    if n <= 0 or m <= 0:
+        return 0.0, "时间结构不足", 0.0
+    ratio = m / n
+    score = 0.0
+    label = f"消化周期{ratio:.2f}倍"
+    if ratio < 0.8:
+        score = -1.5
+        label += "，偏短"
+    elif ratio < 1.3:
+        score = 1.2
+        label += "，一倍窗口"
+    elif ratio < 1.8:
+        score = 1.8
+        label += "，消化较充分"
+    elif ratio <= 2.4:
+        score = 3.0
+        label += "，二倍时间窗口"
+    elif ratio <= 3.0:
+        score = 1.8
+        label += "，长周期消化"
+    else:
+        score = 0.5
+        label += "，结构需重新评估"
+    return score, label, ratio
+
+
+def detect_v124_probe_high_second_confirm_model(df):
+    """
+    V12.4 远期最大量高点 + 高质量9号试盘高点 + 时间倍数 + 日线二次确认模型。
+    只在深度层/种子层运行，不进入全市场基础重扫。
+    """
+    empty = {
+        "score_v124_probe_second_confirm": 0.0,
+        "v124_probe_stage": "无远期试盘结构",
+        "v124_probe_desc": "",
+        "v124_green_price": 0.0,
+        "v124_probe_price": 0.0,
+        "v124_parent_pressure": 0.0,
+        "v124_parent_distance": 0.0,
+        "v124_time_ratio": 0.0,
+        "v124_daily_break_valid": False,
+        "v124_daily_break_label": "",
+    }
+    if df is None or len(df) < 700:
+        return empty
+    tf_defs = [
+        ("月线", _resample_ohlcv(df, "M"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.4),
+        ("周线", _resample_ohlcv(df, "W-FRI"), 220, 1.6),
+        ("季线", _resample_ohlcv(df, "Q"), 45, 3.0),
+    ]
+    best = None
+    cur_close = safe_float(df.iloc[-1].get("close", 0))
+    for tf_name, pdf, lookback, weight in tf_defs:
+        found = _find_valid_max_volume_bull_row(pdf, lookback=lookback)
+        if found is None:
+            continue
+        green_idx, green_row, w = found
+        green_high = safe_float(green_row.get("high", 0))
+        green_vol = safe_float(green_row.get("volume", 0))
+        if green_high <= 0 or green_vol <= 0 or green_idx >= len(w) - 8:
+            continue
+        after = w.iloc[green_idx + 1:].copy().reset_index(drop=False).rename(columns={"index":"orig_idx"})
+        # 9号：绿线之后创出更高高点的高质量试盘K，优先选择质量高且时间间隔合理的。
+        probes = []
+        for _, r in after.iterrows():
+            orig_idx = int(r.get("orig_idx", -1))
+            if orig_idx <= green_idx:
+                continue
+            hi = safe_float(r.get("high", 0))
+            if hi < green_high * 1.003:
+                continue
+            q, qdesc = _probe_k_quality(r, green_high, green_vol)
+            if q < 3.0:
+                continue
+            n = orig_idx - green_idx
+            if n < 3:
+                continue
+            probes.append((q, orig_idx, r, qdesc, n))
+        if not probes:
+            continue
+        probes = sorted(probes, key=lambda x: (x[0], x[4]), reverse=True)
+        q, probe_idx, probe_row, qdesc, n = probes[0]
+        probe_high = safe_float(probe_row.get("high", 0))
+        m = len(w) - 1 - probe_idx
+        tscore, tlabel, tratio = _time_ratio_score(n, m)
+        # 父级压力：绿线之前更高的历史大凹口/大高点，若离红线过近则降级。
+        before_green = w.iloc[:green_idx].copy()
+        parent_pressure = 0.0
+        if not before_green.empty:
+            parent_pressure = safe_float(before_green["high"].max())
+            if parent_pressure <= probe_high * 1.03:
+                parent_pressure = 0.0
+        parent_distance = (parent_pressure / cur_close - 1) if parent_pressure > 0 and cur_close > 0 else 9.99
+        parent_penalty = 0.0
+        parent_label = "无近端上级大凹口压制"
+        if 0 < parent_distance < 0.08:
+            parent_penalty = -5.0
+            parent_label = "上级大凹口压力贴脸"
+        elif 0 < parent_distance < 0.15:
+            parent_penalty = -2.5
+            parent_label = "上方父级压力较近"
+        elif 0 < parent_distance < 0.22:
+            parent_penalty = -0.8
+            parent_label = "上方仍有父级压力"
+        # 历史假突破次数：多次失败后，要求更强日线突破或回踩确认。
+        false_cnt = 0
+        for _, rr in w.iloc[green_idx + 1:].iterrows():
+            if safe_float(rr.get("high", 0)) >= green_high * 1.003 and safe_float(rr.get("close", 0)) < green_high * 1.005:
+                false_cnt += 1
+        brk = _daily_break_quality_against_level(df, probe_high)
+        break_score = safe_float(brk.get("score", 0.0))
+        valid = bool(brk.get("valid", False))
+        # 多次假突破但本次突破不强，不能高分。
+        if false_cnt >= 2 and not valid:
+            break_score -= 2.0
+        score = (q * 1.2 + tscore + max(0.0, break_score) + parent_penalty) * weight
+        if valid:
+            score += 2.0 * weight
+        if parent_penalty <= -5.0:
+            score = min(score, 4.0 * weight)
+        score = max(0.0, min(18.0, score))
+        stage = "后台重点跟踪"
+        if valid and score >= 10 and parent_penalty > -5.0:
+            stage = "日线突破9号线二次确认"
+        elif parent_penalty <= -5.0:
+            stage = "突破小门但父级压力贴脸"
+        desc = (
+            f"{tf_name}绿线{green_high:.2f}，9号试盘高点{probe_high:.2f}；"
+            f"9号质量{q:.1f}({qdesc})；N={n}，M={m}，{tlabel}；"
+            f"日线{brk.get('label','')}；{parent_label}"
+        )
+        cand = {
+            "score_v124_probe_second_confirm": float(score),
+            "v124_probe_stage": stage,
+            "v124_probe_desc": desc,
+            "v124_green_price": float(green_high),
+            "v124_probe_price": float(probe_high),
+            "v124_parent_pressure": float(parent_pressure),
+            "v124_parent_distance": float(parent_distance if parent_distance != 9.99 else 0.0),
+            "v124_time_ratio": float(tratio),
+            "v124_daily_break_valid": bool(valid),
+            "v124_daily_break_label": str(brk.get("label", "")),
+        }
+        if best is None or cand["score_v124_probe_second_confirm"] > best["score_v124_probe_second_confirm"]:
+            best = cand
+    return best if best is not None else empty
+
 def _v12_latest_prior_event_value(df, event_mask, value_series, lookback=10, default=0.0):
     """
     V12：找到当前日前lookback天内最近一次事件对应的值。
@@ -3059,7 +3281,7 @@ def calc_deep_rows(df, code):
 
     df = calc_base_full(df)
 
-    # V12.3：深度层最终只输出最近CHECK_DAYS，所有“逐K回看型”昂贵逻辑只对尾部有效候选K线计算。
+    # V12.4：深度层最终只输出最近CHECK_DAYS，所有“逐K回看型”昂贵逻辑只对尾部有效候选K线计算。
     # 向量化基础指标仍完整保留；减少的是无效历史行重复跑凹口/平台/黄金倍量/台阶等候选判断。
     _active_deep_indices = set(range(max(0, len(df) - max(1, CHECK_DAYS)), len(df)))
 
@@ -3633,6 +3855,12 @@ def calc_deep_rows(df, code):
     # 若多周期关键实底线存在，将它纳入“回踩关键位”体系，但只作为同源关键位之一，后面有封顶。
     struct_key = pd.concat([struct_key, multi_tf_floor.where(multi_tf_floor > 0, 0)], axis=1).max(axis=1)
 
+    # ========================= V12.4：远期绿线+9号试盘高点+时间倍数+日线二次确认 =========================
+    # 该模型只在深度候选/种子票上运行，避免全市场重复重扫100月K。
+    v124_probe_ctx = detect_v124_probe_high_second_confirm_model(df)
+    for _k, _v in v124_probe_ctx.items():
+        extra[_k] = _v
+
     extra["v12_pullback_to_bbiboll"] = (bbi_mid > 0) & (low <= bbi_mid * 1.018) & (close >= bbi_mid * 0.992)
     extra["v12_pullback_to_ma5_ma10"] = (
         ((ma5 > 0) & (low <= ma5 * 1.012) & (close >= ma5 * 0.992))
@@ -3693,6 +3921,8 @@ def calc_deep_rows(df, code):
     extra["v12_formal_push_ok"] = extra["score_v12_pullback_entry"] >= 8
     # 多周期关键实底线已形成成熟回踩段时，日线回踩确认分略低也可进入正式候选，但必须有日线承接。
     extra.loc[(extra["score_multi_tf_key_structure"] >= 10) & (extra["multi_tf_pullback_count"] >= 3) & (extra["score_v12_pullback_entry"] >= 6), "v12_formal_push_ok"] = True
+    # 9号高质量试盘高点经过时间消化后，日线漂亮突破9号线，可以作为大涨前的二次确认候选；父级大凹口贴脸则不放行。
+    extra.loc[(extra["score_v124_probe_second_confirm"] >= 10) & (extra["v124_daily_break_valid"] == True) & (extra["v124_parent_distance"].fillna(0) >= 0.08), "v12_formal_push_ok"] = True
 
 
     # 承接结构总分：涨停后三日实体承接 + 普通关键位回踩承接。
@@ -4138,6 +4368,7 @@ def calc_deep_rows(df, code):
         + extra["score_advanced_ao_kou"].clip(lower=0)
         + extra["score_fibo_reclaim"].clip(lower=0)
         + extra["score_multi_tf_key_structure"].clip(lower=0)
+        + extra["score_v124_probe_second_confirm"].fillna(0) * 0.85
         + extra["score_break_k_quality"].clip(lower=0)
     )
     _structure_max = pd.concat([
@@ -4440,7 +4671,7 @@ def calc_base_full(df):
 
 def v122_base_candidate_gate(row):
     """
-    V12.2标准版基础候选闸门：
+    V12.4标准版基础候选闸门：
     只决定是否值得进入昂贵深度评分，不删除交易逻辑。
     机构思路：先看是否有“结构种子/量价触发/交易质量/低位修复”之一；
     对明显高位、极端过热、基础分过低且无结构种子的股票 early exit。
@@ -4482,7 +4713,7 @@ def v122_base_candidate_gate(row):
     if bucket == "强势观察" and trade_quality < 0 and seed_score < 16:
         return False, "强势观察但交易质量不足"
 
-    return True, "通过V12.2基础闸门"
+    return True, "通过V12.4基础闸门"
 
 
 def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
@@ -4502,12 +4733,12 @@ def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
                 "base_long_cycle_potential_score": safe_float(r.get("base_long_cycle_potential_score", 0)),
                 "base_volume_carry_score": safe_float(r.get("base_volume_carry_score", 0)),
                 "base_trade_quality_score": safe_float(r.get("base_trade_quality_score", 0)),
-                "note": "V12.2后台种子池：正式推送仍需日线回踩/承接触发",
+                "note": "V12.4后台种子池：正式推送仍需日线回踩/承接触发",
             })
         save_json_file(path, {"generated_at_bj": bj_time_str(), "seeds": seeds})
-        print(f"V12.2后台种子池已保存：{path}，记录{len(seeds)}条")
+        print(f"V12.4后台种子池已保存：{path}，记录{len(seeds)}条")
     except Exception as e:
-        print(f"V12.2后台种子池保存失败：{e}")
+        print(f"V12.4后台种子池保存失败：{e}")
 
 def process_stock_base(row):
     code = row["代码"]
@@ -4517,10 +4748,10 @@ def process_stock_base(row):
     if ENABLE_RISK_EARLY_EXIT == "1":
         risk = evaluate_regulatory_risk(code, name)
         if risk.get("hard_exclude"):
-            print(f"V12.2风险硬过滤：{code} {name} 命中重大雷区，跳过K线深算：{'；'.join(risk.get('flags', []))[:80]}")
+            print(f"V12.4风险硬过滤：{code} {name} 命中重大雷区，跳过K线深算：{'；'.join(risk.get('flags', []))[:80]}")
             return []
 
-    df = get_daily_kline(bs_code)
+    df = get_daily_kline(bs_code, lookback_days=BASE_KLINE_LOOKBACK_DAYS, cache_scope="base")
     recent = calc_base_rows(df)
 
     rows = []
@@ -4592,7 +4823,7 @@ def process_stock_deep(row):
     name = row["name"]
     bs_code = row["bs_code"]
 
-    df = get_daily_kline(bs_code)
+    df = get_daily_kline(bs_code, lookback_days=DEEP_KLINE_LOOKBACK_DAYS, cache_scope="deep")
     recent = calc_deep_rows(df, code)
 
     rows = []
@@ -4665,6 +4896,16 @@ def process_stock_deep(row):
             "multi_tf_pullback_stage": str(r.get("multi_tf_pullback_stage", "")) if pd.notna(r.get("multi_tf_pullback_stage", "")) else "",
             "multi_tf_high_break_label": str(r.get("multi_tf_high_break_label", "")) if pd.notna(r.get("multi_tf_high_break_label", "")) else "",
             "multi_tf_high_break_desc": str(r.get("multi_tf_high_break_desc", "")) if pd.notna(r.get("multi_tf_high_break_desc", "")) else "",
+            "score_v124_probe_second_confirm": float(r.get("score_v124_probe_second_confirm", 0)) if pd.notna(r.get("score_v124_probe_second_confirm", 0)) else 0,
+            "v124_probe_stage": str(r.get("v124_probe_stage", "")) if pd.notna(r.get("v124_probe_stage", "")) else "",
+            "v124_probe_desc": str(r.get("v124_probe_desc", "")) if pd.notna(r.get("v124_probe_desc", "")) else "",
+            "v124_green_price": float(r.get("v124_green_price", 0)) if pd.notna(r.get("v124_green_price", 0)) else 0,
+            "v124_probe_price": float(r.get("v124_probe_price", 0)) if pd.notna(r.get("v124_probe_price", 0)) else 0,
+            "v124_parent_pressure": float(r.get("v124_parent_pressure", 0)) if pd.notna(r.get("v124_parent_pressure", 0)) else 0,
+            "v124_parent_distance": float(r.get("v124_parent_distance", 0)) if pd.notna(r.get("v124_parent_distance", 0)) else 0,
+            "v124_time_ratio": float(r.get("v124_time_ratio", 0)) if pd.notna(r.get("v124_time_ratio", 0)) else 0,
+            "v124_daily_break_valid": bool(r.get("v124_daily_break_valid", False)),
+            "v124_daily_break_label": str(r.get("v124_daily_break_label", "")) if pd.notna(r.get("v124_daily_break_label", "")) else "",
             "score_v12_same_source_adjustment": float(r.get("score_v12_same_source_adjustment", 0)) if pd.notna(r.get("score_v12_same_source_adjustment", 0)) else 0,
             "score_v121_risk_gate_block": float(r.get("score_v121_risk_gate_block", 0)) if pd.notna(r.get("score_v121_risk_gate_block", 0)) else 0,
             "score_v121_structure_seed_block": float(r.get("score_v121_structure_seed_block", 0)) if pd.notna(r.get("score_v121_structure_seed_block", 0)) else 0,
@@ -4786,7 +5027,7 @@ def select_deep_targets_v10(base_rows, limit):
         seen_codes.add(code)
         dedup.append(r)
 
-    # V12.2：基础闸门先过滤明显无种子/无触发/高风险候选，避免对全市场重复深算。
+    # V12.4：基础闸门先过滤明显无种子/无触发/高风险候选，避免对全市场重复深算。
     gated = []
     gated_out = []
     for r in dedup:
@@ -4799,7 +5040,7 @@ def select_deep_targets_v10(base_rows, limit):
             gated_out.append(rr)
     if gated:
         dedup = gated
-    print(f"V12.2基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
+    print(f"V12.4基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
     append_seed_pool_snapshot(dedup)
 
     # 配额：健康攻击保留原模型优势，低位修复/量价承接/结构潜力保证入口，强势观察限量。
@@ -4867,7 +5108,7 @@ def select_deep_targets_v10(base_rows, limit):
     )[:limit]
 
     bucket_stats["合计"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
-    bucket_stats["V12.2基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
+    bucket_stats["V12.4基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
 
@@ -5111,6 +5352,14 @@ def build_reason(s):
             f"{s.get('advanced_ao_kou_desc', '')}"
         )
 
+    if s.get("score_v124_probe_second_confirm", 0) > 0:
+        reasons.append(
+            f"V12.4远期绿线/9号线二次确认：{s.get('score_v124_probe_second_confirm', 0):.1f}分，"
+            f"阶段={s.get('v124_probe_stage', '')}，绿线{s.get('v124_green_price', 0):.2f}，9号线{s.get('v124_probe_price', 0):.2f}，"
+            f"时间倍数{s.get('v124_time_ratio', 0):.2f}，父级压力距当前{s.get('v124_parent_distance', 0):.1%}；"
+            f"{s.get('v124_probe_desc', '')}"
+        )
+
     if s.get("monthly_flags"):
         reasons.append(
             f"月线BBI/BOLL：{s.get('monthly_flags')}，中轨支撑{s.get('monthly_support_months', 0):.0f}月，月线分{s.get('score_monthly_cycle', 0):.1f}；细分：{s.get('monthly_detail', '')}"
@@ -5194,6 +5443,8 @@ def build_reason_v12(s):
         watch.append("多周期关键位有记录：" + str(s.get("multi_tf_key_desc", "")))
     if safe_float(s.get("score_multi_tf_break_quality", 0)) >= 8:
         watch.append(str(s.get("multi_tf_high_break_desc", "日线高质量突破多周期关键高点")))
+    if safe_float(s.get("score_v124_probe_second_confirm", 0)) >= 6:
+        watch.append("远期绿线/9号线二次确认模型：" + str(s.get("v124_probe_desc", "")))
     if safe_float(s.get("score_v12_activity", 0)) >= 2:
         watch.append(str(s.get("v12_activity_label", "活跃度较好")))
     if safe_float(s.get("score_v12_pullback_entry", 0)) >= 5:
@@ -5217,6 +5468,8 @@ def build_reason_v12(s):
         problems.append(str(s.get("v12_activity_label", "活跃度偏低")))
     if safe_float(s.get("near_pressure_dist", 0)) > 0 and safe_float(s.get("near_pressure_dist", 0)) < 0.08:
         problems.append("上方近端压力偏近")
+    if safe_float(s.get("v124_parent_distance", 0)) > 0 and safe_float(s.get("v124_parent_distance", 0)) < 0.08:
+        problems.append("9号线/绿线上方仍有更大父级凹口压力贴脸，突破小门不等于打穿大门")
     if safe_float(s.get("rsi", 0)) >= 80 or safe_float(s.get("cci", 0)) >= 250:
         problems.append("指标偏热，不能追")
     if s.get("risk_flags"):
@@ -5237,26 +5490,27 @@ def build_reason_v12(s):
     # 简明后台摘要
     v121_desc = str(s.get("v121_framework_desc", ""))
     if v121_desc:
-        parts.append(f"V12.2框架摘要：{v121_desc}，状态={s.get('v121_framework_label', '')}。")
+        parts.append(f"V12.4框架摘要：{v121_desc}，状态={s.get('v121_framework_label', '')}。")
     parts.append(
         f"后台摘要：总分{s.get('total_score', 0):.1f}，买点{s.get('score_v12_pullback_entry', 0):.1f}，"
-        f"多周期关键位{s.get('score_multi_tf_key_structure', 0):.1f}，同源合并{s.get('score_v12_same_source_adjustment', 0):.1f}，"
-        f"活跃度{s.get('score_v12_activity', 0):.1f}，交易优先{s.get('trade_priority_score', 0):.1f}，池={s.get('candidate_pool', '')}。"
+        f"多周期关键位{s.get('score_multi_tf_key_structure', 0):.1f}，9号线二确{s.get('score_v124_probe_second_confirm', 0):.1f}，"
+        f"同源合并{s.get('score_v12_same_source_adjustment', 0):.1f}，活跃度{s.get('score_v12_activity', 0):.1f}，"
+        f"交易优先{s.get('trade_priority_score', 0):.1f}，池={s.get('candidate_pool', '')}。"
     )
     return " ".join(parts)
 
 
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0):
     lines = []
-    lines.append("📊 <b>一号员工V12.3标准版-去重计算路径选股体系报告</b>")
+    lines.append("📊 <b>一号员工V12.4提速标准版-去重计算路径选股体系报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"评分阈值：综合分 ≥ {FINAL_SCORE_THRESHOLD:.0f}；80分以下不推送，不固定凑满数量。")
-    lines.append(f"V12.3标准版：同类逻辑只计算一次、同源信号合并封顶；正式推送前{RESULT_LIMIT}只，偏向回踩确认/舒服买点。")
-    lines.append("V12.3规则：风险硬过滤→共享特征→多周期关键位→统一突破/回踩/量能/活跃度→同源合并→前5正式推送；审计保留意见/非标审计/无法表示/否定意见等硬排雷。")
-    lines.append("V12.3统一框架：减少重复遍历，凹口/平台/大量阳K/前高等统一为关键位；突破、回踩、量能确认只走统一评价。")
+    lines.append(f"V12.4提速标准版：同类逻辑只计算一次、同源信号合并封顶；正式推送前{RESULT_LIMIT}只，偏向回踩确认/舒服买点。")
+    lines.append("V12.4规则：风险硬过滤→共享特征→多周期关键位→统一突破/回踩/量能/活跃度→同源合并→前5正式推送；审计保留意见/非标审计/无法表示/否定意见等硬排雷。")
+    lines.append("V12.4统一框架：减少重复遍历，凹口/平台/大量阳K/前高等统一为关键位；突破、回踩、量能确认只走统一评价。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -5286,7 +5540,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         )
         lines.append(
             f"综合分：{s['total_score']:.2f} | 阶段：{html.escape(str(s.get('trade_stage', '未知')))} | 池：{html.escape(str(s.get('candidate_pool', '优先候选池')))} | "
-            f"V12.2状态：{html.escape(str(s.get('v121_framework_label', '')))} | 买点：{s.get('score_v12_pullback_entry', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
+            f"V12.4状态：{html.escape(str(s.get('v121_framework_label', '')))} | 买点：{s.get('score_v12_pullback_entry', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
             f"日线结构：{s.get('score_structure_core', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | "
             f"量价：{s.get('score_volume_structure', 0):.1f} | 交易优先：{s.get('trade_priority_score', 0):.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f}"
         )
@@ -5329,6 +5583,9 @@ def main():
     print(f"RETRY_FAILED_KLINE_AFTER_SCAN={RETRY_FAILED_KLINE_AFTER_SCAN}")
     print(f"RETRY_FAILED_KLINE_LIMIT={RETRY_FAILED_KLINE_LIMIT}")
     print(f"MIN_FORMAL_COVERAGE_RATE={MIN_FORMAL_COVERAGE_RATE}")
+    print(f"BASE_KLINE_LOOKBACK_DAYS={BASE_KLINE_LOOKBACK_DAYS}")
+    print(f"DEEP_KLINE_LOOKBACK_DAYS={DEEP_KLINE_LOOKBACK_DAYS}")
+    print(f"MONTHLY_STRUCT_LOOKBACK_MONTHS={MONTHLY_STRUCT_LOOKBACK_MONTHS}")
     print(f"KLINE_LOOKBACK_DAYS={KLINE_LOOKBACK_DAYS}")
     print(f"STOCK_LIST_QUERY_TIMEOUT_SECONDS={STOCK_LIST_QUERY_TIMEOUT_SECONDS}")
     print(f"STOCK_LIST_MAX_RETRIES={STOCK_LIST_MAX_RETRIES}")
@@ -5353,7 +5610,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V12.3标准版：风险硬过滤→共享特征→尾部候选精算→多周期关键位统一→突破/回踩/量能统一评价→同源合并→前5只正式推送。")
+        print("V12.4提速标准版：风险硬过滤→共享特征→尾部候选精算→多周期关键位统一→突破/回踩/量能统一评价→同源合并→前5只正式推送。")
 
         base_rows = []
         all_dates = set()
@@ -5474,8 +5731,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V12.2基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
-        print("V12.2基础候选分桶统计：")
+        print(f"V12.4基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
+        print("V12.4基础候选分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
