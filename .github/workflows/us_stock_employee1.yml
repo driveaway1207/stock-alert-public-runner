@@ -1,0 +1,55 @@
+name: US Stock Employee 1
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 22 * * 1-5"
+
+jobs:
+  run-us-stock-employee1:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy requests
+
+      - name: Run US Stock Employee 1
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ENABLE_TELEGRAM: "1"
+
+          US_TOP_PUSH_LIMIT: "5"
+          US_RESULT_LIMIT: "20"
+          US_DEEP_SCORE_LIMIT: "80"
+
+          US_MIN_PRICE: "1"
+          US_MIN_AVG_DOLLAR_VOL: "5000000"
+
+          US_BASE_LOOKBACK_DAYS: "520"
+          US_DEEP_LOOKBACK_DAYS: "2200"
+
+          US_MAX_STOCKS: "100"
+        run: |
+          python us_stock_employee1_v1_0_standard.py
+
+      - name: Upload result artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-stock-employee1-results
+          path: |
+            us_stock_candidates.json
+            us_stock_seed_pool.json
+            us_signals_history.json
+            us_kline_cache/**
+          if-no-files-found: ignore
