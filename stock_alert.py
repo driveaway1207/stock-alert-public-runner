@@ -88,6 +88,10 @@ warnings.filterwarnings("ignore")
 # ===========================================================================
 
 
+# ========================= V12.8 加速稳定版：不改评分逻辑，只优化数据源调度与日志 =========================
+# 本版保留V12.6/V12.7的评分、筛选、推送逻辑；重点把BaoStock异常后的基础K线扫描切到AkShare-first，减少逐票失败等待和日志刷屏。
+# ===========================================================================
+
 # ========================= V12.6 标准提速版：多周期时间窗口/重心平量/充分率模型说明 =========================
 # 本版不是删减交易逻辑，而是在V12.4“风险先行、基础轻扫、候选深算、同源合并”的计算路径上，
 # 新增并体系化三类专业模型：
@@ -112,7 +116,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V12.7稳定提速版"
+MODEL_VERSION = "V12.8加速稳定版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -140,7 +144,7 @@ V122_STRONG_TRIGGER_SCORE = float(os.environ.get("V122_STRONG_TRIGGER_SCORE", "1
 REQUEST_SLEEP = float(os.environ.get("REQUEST_SLEEP", "0.02"))
 # V9：为月线BBI/BOLL缩口与多次中轨修复提供足够样本；默认约6年，仍可通过环境变量调小以节省时间。
 # V12.4：基础/深度分层取数。全市场基础轻扫只取较短日线，候选深算再补长周期，避免4937只全量拉2200天。
-BASE_KLINE_LOOKBACK_DAYS = int(os.environ.get("BASE_KLINE_LOOKBACK_DAYS", "520"))
+BASE_KLINE_LOOKBACK_DAYS = int(os.environ.get("BASE_KLINE_LOOKBACK_DAYS", "430"))
 DEEP_KLINE_LOOKBACK_DAYS = int(os.environ.get("DEEP_KLINE_LOOKBACK_DAYS", os.environ.get("KLINE_LOOKBACK_DAYS", "2200")))
 KLINE_LOOKBACK_DAYS = DEEP_KLINE_LOOKBACK_DAYS
 MONTHLY_STRUCT_LOOKBACK_MONTHS = int(os.environ.get("MONTHLY_STRUCT_LOOKBACK_MONTHS", "100"))
@@ -180,6 +184,17 @@ DATA_SOURCE_RECOVERY_PAUSE_SECONDS = int(os.environ.get("DATA_SOURCE_RECOVERY_PA
 BASE_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("BASE_EMPTY_CACHE_MIN_ROWS", "120"))
 DEEP_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("DEEP_EMPTY_CACHE_MIN_ROWS", "500"))
 
+# V12.8：加速补丁。评分逻辑不变，只改变数据源调度和日志方式。
+# 当 BaoStock 在股票池阶段或K线阶段已经明显 Broken pipe/重登后，基础K线不再每只都先试 BaoStock，
+# 直接进入 AkShare-first 模式，避免“BaoStock失败→AkShare补拉→下一只又先试BaoStock”的重复耗时。
+V128_AUTO_AKSHARE_FIRST = os.environ.get("V128_AUTO_AKSHARE_FIRST", "1")
+V128_FORCE_AKSHARE_FIRST = os.environ.get("V128_FORCE_AKSHARE_FIRST", "0")
+V128_BAOSTOCK_BROKEN_PIPE_TO_AKSHARE = int(os.environ.get("V128_BAOSTOCK_BROKEN_PIPE_TO_AKSHARE", "1"))
+V128_BAOSTOCK_RELOGIN_TO_AKSHARE = int(os.environ.get("V128_BAOSTOCK_RELOGIN_TO_AKSHARE", "1"))
+V128_AKSHARE_SUCCESS_LOG_INTERVAL = int(os.environ.get("V128_AKSHARE_SUCCESS_LOG_INTERVAL", "100"))
+V128_AKSHARE_FIRST_BASE_ONLY = os.environ.get("V128_AKSHARE_FIRST_BASE_ONLY", "1")
+V128_ALLOW_BAOSTOCK_AFTER_AKSHARE_FAIL = os.environ.get("V128_ALLOW_BAOSTOCK_AFTER_AKSHARE_FAIL", "1")
+
 # V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
 STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
 STOCK_LIST_MAX_RETRIES = int(os.environ.get("STOCK_LIST_MAX_RETRIES", "2"))
@@ -216,7 +231,26 @@ KLINE_SOURCE_STATS = {
     "relogin_count": 0,
     "stock_list_timeout": 0,
     "stock_list_fallback": 0,
+    "akshare_fallback_success": 0,
+    "akshare_fallback_fail": 0,
+    "akshare_first_used": 0,
+    "baostock_skipped_by_v128": 0,
 }
+
+
+def v128_should_use_akshare_first(cache_scope="base"):
+    """V12.8：数据源调度，不改评分。BaoStock明显异常后，基础扫描优先AkShare，提速并避免连续空等。"""
+    if V128_FORCE_AKSHARE_FIRST == "1":
+        return True
+    if V128_AUTO_AKSHARE_FIRST != "1":
+        return False
+    if V128_AKSHARE_FIRST_BASE_ONLY == "1" and str(cache_scope).lower() != "base":
+        return False
+    if KLINE_SOURCE_STATS.get("broken_pipe", 0) >= V128_BAOSTOCK_BROKEN_PIPE_TO_AKSHARE:
+        return True
+    if KLINE_SOURCE_STATS.get("relogin_count", 0) >= V128_BAOSTOCK_RELOGIN_TO_AKSHARE:
+        return True
+    return False
 
 class StockDataTimeout(Exception):
     pass
@@ -453,7 +487,10 @@ def summarize_kline_source_stats():
         f"数据源诊断：BrokenPipe={KLINE_SOURCE_STATS.get('broken_pipe', 0)}，"
         f"timeout={KLINE_SOURCE_STATS.get('timeout', 0)}，other={KLINE_SOURCE_STATS.get('other_error', 0)}，"
         f"pause={KLINE_SOURCE_STATS.get('pause_count', 0)}，relogin={KLINE_SOURCE_STATS.get('relogin_count', 0)}，"
-        f"stockListTimeout={KLINE_SOURCE_STATS.get('stock_list_timeout', 0)}，stockListFallback={KLINE_SOURCE_STATS.get('stock_list_fallback', 0)}"
+        f"stockListTimeout={KLINE_SOURCE_STATS.get('stock_list_timeout', 0)}，stockListFallback={KLINE_SOURCE_STATS.get('stock_list_fallback', 0)}，"
+        f"akshareSuccess={KLINE_SOURCE_STATS.get('akshare_fallback_success', 0)}，"
+        f"akshareFail={KLINE_SOURCE_STATS.get('akshare_fallback_fail', 0)}，"
+        f"akshareFirst={KLINE_SOURCE_STATS.get('akshare_first_used', 0)}"
     )
 
 
@@ -794,7 +831,13 @@ def get_daily_kline_akshare_fallback(bs_code, lookback_days=None, cache_scope="d
                 continue
             write_cached_kline(bs_code, df, cache_scope=cache_scope)
             reset_kline_success_streak()
-            print(f"V12.7 AkShare补拉成功：source=akshare stage=fetch_kline symbol={bs_code} rows={len(df)} scope={cache_scope}")
+            KLINE_SOURCE_STATS["akshare_fallback_success"] = KLINE_SOURCE_STATS.get("akshare_fallback_success", 0) + 1
+            _ak_ok = KLINE_SOURCE_STATS.get("akshare_fallback_success", 0)
+            if _ak_ok <= 3 or (V128_AKSHARE_SUCCESS_LOG_INTERVAL > 0 and _ak_ok % V128_AKSHARE_SUCCESS_LOG_INTERVAL == 0):
+                print(
+                    f"V12.8 AkShare取数成功汇总：source=akshare stage=fetch_kline "
+                    f"success_count={_ak_ok} latest_symbol={bs_code} rows={len(df)} scope={cache_scope}"
+                )
             return df
         except StockDataTimeout as e:
             KLINE_SOURCE_STATS["timeout"] += 1
@@ -806,6 +849,7 @@ def get_daily_kline_akshare_fallback(bs_code, lookback_days=None, cache_scope="d
             KLINE_SOURCE_STATS["consecutive_fail"] += 1
             if attempt <= 2:
                 print(f"AkShare补拉失败：symbol={bs_code} retry={attempt} error={str(e)[:160]}")
+    KLINE_SOURCE_STATS["akshare_fallback_fail"] = KLINE_SOURCE_STATS.get("akshare_fallback_fail", 0) + 1
     return None
 
 def write_cached_kline(bs_code, df, cache_scope="deep"):
@@ -1181,7 +1225,7 @@ def save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_po
 
 
 def get_daily_kline(bs_code, lookback_days=None, cache_scope="deep"):
-    """V12.7：支持基础轻扫短周期、深度精算长周期；增强BaoStock失败兜底与旧缓存。"""
+    """V12.8：支持基础轻扫短周期、深度精算长周期；AkShare-first加速、BaoStock失败兜底与旧缓存。"""
     if lookback_days is None:
         lookback_days = DEEP_KLINE_LOOKBACK_DAYS if cache_scope == "deep" else BASE_KLINE_LOOKBACK_DAYS
     min_rows = 180 if cache_scope == "base" else 700
@@ -1189,6 +1233,26 @@ def get_daily_kline(bs_code, lookback_days=None, cache_scope="deep"):
 
     if cached is not None:
         return cached
+
+    # V12.8：如果 BaoStock 已经明显异常，基础扫描直接 AkShare-first。
+    # 这样不会改变评分逻辑，只是避免每只股票先等待 BaoStock 失败再补拉。
+    if v128_should_use_akshare_first(cache_scope=cache_scope):
+        KLINE_SOURCE_STATS["akshare_first_used"] = KLINE_SOURCE_STATS.get("akshare_first_used", 0) + 1
+        KLINE_SOURCE_STATS["baostock_skipped_by_v128"] = KLINE_SOURCE_STATS.get("baostock_skipped_by_v128", 0) + 1
+        if KLINE_SOURCE_STATS["akshare_first_used"] <= 3 or KLINE_SOURCE_STATS["akshare_first_used"] % 100 == 0:
+            print(
+                f"V12.8 AkShare-first模式：skip_baostock={KLINE_SOURCE_STATS['baostock_skipped_by_v128']} "
+                f"symbol={bs_code} scope={cache_scope}"
+            )
+        first_df = get_daily_kline_akshare_fallback(bs_code, lookback_days=lookback_days, cache_scope=cache_scope)
+        if first_df is not None and not first_df.empty:
+            return first_df
+        stale_min_rows = BASE_EMPTY_CACHE_MIN_ROWS if cache_scope == "base" else DEEP_EMPTY_CACHE_MIN_ROWS
+        stale_df = read_stale_cached_kline(bs_code, cache_scope=cache_scope, min_rows=stale_min_rows)
+        if stale_df is not None and not stale_df.empty:
+            return stale_df
+        if V128_ALLOW_BAOSTOCK_AFTER_AKSHARE_FAIL != "1":
+            return None
 
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
@@ -6522,7 +6586,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V12.7稳定提速版：评分逻辑保持V12.6不变；新增旧缓存兜底、BaoStock失败转AkShare补拉、连续失败快速熔断、失败清单诊断；风险硬过滤→基础轻扫→候选深算→前5只正式推送。")
+        print("V12.8加速稳定版：评分逻辑保持V12.6/V12.7不变；新增AkShare-first加速、减少逐票刷屏、旧缓存兜底、BaoStock失败转AkShare补拉、连续失败熔断；风险硬过滤→基础轻扫→候选深算→前5只正式推送。")
 
         base_rows = []
         all_dates = set()
@@ -6643,8 +6707,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V12.7基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
-        print("V12.7基础候选分桶统计：")
+        print(f"V12.8基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
+        print("V12.8基础候选分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
