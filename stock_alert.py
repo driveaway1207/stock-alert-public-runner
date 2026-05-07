@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 import baostock as bs
 import pandas as pd
+import numpy as np
 import requests
 
 try:
@@ -87,10 +88,13 @@ warnings.filterwarnings("ignore")
 # ===========================================================================
 
 
-# ========================= V12.4 标准版：机构级计算路径重构说明 =========================
-# 本版不是删减交易逻辑，而是重排计算路径：风险先行、基础特征一次计算、多周期关键位统一、
-# 突破/回踩/量能/活跃度统一归类、同源信号合并封顶、深度评分只给真正有种子或触发的股票。
-# 核心目标：保留此前所有有效逻辑，但减少重复遍历、重复打分和无效深算，让正式推送更少更准。
+# ========================= V12.6 标准提速版：多周期时间窗口/重心平量/充分率模型说明 =========================
+# 本版不是删减交易逻辑，而是在V12.4“风险先行、基础轻扫、候选深算、同源合并”的计算路径上，
+# 新增并体系化三类专业模型：
+# 1）爆发前夜时间窗口模型：时间对称/倍数周期、平台蓄势长度、关键位贴近、量能从乱到稳、波动率收缩、日线触发；
+# 2）启动前平量压缩模型：不是只看当前量平，而是比较“前段量能混乱”与“平台末端量能稳定”，识别分歧降低/抛压衰竭；
+# 3）台阶平台量能均值抬升模型：价格平台抬高、平台均量抬高、平台内平量比例高、守启动柱中位/实底、再放量突破。
+# 新模型只在深度候选/种子票运行，不进入4937只全市场基础轻扫，避免重复筛查；评分归入时间/承接/量能同源组并封顶。
 # ===========================================================================
 
 # ========================= V9.1 追高闸门增量优化说明 =========================
@@ -108,7 +112,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V12.4提速标准版"
+MODEL_VERSION = "V12.6标准提速版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -3237,6 +3241,653 @@ def detect_v124_probe_high_second_confirm_model(df):
             best = cand
     return best if best is not None else empty
 
+
+def _v125_volume_cv(vol_series):
+    v = pd.to_numeric(vol_series, errors="coerce").dropna()
+    if len(v) < 3 or safe_float(v.mean()) <= 0:
+        return 9.99
+    return float(v.std() / max(v.mean(), 1e-9))
+
+
+def _v125_flat_volume_ratio(vol_series, band=0.15):
+    v = pd.to_numeric(vol_series, errors="coerce").dropna()
+    if len(v) < 3 or safe_float(v.mean()) <= 0:
+        return 0.0
+    mean_v = safe_float(v.mean())
+    return float(((v >= mean_v * (1 - band)) & (v <= mean_v * (1 + band))).sum() / len(v))
+
+
+def _v125_detect_platform_window(df, end_idx=None, min_len=8, max_len=35, max_range_pct=0.22):
+    """
+    识别最近一段整理平台。用于V12.5台阶平台/爆发前夜模型。
+    平台不是固定天数，而是在多个窗口里找“价格波动相对收敛、低点不破坏”的窗口。
+    """
+    if df is None or len(df) < min_len + 5:
+        return None
+    d = df.copy().reset_index(drop=True)
+    if end_idx is None:
+        end_idx = len(d) - 1
+    best = None
+    for win in range(min(max_len, end_idx + 1), min_len - 1, -1):
+        start = end_idx - win + 1
+        if start < 0:
+            continue
+        w = d.iloc[start:end_idx + 1]
+        hi = safe_float(w["high"].max())
+        lo = safe_float(w["low"].min())
+        center = safe_float(w["close"].median())
+        if center <= 0 or hi <= 0 or lo <= 0:
+            continue
+        range_pct = (hi - lo) / center
+        if range_pct > max_range_pct:
+            continue
+        vol_mean = safe_float(w["volume"].mean())
+        vol_cv = _v125_volume_cv(w["volume"])
+        flat_ratio = _v125_flat_volume_ratio(w["volume"], band=0.15)
+        close_near_high = safe_float(d.iloc[end_idx]["close"]) >= hi * 0.88
+        score = win * 0.10 + max(0.0, (max_range_pct - range_pct) * 10) + flat_ratio * 1.5 + (1.0 if close_near_high else 0.0)
+        cand = {
+            "start": int(start), "end": int(end_idx), "length": int(win), "high": float(hi), "low": float(lo),
+            "center": float(center), "range_pct": float(range_pct), "vol_mean": float(vol_mean),
+            "vol_cv": float(vol_cv), "flat_ratio": float(flat_ratio), "score": float(score),
+            "start_date": str(w.iloc[0].get("date", "")), "end_date": str(w.iloc[-1].get("date", "")),
+        }
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
+
+
+def _v125_find_prior_platform(df, before_idx, min_len=8, max_len=35):
+    if before_idx is None or before_idx < min_len + 5:
+        return None
+    best = None
+    # 在前一段历史里滑动寻找上一平台，避免把连续贴线几天误判为两个平台。
+    for end_idx in range(max(min_len - 1, before_idx - 8), min_len - 2, -3):
+        cand = _v125_detect_platform_window(df, end_idx=end_idx, min_len=min_len, max_len=max_len, max_range_pct=0.24)
+        if not cand:
+            continue
+        if cand["end"] >= before_idx - 3:
+            continue
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
+
+
+def _v125_find_launch_candle_before_platform(df, platform_start, lookback=12):
+    if df is None or platform_start is None or platform_start <= 0:
+        return {"valid": False, "mid": 0.0, "bottom": 0.0, "top": 0.0, "date": "", "desc": "无前置启动柱"}
+    d = df.copy().reset_index(drop=True)
+    start = max(0, platform_start - lookback)
+    sub = d.iloc[start:platform_start]
+    if sub.empty:
+        return {"valid": False, "mid": 0.0, "bottom": 0.0, "top": 0.0, "date": "", "desc": "无前置启动柱"}
+    best = None
+    for i, r in sub.iterrows():
+        op = safe_float(r.get("open", 0)); cl = safe_float(r.get("close", 0)); hi = safe_float(r.get("high", 0)); lo = safe_float(r.get("low", 0))
+        vol = safe_float(r.get("volume", 0))
+        prev_vol = safe_float(d.iloc[i-1].get("volume", 0)) if i > 0 else 0.0
+        vr = vol / prev_vol if prev_vol > 0 else 0.0
+        pct = (cl / op - 1) if op > 0 else 0.0
+        rng = max(hi - lo, 1e-9)
+        pos = (cl - lo) / rng
+        strong = (cl > op and pct >= 0.035 and pos >= 0.65) or (cl > op and vr >= 1.5 and pos >= 0.65)
+        if not strong:
+            continue
+        score = pct * 100 + min(vr, 3.0) + pos
+        if best is None or score > best[0]:
+            bottom = min(op, cl); top = max(op, cl); mid = (bottom + top) / 2
+            best = (score, {"valid": True, "mid": float(mid), "bottom": float(bottom), "top": float(top), "date": str(r.get("date", "")), "desc": f"前置启动柱{r.get('date','')}，中位{mid:.2f}/实底{bottom:.2f}"})
+    return best[1] if best else {"valid": False, "mid": 0.0, "bottom": 0.0, "top": 0.0, "date": "", "desc": "无前置启动柱"}
+
+
+def detect_v125_timing_window_model(df, v124_ctx=None):
+    """
+    V12.5 爆发前夜时间窗口模型。
+    机构化拆分：时间对称/倍数周期、平台蓄势长度、关键位贴近、量能从乱到稳、波动率收缩、日线触发。
+    注意：这是优先级放大器，不是单独买入理由；正式推送仍需日线触发/回踩确认/风险过滤。
+    """
+    empty = {
+        "score_v125_timing_window": 0.0,
+        "v125_timing_label": "无明显爆发时间窗口",
+        "v125_timing_desc": "",
+        "v125_volume_stability_score": 0.0,
+        "v125_vol_cv_prev": 0.0,
+        "v125_vol_cv_recent": 0.0,
+        "v125_flat_volume_ratio": 0.0,
+        "v125_timing_trigger": False,
+        "v125_platform_days": 0,
+    }
+    if df is None or len(df) < 80:
+        return empty
+    d = df.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 80:
+        return empty
+    cur = d.iloc[-1]
+    cur_close = safe_float(cur["close"])
+    # 1）时间对称：优先引用V12.4绿线/9号线模型输出，避免重复重算远期结构。
+    time_score = 0.0
+    time_desc = "无远期时间对称"
+    if isinstance(v124_ctx, dict):
+        ratio = safe_float(v124_ctx.get("v124_time_ratio", 0))
+        if ratio > 0:
+            if 0.85 <= ratio <= 1.15:
+                time_score = 3.0; time_desc = f"一倍时间窗口{ratio:.2f}"
+            elif 1.75 <= ratio <= 2.25:
+                time_score = 4.0; time_desc = f"二倍时间窗口{ratio:.2f}"
+            elif 2.70 <= ratio <= 3.30:
+                time_score = 2.5; time_desc = f"三倍时间窗口{ratio:.2f}"
+            elif 1.30 <= ratio < 1.75 or 2.25 < ratio < 2.70:
+                time_score = 1.5; time_desc = f"时间消化较充分{ratio:.2f}"
+    # 2）平台蓄势与关键位贴近。
+    platform = _v125_detect_platform_window(d.iloc[:-1] if len(d) > 90 else d, end_idx=len(d)-2 if len(d)>90 else len(d)-1, min_len=12, max_len=80, max_range_pct=0.24)
+    platform_score = 0.0
+    proximity_score = 0.0
+    platform_desc = "无清晰平台"
+    platform_days = 0
+    if platform:
+        platform_days = int(platform["length"])
+        if 20 <= platform_days < 40:
+            platform_score = 1.5
+        elif 40 <= platform_days <= 120:
+            platform_score = 3.5
+        elif 120 < platform_days <= 180:
+            platform_score = 2.5
+        elif platform_days > 180:
+            platform_score = 1.0
+        dist_to_high = cur_close / max(platform["high"], 1e-9) - 1
+        if -0.03 <= dist_to_high <= 0.06:
+            proximity_score = 3.0
+        elif -0.08 <= dist_to_high < -0.03:
+            proximity_score = 1.5
+        platform_desc = f"平台{platform_days}日，距上沿{dist_to_high*100:.1f}%"
+    # 3）量能从乱到稳：比较前段CV和近段CV，而不是只看当前平量。
+    prev_vol = d["volume"].iloc[-38:-10]
+    recent_vol = d["volume"].iloc[-10:]
+    cv_prev = _v125_volume_cv(prev_vol)
+    cv_recent = _v125_volume_cv(recent_vol)
+    flat_ratio = _v125_flat_volume_ratio(recent_vol, band=0.15)
+    extreme_prev = int((prev_vol > prev_vol.mean() * 1.8).sum()) if len(prev_vol) >= 5 and prev_vol.mean() > 0 else 0
+    extreme_recent = int((recent_vol > recent_vol.mean() * 1.8).sum()) if len(recent_vol) >= 5 and recent_vol.mean() > 0 else 0
+    volume_stability_score = 0.0
+    vol_desc = f"量CV前{cv_prev:.2f}/近{cv_recent:.2f}，平量{flat_ratio*100:.0f}%"
+    if cv_prev < 9 and cv_recent < 9:
+        if cv_recent <= cv_prev * 0.70 and cv_prev >= 0.35:
+            volume_stability_score += 2.2
+        elif cv_recent <= cv_prev * 0.85:
+            volume_stability_score += 1.2
+        if flat_ratio >= 0.70:
+            volume_stability_score += 1.5
+        elif flat_ratio >= 0.55:
+            volume_stability_score += 0.8
+        if extreme_recent <= max(1, extreme_prev // 2):
+            volume_stability_score += 0.7
+    # 4）波动率收缩：ATR/振幅从大到小，且价格不破平台。
+    tr = (d["high"] - d["low"]) / d["close"].replace(0, pd.NA)
+    atr_prev = safe_float(tr.iloc[-40:-12].mean())
+    atr_recent = safe_float(tr.iloc[-10:].mean())
+    contraction_score = 0.0
+    contraction_desc = f"振幅前{atr_prev*100:.1f}%/近{atr_recent*100:.1f}%"
+    if atr_prev > 0 and atr_recent > 0:
+        if atr_recent <= atr_prev * 0.72:
+            contraction_score += 2.0
+        elif atr_recent <= atr_prev * 0.85:
+            contraction_score += 1.0
+    # 5）触发：健康放量/标准倍量/实体阳线突破平台上沿或关键位。
+    prev = d.iloc[-2]
+    vr1 = safe_float(cur["volume"]) / max(safe_float(prev["volume"]), 1e-9)
+    pos = (safe_float(cur["close"]) - safe_float(cur["low"])) / max(safe_float(cur["high"]) - safe_float(cur["low"]), 1e-9)
+    entity = (safe_float(cur["close"]) - safe_float(cur["open"])) / max(safe_float(cur["open"]), 1e-9)
+    trigger = False
+    trigger_score = 0.0
+    trigger_desc = "未触发"
+    platform_high = safe_float(platform.get("high", 0)) if platform else 0.0
+    if platform_high > 0 and cur_close >= platform_high * 1.006 and cur_close > safe_float(cur["open"]) and pos >= 0.72 and (1.5 <= vr1 <= 3.5 or safe_float(cur["volume"]) >= safe_float(d["volume"].tail(20).mean()) * 1.3):
+        trigger = True
+        trigger_score = 3.0
+        trigger_desc = "平台末端健康放量突破"
+        if entity >= 0.035 and pos >= 0.82:
+            trigger_score += 1.0
+    score = time_score + platform_score + proximity_score + volume_stability_score + contraction_score + trigger_score
+    # 防止坏平量：无平台、无接近关键位且无触发，仅量平不加高分。
+    if platform_score <= 0 and proximity_score <= 0 and not trigger:
+        score = min(score, 5.0)
+    score = max(0.0, min(20.0, score))
+    label = "后台时间窗口"
+    if score >= 16:
+        label = "爆发前夜"
+    elif score >= 12:
+        label = "明显时间窗口"
+    elif score >= 8:
+        label = "进入观察窗口"
+    elif score < 5:
+        label = "时间窗口不明显"
+    desc = "；".join([time_desc, platform_desc, vol_desc, contraction_desc, trigger_desc])
+    return {
+        "score_v125_timing_window": float(score),
+        "v125_timing_label": label,
+        "v125_timing_desc": desc,
+        "v125_volume_stability_score": float(volume_stability_score),
+        "v125_vol_cv_prev": float(cv_prev if cv_prev < 9 else 0.0),
+        "v125_vol_cv_recent": float(cv_recent if cv_recent < 9 else 0.0),
+        "v125_flat_volume_ratio": float(flat_ratio),
+        "v125_timing_trigger": bool(trigger),
+        "v125_platform_days": int(platform_days),
+    }
+
+
+def detect_v125_step_platform_volume_lift_model(df):
+    """
+    V12.5 台阶平台量能均值抬升模型（日线为主）。
+    核心：价格平台上移、平台均量也上移、平台内平量比例高、守前启动柱中位/实底、无放量长阴破坏、再突破。
+    这是承接/台阶资金推进同源组的质量提升项，不单独无限加分。
+    """
+    empty = {
+        "score_v125_step_platform_lift": 0.0,
+        "v125_step_platform_label": "无台阶平台量能抬升",
+        "v125_step_platform_desc": "",
+        "v125_step_volume_ratio": 0.0,
+        "v125_step_price_lift": 0.0,
+        "v125_step_flat_ratio": 0.0,
+        "v125_step_hold_launch_level": False,
+        "v125_step_break_trigger": False,
+    }
+    if df is None or len(df) < 90:
+        return empty
+    d = df.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 90:
+        return empty
+    # 最近平台不含当前突破日，避免把大阳突破日混进平台均量。
+    p2 = _v125_detect_platform_window(d.iloc[:-1], end_idx=len(d)-2, min_len=8, max_len=35, max_range_pct=0.20)
+    if not p2:
+        return empty
+    p1 = _v125_find_prior_platform(d, before_idx=p2["start"] - 3, min_len=8, max_len=35)
+    if not p1:
+        return empty
+    vol_ratio = safe_float(p2["vol_mean"]) / max(safe_float(p1["vol_mean"]), 1e-9)
+    price_lift = safe_float(p2["center"]) / max(safe_float(p1["center"]), 1e-9) - 1
+    flat_ratio = safe_float(p2["flat_ratio"])
+    launch = _v125_find_launch_candle_before_platform(d, p2["start"], lookback=14)
+    p2_low = safe_float(p2["low"])
+    hold_mid = launch.get("valid") and p2_low >= safe_float(launch.get("mid", 0)) * 0.985
+    hold_bottom = launch.get("valid") and p2_low >= safe_float(launch.get("bottom", 0)) * 0.985
+    hold_ok = bool(hold_mid or hold_bottom)
+    p2_df = d.iloc[p2["start"]:p2["end"]+1]
+    p2_vol_ma = safe_float(p2_df["volume"].mean())
+    bad_long_down = 0
+    for _, r in p2_df.iterrows():
+        op = safe_float(r["open"]); cl = safe_float(r["close"]); vol = safe_float(r["volume"])
+        down_pct = (op - cl) / max(op, 1e-9)
+        if cl < op and down_pct >= 0.035 and vol >= p2_vol_ma * 1.35:
+            bad_long_down += 1
+    cur = d.iloc[-1]
+    prev = d.iloc[-2]
+    vr1 = safe_float(cur["volume"]) / max(safe_float(prev["volume"]), 1e-9)
+    pos = (safe_float(cur["close"]) - safe_float(cur["low"])) / max(safe_float(cur["high"]) - safe_float(cur["low"]), 1e-9)
+    break_trigger = bool(safe_float(cur["close"]) >= safe_float(p2["high"]) * 1.006 and safe_float(cur["close"]) > safe_float(cur["open"]) and pos >= 0.70 and (vr1 >= 1.45 or safe_float(cur["volume"]) >= p2_vol_ma * 1.35))
+    score = 0.0
+    if price_lift >= 0.08:
+        score += 2.5
+    elif price_lift >= 0.04:
+        score += 1.2
+    if 1.10 <= vol_ratio <= 1.50:
+        score += 2.0
+    elif 1.50 < vol_ratio <= 2.50:
+        score += 3.0
+    elif 0.85 <= vol_ratio < 1.10:
+        score += 0.8
+    elif vol_ratio > 2.50:
+        score += 1.0  # 高位平台巨量分歧，需要后续质量确认，不能直接高分。
+    if flat_ratio >= 0.75:
+        score += 2.0
+    elif flat_ratio >= 0.60:
+        score += 1.2
+    if safe_float(p2["vol_cv"]) <= safe_float(p1["vol_cv"]) * 0.85:
+        score += 1.0
+    if hold_mid:
+        score += 2.5
+    elif hold_bottom:
+        score += 1.4
+    if bad_long_down == 0:
+        score += 1.5
+    elif bad_long_down >= 2:
+        score -= 2.5
+    if break_trigger:
+        score += 3.0
+    # 坏平量过滤：平台抬高不足、均量没抬高，只靠平量不加高分。
+    if price_lift < 0.04 or vol_ratio < 0.85:
+        score = min(score, 5.0)
+    score = max(0.0, min(16.0, score))
+    label = "台阶平台观察"
+    if score >= 12 and break_trigger:
+        label = "高质量台阶平台再突破"
+    elif score >= 10:
+        label = "台阶平台资金承接较强"
+    elif score >= 7:
+        label = "台阶平台量能抬升"
+    desc = (
+        f"前平台{p1['start_date']}~{p1['end_date']}，后平台{p2['start_date']}~{p2['end_date']}；"
+        f"价格中枢抬升{price_lift*100:.1f}%，均量比{vol_ratio:.2f}，后平台平量{flat_ratio*100:.0f}%；"
+        f"{launch.get('desc','')}，守位={'是' if hold_ok else '否'}，放量长阴{bad_long_down}次，触发={'是' if break_trigger else '否'}"
+    )
+    return {
+        "score_v125_step_platform_lift": float(score),
+        "v125_step_platform_label": label,
+        "v125_step_platform_desc": desc,
+        "v125_step_volume_ratio": float(vol_ratio),
+        "v125_step_price_lift": float(price_lift),
+        "v125_step_flat_ratio": float(flat_ratio),
+        "v125_step_hold_launch_level": bool(hold_ok),
+        "v125_step_break_trigger": bool(break_trigger),
+    }
+
+
+# ========================= V12.6：多周期重心/平量/时间窗口/底部修复充分率模型 =========================
+def _v126_typical_center(period_df):
+    if period_df is None or period_df.empty:
+        return pd.Series(dtype=float)
+    return (pd.to_numeric(period_df["high"], errors="coerce") + pd.to_numeric(period_df["low"], errors="coerce") + pd.to_numeric(period_df["close"], errors="coerce")) / 3.0
+
+
+def _v126_slope_score(values):
+    v = pd.to_numeric(values, errors="coerce").dropna()
+    if len(v) < 4:
+        return 0.0
+    x = np.arange(len(v), dtype=float)
+    y = v.values.astype(float)
+    if np.nanmean(y) <= 0:
+        return 0.0
+    slope = np.polyfit(x, y, 1)[0] / np.nanmean(y)
+    return float(slope)
+
+
+def _v126_center_up_quality(period_df, window=8):
+    """精确定义“重心上移”：typical price斜率为正、低点抬高、近期中枢高于前段，且不能只靠单根异常大阳。"""
+    if period_df is None or len(period_df) < max(6, window):
+        return {"score": 0.0, "label": "重心不足", "desc": "样本不足", "slope": 0.0, "low_lift": 0.0}
+    d = period_df.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < max(6, window):
+        return {"score": 0.0, "label": "重心不足", "desc": "样本不足", "slope": 0.0, "low_lift": 0.0}
+    recent = d.tail(window)
+    prev = d.iloc[max(0, len(d)-window*2):len(d)-window]
+    center = _v126_typical_center(recent)
+    slope = _v126_slope_score(center)
+    rec_mid = safe_float(center.median())
+    prev_mid = safe_float(_v126_typical_center(prev).median()) if len(prev) >= 3 else 0.0
+    center_lift = rec_mid / prev_mid - 1 if prev_mid > 0 else 0.0
+    low_first = safe_float(recent["low"].head(max(2, window//3)).median())
+    low_last = safe_float(recent["low"].tail(max(2, window//3)).median())
+    low_lift = low_last / low_first - 1 if low_first > 0 else 0.0
+    # 避免单根异常大阳硬拉：最近窗口最大单根涨幅占整体重心抬升过高则降权。
+    pct = recent["close"].pct_change().fillna(0)
+    one_bar_boost = safe_float(pct.max())
+    score = 0.0
+    if slope > 0.006:
+        score += 2.0
+    elif slope > 0.0025:
+        score += 1.0
+    if center_lift > 0.08:
+        score += 2.0
+    elif center_lift > 0.03:
+        score += 1.0
+    if low_lift > 0.05:
+        score += 1.5
+    elif low_lift > 0.015:
+        score += 0.8
+    if one_bar_boost > 0.18 and center_lift < one_bar_boost * 0.55:
+        score *= 0.65
+    score = max(0.0, min(6.0, score))
+    label = "重心上移明显" if score >= 4.2 else ("重心温和上移" if score >= 2.2 else "重心上移不足")
+    desc = f"重心斜率{slope:.3f}，中枢抬升{center_lift:.1%}，低点抬升{low_lift:.1%}"
+    return {"score": float(score), "label": label, "desc": desc, "slope": float(slope), "low_lift": float(low_lift)}
+
+
+def _v126_volume_stability_quality(period_df, window=8, prev_window=8):
+    """精确定义“平量/量能稳定”：当前段CV下降、平量比例高、极端量柱减少，并和前段对比。"""
+    if period_df is None or len(period_df) < max(6, window + prev_window):
+        return {"score": 0.0, "label": "平量不足", "desc": "样本不足", "cv_prev": 0.0, "cv_recent": 0.0, "flat_ratio": 0.0}
+    d = period_df.copy().reset_index(drop=True)
+    d["volume"] = pd.to_numeric(d["volume"], errors="coerce")
+    d = d.dropna(subset=["volume"]).reset_index(drop=True)
+    if len(d) < window + prev_window:
+        return {"score": 0.0, "label": "平量不足", "desc": "样本不足", "cv_prev": 0.0, "cv_recent": 0.0, "flat_ratio": 0.0}
+    prev = d["volume"].iloc[-(window+prev_window):-window]
+    recent = d["volume"].iloc[-window:]
+    cv_prev = _v125_volume_cv(prev)
+    cv_recent = _v125_volume_cv(recent)
+    flat_ratio = _v125_flat_volume_ratio(recent, band=0.18)
+    prev_mean = safe_float(prev.mean())
+    recent_mean = safe_float(recent.mean())
+    mean_ratio = recent_mean / prev_mean if prev_mean > 0 else 0.0
+    extreme_prev = int((prev > prev_mean * 1.8).sum()) if prev_mean > 0 else 0
+    extreme_recent = int((recent > recent_mean * 1.8).sum()) if recent_mean > 0 else 0
+    score = 0.0
+    if cv_recent <= cv_prev * 0.72 and cv_prev >= 0.25:
+        score += 2.0
+    elif cv_recent <= cv_prev * 0.88:
+        score += 1.0
+    if flat_ratio >= 0.72:
+        score += 2.0
+    elif flat_ratio >= 0.58:
+        score += 1.0
+    if extreme_recent <= max(1, extreme_prev // 2):
+        score += 0.8
+    if 0.85 <= mean_ratio <= 2.4:
+        score += 0.7
+    elif mean_ratio < 0.55:
+        score -= 1.2  # 防死平量：量太低不是稳定承接。
+    score = max(0.0, min(5.5, score))
+    label = "高质量平量" if score >= 4.0 else ("量能趋稳" if score >= 2.2 else "平量质量一般")
+    desc = f"量CV前{cv_prev:.2f}/近{cv_recent:.2f}，平量{flat_ratio:.0%}，均量比{mean_ratio:.2f}"
+    return {"score": float(score), "label": label, "desc": desc, "cv_prev": float(cv_prev), "cv_recent": float(cv_recent), "flat_ratio": float(flat_ratio)}
+
+
+def detect_v126_multiframe_center_volume_model(df):
+    """
+    V12.6 多周期重心上移 + 平量稳定模型。
+    日/周/月/季独立计算，择优而不重复加分；高周期负责种子，日线负责触发。
+    """
+    empty = {
+        "score_v126_multiframe_center_volume": 0.0,
+        "v126_mtf_cv_label": "无多周期重心平量",
+        "v126_mtf_cv_desc": "",
+        "v126_best_timeframe": "",
+        "v126_center_up_score": 0.0,
+        "v126_volume_flat_score": 0.0,
+        "v126_center_slope": 0.0,
+        "v126_flat_ratio": 0.0,
+    }
+    if df is None or len(df) < 160:
+        return empty
+    tf_defs = [
+        ("日线", df.copy().reset_index(drop=True), 20, 16, 1.0),
+        ("周线", _resample_ohlcv(df, "W-FRI"), 13, 10, 1.25),
+        ("月线", _resample_ohlcv(df, "M"), 8, 8, 1.55),
+        ("季线", _resample_ohlcv(df, "Q"), 6, 5, 1.85),
+    ]
+    cands = []
+    for tf, pdf, w_center, w_vol, weight in tf_defs:
+        if pdf is None or len(pdf) < max(w_center*2, w_vol*2, 6):
+            continue
+        cq = _v126_center_up_quality(pdf, window=w_center)
+        vq = _v126_volume_stability_quality(pdf, window=w_vol, prev_window=w_vol)
+        # 价格重心和平量必须同时有；单独平量不高分，避免死水。
+        raw = (safe_float(cq.get("score", 0))*0.58 + safe_float(vq.get("score", 0))*0.42) * weight
+        if safe_float(cq.get("score", 0)) < 1.5:
+            raw *= 0.55
+        if safe_float(vq.get("score", 0)) < 1.2:
+            raw *= 0.70
+        cands.append({
+            "timeframe": tf,
+            "score": max(0.0, min(12.0, raw)),
+            "center": cq,
+            "volume": vq,
+            "desc": f"{tf}：{cq.get('label')}，{vq.get('label')}（{cq.get('desc')}；{vq.get('desc')}）",
+        })
+    if not cands:
+        return empty
+    cands = sorted(cands, key=lambda x: x["score"], reverse=True)
+    best = cands[0]
+    resonance = sum(1 for x in cands[1:] if x["score"] >= 4.0)
+    score = min(14.0, best["score"] + resonance * 1.0)
+    label = "多周期资金重心稳定推进" if score >= 10 else ("高周期重心/平量种子" if score >= 6 else "重心平量观察")
+    return {
+        "score_v126_multiframe_center_volume": float(score),
+        "v126_mtf_cv_label": label,
+        "v126_mtf_cv_desc": "；".join([x["desc"] for x in cands[:2]]),
+        "v126_best_timeframe": best["timeframe"],
+        "v126_center_up_score": float(best["center"].get("score", 0)),
+        "v126_volume_flat_score": float(best["volume"].get("score", 0)),
+        "v126_center_slope": float(best["center"].get("slope", 0)),
+        "v126_flat_ratio": float(best["volume"].get("flat_ratio", 0)),
+    }
+
+
+def detect_v126_major_high_1000d_window(df):
+    """重大高点后980-1020交易日窄口时间窗口。只轻度加分，但报告必须提示已运行多少个交易日。"""
+    empty = {
+        "score_v126_1000d_window": 0.0,
+        "v126_1000d_label": "无1000日窗口",
+        "v126_1000d_desc": "",
+        "v126_days_from_major_high": 0,
+        "v126_major_high_price": 0.0,
+        "v126_major_high_date": "",
+    }
+    if df is None or len(df) < 980:
+        return empty
+    d = df.copy().reset_index(drop=True)
+    for c in ["high", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["high", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 980:
+        return empty
+    lookback = min(len(d)-1, 2200)
+    hist = d.iloc[-lookback-1:-1].copy().reset_index(drop=True)
+    if hist.empty:
+        return empty
+    # 重大高点：优先找近2200日内显著高点，要求之后有明显回撤，避免把近期小高点误作周期高点。
+    candidates = []
+    for i, r in hist.iterrows():
+        days = len(hist) - i
+        if not (940 <= days <= 1060):
+            continue
+        hi = safe_float(r.get("high", 0))
+        if hi <= 0:
+            continue
+        after_low = safe_float(hist.iloc[i+1:]["low"].min()) if "low" in hist.columns and i+1 < len(hist) else 0.0
+        if after_low > 0 and (hi - after_low) / hi < 0.28:
+            continue
+        # 局部高点确认。
+        left = hist.iloc[max(0, i-20):i+1]["high"].max()
+        right = hist.iloc[i:min(len(hist), i+21)]["high"].max()
+        if hi >= safe_float(left)*0.995 and hi >= safe_float(right)*0.995:
+            candidates.append((abs(days-1000), days, i, r))
+    if not candidates:
+        return empty
+    _, days, idx, row = sorted(candidates, key=lambda x: x[0])[0]
+    score = 0.0
+    if 980 <= days <= 1020:
+        score = 2.0
+        if 990 <= days <= 1010:
+            score = 2.6
+    desc = f"距离周期性高点已{days}个交易日"
+    return {
+        "score_v126_1000d_window": float(score),
+        "v126_1000d_label": "1000日窄口时间窗口" if score > 0 else "无1000日窗口",
+        "v126_1000d_desc": desc,
+        "v126_days_from_major_high": int(days),
+        "v126_major_high_price": safe_float(row.get("high", 0)),
+        "v126_major_high_date": str(row.get("date", "")),
+    }
+
+
+def detect_v126_bottom_exhaustion_repair_seed(df):
+    """
+    底部衰竭修复种子：只做风控/后台观察，不能凭底部大阳直接正式推送。
+    目标是区分“底部好换手”和“底部坏换手”。
+    """
+    empty = {"score_v126_bottom_repair_seed": 0.0, "v126_bottom_repair_label": "无底部修复种子", "v126_bottom_repair_desc": "", "v126_bottom_repair_trigger": False}
+    if df is None or len(df) < 260:
+        return empty
+    d = df.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 260:
+        return empty
+    recent = d.tail(80)
+    prev = d.iloc[-180:-80]
+    cur = d.iloc[-1]
+    long_high = safe_float(d["high"].tail(520).max()) if len(d) >= 520 else safe_float(d["high"].max())
+    long_low = safe_float(d["low"].tail(520).min()) if len(d) >= 520 else safe_float(d["low"].min())
+    close = safe_float(cur["close"])
+    pos = (close - long_low) / max(long_high - long_low, 1e-9)
+    low_not_new = safe_float(recent["low"].tail(20).min()) >= safe_float(recent["low"].head(40).min()) * 0.97
+    body_prev = ((prev["close"] - prev["open"]).abs() / prev["open"].replace(0, pd.NA)).dropna()
+    body_recent = ((recent["close"] - recent["open"]).abs() / recent["open"].replace(0, pd.NA)).dropna()
+    body_shrink = safe_float(body_recent.tail(20).mean()) < safe_float(body_prev.tail(40).mean()) * 0.85 if len(body_prev) >= 10 and len(body_recent) >= 10 else False
+    vol_cv_prev = _v125_volume_cv(prev["volume"].tail(40))
+    vol_cv_recent = _v125_volume_cv(recent["volume"].tail(20))
+    vol_stable = vol_cv_recent <= vol_cv_prev * 0.85 if vol_cv_prev < 9 else False
+    vol_ma20 = safe_float(d["volume"].tail(20).mean())
+    down_long = (recent["close"] < recent["open"]) & (((recent["open"]-recent["close"]) / recent["open"].replace(0, pd.NA)) > 0.035) & (recent["volume"] > vol_ma20 * 1.4)
+    bad_down = int(down_long.sum())
+    platform = _v125_detect_platform_window(d.iloc[:-1], end_idx=len(d)-2, min_len=12, max_len=80, max_range_pct=0.26)
+    platform_high = safe_float(platform.get("high", 0)) if platform else 0.0
+    vr1 = safe_float(cur["volume"]) / max(safe_float(d.iloc[-2]["volume"]), 1e-9)
+    rng = max(safe_float(cur["high"])-safe_float(cur["low"]), 1e-9)
+    close_pos = (close-safe_float(cur["low"])) / rng
+    trigger = bool(platform_high > 0 and close >= platform_high * 1.01 and close > safe_float(cur["open"]) and close_pos >= 0.72 and (vr1 >= 1.5 or safe_float(cur["volume"]) >= vol_ma20*1.35))
+    score = 0.0
+    if pos <= 0.35:
+        score += 2.0
+    elif pos <= 0.50:
+        score += 1.0
+    if low_not_new:
+        score += 1.3
+    if body_shrink:
+        score += 1.0
+    if vol_stable:
+        score += 1.2
+    if bad_down == 0:
+        score += 1.3
+    elif bad_down >= 2:
+        score -= 2.5
+    if platform:
+        score += 1.2
+    if trigger:
+        score += 2.5
+    score = max(0.0, min(10.0, score))
+    label = "底部放量修复触发" if trigger and score >= 6 else ("底部衰竭修复种子" if score >= 5 else "底部修复证据不足")
+    desc = f"长期位置{pos:.0%}，低点不新低={'是' if low_not_new else '否'}，实体收敛={'是' if body_shrink else '否'}，量CV前{vol_cv_prev:.2f}/近{vol_cv_recent:.2f}，放量长阴{bad_down}次，触发={'是' if trigger else '否'}"
+    return {"score_v126_bottom_repair_seed": float(score), "v126_bottom_repair_label": label, "v126_bottom_repair_desc": desc, "v126_bottom_repair_trigger": bool(trigger)}
+
+
+def detect_v126_system_timing_suite(df, v124_ctx=None):
+    """V12.6 统一时间窗口套件：多周期重心平量、1000日窄口、底部衰竭修复。"""
+    out = {}
+    out.update(detect_v126_multiframe_center_volume_model(df))
+    out.update(detect_v126_major_high_1000d_window(df))
+    out.update(detect_v126_bottom_exhaustion_repair_seed(df))
+    # 统一V12.6时间/充分率分：轻加分，正式推送仍需日线触发/回踩确认。
+    score = (
+        safe_float(out.get("score_v126_multiframe_center_volume", 0))*0.55
+        + safe_float(out.get("score_v126_1000d_window", 0))*0.80
+        + safe_float(out.get("score_v126_bottom_repair_seed", 0))*0.35
+    )
+    out["score_v126_timing_sufficiency"] = float(max(0.0, min(16.0, score)))
+    out["v126_timing_sufficiency_desc"] = "；".join([x for x in [out.get("v126_mtf_cv_desc", ""), out.get("v126_1000d_desc", ""), out.get("v126_bottom_repair_desc", "")] if x])
+    return out
+
+
 def _v12_latest_prior_event_value(df, event_mask, value_series, lookback=10, default=0.0):
     """
     V12：找到当前日前lookback天内最近一次事件对应的值。
@@ -3861,6 +4512,21 @@ def calc_deep_rows(df, code):
     for _k, _v in v124_probe_ctx.items():
         extra[_k] = _v
 
+    # ========================= V12.5/12.6：爆发前夜时间窗口 + 台阶平台均量抬升 + 多周期重心平量/1000日窗口 =========================
+    # 只在深度候选/种子票运行，避免全市场基础轻扫重复计算。
+    v125_timing_ctx = detect_v125_timing_window_model(df, v124_probe_ctx)
+    for _k, _v in v125_timing_ctx.items():
+        extra[_k] = _v
+    v125_step_ctx = detect_v125_step_platform_volume_lift_model(df)
+    for _k, _v in v125_step_ctx.items():
+        extra[_k] = _v
+
+    # ========================= V12.6：多周期重心平量 + 1000日窄口 + 底部衰竭修复充分率 =========================
+    # 该套件只在深度候选/种子票运行。它是时间窗口/充分率加分项，不单独构成买点。
+    v126_ctx = detect_v126_system_timing_suite(df, v124_probe_ctx)
+    for _k, _v in v126_ctx.items():
+        extra[_k] = _v
+
     extra["v12_pullback_to_bbiboll"] = (bbi_mid > 0) & (low <= bbi_mid * 1.018) & (close >= bbi_mid * 0.992)
     extra["v12_pullback_to_ma5_ma10"] = (
         ((ma5 > 0) & (low <= ma5 * 1.012) & (close >= ma5 * 0.992))
@@ -3923,6 +4589,29 @@ def calc_deep_rows(df, code):
     extra.loc[(extra["score_multi_tf_key_structure"] >= 10) & (extra["multi_tf_pullback_count"] >= 3) & (extra["score_v12_pullback_entry"] >= 6), "v12_formal_push_ok"] = True
     # 9号高质量试盘高点经过时间消化后，日线漂亮突破9号线，可以作为大涨前的二次确认候选；父级大凹口贴脸则不放行。
     extra.loc[(extra["score_v124_probe_second_confirm"] >= 10) & (extra["v124_daily_break_valid"] == True) & (extra["v124_parent_distance"].fillna(0) >= 0.08), "v12_formal_push_ok"] = True
+    # V12.5：时间窗口本身不等于买点；必须叠加日线触发/回踩承接/台阶再突破，才允许进入正式候选。
+    extra.loc[
+        (extra["score_v125_timing_window"] >= 13)
+        & (
+            (extra["v125_timing_trigger"] == True)
+            | (extra["v125_step_break_trigger"] == True)
+            | (extra["score_v12_pullback_entry"] >= 6)
+        )
+        & (df["long_pos_250"] <= 0.78),
+        "v12_formal_push_ok"
+    ] = True
+    # V12.6：时间窗口/重心平量/1000日窄口只做加分和提示；只有叠加日线触发/回踩/台阶突破时才放行。
+    extra.loc[
+        (extra["score_v126_timing_sufficiency"].fillna(0) >= 7)
+        & (
+            (extra["score_v12_pullback_entry"] >= 6)
+            | (extra["v125_step_break_trigger"] == True)
+            | (extra["v125_timing_trigger"] == True)
+            | (extra["v126_bottom_repair_trigger"] == True)
+        )
+        & (df["long_pos_250"] <= 0.82),
+        "v12_formal_push_ok"
+    ] = True
 
 
     # 承接结构总分：涨停后三日实体承接 + 普通关键位回踩承接。
@@ -4369,6 +5058,10 @@ def calc_deep_rows(df, code):
         + extra["score_fibo_reclaim"].clip(lower=0)
         + extra["score_multi_tf_key_structure"].clip(lower=0)
         + extra["score_v124_probe_second_confirm"].fillna(0) * 0.85
+        + extra["score_v125_timing_window"].fillna(0) * 0.35
+        + extra["score_v125_step_platform_lift"].fillna(0) * 0.45
+        + extra["score_v126_timing_sufficiency"].fillna(0) * 0.35
+        + extra["score_v126_multiframe_center_volume"].fillna(0) * 0.25
         + extra["score_break_k_quality"].clip(lower=0)
     )
     _structure_max = pd.concat([
@@ -4387,7 +5080,7 @@ def calc_deep_rows(df, code):
     _structure_merged_allowance = (_structure_max + (_structure_hits - 1).clip(lower=0) * 2.0).clip(upper=26.0)
     extra["score_v12_same_source_adjustment"] = (_structure_merged_allowance - _structure_raw_sum).clip(lower=-18.0, upper=0.0)
 
-    # ========================= V12.1：机构级分层打分框架 =========================
+    # ========================= V12.6：机构级分层打分框架 =========================
     # 目标：不删逻辑，但把同源信号合并成“结构、突破、承接、量能、活跃度、交易质量、风险”七个块，
     # 避免凹口/平台/最大量阳K高点/关键位突破等同一类行为重复堆分。
     extra["score_v121_risk_gate_block"] = (
@@ -4414,15 +5107,19 @@ def calc_deep_rows(df, code):
     extra["score_v121_pullback_confirm_block"] = (
         extra["score_v12_pullback_entry"].fillna(0) * 1.25
         + extra["score_carry_structure"].fillna(0) * 0.80
-        + extra["score_stepwise_push"].fillna(0) * 0.45
+        + extra["score_stepwise_push"].fillna(0) * 0.35
+        + extra["score_v125_step_platform_lift"].fillna(0) * 0.55
+        + extra["score_v126_multiframe_center_volume"].fillna(0) * 0.35
         + extra["score_behavior"].fillna(0) * 0.20
     ).clip(0.0, 26.0)
 
     # 量能确认块：标准倍量、倍量后平量、分散健康倍量、阳梯量、阳阴量价统一归类。
     extra["score_v121_volume_confirm_block"] = (
         extra["score_volume_structure"].fillna(0) * 0.70
-        + extra["score_yang_yin_volume"].fillna(0) * 0.55
-        + extra["score_count"].fillna(0) * 0.35
+        + extra["score_yang_yin_volume"].fillna(0) * 0.50
+        + extra["score_v125_timing_window"].fillna(0) * 0.25
+        + extra["score_v126_multiframe_center_volume"].fillna(0) * 0.20
+        + extra["score_count"].fillna(0) * 0.30
     ).clip(-5.0, 22.0)
 
     # 活跃度弹性块：100日涨停/大阳/大阴/跳空/ATR/黏密度统一输出，避免和量能、频次重复。
@@ -4441,7 +5138,15 @@ def calc_deep_rows(df, code):
         + extra["score_stage_adjustment"].fillna(0) * 0.55
     ).clip(-32.0, 36.0)
 
-    # V12.1总分：由七个机构级块组成。旧逻辑仍然计算并保留，但不再重复线性堆加。
+    # V12.5/12.6时间窗口块：只作为优先级放大器，不能单独把无触发股票推上正式候选。
+    extra["score_v125_timing_block"] = (
+        extra["score_v125_timing_window"].fillna(0) * 0.60
+        + extra["score_v125_step_platform_lift"].fillna(0) * 0.38
+        + extra["score_v126_timing_sufficiency"].fillna(0) * 0.55
+        + extra["score_v126_1000d_window"].fillna(0) * 0.45
+    ).clip(0.0, 22.0)
+
+    # V12.6总分：由机构级分层块组成。旧逻辑仍然计算并保留，但不再重复线性堆加。
     extra["total_score"] = (
         extra["score_base_model"].fillna(0)
         + extra["score_v121_structure_seed_block"]
@@ -4450,6 +5155,7 @@ def calc_deep_rows(df, code):
         + extra["score_v121_volume_confirm_block"]
         + extra["score_v121_activity_elasticity_block"]
         + extra["score_v121_trade_quality_block"]
+        + extra["score_v125_timing_block"] * 0.55
         + extra["score_v121_risk_gate_block"]
     )
 
@@ -4465,6 +5171,8 @@ def calc_deep_rows(df, code):
         + "/量能" + extra["score_v121_volume_confirm_block"].round(1).astype(str)
         + "/活跃" + extra["score_v121_activity_elasticity_block"].round(1).astype(str)
         + "/交易" + extra["score_v121_trade_quality_block"].round(1).astype(str)
+        + "/时窗" + extra["score_v125_timing_block"].round(1).astype(str)
+        + "/充分" + extra["score_v126_timing_sufficiency"].round(1).astype(str)
         + "/风险" + extra["score_v121_risk_gate_block"].round(1).astype(str)
     )
 
@@ -4484,6 +5192,7 @@ def calc_deep_rows(df, code):
         + extra["score_carry_structure"] * 0.80
         + extra["score_break_k_quality"] * 0.60
         + extra["score_v12_activity"] * 0.35
+        + extra["score_v125_timing_block"] * 0.25
     )
     extra["trade_priority_score"] = (
         structure_strength_v11 * 0.22
@@ -4713,7 +5422,7 @@ def v122_base_candidate_gate(row):
     if bucket == "强势观察" and trade_quality < 0 and seed_score < 16:
         return False, "强势观察但交易质量不足"
 
-    return True, "通过V12.4基础闸门"
+    return True, "通过V12.5基础闸门"
 
 
 def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
@@ -4733,12 +5442,12 @@ def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
                 "base_long_cycle_potential_score": safe_float(r.get("base_long_cycle_potential_score", 0)),
                 "base_volume_carry_score": safe_float(r.get("base_volume_carry_score", 0)),
                 "base_trade_quality_score": safe_float(r.get("base_trade_quality_score", 0)),
-                "note": "V12.4后台种子池：正式推送仍需日线回踩/承接触发",
+                "note": "V12.5后台种子池：正式推送仍需日线回踩/承接触发",
             })
         save_json_file(path, {"generated_at_bj": bj_time_str(), "seeds": seeds})
-        print(f"V12.4后台种子池已保存：{path}，记录{len(seeds)}条")
+        print(f"V12.5后台种子池已保存：{path}，记录{len(seeds)}条")
     except Exception as e:
-        print(f"V12.4后台种子池保存失败：{e}")
+        print(f"V12.5后台种子池保存失败：{e}")
 
 def process_stock_base(row):
     code = row["代码"]
@@ -4748,7 +5457,7 @@ def process_stock_base(row):
     if ENABLE_RISK_EARLY_EXIT == "1":
         risk = evaluate_regulatory_risk(code, name)
         if risk.get("hard_exclude"):
-            print(f"V12.4风险硬过滤：{code} {name} 命中重大雷区，跳过K线深算：{'；'.join(risk.get('flags', []))[:80]}")
+            print(f"V12.5风险硬过滤：{code} {name} 命中重大雷区，跳过K线深算：{'；'.join(risk.get('flags', []))[:80]}")
             return []
 
     df = get_daily_kline(bs_code, lookback_days=BASE_KLINE_LOOKBACK_DAYS, cache_scope="base")
@@ -4906,6 +5615,40 @@ def process_stock_deep(row):
             "v124_time_ratio": float(r.get("v124_time_ratio", 0)) if pd.notna(r.get("v124_time_ratio", 0)) else 0,
             "v124_daily_break_valid": bool(r.get("v124_daily_break_valid", False)),
             "v124_daily_break_label": str(r.get("v124_daily_break_label", "")) if pd.notna(r.get("v124_daily_break_label", "")) else "",
+            "score_v125_timing_window": float(r.get("score_v125_timing_window", 0)) if pd.notna(r.get("score_v125_timing_window", 0)) else 0,
+            "v125_timing_label": str(r.get("v125_timing_label", "")) if pd.notna(r.get("v125_timing_label", "")) else "",
+            "v125_timing_desc": str(r.get("v125_timing_desc", "")) if pd.notna(r.get("v125_timing_desc", "")) else "",
+            "v125_volume_stability_score": float(r.get("v125_volume_stability_score", 0)) if pd.notna(r.get("v125_volume_stability_score", 0)) else 0,
+            "v125_flat_volume_ratio": float(r.get("v125_flat_volume_ratio", 0)) if pd.notna(r.get("v125_flat_volume_ratio", 0)) else 0,
+            "v125_timing_trigger": bool(r.get("v125_timing_trigger", False)),
+            "v125_platform_days": float(r.get("v125_platform_days", 0)) if pd.notna(r.get("v125_platform_days", 0)) else 0,
+            "score_v125_step_platform_lift": float(r.get("score_v125_step_platform_lift", 0)) if pd.notna(r.get("score_v125_step_platform_lift", 0)) else 0,
+            "v125_step_platform_label": str(r.get("v125_step_platform_label", "")) if pd.notna(r.get("v125_step_platform_label", "")) else "",
+            "v125_step_platform_desc": str(r.get("v125_step_platform_desc", "")) if pd.notna(r.get("v125_step_platform_desc", "")) else "",
+            "v125_step_volume_ratio": float(r.get("v125_step_volume_ratio", 0)) if pd.notna(r.get("v125_step_volume_ratio", 0)) else 0,
+            "v125_step_price_lift": float(r.get("v125_step_price_lift", 0)) if pd.notna(r.get("v125_step_price_lift", 0)) else 0,
+            "v125_step_flat_ratio": float(r.get("v125_step_flat_ratio", 0)) if pd.notna(r.get("v125_step_flat_ratio", 0)) else 0,
+            "v125_step_break_trigger": bool(r.get("v125_step_break_trigger", False)),
+            "score_v125_timing_block": float(r.get("score_v125_timing_block", 0)) if pd.notna(r.get("score_v125_timing_block", 0)) else 0,
+            "score_v126_timing_sufficiency": float(r.get("score_v126_timing_sufficiency", 0)) if pd.notna(r.get("score_v126_timing_sufficiency", 0)) else 0,
+            "v126_timing_sufficiency_desc": str(r.get("v126_timing_sufficiency_desc", "")) if pd.notna(r.get("v126_timing_sufficiency_desc", "")) else "",
+            "score_v126_multiframe_center_volume": float(r.get("score_v126_multiframe_center_volume", 0)) if pd.notna(r.get("score_v126_multiframe_center_volume", 0)) else 0,
+            "v126_mtf_cv_label": str(r.get("v126_mtf_cv_label", "")) if pd.notna(r.get("v126_mtf_cv_label", "")) else "",
+            "v126_mtf_cv_desc": str(r.get("v126_mtf_cv_desc", "")) if pd.notna(r.get("v126_mtf_cv_desc", "")) else "",
+            "v126_best_timeframe": str(r.get("v126_best_timeframe", "")) if pd.notna(r.get("v126_best_timeframe", "")) else "",
+            "v126_center_up_score": float(r.get("v126_center_up_score", 0)) if pd.notna(r.get("v126_center_up_score", 0)) else 0,
+            "v126_volume_flat_score": float(r.get("v126_volume_flat_score", 0)) if pd.notna(r.get("v126_volume_flat_score", 0)) else 0,
+            "v126_flat_ratio": float(r.get("v126_flat_ratio", 0)) if pd.notna(r.get("v126_flat_ratio", 0)) else 0,
+            "score_v126_1000d_window": float(r.get("score_v126_1000d_window", 0)) if pd.notna(r.get("score_v126_1000d_window", 0)) else 0,
+            "v126_1000d_label": str(r.get("v126_1000d_label", "")) if pd.notna(r.get("v126_1000d_label", "")) else "",
+            "v126_1000d_desc": str(r.get("v126_1000d_desc", "")) if pd.notna(r.get("v126_1000d_desc", "")) else "",
+            "v126_days_from_major_high": float(r.get("v126_days_from_major_high", 0)) if pd.notna(r.get("v126_days_from_major_high", 0)) else 0,
+            "v126_major_high_price": float(r.get("v126_major_high_price", 0)) if pd.notna(r.get("v126_major_high_price", 0)) else 0,
+            "v126_major_high_date": str(r.get("v126_major_high_date", "")) if pd.notna(r.get("v126_major_high_date", "")) else "",
+            "score_v126_bottom_repair_seed": float(r.get("score_v126_bottom_repair_seed", 0)) if pd.notna(r.get("score_v126_bottom_repair_seed", 0)) else 0,
+            "v126_bottom_repair_label": str(r.get("v126_bottom_repair_label", "")) if pd.notna(r.get("v126_bottom_repair_label", "")) else "",
+            "v126_bottom_repair_desc": str(r.get("v126_bottom_repair_desc", "")) if pd.notna(r.get("v126_bottom_repair_desc", "")) else "",
+            "v126_bottom_repair_trigger": bool(r.get("v126_bottom_repair_trigger", False)),
             "score_v12_same_source_adjustment": float(r.get("score_v12_same_source_adjustment", 0)) if pd.notna(r.get("score_v12_same_source_adjustment", 0)) else 0,
             "score_v121_risk_gate_block": float(r.get("score_v121_risk_gate_block", 0)) if pd.notna(r.get("score_v121_risk_gate_block", 0)) else 0,
             "score_v121_structure_seed_block": float(r.get("score_v121_structure_seed_block", 0)) if pd.notna(r.get("score_v121_structure_seed_block", 0)) else 0,
@@ -5040,7 +5783,7 @@ def select_deep_targets_v10(base_rows, limit):
             gated_out.append(rr)
     if gated:
         dedup = gated
-    print(f"V12.4基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
+    print(f"V12.5基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
     append_seed_pool_snapshot(dedup)
 
     # 配额：健康攻击保留原模型优势，低位修复/量价承接/结构潜力保证入口，强势观察限量。
@@ -5108,7 +5851,7 @@ def select_deep_targets_v10(base_rows, limit):
     )[:limit]
 
     bucket_stats["合计"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
-    bucket_stats["V12.4基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
+    bucket_stats["V12.5基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
 
@@ -5319,6 +6062,16 @@ def build_reason(s):
     )
     if s.get("score_stepwise_push", 0) > 0:
         reasons.append(f"台阶式资金推进：{s.get('stepwise_desc', '')}")
+    if safe_float(s.get("score_v126_timing_sufficiency", 0)) > 0:
+        parts126 = []
+        if safe_float(s.get("score_v126_multiframe_center_volume", 0)) > 0:
+            parts126.append(f"多周期重心/平量：{s.get('v126_mtf_cv_label', '')}，{s.get('v126_best_timeframe', '')}主导，{s.get('v126_mtf_cv_desc', '')}")
+        if safe_float(s.get("score_v126_1000d_window", 0)) > 0:
+            parts126.append(f"时间窗口：{s.get('v126_1000d_desc', '')}，仅作轻度提示，不单独构成买点")
+        if safe_float(s.get("score_v126_bottom_repair_seed", 0)) > 0:
+            parts126.append(f"底部修复充分率：{s.get('v126_bottom_repair_label', '')}，{s.get('v126_bottom_repair_desc', '')}")
+        if parts126:
+            reasons.append("V12.6时窗/充分率：" + "；".join(parts126))
     if s.get("three_yin_tactic"):
         reasons.append("三阴战法：已识别，属于回撤中的轻度结构提示，需结合关键位与后续大阳修复")
     if s.get("double_yang_sandwich_yin"):
@@ -5502,15 +6255,15 @@ def build_reason_v12(s):
 
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0):
     lines = []
-    lines.append("📊 <b>一号员工V12.4提速标准版-去重计算路径选股体系报告</b>")
+    lines.append("📊 <b>一号员工V12.6标准提速版-爆发前夜时间窗口选股体系报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"评分阈值：综合分 ≥ {FINAL_SCORE_THRESHOLD:.0f}；80分以下不推送，不固定凑满数量。")
-    lines.append(f"V12.4提速标准版：同类逻辑只计算一次、同源信号合并封顶；正式推送前{RESULT_LIMIT}只，偏向回踩确认/舒服买点。")
-    lines.append("V12.4规则：风险硬过滤→共享特征→多周期关键位→统一突破/回踩/量能/活跃度→同源合并→前5正式推送；审计保留意见/非标审计/无法表示/否定意见等硬排雷。")
-    lines.append("V12.4统一框架：减少重复遍历，凹口/平台/大量阳K/前高等统一为关键位；突破、回踩、量能确认只走统一评价。")
+    lines.append(f"V12.6标准提速版：风险硬过滤→基础轻扫→候选深算；新增多周期重心/平量、1000日窄口时间提示、底部修复充分率，正式推送前{RESULT_LIMIT}只。")
+    lines.append("V12.6规则：风险硬过滤→基础轻扫→候选深算→多周期关键位→重心平量/1000日时窗/底部充分率→统一突破/回踩/量能/活跃度→同源合并→前5正式推送。")
+    lines.append("V12.5统一框架：新增模型只在深度候选/种子票运行，不进入全市场基础轻扫；时间窗口只作放大器，必须叠加日线触发。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
@@ -5540,7 +6293,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         )
         lines.append(
             f"综合分：{s['total_score']:.2f} | 阶段：{html.escape(str(s.get('trade_stage', '未知')))} | 池：{html.escape(str(s.get('candidate_pool', '优先候选池')))} | "
-            f"V12.4状态：{html.escape(str(s.get('v121_framework_label', '')))} | 买点：{s.get('score_v12_pullback_entry', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
+            f"V12.6状态：{html.escape(str(s.get('v121_framework_label', '')))} | 买点：{s.get('score_v12_pullback_entry', 0):.1f} | 时窗：{s.get('score_v125_timing_window', 0):.1f} | V12.6充分率：{s.get('score_v126_timing_sufficiency', 0):.1f} | 台阶：{s.get('score_v125_step_platform_lift', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
             f"日线结构：{s.get('score_structure_core', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | "
             f"量价：{s.get('score_volume_structure', 0):.1f} | 交易优先：{s.get('trade_priority_score', 0):.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f}"
         )
@@ -5610,7 +6363,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V12.4提速标准版：风险硬过滤→共享特征→尾部候选精算→多周期关键位统一→突破/回踩/量能统一评价→同源合并→前5只正式推送。")
+        print("V12.6标准提速版：风险硬过滤→基础轻扫→候选深算→多周期关键位统一→时间窗口/重心平量/底部充分率→同源合并→前5只正式推送。")
 
         base_rows = []
         all_dates = set()
@@ -5731,8 +6484,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V12.4基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
-        print("V12.4基础候选分桶统计：")
+        print(f"V12.5基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
+        print("V12.5基础候选分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
