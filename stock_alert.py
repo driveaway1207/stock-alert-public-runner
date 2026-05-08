@@ -97,6 +97,17 @@ warnings.filterwarnings("ignore")
 # 新模型只在深度候选/种子票运行，不进入4937只全市场基础轻扫，避免重复筛查；评分归入时间/承接/量能同源组并封顶。
 # ===========================================================================
 
+# ========================= V14 原主模型完整底座 + 增量体系重构说明 =========================
+# 本版不是重写模型，而是在V12.6完整底座上做后置增量：
+# 1）保留原有倍量、倍量后平量、分散健康倍量、凹口、平台、破底翻、BBI/BOLL中轨修复、
+#    近区精准线、缺口、阳包阴、双阳夹阴、三阴战法、台阶推进、右侧平台均量、多周期最大阳量K、
+#    日线不追高、财务硬雷区、防守位/RR等所有已确认逻辑；
+# 2）新增阳包阴精细评分：按跳空越过前阴开盘、实体内高开收复、低/平开完全反包、仅修复中位等分档，
+#    同时评估上下影线、收盘位置、量能比和结构位置；
+# 3）新增V14后置分项表：原深度总分为主，V14只做风险扣分、追高校准、量能确认、可操作性校准和解释；
+# 4）最终三选不再被“优先池/80分/买点未到封顶”机械杀光，财务硬雷区仍一票否决，普通缺点只扣分。
+# ===========================================================================
+
 # ========================= V9.1 追高闸门增量优化说明 =========================
 # 本文件基于用户提供的V8/V9源码继续做“手术式增量优化”，原则是：
 # 1）BaoStock数据源、主流程、Telegram变量、缓存、基础评分底座不动；
@@ -112,7 +123,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V13正式三选平衡版"
+MODEL_VERSION = "V14原主模型完整底座+增量体系版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -193,6 +204,18 @@ FINAL_SCORE_THRESHOLD = float(os.environ.get("FINAL_SCORE_THRESHOLD", "75"))
 ONLY_PUSH_PRIORITY_POOL = os.environ.get("ONLY_PUSH_PRIORITY_POOL", "0")
 # V9.1：强势观察池不作为正式推送，可在候选JSON中保留，供三号员工或人工复盘。
 SAVE_STRONG_WATCH_POOL = os.environ.get("SAVE_STRONG_WATCH_POOL", "1")
+
+# ========================= V14：原主模型完整底座 + 增量分层三选 =========================
+# 最高原则：不推翻V12.6主模型、不删除任何已讨论有效逻辑，只做增量细化、同源合并、权重校准、
+# 后置风控审核、报告打分表和最终三选优化。
+# V14正式三选：先剔除财务/审计/监管硬雷区，再在剩余深度候选中按“原深度总分为主、V14校准为辅”
+# 尽可能选出相对最优3只。普通缺点（右侧量能不足、买点不完美、日线略高）做扣分/降级，不再一刀切杀光。
+V14_ENABLE_FINAL_RESCUE = os.environ.get("V14_ENABLE_FINAL_RESCUE", "1")
+V14_TARGET_PUSH_COUNT = int(os.environ.get("V14_TARGET_PUSH_COUNT", str(RESULT_LIMIT)))
+V14_MIN_ABSOLUTE_SCORE = float(os.environ.get("V14_MIN_ABSOLUTE_SCORE", "70"))
+V14_PREFERRED_SCORE = float(os.environ.get("V14_PREFERRED_SCORE", "75"))
+V14_IGNORE_HISTORY_FOR_RERUN = os.environ.get("V14_IGNORE_HISTORY_FOR_RERUN", "1")
+V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 VR1_MIN = 1.8
 VR1_MAX = 2.5
 
@@ -4279,28 +4302,119 @@ def calc_deep_rows(df, code):
     extra["hold_limit_mid"] = extra["limit_up"].shift(1).fillna(False) & (df["low"] >= extra["limit_real_mid"].shift(1))
     extra["hold_limit_bottom"] = extra["limit_up"].shift(1).fillna(False) & (df["low"] >= extra["limit_real_bottom"].shift(1))
 
-    extra["bull_engulf"] = (
-        (df["close"] > df["open"])
-        & (df["close"].shift(1) < df["open"].shift(1))
-        & (df["close"] >= df["open"].shift(1))
-        & (df["open"] <= df["close"].shift(1))
-    )
+    # V14阳包阴精细评分：不仅判断是否反包，还分档评估开盘位置、实体覆盖、上下影线、收盘质量和量能质量。
+    prev_open = df["open"].shift(1)
+    prev_close = df["close"].shift(1)
+    prev_high = df["high"].shift(1)
+    prev_low = df["low"].shift(1)
+    prev_body_top = pd.concat([prev_open, prev_close], axis=1).max(axis=1)
+    prev_body_bottom = pd.concat([prev_open, prev_close], axis=1).min(axis=1)
+    prev_body_mid = (prev_body_top + prev_body_bottom) / 2
 
-    extra["engulf_vol_ratio"] = df["volume"] / df["volume"].shift(1)
+    today_body_top = df[["open", "close"]].max(axis=1)
+    today_body_bottom = df[["open", "close"]].min(axis=1)
+    today_range = (df["high"] - df["low"]).replace(0, pd.NA)
+    prev_range = (prev_high - prev_low).replace(0, pd.NA)
+    today_upper_shadow = (df["high"] - today_body_top).clip(lower=0)
+    today_lower_shadow = (today_body_bottom - df["low"]).clip(lower=0)
+    prev_upper_shadow = (prev_high - prev_body_top).clip(lower=0)
+    prev_lower_shadow = (prev_body_bottom - prev_low).clip(lower=0)
+    extra["v14_today_upper_shadow_ratio"] = (today_upper_shadow / today_range).fillna(0)
+    extra["v14_today_lower_shadow_ratio"] = (today_lower_shadow / today_range).fillna(0)
+    extra["v14_prev_upper_shadow_ratio"] = (prev_upper_shadow / prev_range).fillna(0)
+    extra["v14_prev_lower_shadow_ratio"] = (prev_lower_shadow / prev_range).fillna(0)
 
-    extra["score_engulf_quality"] = 0
-    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] < 0.8), "score_engulf_quality"] = 1
-    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] >= 0.8) & (extra["engulf_vol_ratio"] < 1.0), "score_engulf_quality"] = 2
-    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] >= 1.0) & (extra["engulf_vol_ratio"] <= 1.5), "score_engulf_quality"] = 5
-    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] > 1.5) & (extra["engulf_vol_ratio"] <= 2.0), "score_engulf_quality"] = 3
-    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] > 2.0), "score_engulf_quality"] = 0
+    prev_bear = prev_close < prev_open
+    today_bull = df["close"] > df["open"]
+    # 宽口径：至少修复前阴实体中位才纳入阳包阴候选；强弱由grade分层。
+    extra["bull_engulf"] = today_bull & prev_bear & (df["close"] > prev_body_mid)
+    extra["engulf_vol_ratio"] = df["volume"] / df["volume"].shift(1).replace(0, pd.NA)
+
+    extra["v14_bull_engulf_grade"] = 0
+    # 4档最强：跳空/高开直接越过前阴开盘价（前阴实体实顶），开盘即站到空头成本上方。
+    extra.loc[extra["bull_engulf"] & (df["open"] > prev_open) & (df["close"] > prev_open), "v14_bull_engulf_grade"] = 4
+    # 3档：开在前阴实体内，收盘站上前阴开盘价。
+    extra.loc[
+        extra["bull_engulf"]
+        & (extra["v14_bull_engulf_grade"] == 0)
+        & (df["open"] > prev_close)
+        & (df["open"] <= prev_open)
+        & (df["close"] > prev_open),
+        "v14_bull_engulf_grade"
+    ] = 3
+    # 2档：低/平开后收盘站上前阴开盘价，完成实体反包，但开盘主动性弱于前两档。
+    extra.loc[
+        extra["bull_engulf"]
+        & (extra["v14_bull_engulf_grade"] == 0)
+        & (df["close"] > prev_open),
+        "v14_bull_engulf_grade"
+    ] = 2
+    # 1档：只修复前阴实体中位，尚未站上前阴开盘价。
+    extra.loc[
+        extra["bull_engulf"]
+        & (extra["v14_bull_engulf_grade"] == 0)
+        & (df["close"] > prev_body_mid),
+        "v14_bull_engulf_grade"
+    ] = 1
+
+    extra["v14_bull_engulf_pattern_score"] = 0.0
+    extra.loc[extra["v14_bull_engulf_grade"] == 4, "v14_bull_engulf_pattern_score"] = 10.0
+    extra.loc[extra["v14_bull_engulf_grade"] == 3, "v14_bull_engulf_pattern_score"] = 8.0
+    extra.loc[extra["v14_bull_engulf_grade"] == 2, "v14_bull_engulf_pattern_score"] = 7.0
+    extra.loc[extra["v14_bull_engulf_grade"] == 1, "v14_bull_engulf_pattern_score"] = 4.0
+
+    # 影线质量：阳线上影越短、收盘越靠近最高越强；长上影/收不住要降级。前阴长下影+次日强反包可轻微加分。
+    extra["v14_bull_engulf_shadow_score"] = 0.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"] <= 0.15) & (df["pos"] >= 0.85), "v14_bull_engulf_shadow_score"] += 4.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"].between(0.15, 0.25, inclusive="right")) & (df["pos"] >= 0.70), "v14_bull_engulf_shadow_score"] += 2.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_lower_shadow_ratio"] >= 0.15) & (df["pos"] >= 0.70), "v14_bull_engulf_shadow_score"] += 1.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_prev_lower_shadow_ratio"] >= 0.25) & (extra["v14_bull_engulf_grade"] >= 2), "v14_bull_engulf_shadow_score"] += 1.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"] > 0.35), "v14_bull_engulf_shadow_score"] -= 2.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"] > 0.50), "v14_bull_engulf_shadow_score"] -= 2.0
+    extra.loc[extra["bull_engulf"] & (extra["v14_prev_upper_shadow_ratio"] > 0.35) & (df["close"] < prev_high), "v14_bull_engulf_shadow_score"] -= 1.0
+    extra.loc[extra["bull_engulf"] & (df["pos"] < 0.60), "v14_bull_engulf_shadow_score"] -= 2.0
+    extra["v14_bull_engulf_shadow_score"] = extra["v14_bull_engulf_shadow_score"].clip(-4, 4)
+
+    # 量能质量：阳量等于或略大于前阴量、1.5倍以内最佳；过度爆量不重奖，高位爆量还要谨慎。
+    extra["v14_bull_engulf_volume_score"] = 0.0
+    extra.loc[extra["bull_engulf"] & extra["engulf_vol_ratio"].between(1.0, 1.5, inclusive="both"), "v14_bull_engulf_volume_score"] = 3.0
+    extra.loc[extra["bull_engulf"] & extra["engulf_vol_ratio"].between(0.8, 1.0, inclusive="left"), "v14_bull_engulf_volume_score"] = 1.0
+    extra.loc[extra["bull_engulf"] & extra["engulf_vol_ratio"].between(1.5, 2.0, inclusive="right"), "v14_bull_engulf_volume_score"] = 1.5
+    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] > 2.0) & (df["long_pos_250"] <= 0.45), "v14_bull_engulf_volume_score"] = 0.8
+    extra.loc[extra["bull_engulf"] & (extra["engulf_vol_ratio"] > 2.0) & (df["long_pos_250"] > 0.65), "v14_bull_engulf_volume_score"] = -1.0
+
+    # 位置轻加权：只作为阳包阴细项，不替代平台/凹口/倍量结构主分，防止重复堆分。
+    extra["v14_bull_engulf_context_score"] = 0.0
+    extra.loc[extra["bull_engulf"] & (df["long_pos_250"] <= 0.45), "v14_bull_engulf_context_score"] += 1.0
+    extra.loc[extra["bull_engulf"] & (df["break_rate"] > 0) & (df["break_rate"] <= 0.08), "v14_bull_engulf_context_score"] += 1.0
+    extra.loc[extra["bull_engulf"] & ((df["bias20"] > 0.12) | (df["long_pos_250"] > 0.80)), "v14_bull_engulf_context_score"] -= 2.0
+
+    extra["v14_bull_engulf_score_current"] = (
+        extra["v14_bull_engulf_pattern_score"]
+        + extra["v14_bull_engulf_shadow_score"]
+        + extra["v14_bull_engulf_volume_score"]
+        + extra["v14_bull_engulf_context_score"]
+    ).clip(0, 18)
+
+    extra["v14_bull_engulf_desc"] = "无阳包阴"
+    extra.loc[extra["v14_bull_engulf_grade"] == 1, "v14_bull_engulf_desc"] = "阳包阴弱修复：仅修复前阴实体中位，未完全站上前阴开盘价"
+    extra.loc[extra["v14_bull_engulf_grade"] == 2, "v14_bull_engulf_desc"] = "阳包阴有效反包：低/平开后收盘站上前阴开盘价"
+    extra.loc[extra["v14_bull_engulf_grade"] == 3, "v14_bull_engulf_desc"] = "阳包阴强反包：开在前阴实体内，收盘站上前阴开盘价"
+    extra.loc[extra["v14_bull_engulf_grade"] == 4, "v14_bull_engulf_desc"] = "阳包阴最强档：跳空/高开越过前阴开盘价后继续上攻"
+    extra.loc[extra["bull_engulf"] & (df["close"] > prev_high), "v14_bull_engulf_desc"] = extra.loc[extra["bull_engulf"] & (df["close"] > prev_high), "v14_bull_engulf_desc"] + "；收盘进一步站上前阴最高价"
+    extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"] > 0.35), "v14_bull_engulf_desc"] = extra.loc[extra["bull_engulf"] & (extra["v14_today_upper_shadow_ratio"] > 0.35), "v14_bull_engulf_desc"] + "；但阳线上影偏长，需降级观察"
+
+    # 兼容原模型的阳包阴频次分：用V14精细分压缩到原score_engulf_quality，保留原有滚动统计，不另起炉灶。
+    extra["score_engulf_quality"] = (extra["v14_bull_engulf_score_current"] / 3.0).clip(0, 6)
+    extra.loc[~extra["bull_engulf"], "score_engulf_quality"] = 0
 
     extra["bull_engulf_score_20"] = extra["score_engulf_quality"].rolling(20).sum().clip(0, 6)
     extra["bull_engulf_count_20"] = extra["bull_engulf"].rolling(20).sum()
-    # 50日高质量阳包阴：数量、量能比和后续不破实体中位都要考虑，不能只数次数。
+    # 50日高质量阳包阴：数量、量能、影线、收盘位置一起考虑，不能只数次数。
     extra["bull_engulf_quality"] = (
         extra["bull_engulf"]
-        & (extra["engulf_vol_ratio"] >= 1.0)
+        & (extra["v14_bull_engulf_score_current"] >= 9)
+        & (extra["engulf_vol_ratio"] >= 0.9)
         & (extra["engulf_vol_ratio"] <= 1.8)
         & (df["pos"] >= 0.60)
     )
@@ -4311,7 +4425,6 @@ def calc_deep_rows(df, code):
     extra.loc[extra["bull_engulf_quality_count_50"] >= 3, "score_bull_engulf_50"] += 1.5
     extra.loc[extra["bull_engulf_quality_count_50"] >= 5, "score_bull_engulf_50"] += 2.0
     extra["score_bull_engulf_50"] = extra["score_bull_engulf_50"].clip(0, 4)
-    extra["bull_engulf_count_50"] = extra["bull_engulf"].rolling(50).sum()
     extra["bull_engulf_score_50"] = extra["score_engulf_quality"].rolling(50).sum().clip(0, 4)
 
     big_down_prev = (
@@ -5871,6 +5984,14 @@ def process_stock_deep(row):
             "up_down_vol_ratio_60": float(r.get("up_down_vol_ratio_60", 0)) if pd.notna(r.get("up_down_vol_ratio_60", 0)) else 0,
             "bull_engulf_count_50": float(r.get("bull_engulf_count_50", 0)) if pd.notna(r.get("bull_engulf_count_50", 0)) else 0,
             "bull_engulf_quality_count_50": float(r.get("bull_engulf_quality_count_50", 0)) if pd.notna(r.get("bull_engulf_quality_count_50", 0)) else 0,
+            "v14_bull_engulf_score_current": float(r.get("v14_bull_engulf_score_current", 0)) if pd.notna(r.get("v14_bull_engulf_score_current", 0)) else 0,
+            "v14_bull_engulf_grade": float(r.get("v14_bull_engulf_grade", 0)) if pd.notna(r.get("v14_bull_engulf_grade", 0)) else 0,
+            "v14_bull_engulf_pattern_score": float(r.get("v14_bull_engulf_pattern_score", 0)) if pd.notna(r.get("v14_bull_engulf_pattern_score", 0)) else 0,
+            "v14_bull_engulf_shadow_score": float(r.get("v14_bull_engulf_shadow_score", 0)) if pd.notna(r.get("v14_bull_engulf_shadow_score", 0)) else 0,
+            "v14_bull_engulf_volume_score": float(r.get("v14_bull_engulf_volume_score", 0)) if pd.notna(r.get("v14_bull_engulf_volume_score", 0)) else 0,
+            "v14_today_upper_shadow_ratio": float(r.get("v14_today_upper_shadow_ratio", 0)) if pd.notna(r.get("v14_today_upper_shadow_ratio", 0)) else 0,
+            "v14_today_lower_shadow_ratio": float(r.get("v14_today_lower_shadow_ratio", 0)) if pd.notna(r.get("v14_today_lower_shadow_ratio", 0)) else 0,
+            "v14_bull_engulf_desc": str(r.get("v14_bull_engulf_desc", "")) if pd.notna(r.get("v14_bull_engulf_desc", "")) else "",
             "scattered_beiliang_count_60": float(r.get("scattered_beiliang_count_60", 0)) if pd.notna(r.get("scattered_beiliang_count_60", 0)) else 0,
             "flat_volume_count_60": float(r.get("flat_volume_count_60", 0)) if pd.notna(r.get("flat_volume_count_60", 0)) else 0,
             "effective_gap_up_count_50": float(r.get("effective_gap_up_count_50", 0)) if pd.notna(r.get("effective_gap_up_count_50", 0)) else 0,
@@ -6408,386 +6529,310 @@ def build_reason_v12(s):
     return " ".join(parts)
 
 
-
-# ========================= V13 正式三选平衡版：相对最优三选 + 分项打分表 =========================
-# 原则：不删除前面V12所有结构/量能/回踩/排雷逻辑；
-# 只在最终排序阶段把“硬剔除”和“扣分降权”分开，避免全市场0输出。
-# 1）财务/审计/监管硬雷区仍一票否决；
-# 2）普通追高、量能不足、买点不完美改为扣分，不再一刀切；
-# 3）正式结果尽可能补足3只，并按A/B/C等级提示强弱；
-# 4）每只票输出大维度打分表，说明总分来源。
-# ===========================================================================
-
-V13_FORMAL_TARGET_COUNT = int(os.environ.get("V13_FORMAL_TARGET_COUNT", "3"))
-V13_STRONG_SCORE = float(os.environ.get("V13_STRONG_SCORE", "80"))
-V13_FORMAL_MIN_SCORE = float(os.environ.get("V13_FORMAL_MIN_SCORE", "75"))
-V13_WEAK_MIN_SCORE = float(os.environ.get("V13_WEAK_MIN_SCORE", "72"))
-V13_ABSOLUTE_MIN_SCORE = float(os.environ.get("V13_ABSOLUTE_MIN_SCORE", "68"))
+def _v14_clip(value, low=0.0, high=100.0):
+    try:
+        return max(low, min(high, float(value)))
+    except Exception:
+        return low
 
 
-def _v13_clip(value, lo, hi):
-    return max(lo, min(hi, safe_float(value, 0.0)))
+def v14_candidate_audit(s):
+    """
+    V14后置审核：不替代原主模型，只在原total_score基础上做风控/追高/可操作性/量能确认校准，
+    并生成可读打分表。财务/审计/监管硬雷区仍一票否决；普通缺点只扣分，不再机械杀光候选。
+    """
+    r = dict(s)
+    original = safe_float(r.get("total_score", 0))
+    r["v14_original_total_score"] = original
 
+    hard_reasons = []
+    if bool(r.get("risk_hard_exclude", False)):
+        hard_reasons.append("财务/审计/监管硬雷区")
+    risk_text = str(r.get("risk_flags", ""))
+    hard_keywords = ["审计", "保留意见", "无法表示", "否定意见", "退市", "ST", "立案", "信披", "资金占用", "违规担保", "债务违约", "-UW", "-U"]
+    if risk_text and any(k in risk_text for k in hard_keywords):
+        hard_reasons.append("风险标签命中硬雷区")
 
-def _v13_grade(score):
-    score = safe_float(score, 0.0)
-    if score >= V13_STRONG_SCORE:
-        return "A类强候选"
-    if score >= V13_FORMAL_MIN_SCORE:
-        return "B类合格候选"
-    if score >= V13_WEAK_MIN_SCORE:
-        return "C类弱候选"
-    return "D类仅观察"
+    # 大维度拆分：这些是报告解释口径，不从0推翻重算。
+    long_cycle = _v14_clip(safe_float(r.get("score_monthly_cycle", 0)) + safe_float(r.get("score_long_cycle", 0)) * 0.30 + safe_float(r.get("score_monthly_height_space", 0)) * 0.30, 0, 15)
+    multi_tf = _v14_clip(safe_float(r.get("score_multi_tf_key_structure", 0)) + safe_float(r.get("score_multi_tf_break_quality", 0)) * 0.50 + safe_float(r.get("score_v124_probe_second_confirm", 0)) * 0.35, 0, 12)
+    near_structure = _v14_clip(safe_float(r.get("score_structure_core", 0)) + safe_float(r.get("score_pattern", 0)) * 0.35 + safe_float(r.get("score_key_pullback_hold", 0)) * 0.35 + safe_float(r.get("score_advanced_ao_kou", 0)) * 0.40, 0, 18)
+    volume_fund = _v14_clip(safe_float(r.get("score_volume_structure", 0)) * 0.65 + safe_float(r.get("score_yang_yin_volume", 0)) * 0.45 + safe_float(r.get("score_count", 0)) * 0.35 + safe_float(r.get("score_v125_step_platform_lift", 0)) * 0.35, 0, 18)
+    entry_hold = _v14_clip(safe_float(r.get("score_v12_pullback_entry", 0)) * 0.70 + safe_float(r.get("score_behavior", 0)) * 0.35 + safe_float(r.get("score_limitup_hold_3d", 0)) * 0.45 + safe_float(r.get("score_carry_structure", 0)) * 0.30, 0, 20)
+    operability = _v14_clip(safe_float(r.get("score_trade_quality", 0)) * 0.55 + safe_float(r.get("trade_priority_score", 0)) * 0.35 + safe_float(r.get("score_pressure_space", 0)) * 0.35 + safe_float(r.get("score_key_distance", 0)) * 0.45, 0, 12)
+    activity_aux = _v14_clip(safe_float(r.get("score_v12_activity", 0)) * 0.50 + safe_float(r.get("score_v125_timing_window", 0)) * 0.30 + safe_float(r.get("score_v126_timing_sufficiency", 0)) * 0.30, 0, 5)
 
+    # V14阳包阴细项：作为K线质量解释与少量校准，已纳入原行为分，不重复重奖。
+    engulf_score = safe_float(r.get("v14_bull_engulf_score_current", 0))
+    engulf_bonus = 0.0
+    if engulf_score >= 14:
+        engulf_bonus = 1.5
+    elif engulf_score >= 10:
+        engulf_bonus = 0.8
+    elif engulf_score >= 6:
+        engulf_bonus = 0.3
 
-def _v13_text_has_any(text, keywords):
-    text = str(text or "")
-    return any(k in text for k in keywords)
+    # 追高/无操作性分级扣分：普通偏高扣分，极端才强封顶。
+    chase_penalty = 0.0
+    chase_reasons = []
+    bias20 = safe_float(r.get("bias20", 0))
+    bias60 = safe_float(r.get("bias60", 0))
+    pct = safe_float(r.get("pct_chg", 0))
+    dist_key = safe_float(r.get("distance_to_key", r.get("distance_to_key_base", 0)))
+    near_pressure = safe_float(r.get("near_pressure_dist", 0))
+    rsi = safe_float(r.get("rsi", 0))
+    cci = safe_float(r.get("cci", 0))
 
-
-def v13_financial_hard_reject(s):
-    """V13：只把真正不能碰的财务/审计/监管问题当硬剔除。"""
-    reasons = []
-    name = str(s.get("name", ""))
-    risk_flags = str(s.get("risk_flags", ""))
-    risk_note = str(s.get("risk_note", ""))
-    combined = "；".join([name, risk_flags, risk_note])
-
-    if bool(s.get("risk_hard_exclude", False)):
-        reasons.append("外部雷区文件标记硬剔除")
-    if _v13_text_has_any(combined, ["*ST", " ST", "退市", "退"]):
-        reasons.append("ST/退市风险")
-    if _v13_text_has_any(combined, ["保留意见", "无法表示", "否定意见", "非标审计", "非标准审计"]):
-        reasons.append("审计意见重大异常")
-    if _v13_text_has_any(combined, ["立案", "信披违规", "资金占用", "违规担保", "债务违约", "重大处罚"]):
-        reasons.append("重大监管/治理雷区")
-    # -U/-UW 往往代表尚未盈利属性；在一号员工正式三选中先硬剔除，防止财务风险票混入。
-    if ("-UW" in name) or name.endswith("-U") or ("-U" in name):
-        reasons.append("未盈利属性(-U/-UW)不进正式三选")
-    return reasons
-
-
-def v13_extreme_trade_reject(s):
-    """V13：只剔除极端追高/完全无防守位，普通偏高只扣分。"""
-    reasons = []
-    pct = safe_float(s.get("pct_chg", 0))
-    entity_pct = safe_float(s.get("entity_pct", 0))
-    bias20 = safe_float(s.get("bias20", 0))
-    bias60 = safe_float(s.get("bias60", 0))
-    dist_key = safe_float(s.get("distance_to_key", s.get("distance_to_key_base", 0)))
-    near_p = safe_float(s.get("near_pressure_dist", 0))
-    rr = safe_float(s.get("risk_reward_ratio", 0))
-    defense_dist = safe_float(s.get("defense_dist", 0))
-    long_pos = safe_float(s.get("long_pos_250", 0))
-    pullback = safe_float(s.get("score_v12_pullback_entry", 0))
-    trade_quality = safe_float(s.get("score_trade_quality", 0))
-    structure = safe_float(s.get("score_structure_core", 0)) + safe_float(s.get("score_advanced_ao_kou", 0)) + safe_float(s.get("score_fibo_reclaim", 0))
-
-    if (bias20 > 0.25 and bias60 > 0.22 and pct >= 5.0 and pullback < 5):
-        reasons.append("日线严重追高：20/60日乖离过高且无回踩承接")
-    if (dist_key > 0.18 and pct >= 5.0 and pullback < 5):
-        reasons.append("远离近区关键位过多，需要追涨")
-    if (long_pos > 0.90 and entity_pct >= 6.0 and pullback < 5):
-        reasons.append("年内高位强攻且无舒服买点")
-    if (0 < near_p < 0.025 and pct >= 6.0 and pullback < 6):
-        reasons.append("强攻贴近近端压力，风险收益比不够")
-    if (rr > 0 and rr < 0.85 and defense_dist > 0.12 and trade_quality < 3 and structure < 6):
-        reasons.append("无清晰防守位/风险收益比明显不合格")
-    return reasons
-
-
-def v13_dimension_scores(s):
-    """把已有V12分数映射成V13大维度分，便于报告和最终相对排序。"""
-    # A 大周期结构 15
-    d_cycle = _v13_clip(
-        safe_float(s.get("score_monthly_cycle", 0)) * 0.55
-        + safe_float(s.get("score_monthly_height_space", 0)) * 0.45
-        + safe_float(s.get("score_v126_timing_sufficiency", 0)) * 0.20,
-        0, 15
-    )
-
-    # B 多周期最大阳量K/关键位 12
-    d_multitf = _v13_clip(
-        safe_float(s.get("score_multi_tf_key_structure", 0)) * 0.55
-        + max(0.0, safe_float(s.get("score_multi_tf_break_quality", 0))) * 0.35
-        + safe_float(s.get("score_v124_probe_second_confirm", 0)) * 0.25,
-        0, 12
-    )
-
-    # C 近区结构 18
-    d_near = _v13_clip(
-        safe_float(s.get("score_structure_core", 0)) * 0.75
-        + safe_float(s.get("score_advanced_ao_kou", 0)) * 0.45
-        + safe_float(s.get("score_fibo_reclaim", 0)) * 0.40
-        + safe_float(s.get("score_v12_same_source_adjustment", 0)) * 0.25,
-        0, 18
-    )
-
-    # D 量能资金 18
-    d_volume = _v13_clip(
-        safe_float(s.get("score_volume_structure", 0)) * 0.75
-        + safe_float(s.get("score_v125_step_platform_lift", 0)) * 0.35
-        + safe_float(s.get("score_double_yang_sandwich", 0)) * 0.25,
-        0, 18
-    )
-
-    # E 回踩承接/买点 20
-    d_entry = _v13_clip(
-        safe_float(s.get("score_v12_pullback_entry", 0)) * 1.05
-        + safe_float(s.get("score_carry_structure", 0)) * 0.45
-        + safe_float(s.get("score_limitup_hold_3d", 0)) * 0.40,
-        0, 20
-    )
-
-    # F 可操作性/RR 12
-    d_trade = _v13_clip(
-        safe_float(s.get("score_trade_quality", 0)) * 0.45
-        + safe_float(s.get("trade_priority_score", 0)) * 0.30,
-        0, 12
-    )
-    rr = safe_float(s.get("risk_reward_ratio", 0))
-    if rr >= 2.0:
-        d_trade = min(12.0, d_trade + 2.0)
-    elif 1.5 <= rr < 2.0:
-        d_trade = min(12.0, d_trade + 1.0)
-    elif 0 < rr < 1.2:
-        d_trade = max(0.0, d_trade - 2.0)
-
-    # G 活跃度/板块辅助 5。一号员工只给活跃度，板块龙头联动留给三号员工。
-    d_activity = _v13_clip(safe_float(s.get("score_v12_activity", 0)) * 0.70 + safe_float(s.get("score_v125_timing_window", 0)) * 0.10, 0, 5)
-
-    # H 追高惩罚 -25~0：普通缺陷扣分，不再一刀切。
-    pct = safe_float(s.get("pct_chg", 0))
-    entity_pct = safe_float(s.get("entity_pct", 0))
-    bias20 = safe_float(s.get("bias20", 0))
-    bias60 = safe_float(s.get("bias60", 0))
-    dist_key = safe_float(s.get("distance_to_key", s.get("distance_to_key_base", 0)))
-    near_p = safe_float(s.get("near_pressure_dist", 0))
-    pullback = safe_float(s.get("score_v12_pullback_entry", 0))
-    right_left_ratio = safe_float(s.get("v125_step_volume_ratio", 0))
-    penalty = 0.0
-    if bias20 > 0.12:
-        penalty -= 3.0
-    if bias20 > 0.18:
-        penalty -= 4.0
-    if bias60 > 0.20:
-        penalty -= 3.0
-    if dist_key > 0.08:
-        penalty -= 3.0
+    if bias20 > 0.25:
+        chase_penalty += 10; chase_reasons.append("20日乖离>25%")
+    elif bias20 > 0.18:
+        chase_penalty += 7; chase_reasons.append("20日乖离偏高")
+    elif bias20 > 0.12:
+        chase_penalty += 4; chase_reasons.append("20日乖离略高")
+    if bias60 > 0.25:
+        chase_penalty += 6; chase_reasons.append("60日乖离偏高")
+    if pct > 8 and safe_float(r.get("score_v12_pullback_entry", 0)) < 6:
+        chase_penalty += 6; chase_reasons.append("大涨但承接买点不足")
     if dist_key > 0.15:
-        penalty -= 4.0
-    if pct > 7.0 and pullback < 6:
-        penalty -= 5.0
-    if entity_pct > 6.0 and pullback < 6:
-        penalty -= 3.0
-    if 0 < near_p < 0.05:
-        penalty -= 4.0
-    if right_left_ratio and right_left_ratio < 0.70:
-        penalty -= 4.0
-    elif right_left_ratio and right_left_ratio < 0.90:
-        penalty -= 2.0
-    penalty += safe_float(s.get("score_chase_penalty", 0)) * 0.35
-    d_chase = _v13_clip(penalty, -25, 0)
+        chase_penalty += 7; chase_reasons.append("离关键位>15%")
+    elif dist_key > 0.08:
+        chase_penalty += 4; chase_reasons.append("离关键位偏远")
+    if near_pressure > 0 and near_pressure < 0.05:
+        chase_penalty += 5; chase_reasons.append("近端压力贴近")
+    elif near_pressure > 0 and near_pressure < 0.08:
+        chase_penalty += 3; chase_reasons.append("近端压力偏近")
+    if rsi >= 85 or cci >= 300:
+        chase_penalty += 6; chase_reasons.append("指标重度过热")
+    elif rsi >= 80 or cci >= 250:
+        chase_penalty += 3; chase_reasons.append("指标偏热")
+    chase_penalty = min(chase_penalty, 25)
 
-    # 风险扣分：已有外部风险分数只作为扣分，不参与正分。
-    d_risk_penalty = min(0.0, safe_float(s.get("score_regulatory_risk", 0)))
+    # 可操作性扣分：无防守、RR过低、买点未到，只降级不乱杀。
+    op_penalty = 0.0
+    op_reasons = []
+    defense_dist = safe_float(r.get("defense_dist", 0))
+    rr = safe_float(r.get("risk_reward_ratio", 0))
+    if defense_dist > 0.18:
+        op_penalty += 6; op_reasons.append("防守距离过大")
+    elif defense_dist > 0.12:
+        op_penalty += 4; op_reasons.append("防守距离偏大")
+    if rr > 0 and rr < 1.2:
+        op_penalty += 5; op_reasons.append("风险收益比不足")
+    elif rr > 0 and rr < 1.5:
+        op_penalty += 2; op_reasons.append("RR一般")
+    if safe_float(r.get("score_v12_pullback_entry", 0)) < 4 and safe_float(r.get("score_multi_tf_break_quality", 0)) < 5:
+        op_penalty += 4; op_reasons.append("回踩/突破触发不足")
+    op_penalty = min(op_penalty, 15)
 
-    score = d_cycle + d_multitf + d_near + d_volume + d_entry + d_trade + d_activity + d_chase + d_risk_penalty
-    score = _v13_clip(score, 0, 100)
+    # 量能不足扣分：只做校准，不能一刀切。
+    volume_penalty = 0.0
+    volume_reasons = []
+    if safe_float(r.get("flat_volume_count_60", 0)) <= 0 and safe_float(r.get("scattered_beiliang_count_60", 0)) <= 1 and safe_float(r.get("score_volume_structure", 0)) < 5:
+        volume_penalty += 4; volume_reasons.append("健康倍量/倍平量不足")
+    if safe_float(r.get("up_down_vol_ratio_60", 1)) > 0 and safe_float(r.get("up_down_vol_ratio_60", 1)) < 0.9:
+        volume_penalty += 3; volume_reasons.append("60日阳量弱于阴量")
+    volume_penalty = min(volume_penalty, 8)
 
-    details = {
-        "大周期结构": (15.0, d_cycle, "月线/季线位置、中轨修复、时间充分率"),
-        "多周期最大阳量K": (12.0, d_multitf, "周/月/季/日关键高点与日线突破质量"),
-        "近区结构": (18.0, d_near, "平台/凹口/破底翻/首次倍量结构"),
-        "量能资金": (18.0, d_volume, "标准倍量、倍量后平量、阳阴量关系、台阶平台量能"),
-        "回踩承接/买点": (20.0, d_entry, "突破后回踩、涨停后三日承接、关键位守位"),
-        "可操作性/RR": (12.0, d_trade, "防守位、风险收益比、交易优先级"),
-        "活跃度/时间辅助": (5.0, d_activity, "活跃度、时间窗口仅轻度辅助"),
-        "追高惩罚": (0.0, d_chase, "日线乖离、离关键位距离、贴近压力、右侧量能不足"),
-        "财务/监管扣分": (0.0, d_risk_penalty, "外部风险文件与硬雷区扣分"),
+    # 池子不是优先候选只扣分，不直接杀，保留原模型候选体系但避免0票。
+    pool = str(r.get("candidate_pool", "优先候选池"))
+    pool_penalty = 0.0
+    if pool and pool != "优先候选池":
+        pool_penalty = 3.0
+
+    v14_adjustment = engulf_bonus - chase_penalty - op_penalty - volume_penalty - pool_penalty
+    final_score = original + v14_adjustment
+
+    # 严重追高/无防守可封顶，但默认不剔除，避免全市场0只。
+    severe_chase = (bias20 > 0.25 and dist_key > 0.12) or (pct > 9 and defense_dist > 0.15)
+    if severe_chase:
+        final_score = min(final_score, 74.0)
+        chase_reasons.append("严重追高封顶")
+    if V14_BLOCK_SEVERE_NO_DEFENSE == "1" and defense_dist > 0.22 and rr > 0 and rr < 1.1:
+        hard_reasons.append("无交易防守位且RR不足")
+
+    if hard_reasons:
+        r["v14_blocked"] = True
+        r["v14_block_reason"] = "；".join(sorted(set(hard_reasons)))
+        final_score = min(final_score, 59.0)
+    else:
+        r["v14_blocked"] = False
+        r["v14_block_reason"] = ""
+
+    final_score = _v14_clip(final_score, 0, 100)
+    r["v14_final_score"] = final_score
+    r["v14_adjustment"] = v14_adjustment
+    r["v14_chase_penalty"] = -chase_penalty
+    r["v14_operability_penalty"] = -op_penalty
+    r["v14_volume_penalty"] = -volume_penalty
+    r["v14_pool_penalty"] = -pool_penalty
+    r["v14_engulf_bonus"] = engulf_bonus
+    r["v14_chase_reasons"] = "；".join(chase_reasons) if chase_reasons else "无明显追高扣分"
+    r["v14_operability_reasons"] = "；".join(op_reasons) if op_reasons else "可操作性未触发明显扣分"
+    r["v14_volume_reasons"] = "；".join(volume_reasons) if volume_reasons else "量能未触发明显扣分"
+
+    if final_score >= 80:
+        level = "A类强候选"
+    elif final_score >= 75:
+        level = "B类合格候选"
+    elif final_score >= 70:
+        level = "C类弱候选/需确认"
+    else:
+        level = "低于正式三选底线"
+    r["v14_level"] = level
+
+    r["v14_score_breakdown"] = {
+        "原主模型深度分": round(original, 2),
+        "大周期结构": round(long_cycle, 2),
+        "多周期最大阳量K/关键位": round(multi_tf, 2),
+        "近区结构/精准线": round(near_structure, 2),
+        "量能资金": round(volume_fund, 2),
+        "承接买点": round(entry_hold, 2),
+        "可操作性/RR": round(operability, 2),
+        "活跃度/时间辅助": round(activity_aux, 2),
+        "阳包阴细项": round(engulf_score, 2),
+        "V14阳包阴校准": round(engulf_bonus, 2),
+        "追高惩罚": round(-chase_penalty, 2),
+        "可操作性惩罚": round(-op_penalty, 2),
+        "量能不足惩罚": round(-volume_penalty, 2),
+        "池子降级": round(-pool_penalty, 2),
+        "V14最终分": round(final_score, 2),
     }
-    return score, details
+    r["total_score"] = final_score
+    return r
 
 
-def v13_prepare_candidate(s):
-    """给候选附加V13分数、等级和拦截原因。"""
-    score, details = v13_dimension_scores(s)
-    s["v13_score"] = float(score)
-    s["v13_grade"] = _v13_grade(score)
-    s["v13_score_table"] = details
-    hard = v13_financial_hard_reject(s)
-    extreme = v13_extreme_trade_reject(s)
-    s["v13_hard_reject_reasons"] = "；".join(hard)
-    s["v13_extreme_reject_reasons"] = "；".join(extreme)
-    s["v13_final_reject"] = bool(hard or extreme)
-    return s
+def v14_score_table_text(s):
+    b = s.get("v14_score_breakdown", {}) or {}
+    order = [
+        "原主模型深度分", "大周期结构", "多周期最大阳量K/关键位", "近区结构/精准线", "量能资金", "承接买点", "可操作性/RR",
+        "活跃度/时间辅助", "阳包阴细项", "V14阳包阴校准", "追高惩罚", "可操作性惩罚", "量能不足惩罚", "池子降级", "V14最终分"
+    ]
+    parts = []
+    for k in order:
+        if k in b:
+            parts.append(f"{k}:{b[k]}")
+    return " | ".join(parts)
 
 
-def v13_select_final_signals(deep_rows, history, limit=None):
-    """V13：剔除硬雷区/极端追高后，尽可能选出相对最优三只。"""
-    if limit is None:
-        limit = min(RESULT_LIMIT if RESULT_LIMIT > 0 else V13_FORMAL_TARGET_COUNT, V13_FORMAL_TARGET_COUNT)
-    prepared = []
-    rejected = []
-    for raw in deep_rows:
-        r = dict(raw)
-        v13_prepare_candidate(r)
-        if r.get("v13_final_reject"):
-            rejected.append(r)
-            continue
-        prepared.append(r)
-
-    prepared = sorted(
-        prepared,
+def select_final_signals_v14(deep_rows, history=None, limit=None):
+    """
+    V14最终三选：保留原主模型排序逻辑的基础上，进行后置审核与相对最优三选。
+    只硬剔除财务/审计/监管硬雷区；普通缺点扣分，尽量每天选出科学合理的3只。
+    """
+    if history is None:
+        history = {}
+    limit = int(limit or V14_TARGET_PUSH_COUNT or RESULT_LIMIT or 3)
+    audited = [v14_candidate_audit(r) for r in deep_rows]
+    blocked = [r for r in audited if r.get("v14_blocked")]
+    eligible = [r for r in audited if not r.get("v14_blocked")]
+    eligible = sorted(
+        eligible,
         key=lambda x: (
-            safe_float(x.get("v13_score", 0)),
-            safe_float(x.get("total_score", 0)),
+            safe_float(x.get("v14_final_score", x.get("total_score", 0))),
             safe_float(x.get("trade_priority_score", 0)),
+            safe_float(x.get("score_trade_quality", 0)),
             safe_float(x.get("score_v12_pullback_entry", 0)),
+            safe_float(x.get("total_score", 0)),
         ),
         reverse=True,
     )
-
-    # 先取>=75，再不足用>=72补，仍不足用>=68补。这样尽可能三选，但不把硬雷/极端追高放进来。
-    bands = [V13_FORMAL_MIN_SCORE, V13_WEAK_MIN_SCORE, V13_ABSOLUTE_MIN_SCORE]
     final = []
-    seen = set()
-    for min_score in bands:
-        for r in prepared:
-            if len(final) >= limit:
-                break
-            code = str(r.get("code", ""))
-            if code in seen:
-                continue
-            if safe_float(r.get("v13_score", 0)) < min_score:
-                continue
-            key = f"{r.get('date', '')}_{code}"
-            # 同日重复推送仍避免；若历史已存在，则跳过，但不会影响同一批其他票补足。
-            if key in history:
-                continue
-            final.append(r)
-            seen.add(code)
-            history[key] = {
-                "date": r.get("date", ""),
-                "code": code,
-                "name": r.get("name", ""),
-                "score": safe_float(r.get("score", 0)),
-                "base_score": safe_float(r.get("base_score", 0)),
-                "total_score": safe_float(r.get("total_score", 0)),
-                "v13_score": safe_float(r.get("v13_score", 0)),
-                "candidate_pool": str(r.get("candidate_pool", "")),
-                "v13_grade": str(r.get("v13_grade", "")),
-            }
+    diagnostics = []
+    for r in eligible:
+        key = f"{r.get('date','')}_{r.get('code','')}"
+        if V14_IGNORE_HISTORY_FOR_RERUN != "1" and key in history:
+            rr = dict(r); rr["v14_skip_reason"] = "signals_history已推送过"; diagnostics.append(rr); continue
+        if safe_float(r.get("v14_final_score", 0)) < V14_MIN_ABSOLUTE_SCORE:
+            rr = dict(r); rr["v14_skip_reason"] = f"V14最终分低于{V14_MIN_ABSOLUTE_SCORE}"; diagnostics.append(rr); continue
+        final.append(r)
         if len(final) >= limit:
             break
-
-    diagnostics = []
-    # 诊断取最接近但被拦截/未入选的前10只，便于复盘。
-    all_diag = rejected + [x for x in prepared if str(x.get("code", "")) not in seen]
-    all_diag = sorted(all_diag, key=lambda x: (safe_float(x.get("v13_score", 0)), safe_float(x.get("total_score", 0))), reverse=True)
-    for r in all_diag[:10]:
-        reason = str(r.get("v13_hard_reject_reasons") or r.get("v13_extreme_reject_reasons") or "分数/排序未进入前三")
-        diagnostics.append({
-            "code": r.get("code", ""),
-            "name": r.get("name", ""),
-            "v13_score": safe_float(r.get("v13_score", 0)),
-            "old_score": safe_float(r.get("total_score", 0)),
-            "pool": str(r.get("candidate_pool", "")),
-            "reason": reason,
-        })
-    return final, rejected, diagnostics
+    # 如果70分以上不足3只，仍保留诊断，不强行把硬雷或极低分票推入正式三选。
+    selected_codes = {str(r.get("code")) for r in final}
+    for r in eligible:
+        if str(r.get("code")) not in selected_codes:
+            rr = dict(r)
+            if not rr.get("v14_skip_reason"):
+                rr["v14_skip_reason"] = "未进入前三，相对分数靠后"
+            diagnostics.append(rr)
+    for r in blocked[:20]:
+        rr = dict(r); rr["v14_skip_reason"] = rr.get("v14_block_reason", "硬雷区剔除"); diagnostics.append(rr)
+    return final, diagnostics[:20], audited
 
 
-def v13_score_table_text(s):
-    details = s.get("v13_score_table", {})
-    if not isinstance(details, dict) or not details:
-        _, details = v13_dimension_scores(s)
-    lines = []
-    for name, tup in details.items():
-        try:
-            full, score, desc = tup
-        except Exception:
-            continue
-        if full > 0:
-            lines.append(f"{name}：{score:.1f}/{full:.0f}（{desc}）")
-        else:
-            lines.append(f"{name}：{score:.1f}（{desc}）")
+def v14_diagnostics_text(rows, n=8):
+    if not rows:
+        return ""
+    lines = ["V14拦截/落选诊断前{}只：".format(min(n, len(rows)))]
+    for i, r in enumerate(rows[:n], 1):
+        lines.append(
+            f"{i}. {r.get('name','')}({r.get('code','')}) 分{safe_float(r.get('v14_final_score', r.get('total_score', 0))):.1f}："
+            f"{r.get('v14_skip_reason', r.get('v14_block_reason', '未入选'))}；追高={r.get('v14_chase_reasons','')}；操作={r.get('v14_operability_reasons','')}"
+        )
     return "\n".join(lines)
 
 
-def v13_short_decision_text(s):
-    notes = []
-    if safe_float(s.get("v13_score", 0)) >= V13_STRONG_SCORE:
-        notes.append("强候选：结构、承接和可操作性综合较好")
-    elif safe_float(s.get("v13_score", 0)) >= V13_FORMAL_MIN_SCORE:
-        notes.append("合格候选：可以进入三选，但需按确认条件执行")
-    else:
-        notes.append("弱候选：全市场相对最优之一，但必须更谨慎，不可追高")
-    if safe_float(s.get("score_v12_pullback_entry", 0)) < 6:
-        notes.append("买点承接分不高，优先等回踩/放量确认")
-    if safe_float(s.get("bias20", 0)) > 0.12:
-        notes.append("20日乖离偏高，禁止追涨")
-    if safe_float(s.get("near_pressure_dist", 0)) > 0 and safe_float(s.get("near_pressure_dist", 0)) < 0.08:
-        notes.append("近端压力偏近，需要看突破质量")
-    if safe_float(s.get("v125_step_volume_ratio", 0)) and safe_float(s.get("v125_step_volume_ratio", 0)) < 0.90:
-        notes.append("右侧平台均量不足，需放量确认")
-    return "；".join(notes)
-
-def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, diagnostics=None, rejected_count=0):
-    diagnostics = diagnostics or []
+def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
     lines = []
-    lines.append("📊 <b>一号员工V13正式三选平衡版报告</b>")
+    lines.append("📊 <b>一号员工V14原主模型完整底座+增量体系三选报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
-    lines.append(f"深度评分：{deep_count}只 | 正式三选输出：<b>{len(final_signals)}</b>只 | V13硬拦截：{rejected_count}只")
-    lines.append(f"V13规则：财务/审计/监管硬雷区一票否决；极端追高/无防守位剔除；普通缺陷只扣分；剔除硬雷后尽可能从全市场选出相对最优{V13_FORMAL_TARGET_COUNT}只。")
-    lines.append(f"分数等级：A≥{V13_STRONG_SCORE:.0f}；B≥{V13_FORMAL_MIN_SCORE:.0f}；C≥{V13_WEAK_MIN_SCORE:.0f}。C类也可进三选，但必须按确认条件执行，禁止追高。")
+    lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
+    lines.append(f"V14三选口径：财务/审计/监管硬雷区一票否决；普通缺点只扣分/降级；原V12.6深度总分为主，V14后置校准为辅，尽量选出相对最优{V14_TARGET_PUSH_COUNT}只。")
+    lines.append("保留底座：倍量/倍量后平量/分散健康倍量/凹口/平台/破底翻/BBI-BOLL中轨修复/近区精准线/缺口/阳包阴/双阳夹阴/台阶/多周期最大阳量K/不追高/RR等均不删除。")
+    lines.append("V14新增：阳包阴按跳空越过前阴开盘、实体内高开收复、低/平开完全反包、仅修复中位四档，并纳入上下影线、收盘位置、量能质量。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
         lines.append("")
-        lines.append("⚠️ 今日V13仍未选出正式三选。下面列出最接近候选/拦截原因，便于复盘模型。")
-        for i, d in enumerate(diagnostics[:10], 1):
-            lines.append(f"{i}. {html.escape(str(d.get('name','')))}({html.escape(str(d.get('code','')))}) V13={d.get('v13_score',0):.1f} 原分={d.get('old_score',0):.1f} 池={html.escape(str(d.get('pool','')))} 原因={html.escape(str(d.get('reason','')))}")
+        lines.append("⚠️ 今日暂无正式三选股票。V14按设计会尽量三选；若仍为0，通常代表硬雷区/样本/覆盖率或代码覆盖异常，需要看下方诊断。")
+        diag = v14_diagnostics_text(v14_diagnostics or [], 10)
+        if diag:
+            lines.append(html.escape(diag))
         return "\n".join(lines)
 
     stage_count = {}
-    grade_count = {}
     for s in final_signals:
         stage = s.get("trade_stage", "未知")
         stage_count[stage] = stage_count.get(stage, 0) + 1
-        grade = s.get("v13_grade", _v13_grade(s.get("v13_score", 0)))
-        grade_count[grade] = grade_count.get(grade, 0) + 1
     stage_text = "；".join([f"{k}{v}只" for k, v in stage_count.items()])
-    grade_text = "；".join([f"{k}{v}只" for k, v in grade_count.items()])
-    lines.append(f"等级分布：{grade_text}")
     lines.append(f"阶段分布：{stage_text}")
     lines.append("")
-    lines.append("<b>正式三选与分项打分表</b>")
+    lines.append("<b>详细结构诊断</b>")
 
     for i, s in enumerate(final_signals, 1):
-        if "v13_score" not in s:
-            v13_prepare_candidate(s)
+        lines.append("")
+        lines.append(f"{i}. <b>{html.escape(s['name'])}</b> ({html.escape(s['code'])})")
+        lines.append(f"日期：{s['date']}")
+        lines.append(f"收盘：{s['close']:.2f} | 涨幅：{s['pct_chg']:.2f}% | 成交额：{s['amount'] / 100000000:.2f}亿")
         if not s.get('next_day_strategy'):
             s.update(classify_next_day_strategy(s))
-        lines.append("")
-        lines.append(f"{i}. <b>{html.escape(str(s['name']))}</b> ({html.escape(str(s['code']))})")
-        lines.append(f"日期：{s.get('date','')} | 收盘：{safe_float(s.get('close',0)):.2f} | 涨幅：{safe_float(s.get('pct_chg',0)):.2f}% | 成交额：{safe_float(s.get('amount',0)) / 100000000:.2f}亿")
-        lines.append(f"V13综合分：<b>{safe_float(s.get('v13_score',0)):.2f}</b> | 等级：{html.escape(str(s.get('v13_grade','')))} | 原模型分：{safe_float(s.get('total_score',0)):.2f} | 阶段：{html.escape(str(s.get('trade_stage','未知')))} | 池：{html.escape(str(s.get('candidate_pool','')))}")
-        lines.append(f"次日策略：{html.escape(str(s.get('next_day_strategy', '')))} | 禁止追高线：{safe_float(s.get('no_chase_line', 0)):.2f} | 回踩观察区：{html.escape(str(s.get('pullback_zone', '')))}")
-        lines.append("【大维度打分】\n" + html.escape(v13_score_table_text(s)))
-        lines.append("【V13结论】" + html.escape(v13_short_decision_text(s)))
-        lines.append("【结构诊断】" + html.escape(build_reason_v12(s)))
+        lines.append(
+            f"次日策略：{html.escape(str(s.get('next_day_strategy', '')))} | 禁止追高线：{s.get('no_chase_line', 0):.2f} | 回踩观察区：{html.escape(str(s.get('pullback_zone', '')))}"
+        )
+        lines.append(
+            f"V14最终分：{s.get('v14_final_score', s.get('total_score', 0)):.2f} | 原主模型分：{s.get('v14_original_total_score', s.get('total_score', 0)):.2f} | 等级：{html.escape(str(s.get('v14_level', '')))} | "
+            f"阶段：{html.escape(str(s.get('trade_stage', '未知')))} | 池：{html.escape(str(s.get('candidate_pool', '优先候选池')))} | "
+            f"买点：{s.get('score_v12_pullback_entry', 0):.1f} | 台阶：{s.get('score_v125_step_platform_lift', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
+            f"日线结构：{s.get('score_structure_core', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | 量价：{s.get('score_volume_structure', 0):.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f}"
+        )
+        lines.append("V14打分表：" + html.escape(v14_score_table_text(s)))
+        if safe_float(s.get('v14_bull_engulf_score_current', 0)) > 0:
+            lines.append(
+                "阳包阴细项："
+                + html.escape(str(s.get('v14_bull_engulf_desc', '')))
+                + f"；总{s.get('v14_bull_engulf_score_current',0):.1f}/18，形态{s.get('v14_bull_engulf_pattern_score',0):.1f}，影线{s.get('v14_bull_engulf_shadow_score',0):.1f}，量能{s.get('v14_bull_engulf_volume_score',0):.1f}，上影占比{s.get('v14_today_upper_shadow_ratio',0):.0%}。"
+            )
+        lines.append("V14扣分原因：追高=" + html.escape(str(s.get('v14_chase_reasons', ''))) + "；操作=" + html.escape(str(s.get('v14_operability_reasons', ''))) + "；量能=" + html.escape(str(s.get('v14_volume_reasons', ''))))
+        lines.append("诊断：" + build_reason_v12(s))
 
-    if diagnostics:
+    if v14_diagnostics:
         lines.append("")
-        lines.append("<b>未入选/被拦截前10只诊断</b>")
-        for i, d in enumerate(diagnostics[:10], 1):
-            lines.append(f"{i}. {html.escape(str(d.get('name','')))}({html.escape(str(d.get('code','')))}) V13={d.get('v13_score',0):.1f} 原分={d.get('old_score',0):.1f} 池={html.escape(str(d.get('pool','')))} 原因={html.escape(str(d.get('reason','')))}")
-
+        lines.append(html.escape(v14_diagnostics_text(v14_diagnostics, 8)))
     return "\n".join(lines)
+
 
 def build_error_message(error_text):
     lines = []
@@ -6854,7 +6899,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V13正式三选平衡版：不删除V12结构/量能/回踩/风控逻辑；最终阶段改为硬雷区剔除 + 极端追高剔除 + 相对最优三选；每只输出大维度打分表。")
+        print("V14原主模型完整底座+增量体系版：不删V12.6主模型任何有效逻辑；新增阳包阴精细分层、V14后置审核、相对最优三选、分项打分表；财务硬雷区一票否决，普通缺点扣分不杀光。")
 
         base_rows = []
         all_dates = set()
@@ -7035,20 +7080,30 @@ def main():
             send_telegram(build_error_message(warning))
             return
 
-        # V13：最终选择不再只按80分+优先池硬卡，而是先剔除硬雷区/极端追高，
-        # 再从剩余股票中尽可能选出相对最优三只，并输出拦截诊断。
-        final_signals, strong_watch_pool, v13_diagnostics = v13_select_final_signals(
-            deep_rows,
-            history,
-            limit=min(RESULT_LIMIT if RESULT_LIMIT > 0 else V13_FORMAL_TARGET_COUNT, V13_FORMAL_TARGET_COUNT),
-        )
+        # V14最终三选：原主模型完整跑完后，只做后置审核/分层扣分/相对最优三选；不重写、不删主模型逻辑。
+        final_signals, v14_diagnostics, v14_audited_rows = select_final_signals_v14(deep_rows, history, limit=V14_TARGET_PUSH_COUNT)
+        strong_watch_pool = [r for r in v14_audited_rows if (not r.get("v14_blocked")) and str(r.get("code")) not in {str(x.get("code")) for x in final_signals}][:80]
+
+        for r in final_signals:
+            key = f"{r.get('date','')}_{r.get('code','')}"
+            history[key] = {
+                "date": r.get("date", ""),
+                "code": r.get("code", ""),
+                "name": r.get("name", ""),
+                "score": r.get("score", 0),
+                "base_score": r.get("base_score", 0),
+                "total_score": r.get("total_score", 0),
+                "v14_final_score": r.get("v14_final_score", r.get("total_score", 0)),
+                "v14_level": r.get("v14_level", ""),
+                "candidate_pool": r.get("candidate_pool", ""),
+            }
 
         print(f"近{CHECK_DAYS}个交易日排查完成：{dates}（默认仅最新有行情日；可用CHECK_DAYS调整）")
         print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
         print(f"基础评分数量：{len(base_rows)} 条")
         print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
-        print(f"最终推送数量：{len(final_signals)} 只")
-        print(f"强势观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON）")
+        print(f"V14最终三选数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
+        print(f"V14后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON）")
 
         save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_pool)
         save_signal_history(history)
@@ -7060,8 +7115,7 @@ def main():
             kline_success=kline_success,
             kline_fail=kline_fail,
             deep_count=len(deep_rows),
-            diagnostics=v13_diagnostics,
-            rejected_count=len(strong_watch_pool),
+            v14_diagnostics=v14_diagnostics
         )
 
         send_telegram(msg)
