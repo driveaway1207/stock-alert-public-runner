@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-人工审核友好版：A股最高收盘共振线/平台颈线候选导出
+A股数据层体检表导出
 
-特点：
-1. 继续使用 kline_cache，速度快
-2. 自动增量更新缓存
-3. 输出富途代码：SZ.000001 / SH.600519
-4. 补全股票名称
-5. 字段改成人能看懂
-6. 结构质量分拆成几个子项
-7. 新股/次新股过滤
+目的：
+只检查K线数据是否可靠，不做结构、不做颈线、不做推荐。
+
+输出：
+outputs/data_health_check_日期.csv
+outputs/data_health_failed_日期.csv
+
+用户只需要审核：
+人工审核
+人工备注
 """
 
 import os
@@ -30,21 +32,20 @@ KLINE_CACHE_DIR = "kline_cache"
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(KLINE_CACHE_DIR, exist_ok=True)
 
-LOOKBACK_LIST = [120, 250]
-
-TOUCH_TOL = 0.02
-MIN_BARS = 120
-MIN_LIST_DAYS = 120
-EXCLUDE_RECENT_IPO_BARS = 60
-MAX_OUTPUT_PER_STOCK = 2
+MIN_DAILY_BARS = 120
+FULL_DAILY_BARS = 250
 INCREMENTAL_DAYS = 60
 
-FAILED_ROWS = []
 BAOSTOCK_READY = False
+FAILED_ROWS = []
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def fmt_seconds(sec):
@@ -59,11 +60,7 @@ def fmt_seconds(sec):
     return f"{s}s"
 
 
-def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def futu_code(code):
+def stock_code(code):
     code = str(code).zfill(6)
     if code.startswith("6"):
         return "SH." + code
@@ -72,12 +69,20 @@ def futu_code(code):
 
 def baostock_code(code):
     code = str(code).zfill(6)
-    return "sh." + code if code.startswith("6") else "sz." + code
+    if code.startswith("6"):
+        return "sh." + code
+    return "sz." + code
 
 
 def eastmoney_secid(code):
     code = str(code).zfill(6)
-    return "1." + code if code.startswith("6") else "0." + code
+    if code.startswith("6"):
+        return "1." + code
+    return "0." + code
+
+
+def cache_path(code):
+    return os.path.join(KLINE_CACHE_DIR, f"{str(code).zfill(6)}.csv")
 
 
 def normalize_daily_columns(df):
@@ -91,22 +96,28 @@ def normalize_daily_columns(df):
         "Date": "date",
         "datetime": "date",
         "time": "date",
+
         "开盘": "open",
         "开盘价": "open",
         "Open": "open",
+
         "收盘": "close",
         "收盘价": "close",
         "Close": "close",
+
         "最高": "high",
         "最高价": "high",
         "High": "high",
+
         "最低": "low",
         "最低价": "low",
         "Low": "low",
+
         "成交量": "volume",
         "成交量(手)": "volume",
         "vol": "volume",
         "Volume": "volume",
+
         "成交额": "amount",
         "成交额(元)": "amount",
         "turnover": "amount",
@@ -115,8 +126,8 @@ def normalize_daily_columns(df):
 
     df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
-    need = ["date", "open", "close", "high", "low", "volume"]
-    if not all(c in df.columns for c in need):
+    required = ["date", "open", "close", "high", "low", "volume"]
+    if not all(c in df.columns for c in required):
         return None
 
     if "amount" not in df.columns:
@@ -128,17 +139,8 @@ def normalize_daily_columns(df):
     for col in ["open", "close", "high", "low", "volume", "amount"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["date", "open", "close", "high", "low", "volume"])
     df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
-
-    if len(df) < MIN_BARS:
-        return None
-
     return df
-
-
-def cache_path(code):
-    return os.path.join(KLINE_CACHE_DIR, f"{str(code).zfill(6)}.csv")
 
 
 def read_cache(code):
@@ -155,7 +157,7 @@ def read_cache(code):
 def save_cache(code, df):
     try:
         df = normalize_daily_columns(df)
-        if df is None:
+        if df is None or df.empty:
             return
         df.to_csv(cache_path(code), index=False, encoding="utf-8-sig")
     except Exception as e:
@@ -163,24 +165,32 @@ def save_cache(code, df):
 
 
 def merge_kline(old_df, new_df):
-    if old_df is None:
-        return normalize_daily_columns(new_df)
-    if new_df is None:
-        return normalize_daily_columns(old_df)
+    old_df = normalize_daily_columns(old_df)
+    new_df = normalize_daily_columns(new_df)
+
+    if old_df is None or old_df.empty:
+        return new_df
+    if new_df is None or new_df.empty:
+        return old_df
+
     df = pd.concat([old_df, new_df], ignore_index=True)
     return normalize_daily_columns(df)
 
 
 def cache_is_fresh(df):
-    if df is None or df.empty:
+    if df is None or df.empty or "date" not in df.columns:
         return False
+
     last_date = pd.to_datetime(df["date"].max()).date()
     now_date = datetime.now().date()
+
+    # 周末/节假日/停牌允许一定宽松度
     return (now_date - last_date).days <= 5
 
 
 def baostock_login_once():
     global BAOSTOCK_READY
+
     if BAOSTOCK_READY:
         return True
 
@@ -197,34 +207,15 @@ def baostock_login_once():
 
 def baostock_logout_once():
     global BAOSTOCK_READY
+
     if BAOSTOCK_READY:
         try:
             bs.logout()
             log("[BAOSTOCK LOGOUT] success")
         except Exception as e:
             log(f"[WARN] baostock logout failed: {e}")
+
     BAOSTOCK_READY = False
-
-
-def fetch_stock_list_from_baostock():
-    if not baostock_login_once():
-        raise RuntimeError("baostock login failed")
-
-    rs = bs.query_all_stock(day=today_str())
-    data = []
-    fields = rs.fields
-
-    while rs.next():
-        data.append(rs.get_row_data())
-
-    if not data:
-        raise RuntimeError("baostock query_all_stock returned empty")
-
-    df = pd.DataFrame(data, columns=fields)
-    df = df[df["code"].str.startswith(("sh.6", "sz.0", "sz.3"))].copy()
-    df["code"] = df["code"].str[-6:]
-    df["name"] = df.get("code_name", df["code"])
-    return df[["code", "name"]]
 
 
 def fetch_stock_list_from_akshare():
@@ -234,35 +225,50 @@ def fetch_stock_list_from_akshare():
     return df[["code", "name"]]
 
 
-def fetch_stock_list():
-    stocks = None
+def fetch_stock_list_from_baostock():
+    if not baostock_login_once():
+        raise RuntimeError("baostock login failed")
 
+    rs = bs.query_all_stock(day=today_str())
+
+    rows = []
+    fields = rs.fields
+
+    while rs.next():
+        rows.append(rs.get_row_data())
+
+    if not rows:
+        raise RuntimeError("baostock query_all_stock returned empty")
+
+    df = pd.DataFrame(rows, columns=fields)
+    df = df[df["code"].str.startswith(("sh.6", "sz.0", "sz.3"))].copy()
+    df["code"] = df["code"].str[-6:]
+    df["name"] = df.get("code_name", df["code"])
+    return df[["code", "name"]]
+
+
+def fetch_stock_list():
     for attempt in range(3):
         try:
             log(f"[FETCH LIST] source=akshare attempt={attempt + 1}")
-            stocks = fetch_stock_list_from_akshare()
-            break
+            df = fetch_stock_list_from_akshare()
+            if df is not None and not df.empty:
+                return df.drop_duplicates("code").reset_index(drop=True)
         except Exception as e:
             log(f"[WARN] akshare stock list failed attempt={attempt + 1}: {e}")
             time.sleep(3)
 
-    if stocks is None:
-        for attempt in range(3):
-            try:
-                log(f"[FETCH LIST] source=baostock attempt={attempt + 1}")
-                stocks = fetch_stock_list_from_baostock()
-                break
-            except Exception as e:
-                log(f"[WARN] baostock stock list failed attempt={attempt + 1}: {e}")
-                time.sleep(3)
+    for attempt in range(3):
+        try:
+            log(f"[FETCH LIST] source=baostock attempt={attempt + 1}")
+            df = fetch_stock_list_from_baostock()
+            if df is not None and not df.empty:
+                return df.drop_duplicates("code").reset_index(drop=True)
+        except Exception as e:
+            log(f"[WARN] baostock stock list failed attempt={attempt + 1}: {e}")
+            time.sleep(3)
 
-    if stocks is None:
-        raise RuntimeError("all stock list sources failed")
-
-    stocks["code"] = stocks["code"].astype(str).str.zfill(6)
-    stocks["name"] = stocks["name"].astype(str)
-
-    return stocks.drop_duplicates("code").reset_index(drop=True)
+    raise RuntimeError("all stock list sources failed")
 
 
 def fetch_daily_from_baostock(code, start_date="2023-01-01"):
@@ -279,16 +285,16 @@ def fetch_daily_from_baostock(code, start_date="2023-01-01"):
         adjustflag="2",
     )
 
-    data = []
+    rows = []
     fields = rs.fields
 
     while rs.next():
-        data.append(rs.get_row_data())
+        rows.append(rs.get_row_data())
 
-    if not data:
+    if not rows:
         return None
 
-    return normalize_daily_columns(pd.DataFrame(data, columns=fields))
+    return normalize_daily_columns(pd.DataFrame(rows, columns=fields))
 
 
 def fetch_daily_from_akshare(code):
@@ -302,6 +308,7 @@ def fetch_daily_from_akshare(code):
 
 def fetch_daily_from_eastmoney(code, beg="20230101"):
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
     params = {
         "secid": eastmoney_secid(code),
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -317,14 +324,14 @@ def fetch_daily_from_eastmoney(code, beg="20230101"):
         url,
         params=params,
         headers={"User-Agent": "Mozilla/5.0"},
-        timeout=15
+        timeout=15,
     )
     r.raise_for_status()
     js = r.json()
 
     klines = (js.get("data") or {}).get("klines") or []
-    rows = []
 
+    rows = []
     for item in klines:
         p = item.split(",")
         if len(p) >= 7:
@@ -351,329 +358,251 @@ def fetch_incremental(code, cache_df):
 
     try:
         df = fetch_daily_from_baostock(code, start_str)
-        if df is not None:
-            return df, "baostock_incremental"
+        if df is not None and not df.empty:
+            return df, "增量更新成功"
     except Exception as e:
-        log(f"[WARN] incremental baostock failed code={code} err={e}")
+        log(f"[WARN] baostock update failed code={code} err={e}")
 
     try:
         df = fetch_daily_from_akshare(code)
-        if df is not None:
-            return df, "akshare_full"
+        if df is not None and not df.empty:
+            return df, "补充更新成功"
     except Exception as e:
-        log(f"[WARN] incremental akshare failed code={code} err={e}")
+        log(f"[WARN] akshare update failed code={code} err={e}")
 
     try:
         df = fetch_daily_from_eastmoney(code, start_str)
-        if df is not None:
-            return df, "eastmoney_incremental"
+        if df is not None and not df.empty:
+            return df, "补充更新成功"
     except Exception as e:
-        log(f"[WARN] incremental eastmoney failed code={code} err={e}")
+        log(f"[WARN] eastmoney update failed code={code} err={e}")
 
-    return None, "failed"
+    return None, "更新失败"
 
 
-def fetch_daily(code, name):
+def get_daily_kline(code):
     code = str(code).zfill(6)
     cache_df = read_cache(code)
+    cache_exists = cache_df is not None and not cache_df.empty
 
-    if cache_df is not None and cache_is_fresh(cache_df):
-        return cache_df, "cache_fresh"
+    if cache_exists and cache_is_fresh(cache_df):
+        return cache_df, "有", "新鲜", "无需更新"
 
-    if cache_df is not None:
-        new_df, source = fetch_incremental(code, cache_df)
+    if cache_exists:
+        new_df, update_status = fetch_incremental(code, cache_df)
         merged = merge_kline(cache_df, new_df)
-        if merged is not None:
+        if merged is not None and not merged.empty:
             save_cache(code, merged)
-            return merged, f"cache_plus_{source}"
+            freshness = "新鲜" if cache_is_fresh(merged) else "偏旧"
+            return merged, "有", freshness, update_status
 
-    full_df, source = fetch_incremental(code, None)
-    if full_df is not None:
+    full_df, update_status = fetch_incremental(code, None)
+    if full_df is not None and not full_df.empty:
         save_cache(code, full_df)
-        return full_df, source
+        freshness = "新鲜" if cache_is_fresh(full_df) else "偏旧"
+        return full_df, "无", freshness, "首次建立缓存"
 
-    FAILED_ROWS.append({
-        "富途代码": futu_code(code),
-        "股票名称": name,
-        "失败原因": "all_daily_sources_failed",
-    })
-    return None, "failed"
+    return None, "无", "不可用", "更新失败"
 
 
-def count_separated_touches(window, line_price, tol=TOUCH_TOL, min_gap=5):
-    mask = (
-        (window["high"] >= line_price * (1 - tol)) &
-        (window["close"] <= line_price * (1 + tol))
-    )
-    idxs = list(window[mask].index)
-
-    if not idxs:
+def count_recent_bars(df, days):
+    if df is None or df.empty:
         return 0
 
-    count = 1
-    last = idxs[0]
-    for idx in idxs[1:]:
-        if idx - last >= min_gap:
-            count += 1
-            last = idx
-
-    return count
+    latest = pd.to_datetime(df["date"].max())
+    start = latest - pd.Timedelta(days=days)
+    return int((df["date"] >= start).sum())
 
 
-def line_quality_level(score):
-    if score >= 80:
-        return "A-较强"
-    if score >= 65:
-        return "B-可观察"
-    if score >= 50:
-        return "C-一般"
-    return "D-偏弱"
+def first_bad_date(df, mask):
+    bad = df[mask]
+    if bad.empty:
+        return ""
+    return bad.iloc[0]["date"].strftime("%Y-%m-%d")
 
 
-def find_highest_close_line(df, lookback):
-    if len(df) < max(MIN_BARS, lookback):
-        return None
-
-    if len(df) < MIN_LIST_DAYS:
-        return None
-
-    recent = df.tail(lookback).copy()
-    if len(recent) < lookback * 0.8:
-        return None
-
-    recent_for_line = recent.iloc[EXCLUDE_RECENT_IPO_BARS:]
-    if recent_for_line.empty:
-        return None
-
-    idx = recent_for_line["close"].idxmax()
-    source = df.loc[idx]
-
-    line_price = float(source["close"])
-    line_date = source["date"]
-
-    # 排除最近5天刚形成的新高点，避免孤立点
-    if idx > len(df) - 5:
-        return None
-
-    window = df.tail(lookback).copy()
-
-    separated_touch_count = count_separated_touches(window, line_price)
-
-    near_close = window[
-        (window["close"] >= line_price * (1 - TOUCH_TOL)) &
-        (window["close"] <= line_price * (1 + TOUCH_TOL))
-    ]
-    near_close_days = len(near_close)
-
-    close_above_days = len(window[window["close"] > line_price])
-    high_break_days = len(window[window["high"] > line_price])
-
-    last = df.iloc[-1]
-    current_price = float(last["close"])
-    distance_pct = (line_price - current_price) / current_price * 100
-
-    source_open = float(source["open"])
-    source_close = float(source["close"])
-    source_high = float(source["high"])
-    source_low = float(source["low"])
-    source_volume = float(source["volume"])
-
-    body_top = max(source_open, source_close)
-    body_bottom = min(source_open, source_close)
-    is_bull = source_close > source_open
-    close_pos = (source_close - source_low) / max(source_high - source_low, 0.01)
-
-    # 是否最大量阳K
-    bull_window = window[window["close"] > window["open"]].copy()
-    if not bull_window.empty:
-        max_vol_bull_idx = bull_window["volume"].idxmax()
-        max_vol_bull = df.loc[max_vol_bull_idx]
-        max_vol_bull_high = float(max_vol_bull["high"])
-        max_vol_bull_body_low = min(float(max_vol_bull["open"]), float(max_vol_bull["close"]))
-        is_max_vol_bull_source = idx == max_vol_bull_idx
-        vol_high_gap_pct = abs(max_vol_bull_high - source_high) / max(source_high, 0.01) * 100
-    else:
-        max_vol_bull_idx = None
-        max_vol_bull_high = None
-        max_vol_bull_body_low = None
-        is_max_vol_bull_source = False
-        vol_high_gap_pct = None
-
-    # 突破识别
-    breakout = None
-    after_line = df[df.index > idx].copy()
-
-    for j, r in after_line.iterrows():
-        body_high = max(float(r["open"]), float(r["close"]))
-        body_low = min(float(r["open"]), float(r["close"]))
-        body_size = max(body_high - body_low, 0.01)
-
-        entity_above_ratio = max(0, body_high - max(body_low, line_price)) / body_size
-        body_stand = float(r["close"]) > line_price and entity_above_ratio >= 0.5
-        gap_stand = float(r["low"]) > line_price
-
-        if body_stand or gap_stand:
-            breakout = (j, r, "跳空站上" if gap_stand else "实体站上")
-            break
-
-    if breakout is None:
-        breakout_date = ""
-        breakout_type = "未有效站上"
-        fell_back_3 = ""
-        fell_back_5 = ""
-        structure_status = "接近/未突破"
-    else:
-        bidx, brow, breakout_type = breakout
-        breakout_date = brow["date"].strftime("%Y-%m-%d")
-
-        next3 = df.iloc[bidx + 1:bidx + 4]
-        next5 = df.iloc[bidx + 1:bidx + 6]
-
-        fell_back_3 = "是" if (not next3.empty and (next3["close"] < line_price).any()) else "否"
-        fell_back_5 = "是" if (not next5.empty and (next5["close"] < line_price).any()) else "否"
-        structure_status = "已突破"
-
-    # 结构质量分拆解，满分100
-    line_source_score = 20
-    if is_bull and close_pos >= 0.65:
-        line_source_score += 5
-    if is_max_vol_bull_source:
-        line_source_score += 5
-    line_source_score = min(line_source_score, 30)
-
-    platform_score = min(separated_touch_count * 6, 24)
-    if near_close_days >= 20:
-        platform_score += 4
-    platform_score = min(platform_score, 30)
-
-    breakout_score = 0
-    if breakout_type == "实体站上":
-        breakout_score = 18
-    elif breakout_type == "跳空站上":
-        breakout_score = 22
-    if fell_back_3 == "否" and breakout_type != "未有效站上":
-        breakout_score += 5
-    breakout_score = min(breakout_score, 30)
-
-    distance_score = 10
-    if distance_pct > 15:
-        distance_score = 2
-    elif distance_pct > 8:
-        distance_score = 5
-    elif distance_pct < -10:
-        distance_score = 4
-
-    raw_score = line_source_score + platform_score + breakout_score + distance_score
-    quality_score = min(100, round(raw_score, 1))
-
-    if structure_status == "已突破":
-        conclusion = f"候选线已被{breakout_type}，重点核对突破是否真实、是否为平台上沿/阶段高点。"
-    elif abs(distance_pct) <= 5:
-        conclusion = "当前接近候选线但未有效突破，重点核对这条线是否为真实压力/平台上沿。"
-    elif distance_pct > 5:
-        conclusion = "候选线在当前价上方，属于上方压力观察线。"
-    else:
-        conclusion = "当前已在线上方，但未识别到清晰有效突破动作，需人工核对是否漏判。"
-
-    review_focus = (
-        "请人工判断：这条线是否来自平台上沿、阶段最高收盘或阶段高点压力；"
-        "不是前低、现价线、孤立尖峰或上市初期乱波动。"
-    )
-
-    return {
-        "候选线价格": round(line_price, 2),
-        "候选线类型": f"{lookback}日最高收盘共振线",
-        "候选线来源K日期": line_date.strftime("%Y-%m-%d"),
-        "来源K开盘": round(source_open, 2),
-        "来源K收盘": round(source_close, 2),
-        "来源K最高": round(source_high, 2),
-        "来源K最低": round(source_low, 2),
-        "来源K成交量": round(source_volume, 0),
-        "来源K是否阳线": "是" if is_bull else "否",
-        "来源K收盘位置": round(close_pos, 2),
-        "当前价到候选线距离%": round(distance_pct, 2),
-        "有效触碰次数": int(separated_touch_count),
-        "线附近收盘天数": int(near_close_days),
-        "突破日期": breakout_date,
-        "突破方式": breakout_type,
-        "突破后3日是否跌回": fell_back_3,
-        "突破后5日是否跌回": fell_back_5,
-        "结构状态": structure_status,
-        "是否最大量阳K来源": "是" if is_max_vol_bull_source else "否",
-        "最大量阳K高点": round(max_vol_bull_high, 2) if max_vol_bull_high is not None else "",
-        "最大量阳K实体实底": round(max_vol_bull_body_low, 2) if max_vol_bull_body_low is not None else "",
-        "最大量阳K高点与来源K高点距离%": round(vol_high_gap_pct, 2) if vol_high_gap_pct is not None else "",
-        "线来源评分": line_source_score,
-        "平台共振评分": platform_score,
-        "突破确认评分": breakout_score,
-        "位置距离评分": distance_score,
-        "结构质量分": quality_score,
-        "结构质量等级": line_quality_level(quality_score),
-        "模型结论": conclusion,
-        "人工审核重点": review_focus,
+def inspect_kline(df, code, name, cache_exists, freshness, update_status):
+    result = {
+        "股票代码": stock_code(code),
+        "股票名称": name,
+        "市场": "沪市" if str(code).startswith("6") else "深市",
+        "是否ST": "是" if "ST" in name.upper() else "否",
+        "是否N/C新股": "是" if name.startswith(("N", "C")) else "否",
+        "缓存是否存在": cache_exists,
+        "缓存是否新鲜": freshness,
+        "缓存更新状态": update_status,
+        "K线起始日期": "",
+        "K线最新日期": "",
+        "K线总根数": 0,
+        "最近30日K线数量": 0,
+        "最近60日K线数量": 0,
+        "是否少于120根K": "是",
+        "是否少于250根K": "是",
+        "上市成熟度": "数据不可用",
+        "是否存在开高低收缺失": "是",
+        "是否存在价格为0": "未知",
+        "是否存在high_low错误": "未知",
+        "是否存在high小于开收": "未知",
+        "是否存在low大于开收": "未知",
+        "价格异常K线数量": 0,
+        "价格异常日期示例": "",
+        "是否存在成交量缺失": "未知",
+        "是否存在成交量为0": "未知",
+        "最近20日是否长期无量": "未知",
+        "是否存在成交额缺失": "未知",
+        "成交量异常日期示例": "",
+        "数据体检结论": "不通过",
+        "可进入模型": "不可进入",
+        "不可进入原因": "K线数据不可用",
+        "人工审核": "",
+        "人工备注": "",
     }
 
+    if df is None or df.empty:
+        return result
 
-def save_outputs(rows, failed_rows, source_count, success, failed, elapsed):
-    today = datetime.now().strftime("%Y-%m-%d")
+    df = normalize_daily_columns(df)
+    if df is None or df.empty:
+        return result
 
-    out_path = os.path.join(OUT_DIR, f"structure_line_candidates_review_{today}.csv")
-    failed_path = os.path.join(OUT_DIR, f"structure_line_failed_{today}.csv")
+    n = len(df)
+    latest_date = pd.to_datetime(df["date"].max())
+    first_date = pd.to_datetime(df["date"].min())
 
-    out = pd.DataFrame(rows)
+    result["K线起始日期"] = first_date.strftime("%Y-%m-%d")
+    result["K线最新日期"] = latest_date.strftime("%Y-%m-%d")
+    result["K线总根数"] = n
+    result["最近30日K线数量"] = count_recent_bars(df, 45)
+    result["最近60日K线数量"] = count_recent_bars(df, 90)
+    result["是否少于120根K"] = "是" if n < 120 else "否"
+    result["是否少于250根K"] = "是" if n < 250 else "否"
 
-    if not out.empty:
-        cols = [
-            "富途代码",
-            "原始代码",
-            "股票名称",
-            "数据源",
-            "数据更新日期",
-            "当前最新K日期",
-            "当前收盘价",
-            "候选线价格",
-            "候选线类型",
-            "候选线来源K日期",
-            "来源K开盘",
-            "来源K收盘",
-            "来源K最高",
-            "来源K最低",
-            "来源K成交量",
-            "来源K是否阳线",
-            "来源K收盘位置",
-            "当前价到候选线距离%",
-            "有效触碰次数",
-            "线附近收盘天数",
-            "突破日期",
-            "突破方式",
-            "突破后3日是否跌回",
-            "突破后5日是否跌回",
-            "结构状态",
-            "是否最大量阳K来源",
-            "最大量阳K高点",
-            "最大量阳K实体实底",
-            "最大量阳K高点与来源K高点距离%",
-            "线来源评分",
-            "平台共振评分",
-            "突破确认评分",
-            "位置距离评分",
-            "结构质量分",
-            "结构质量等级",
-            "模型结论",
-            "人工审核重点",
-            "人工评价",
-            "错误类型",
-            "备注",
-        ]
+    if n < 120 or name.startswith(("N", "C")):
+        result["上市成熟度"] = "新股/次新股，不进入结构模型"
+    elif n < 250:
+        result["上市成熟度"] = "数据偏短，仅短周期观察"
+    else:
+        result["上市成熟度"] = "成熟，可进入基础结构模型"
 
-        out = out[cols]
-        out.to_csv(out_path, index=False, encoding="utf-8-sig")
+    missing_ohlc_mask = df[["open", "high", "low", "close"]].isna().any(axis=1)
+    zero_price_mask = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+    high_low_error_mask = df["high"] < df["low"]
+    high_less_oc_mask = (df["high"] < df["open"]) | (df["high"] < df["close"])
+    low_greater_oc_mask = (df["low"] > df["open"]) | (df["low"] > df["close"])
+
+    price_error_mask = (
+        missing_ohlc_mask |
+        zero_price_mask |
+        high_low_error_mask |
+        high_less_oc_mask |
+        low_greater_oc_mask
+    )
+
+    result["是否存在开高低收缺失"] = "是" if missing_ohlc_mask.any() else "否"
+    result["是否存在价格为0"] = "是" if zero_price_mask.any() else "否"
+    result["是否存在high_low错误"] = "是" if high_low_error_mask.any() else "否"
+    result["是否存在high小于开收"] = "是" if high_less_oc_mask.any() else "否"
+    result["是否存在low大于开收"] = "是" if low_greater_oc_mask.any() else "否"
+    result["价格异常K线数量"] = int(price_error_mask.sum())
+    result["价格异常日期示例"] = first_bad_date(df, price_error_mask)
+
+    volume_missing_mask = df["volume"].isna()
+    volume_zero_mask = df["volume"] <= 0
+    amount_missing_mask = df["amount"].isna()
+
+    recent20 = df.tail(20)
+    long_zero_volume = len(recent20) >= 10 and (recent20["volume"] <= 0).sum() >= 10
+
+    volume_error_mask = volume_missing_mask | volume_zero_mask | amount_missing_mask
+
+    result["是否存在成交量缺失"] = "是" if volume_missing_mask.any() else "否"
+    result["是否存在成交量为0"] = "是" if volume_zero_mask.any() else "否"
+    result["最近20日是否长期无量"] = "是" if long_zero_volume else "否"
+    result["是否存在成交额缺失"] = "是" if amount_missing_mask.any() else "否"
+    result["成交量异常日期示例"] = first_bad_date(df, volume_error_mask)
+
+    reasons = []
+
+    if name.startswith(("N", "C")):
+        reasons.append("N/C新股")
+    if "ST" in name.upper():
+        reasons.append("ST股票")
+    if n < 120:
+        reasons.append("K线少于120根")
+    if price_error_mask.any():
+        reasons.append("存在价格硬错误")
+    if long_zero_volume:
+        reasons.append("最近20日长期无量")
+    if freshness == "不可用":
+        reasons.append("缓存不可用")
+
+    if reasons:
+        result["数据体检结论"] = "不通过"
+        result["可进入模型"] = "不可进入"
+        result["不可进入原因"] = "；".join(reasons)
+    elif n < 250:
+        result["数据体检结论"] = "限制使用"
+        result["可进入模型"] = "仅日线短周期观察"
+        result["不可进入原因"] = "K线少于250根，不进入周线/月线/大周期结构模型"
+    else:
+        result["数据体检结论"] = "通过"
+        result["可进入模型"] = "日线/周线/基础压力区/平台/倍量"
+        result["不可进入原因"] = ""
+
+    return result
+
+
+def save_outputs(rows, failed_rows, elapsed, success, failed):
+    today = today_str()
+    out_path = os.path.join(OUT_DIR, f"data_health_check_{today}.csv")
+    failed_path = os.path.join(OUT_DIR, f"data_health_failed_{today}.csv")
+
+    df = pd.DataFrame(rows)
+
+    cols = [
+        "股票代码",
+        "股票名称",
+        "市场",
+        "是否ST",
+        "是否N/C新股",
+        "缓存是否存在",
+        "缓存是否新鲜",
+        "缓存更新状态",
+        "K线起始日期",
+        "K线最新日期",
+        "K线总根数",
+        "最近30日K线数量",
+        "最近60日K线数量",
+        "是否少于120根K",
+        "是否少于250根K",
+        "上市成熟度",
+        "是否存在开高低收缺失",
+        "是否存在价格为0",
+        "是否存在high_low错误",
+        "是否存在high小于开收",
+        "是否存在low大于开收",
+        "价格异常K线数量",
+        "价格异常日期示例",
+        "是否存在成交量缺失",
+        "是否存在成交量为0",
+        "最近20日是否长期无量",
+        "是否存在成交额缺失",
+        "成交量异常日期示例",
+        "数据体检结论",
+        "可进入模型",
+        "不可进入原因",
+        "人工审核",
+        "人工备注",
+    ]
+
+    if not df.empty:
+        df = df[cols]
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
         pd.DataFrame([{
-            "诊断": "没有生成任何候选线",
+            "诊断": "未生成数据体检结果",
             "success": success,
             "failed": failed,
-            "source_count": str(source_count),
             "elapsed": fmt_seconds(elapsed),
         }]).to_csv(out_path, index=False, encoding="utf-8-sig")
 
@@ -688,78 +617,38 @@ def save_outputs(rows, failed_rows, source_count, success, failed, elapsed):
 
 def main():
     start_ts = time.time()
-
     rows = []
     success = 0
     failed = 0
-    skipped_new_stock = 0
-    source_count = {}
 
     try:
         stocks = fetch_stock_list()
         total = len(stocks)
 
-        log(f"[START] stocks={total}")
+        log(f"[START] data health check stocks={total}")
 
         for i, row in stocks.iterrows():
             code = str(row["code"]).zfill(6)
             name = str(row["name"])
 
             try:
-                if name.startswith(("N", "C")):
-                    skipped_new_stock += 1
-                    continue
-
-                df, source = fetch_daily(code, name)
-                source_count[source] = source_count.get(source, 0) + 1
-
-                if df is None or len(df) < MIN_LIST_DAYS:
-                    skipped_new_stock += 1
-                    continue
-
-                candidates = []
-
-                for lb in LOOKBACK_LIST:
-                    item = find_highest_close_line(df, lb)
-                    if item:
-                        item.update({
-                            "富途代码": futu_code(code),
-                            "原始代码": code,
-                            "股票名称": name,
-                            "数据源": source,
-                            "数据更新日期": today_str(),
-                            "当前最新K日期": df.iloc[-1]["date"].strftime("%Y-%m-%d"),
-                            "当前收盘价": round(float(df.iloc[-1]["close"]), 2),
-                            "人工评价": "",
-                            "错误类型": "",
-                            "备注": "",
-                        })
-                        candidates.append(item)
-
-                candidates = sorted(
-                    candidates,
-                    key=lambda x: x["结构质量分"],
-                    reverse=True
-                )
-
-                rows.extend(candidates[:MAX_OUTPUT_PER_STOCK])
+                df, cache_exists, freshness, update_status = get_daily_kline(code)
+                item = inspect_kline(df, code, name, cache_exists, freshness, update_status)
+                rows.append(item)
                 success += 1
 
             except Exception as e:
                 failed += 1
-                source_count["failed"] = source_count.get("failed", 0) + 1
-
                 FAILED_ROWS.append({
-                    "富途代码": futu_code(code),
+                    "股票代码": stock_code(code),
                     "股票名称": name,
                     "失败原因": str(e),
                 })
-
                 log(f"[ERROR] code={code} name={name}: {e}")
                 traceback.print_exc(limit=1)
 
             done = i + 1
-            if done % 50 == 0 or done == total:
+            if done % 100 == 0 or done == total:
                 elapsed = time.time() - start_ts
                 avg = elapsed / max(done, 1)
                 remain = avg * (total - done)
@@ -767,31 +656,17 @@ def main():
 
                 log(
                     f"[PROGRESS] {done}/{total} ({pct:.2f}%) | "
-                    f"success={success} failed={failed} skipped_new={skipped_new_stock} "
-                    f"candidates={len(rows)} | sources={source_count} | "
+                    f"success={success} failed={failed} | "
                     f"elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(remain)}"
                 )
 
-            time.sleep(0.005)
+            time.sleep(0.003)
 
     finally:
         elapsed = time.time() - start_ts
-
-        save_outputs(
-            rows=rows,
-            failed_rows=FAILED_ROWS,
-            source_count=source_count,
-            success=success,
-            failed=failed,
-            elapsed=elapsed,
-        )
-
+        save_outputs(rows, FAILED_ROWS, elapsed, success, failed)
         baostock_logout_once()
-
-        log(
-            f"[DONE] success={success}, failed={failed}, skipped_new={skipped_new_stock}, "
-            f"candidates={len(rows)}, sources={source_count}, elapsed={fmt_seconds(elapsed)}"
-        )
+        log(f"[DONE] success={success}, failed={failed}, elapsed={fmt_seconds(elapsed)}")
 
 
 if __name__ == "__main__":
