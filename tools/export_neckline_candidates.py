@@ -2,18 +2,22 @@
 """
 全A股“最高收盘共振线/平台颈线候选”导出脚本
 
+用途：
+- 只验证结构线识别，不做买卖，不推送Telegram
+- 输出CSV给人工审核：模型画的线到底对不对
+
 数据源顺序：
-1）BaoStock 主源
+1）BaoStock 主源：全程只登录一次，速度快很多
 2）AkShare 兜底
 3）东方财富直连兜底
 
-只做结构线识别验证，不做买卖，不推送Telegram。
+输出：
+outputs/structure_line_candidates_日期.csv
+outputs/structure_line_failed_日期.csv
 """
 
 import os
 import time
-import math
-import json
 import traceback
 from datetime import datetime
 
@@ -35,6 +39,7 @@ EXCLUDE_RECENT_IPO_BARS = 60
 MAX_OUTPUT_PER_STOCK = 2
 
 FAILED_ROWS = []
+BAOSTOCK_READY = False
 
 
 def log(msg):
@@ -55,21 +60,44 @@ def fmt_seconds(sec):
 
 def baostock_code(code):
     code = str(code).zfill(6)
-    if code.startswith("6"):
-        return "sh." + code
-    return "sz." + code
+    return "sh." + code if code.startswith("6") else "sz." + code
 
 
 def eastmoney_secid(code):
     code = str(code).zfill(6)
-    if code.startswith("6"):
-        return "1." + code
-    return "0." + code
+    return "1." + code if code.startswith("6") else "0." + code
+
+
+def baostock_login_once():
+    global BAOSTOCK_READY
+    if BAOSTOCK_READY:
+        return True
+
+    lg = bs.login()
+    log(f"[BAOSTOCK LOGIN] {lg.error_code} {lg.error_msg}")
+
+    if lg.error_code == "0":
+        BAOSTOCK_READY = True
+        return True
+
+    BAOSTOCK_READY = False
+    return False
+
+
+def baostock_logout_once():
+    global BAOSTOCK_READY
+    if BAOSTOCK_READY:
+        try:
+            bs.logout()
+            log("[BAOSTOCK LOGOUT] success")
+        except Exception as e:
+            log(f"[WARN] baostock logout failed: {e}")
+    BAOSTOCK_READY = False
 
 
 def fetch_stock_list_from_baostock():
-    lg = bs.login()
-    log(f"[BAOSTOCK LOGIN LIST] {lg.error_code} {lg.error_msg}")
+    if not baostock_login_once():
+        raise RuntimeError("baostock login failed")
 
     rs = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
 
@@ -78,8 +106,6 @@ def fetch_stock_list_from_baostock():
 
     while rs.next():
         data.append(rs.get_row_data())
-
-    bs.logout()
 
     if not data:
         raise RuntimeError("baostock query_all_stock returned empty")
@@ -102,18 +128,18 @@ def fetch_stock_list_from_akshare():
 def fetch_stock_list():
     for attempt in range(3):
         try:
-            log(f"[FETCH LIST] source=baostock attempt={attempt+1}")
+            log(f"[FETCH LIST] source=baostock attempt={attempt + 1}")
             return fetch_stock_list_from_baostock()
         except Exception as e:
-            log(f"[WARN] baostock stock list failed attempt={attempt+1}: {e}")
-            time.sleep(5)
+            log(f"[WARN] baostock stock list failed attempt={attempt + 1}: {e}")
+            time.sleep(3)
 
     for attempt in range(3):
         try:
-            log(f"[FETCH LIST] source=akshare attempt={attempt+1}")
+            log(f"[FETCH LIST] source=akshare attempt={attempt + 1}")
             return fetch_stock_list_from_akshare()
         except Exception as e:
-            log(f"[WARN] akshare stock list failed attempt={attempt+1}: {e}")
+            log(f"[WARN] akshare stock list failed attempt={attempt + 1}: {e}")
             time.sleep(5)
 
     raise RuntimeError("all stock list sources failed")
@@ -138,9 +164,11 @@ def clean_daily_df(df):
 
 
 def fetch_daily_from_baostock(code):
-    bs_code = baostock_code(code)
+    if not BAOSTOCK_READY:
+        if not baostock_login_once():
+            return None
 
-    lg = bs.login()
+    bs_code = baostock_code(code)
 
     rs = bs.query_history_k_data_plus(
         bs_code,
@@ -156,8 +184,6 @@ def fetch_daily_from_baostock(code):
 
     while rs.next():
         data.append(rs.get_row_data())
-
-    bs.logout()
 
     if not data:
         return None
@@ -213,7 +239,6 @@ def fetch_daily_from_eastmoney(code):
     r.raise_for_status()
 
     js = r.json()
-
     data = js.get("data") or {}
     klines = data.get("klines") or []
 
@@ -243,14 +268,12 @@ def fetch_daily_from_eastmoney(code):
 
 def fetch_daily(code, name):
     # 1）BaoStock 主源
-    for attempt in range(2):
-        try:
-            df = fetch_daily_from_baostock(code)
-            if df is not None:
-                return df, "baostock"
-        except Exception as e:
-            log(f"[WARN] source=baostock code={code} name={name} attempt={attempt+1} err={e}")
-            time.sleep(1.5 + attempt)
+    try:
+        df = fetch_daily_from_baostock(code)
+        if df is not None:
+            return df, "baostock"
+    except Exception as e:
+        log(f"[WARN] source=baostock code={code} name={name} err={e}")
 
     # 2）AkShare 兜底
     for attempt in range(2):
@@ -259,8 +282,8 @@ def fetch_daily(code, name):
             if df is not None:
                 return df, "akshare"
         except Exception as e:
-            log(f"[WARN] source=akshare code={code} name={name} attempt={attempt+1} err={e}")
-            time.sleep(2 + attempt * 2)
+            log(f"[WARN] source=akshare code={code} name={name} attempt={attempt + 1} err={e}")
+            time.sleep(1.5 + attempt)
 
     # 3）东方财富直连兜底
     for attempt in range(2):
@@ -269,8 +292,8 @@ def fetch_daily(code, name):
             if df is not None:
                 return df, "eastmoney"
         except Exception as e:
-            log(f"[WARN] source=eastmoney code={code} name={name} attempt={attempt+1} err={e}")
-            time.sleep(2 + attempt * 2)
+            log(f"[WARN] source=eastmoney code={code} name={name} attempt={attempt + 1} err={e}")
+            time.sleep(1.5 + attempt)
 
     FAILED_ROWS.append({
         "股票代码": code,
@@ -300,7 +323,7 @@ def find_highest_close_line(df, lookback):
     line_price = float(df.loc[idx, "close"])
     line_date = df.loc[idx, "date"]
 
-    # 不能是最近几天刚冒出来的孤立点
+    # 排除最近几天刚冒出来的孤立最高收盘
     if idx > len(df) - 5:
         return None
 
@@ -418,8 +441,7 @@ def find_highest_close_line(df, lookback):
     }
 
 
-def main():
-    start_ts = time.time()
+def save_outputs(rows, failed_rows, source_count, success, failed, elapsed):
     today = datetime.now().strftime("%Y-%m-%d")
 
     out_path = os.path.join(
@@ -431,94 +453,6 @@ def main():
         OUT_DIR,
         f"structure_line_failed_{today}.csv"
     )
-
-    stocks = fetch_stock_list()
-
-    rows = []
-    success = 0
-    failed = 0
-
-    source_count = {
-        "baostock": 0,
-        "akshare": 0,
-        "eastmoney": 0,
-        "failed": 0,
-    }
-
-    total = len(stocks)
-
-    log(f"[START] stocks={total}")
-
-    for i, row in stocks.iterrows():
-        code = str(row["code"]).zfill(6)
-        name = str(row["name"])
-
-        try:
-            df, source = fetch_daily(code, name)
-            source_count[source] = source_count.get(source, 0) + 1
-
-            if df is None or len(df) < MIN_BARS:
-                failed += 1
-                continue
-
-            candidates = []
-
-            for lb in LOOKBACK_LIST:
-                item = find_highest_close_line(df, lb)
-
-                if item:
-                    item.update({
-                        "股票代码": code,
-                        "股票名称": name,
-                        "数据源": source,
-                        "最新日期": df.iloc[-1]["date"].strftime("%Y-%m-%d"),
-                        "最新收盘": round(float(df.iloc[-1]["close"]), 2),
-                        "人工评价": "",
-                        "错误类型": "",
-                        "备注": "",
-                    })
-
-                    candidates.append(item)
-
-            candidates = sorted(
-                candidates,
-                key=lambda x: x["模型可信度"],
-                reverse=True
-            )
-
-            rows.extend(candidates[:MAX_OUTPUT_PER_STOCK])
-            success += 1
-
-        except Exception as e:
-            failed += 1
-            source_count["failed"] += 1
-            FAILED_ROWS.append({
-                "股票代码": code,
-                "股票名称": name,
-                "失败原因": str(e),
-            })
-            log(f"[ERROR] code={code} name={name}: {e}")
-            traceback.print_exc(limit=1)
-
-        done = i + 1
-
-        if done % 50 == 0 or done == total:
-            elapsed = time.time() - start_ts
-            avg = elapsed / max(done, 1)
-            remain = avg * (total - done)
-            pct = done / total * 100
-
-            log(
-                f"[PROGRESS] {done}/{total} "
-                f"({pct:.2f}%) | "
-                f"success={success} failed={failed} "
-                f"candidates={len(rows)} | "
-                f"sources={source_count} | "
-                f"elapsed={fmt_seconds(elapsed)} "
-                f"eta={fmt_seconds(remain)}"
-            )
-
-        time.sleep(0.03)
 
     out = pd.DataFrame(rows)
 
@@ -557,10 +491,11 @@ def main():
             "success": success,
             "failed": failed,
             "source_count": str(source_count),
+            "elapsed": fmt_seconds(elapsed),
         }]).to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    if FAILED_ROWS:
-        pd.DataFrame(FAILED_ROWS).to_csv(
+    if failed_rows:
+        pd.DataFrame(failed_rows).to_csv(
             failed_path,
             index=False,
             encoding="utf-8-sig"
@@ -574,16 +509,120 @@ def main():
             encoding="utf-8-sig"
         )
 
-    elapsed = time.time() - start_ts
-
-    log(
-        f"[DONE] success={success}, failed={failed}, "
-        f"candidates={len(rows)}, sources={source_count}, "
-        f"elapsed={fmt_seconds(elapsed)}"
-    )
-
     log(f"[CSV] {out_path}")
     log(f"[FAILED CSV] {failed_path}")
+
+
+def main():
+    start_ts = time.time()
+
+    rows = []
+    success = 0
+    failed = 0
+
+    source_count = {
+        "baostock": 0,
+        "akshare": 0,
+        "eastmoney": 0,
+        "failed": 0,
+    }
+
+    try:
+        stocks = fetch_stock_list()
+        total = len(stocks)
+
+        log(f"[START] stocks={total}")
+
+        for i, row in stocks.iterrows():
+            code = str(row["code"]).zfill(6)
+            name = str(row["name"])
+
+            try:
+                df, source = fetch_daily(code, name)
+                source_count[source] = source_count.get(source, 0) + 1
+
+                if df is None or len(df) < MIN_BARS:
+                    failed += 1
+                    continue
+
+                candidates = []
+
+                for lb in LOOKBACK_LIST:
+                    item = find_highest_close_line(df, lb)
+
+                    if item:
+                        item.update({
+                            "股票代码": code,
+                            "股票名称": name,
+                            "数据源": source,
+                            "最新日期": df.iloc[-1]["date"].strftime("%Y-%m-%d"),
+                            "最新收盘": round(float(df.iloc[-1]["close"]), 2),
+                            "人工评价": "",
+                            "错误类型": "",
+                            "备注": "",
+                        })
+
+                        candidates.append(item)
+
+                candidates = sorted(
+                    candidates,
+                    key=lambda x: x["模型可信度"],
+                    reverse=True
+                )
+
+                rows.extend(candidates[:MAX_OUTPUT_PER_STOCK])
+                success += 1
+
+            except Exception as e:
+                failed += 1
+                source_count["failed"] += 1
+                FAILED_ROWS.append({
+                    "股票代码": code,
+                    "股票名称": name,
+                    "失败原因": str(e),
+                })
+                log(f"[ERROR] code={code} name={name}: {e}")
+                traceback.print_exc(limit=1)
+
+            done = i + 1
+
+            if done % 50 == 0 or done == total:
+                elapsed = time.time() - start_ts
+                avg = elapsed / max(done, 1)
+                remain = avg * (total - done)
+                pct = done / total * 100
+
+                log(
+                    f"[PROGRESS] {done}/{total} "
+                    f"({pct:.2f}%) | "
+                    f"success={success} failed={failed} "
+                    f"candidates={len(rows)} | "
+                    f"sources={source_count} | "
+                    f"elapsed={fmt_seconds(elapsed)} "
+                    f"eta={fmt_seconds(remain)}"
+                )
+
+            time.sleep(0.01)
+
+    finally:
+        elapsed = time.time() - start_ts
+
+        save_outputs(
+            rows=rows,
+            failed_rows=FAILED_ROWS,
+            source_count=source_count,
+            success=success,
+            failed=failed,
+            elapsed=elapsed,
+        )
+
+        baostock_logout_once()
+
+        log(
+            f"[DONE] success={success}, failed={failed}, "
+            f"candidates={len(rows)}, sources={source_count}, "
+            f"elapsed={fmt_seconds(elapsed)}"
+        )
 
 
 if __name__ == "__main__":
