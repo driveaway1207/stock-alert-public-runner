@@ -1,0 +1,35 @@
+name: Export Neckline Candidates
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  export:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install akshare pandas openpyxl
+
+      - name: Run Export Script
+        run: |
+          python tools/export_neckline_candidates.py
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: neckline-candidates
+          path: outputs/*.csv
