@@ -1,23 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-全A股“最高收盘共振线/平台颈线候选”导出脚本
+A股颈线/最高收盘共振线候选导出：缓存优先加速版
 
-用途：
-- 只验证结构线识别，不做买卖，不推送Telegram
-- 输出CSV给人工审核：模型画的线到底对不对
+优先级：
+1）读取一号员工/V14已有K线缓存
+2）BaoStock 兜底
+3）AkShare 兜底
+4）东方财富直连兜底
 
-数据源顺序：
-1）BaoStock 主源：全程只登录一次，速度快很多
-2）AkShare 兜底
-3）东方财富直连兜底
-
-输出：
-outputs/structure_line_candidates_日期.csv
-outputs/structure_line_failed_日期.csv
+只导出CSV，不推送Telegram，不影响正式一号员工。
 """
 
 import os
 import time
+import glob
 import traceback
 from datetime import datetime
 
@@ -31,7 +27,6 @@ OUT_DIR = "outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 LOOKBACK_LIST = [120, 250]
-
 TOUCH_TOL = 0.02
 MIN_TOUCH = 2
 MIN_BARS = 80
@@ -40,6 +35,17 @@ MAX_OUTPUT_PER_STOCK = 2
 
 FAILED_ROWS = []
 BAOSTOCK_READY = False
+
+# 自动扫描这些目录里的历史K线缓存
+CACHE_DIR_CANDIDATES = [
+    "cache",
+    "data",
+    "kline_cache",
+    "kline",
+    "klines",
+    "stock_cache",
+    "outputs",
+]
 
 
 def log(msg):
@@ -68,6 +74,106 @@ def eastmoney_secid(code):
     return "1." + code if code.startswith("6") else "0." + code
 
 
+def normalize_daily_columns(df):
+    if df is None or df.empty:
+        return None
+
+    rename_map = {
+        "日期": "date",
+        "交易日期": "date",
+        "trade_date": "date",
+        "Date": "date",
+        "datetime": "date",
+        "time": "date",
+
+        "开盘": "open",
+        "开盘价": "open",
+        "Open": "open",
+
+        "收盘": "close",
+        "收盘价": "close",
+        "Close": "close",
+
+        "最高": "high",
+        "最高价": "high",
+        "High": "high",
+
+        "最低": "low",
+        "最低价": "low",
+        "Low": "low",
+
+        "成交量": "volume",
+        "成交量(手)": "volume",
+        "vol": "volume",
+        "Volume": "volume",
+
+        "成交额": "amount",
+        "成交额(元)": "amount",
+        "turnover": "amount",
+        "Amount": "amount",
+    }
+
+    df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
+
+    need = ["date", "open", "close", "high", "low", "volume"]
+    if not all(c in df.columns for c in need):
+        return None
+
+    if "amount" not in df.columns:
+        df["amount"] = 0
+
+    df = df[["date", "open", "close", "high", "low", "volume", "amount"]].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    for col in ["open", "close", "high", "low", "volume", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["date", "open", "close", "high", "low", "volume"])
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    if len(df) < MIN_BARS:
+        return None
+
+    return df
+
+
+def build_cache_index():
+    files = []
+    for d in CACHE_DIR_CANDIDATES:
+        if os.path.exists(d):
+            files.extend(glob.glob(os.path.join(d, "**", "*.csv"), recursive=True))
+            files.extend(glob.glob(os.path.join(d, "**", "*.parquet"), recursive=True))
+            files.extend(glob.glob(os.path.join(d, "**", "*.pkl"), recursive=True))
+
+    index = {}
+    for path in files:
+        base = os.path.basename(path)
+        digits = "".join(ch for ch in base if ch.isdigit())
+        if len(digits) >= 6:
+            code = digits[-6:]
+            if code not in index:
+                index[code] = path
+
+    log(f"[CACHE] indexed_files={len(index)}")
+    return index
+
+
+def read_cache_file(path):
+    try:
+        if path.endswith(".csv"):
+            df = pd.read_csv(path)
+        elif path.endswith(".parquet"):
+            df = pd.read_parquet(path)
+        elif path.endswith(".pkl"):
+            df = pd.read_pickle(path)
+        else:
+            return None
+        return normalize_daily_columns(df)
+    except Exception as e:
+        log(f"[WARN] read_cache failed path={path} err={e}")
+        return None
+
+
 def baostock_login_once():
     global BAOSTOCK_READY
     if BAOSTOCK_READY:
@@ -80,7 +186,6 @@ def baostock_login_once():
         BAOSTOCK_READY = True
         return True
 
-    BAOSTOCK_READY = False
     return False
 
 
@@ -100,7 +205,6 @@ def fetch_stock_list_from_baostock():
         raise RuntimeError("baostock login failed")
 
     rs = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
-
     data = []
     fields = rs.fields
 
@@ -125,7 +229,15 @@ def fetch_stock_list_from_akshare():
     return df[["code", "name"]]
 
 
-def fetch_stock_list():
+def fetch_stock_list(cache_index):
+    codes_from_cache = sorted(cache_index.keys())
+    if len(codes_from_cache) >= 1000:
+        log(f"[STOCK LIST] using cache index codes={len(codes_from_cache)}")
+        return pd.DataFrame({
+            "code": codes_from_cache,
+            "name": codes_from_cache,
+        })
+
     for attempt in range(3):
         try:
             log(f"[FETCH LIST] source=baostock attempt={attempt + 1}")
@@ -145,38 +257,18 @@ def fetch_stock_list():
     raise RuntimeError("all stock list sources failed")
 
 
-def clean_daily_df(df):
-    if df is None or df.empty:
-        return None
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    for col in ["open", "close", "high", "low", "volume", "amount"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["date", "open", "close", "high", "low", "volume"])
-    df = df.sort_values("date").reset_index(drop=True)
-
-    if len(df) < MIN_BARS:
-        return None
-
-    return df
-
-
 def fetch_daily_from_baostock(code):
     if not BAOSTOCK_READY:
         if not baostock_login_once():
             return None
 
-    bs_code = baostock_code(code)
-
     rs = bs.query_history_k_data_plus(
-        bs_code,
+        baostock_code(code),
         "date,open,high,low,close,volume,amount",
         start_date="2023-01-01",
         end_date=datetime.now().strftime("%Y-%m-%d"),
         frequency="d",
-        adjustflag="2"
+        adjustflag="2",
     )
 
     data = []
@@ -188,40 +280,22 @@ def fetch_daily_from_baostock(code):
     if not data:
         return None
 
-    df = pd.DataFrame(data, columns=fields)
-    return clean_daily_df(df)
+    return normalize_daily_columns(pd.DataFrame(data, columns=fields))
 
 
 def fetch_daily_from_akshare(code):
     df = ak.stock_zh_a_hist(
         symbol=str(code).zfill(6),
         period="daily",
-        adjust="qfq"
+        adjust="qfq",
     )
-
-    if df is None or df.empty:
-        return None
-
-    df = df.rename(columns={
-        "日期": "date",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume",
-        "成交额": "amount",
-    })
-
-    return clean_daily_df(df)
+    return normalize_daily_columns(df)
 
 
 def fetch_daily_from_eastmoney(code):
-    secid = eastmoney_secid(code)
-
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-
     params = {
-        "secid": secid,
+        "secid": eastmoney_secid(code),
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57",
         "klt": "101",
@@ -231,43 +305,35 @@ def fetch_daily_from_eastmoney(code):
         "lmt": "1000000",
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
     r.raise_for_status()
-
     js = r.json()
-    data = js.get("data") or {}
-    klines = data.get("klines") or []
 
-    if not klines:
-        return None
-
+    klines = (js.get("data") or {}).get("klines") or []
     rows = []
-
     for item in klines:
-        parts = item.split(",")
-        if len(parts) < 7:
-            continue
+        p = item.split(",")
+        if len(p) >= 7:
+            rows.append({
+                "date": p[0],
+                "open": p[1],
+                "close": p[2],
+                "high": p[3],
+                "low": p[4],
+                "volume": p[5],
+                "amount": p[6],
+            })
 
-        rows.append({
-            "date": parts[0],
-            "open": parts[1],
-            "close": parts[2],
-            "high": parts[3],
-            "low": parts[4],
-            "volume": parts[5],
-            "amount": parts[6],
-        })
-
-    df = pd.DataFrame(rows)
-    return clean_daily_df(df)
+    return normalize_daily_columns(pd.DataFrame(rows))
 
 
-def fetch_daily(code, name):
-    # 1）BaoStock 主源
+def fetch_daily(code, name, cache_index):
+    path = cache_index.get(str(code).zfill(6))
+    if path:
+        df = read_cache_file(path)
+        if df is not None:
+            return df, "cache"
+
     try:
         df = fetch_daily_from_baostock(code)
         if df is not None:
@@ -275,7 +341,6 @@ def fetch_daily(code, name):
     except Exception as e:
         log(f"[WARN] source=baostock code={code} name={name} err={e}")
 
-    # 2）AkShare 兜底
     for attempt in range(2):
         try:
             df = fetch_daily_from_akshare(code)
@@ -285,7 +350,6 @@ def fetch_daily(code, name):
             log(f"[WARN] source=akshare code={code} name={name} attempt={attempt + 1} err={e}")
             time.sleep(1.5 + attempt)
 
-    # 3）东方财富直连兜底
     for attempt in range(2):
         try:
             df = fetch_daily_from_eastmoney(code)
@@ -309,21 +373,17 @@ def find_highest_close_line(df, lookback):
         return None
 
     recent = df.tail(lookback).copy()
-
     if len(recent) < 60:
         return None
 
     recent = recent.iloc[EXCLUDE_RECENT_IPO_BARS:]
-
     if recent.empty:
         return None
 
     idx = recent["close"].idxmax()
-
     line_price = float(df.loc[idx, "close"])
     line_date = df.loc[idx, "date"]
 
-    # 排除最近几天刚冒出来的孤立最高收盘
     if idx > len(df) - 5:
         return None
 
@@ -333,14 +393,12 @@ def find_highest_close_line(df, lookback):
         (window["close"] >= line_price * (1 - TOUCH_TOL)) &
         (window["close"] <= line_price * (1 + TOUCH_TOL))
     ]
-
     touch_count = len(near)
 
     pressure = window[
         (window["high"] >= line_price * (1 - TOUCH_TOL)) &
         (window["close"] <= line_price * (1 + TOUCH_TOL))
     ]
-
     pressure_count = len(pressure)
 
     if touch_count < MIN_TOUCH and pressure_count < MIN_TOUCH:
@@ -356,22 +414,13 @@ def find_highest_close_line(df, lookback):
         body_high = max(r["open"], r["close"])
         body_low = min(r["open"], r["close"])
         body_size = max(body_high - body_low, 0.01)
-
         entity_above_ratio = max(0, body_high - max(body_low, line_price)) / body_size
 
-        body_stand = (
-            r["close"] > line_price and
-            entity_above_ratio >= 0.5
-        )
-
+        body_stand = r["close"] > line_price and entity_above_ratio >= 0.5
         gap_stand = r["low"] > line_price
 
         if body_stand or gap_stand:
-            breakout = (
-                j,
-                r,
-                "跳空站上" if gap_stand else "实体站上"
-            )
+            breakout = (j, r, "跳空站上" if gap_stand else "实体站上")
             break
 
     if breakout is None:
@@ -383,43 +432,22 @@ def find_highest_close_line(df, lookback):
     else:
         bidx, brow, breakout_type = breakout
         breakout_date = brow["date"].strftime("%Y-%m-%d")
-
         next3 = df.iloc[bidx + 1:bidx + 4]
         next5 = df.iloc[bidx + 1:bidx + 6]
 
-        fell_back_3 = (
-            "是"
-            if (
-                not next3.empty and
-                (next3["close"] < line_price).any()
-            )
-            else "否"
-        )
-
-        fell_back_5 = (
-            "是"
-            if (
-                not next5.empty and
-                (next5["close"] < line_price).any()
-            )
-            else "否"
-        )
-
+        fell_back_3 = "是" if (not next3.empty and (next3["close"] < line_price).any()) else "否"
+        fell_back_5 = "是" if (not next5.empty and (next5["close"] < line_price).any()) else "否"
         status = "已突破"
 
     score = 0
     score += min(touch_count, 5) * 10
     score += min(pressure_count, 5) * 8
-
     if is_above:
         score += 15
-
     if breakout_type:
         score += 20
-
     if fell_back_3 == "否":
         score += 10
-
     score = min(score, 100)
 
     return {
@@ -443,46 +471,22 @@ def find_highest_close_line(df, lookback):
 
 def save_outputs(rows, failed_rows, source_count, success, failed, elapsed):
     today = datetime.now().strftime("%Y-%m-%d")
-
-    out_path = os.path.join(
-        OUT_DIR,
-        f"structure_line_candidates_{today}.csv"
-    )
-
-    failed_path = os.path.join(
-        OUT_DIR,
-        f"structure_line_failed_{today}.csv"
-    )
+    out_path = os.path.join(OUT_DIR, f"structure_line_candidates_{today}.csv")
+    failed_path = os.path.join(OUT_DIR, f"structure_line_failed_{today}.csv")
 
     out = pd.DataFrame(rows)
 
     if not out.empty:
         cols = [
-            "股票代码",
-            "股票名称",
-            "数据源",
-            "最新日期",
-            "最新收盘",
-            "候选线价格",
-            "候选线类型",
-            "线来源日期",
-            "线来源K线最高价",
-            "线来源K线收盘价",
-            "线附近触碰次数",
-            "线附近受压次数",
-            "当前收盘是否站上",
-            "突破日期",
-            "突破方式",
-            "突破后3日是否跌回",
-            "突破后5日是否跌回",
-            "结构状态",
-            "模型可信度",
-            "模型理由",
-            "人工评价",
-            "错误类型",
-            "备注",
+            "股票代码", "股票名称", "数据源", "最新日期", "最新收盘",
+            "候选线价格", "候选线类型", "线来源日期",
+            "线来源K线最高价", "线来源K线收盘价",
+            "线附近触碰次数", "线附近受压次数",
+            "当前收盘是否站上", "突破日期", "突破方式",
+            "突破后3日是否跌回", "突破后5日是否跌回",
+            "结构状态", "模型可信度", "模型理由",
+            "人工评价", "错误类型", "备注",
         ]
-
         out = out[cols]
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
@@ -495,19 +499,9 @@ def save_outputs(rows, failed_rows, source_count, success, failed, elapsed):
         }]).to_csv(out_path, index=False, encoding="utf-8-sig")
 
     if failed_rows:
-        pd.DataFrame(failed_rows).to_csv(
-            failed_path,
-            index=False,
-            encoding="utf-8-sig"
-        )
+        pd.DataFrame(failed_rows).to_csv(failed_path, index=False, encoding="utf-8-sig")
     else:
-        pd.DataFrame([{
-            "诊断": "无失败股票"
-        }]).to_csv(
-            failed_path,
-            index=False,
-            encoding="utf-8-sig"
-        )
+        pd.DataFrame([{"诊断": "无失败股票"}]).to_csv(failed_path, index=False, encoding="utf-8-sig")
 
     log(f"[CSV] {out_path}")
     log(f"[FAILED CSV] {failed_path}")
@@ -521,6 +515,7 @@ def main():
     failed = 0
 
     source_count = {
+        "cache": 0,
         "baostock": 0,
         "akshare": 0,
         "eastmoney": 0,
@@ -528,7 +523,8 @@ def main():
     }
 
     try:
-        stocks = fetch_stock_list()
+        cache_index = build_cache_index()
+        stocks = fetch_stock_list(cache_index)
         total = len(stocks)
 
         log(f"[START] stocks={total}")
@@ -538,7 +534,7 @@ def main():
             name = str(row["name"])
 
             try:
-                df, source = fetch_daily(code, name)
+                df, source = fetch_daily(code, name, cache_index)
                 source_count[source] = source_count.get(source, 0) + 1
 
                 if df is None or len(df) < MIN_BARS:
@@ -549,7 +545,6 @@ def main():
 
                 for lb in LOOKBACK_LIST:
                     item = find_highest_close_line(df, lb)
-
                     if item:
                         item.update({
                             "股票代码": code,
@@ -561,15 +556,9 @@ def main():
                             "错误类型": "",
                             "备注": "",
                         })
-
                         candidates.append(item)
 
-                candidates = sorted(
-                    candidates,
-                    key=lambda x: x["模型可信度"],
-                    reverse=True
-                )
-
+                candidates = sorted(candidates, key=lambda x: x["模型可信度"], reverse=True)
                 rows.extend(candidates[:MAX_OUTPUT_PER_STOCK])
                 success += 1
 
@@ -585,39 +574,24 @@ def main():
                 traceback.print_exc(limit=1)
 
             done = i + 1
-
             if done % 50 == 0 or done == total:
                 elapsed = time.time() - start_ts
                 avg = elapsed / max(done, 1)
                 remain = avg * (total - done)
                 pct = done / total * 100
-
                 log(
-                    f"[PROGRESS] {done}/{total} "
-                    f"({pct:.2f}%) | "
-                    f"success={success} failed={failed} "
-                    f"candidates={len(rows)} | "
+                    f"[PROGRESS] {done}/{total} ({pct:.2f}%) | "
+                    f"success={success} failed={failed} candidates={len(rows)} | "
                     f"sources={source_count} | "
-                    f"elapsed={fmt_seconds(elapsed)} "
-                    f"eta={fmt_seconds(remain)}"
+                    f"elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(remain)}"
                 )
 
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     finally:
         elapsed = time.time() - start_ts
-
-        save_outputs(
-            rows=rows,
-            failed_rows=FAILED_ROWS,
-            source_count=source_count,
-            success=success,
-            failed=failed,
-            elapsed=elapsed,
-        )
-
+        save_outputs(rows, FAILED_ROWS, source_count, success, failed, elapsed)
         baostock_logout_once()
-
         log(
             f"[DONE] success={success}, failed={failed}, "
             f"candidates={len(rows)}, sources={source_count}, "
