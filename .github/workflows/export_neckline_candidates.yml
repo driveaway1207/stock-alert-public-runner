@@ -20,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install baostock akshare pandas openpyxl requests tqdm
+          pip install baostock akshare pandas openpyxl requests
 
       - name: Run Export Script
         run: |
