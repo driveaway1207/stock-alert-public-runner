@@ -6,6 +6,7 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -19,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install akshare baostock pandas openpyxl
+          pip install baostock akshare pandas openpyxl requests tqdm
 
       - name: Run Export Script
         run: |
