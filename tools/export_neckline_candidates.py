@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 全A股“最高收盘共振线/平台颈线候选”导出脚本
-只做结构线识别验证，不做买卖，不推送Telegram。
 
 数据源顺序：
-1）AkShare
-2）BaoStock
-单只股票失败不终止，全局失败也尽量输出诊断CSV。
+1）BaoStock 主源
+2）AkShare 兜底
+3）东方财富直连兜底
+
+只做结构线识别验证，不做买卖，不推送Telegram。
 """
 
 import os
 import time
+import math
+import json
 import traceback
 from datetime import datetime
 
+import requests
 import pandas as pd
-import akshare as ak
 import baostock as bs
+import akshare as ak
 
 
 OUT_DIR = "outputs"
@@ -37,16 +41,35 @@ def log(msg):
     print(msg, flush=True)
 
 
-def fetch_stock_list_from_akshare():
-    df = ak.stock_info_a_code_name()
-    df["code"] = df["code"].astype(str).str.zfill(6)
-    df["name"] = df["name"].astype(str)
-    return df[["code", "name"]]
+def fmt_seconds(sec):
+    sec = int(max(sec, 0))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h:
+        return f"{h}h{m}m{s}s"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
+def baostock_code(code):
+    code = str(code).zfill(6)
+    if code.startswith("6"):
+        return "sh." + code
+    return "sz." + code
+
+
+def eastmoney_secid(code):
+    code = str(code).zfill(6)
+    if code.startswith("6"):
+        return "1." + code
+    return "0." + code
 
 
 def fetch_stock_list_from_baostock():
     lg = bs.login()
-    log(f"[BAOSTOCK LOGIN] {lg.error_code} {lg.error_msg}")
+    log(f"[BAOSTOCK LOGIN LIST] {lg.error_code} {lg.error_msg}")
 
     rs = bs.query_all_stock(day=datetime.now().strftime("%Y-%m-%d"))
 
@@ -62,7 +85,6 @@ def fetch_stock_list_from_baostock():
         raise RuntimeError("baostock query_all_stock returned empty")
 
     df = pd.DataFrame(data, columns=fields)
-
     df = df[df["code"].str.startswith(("sh.6", "sz.0", "sz.3"))].copy()
     df["code"] = df["code"].str[-6:]
     df["name"] = df["code"]
@@ -70,21 +92,28 @@ def fetch_stock_list_from_baostock():
     return df[["code", "name"]]
 
 
-def fetch_stock_list():
-    for attempt in range(3):
-        try:
-            log(f"[FETCH LIST] source=akshare attempt={attempt+1}")
-            return fetch_stock_list_from_akshare()
-        except Exception as e:
-            log(f"[WARN] akshare stock list failed attempt={attempt+1}: {e}")
-            time.sleep(5)
+def fetch_stock_list_from_akshare():
+    df = ak.stock_info_a_code_name()
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["name"] = df["name"].astype(str)
+    return df[["code", "name"]]
 
+
+def fetch_stock_list():
     for attempt in range(3):
         try:
             log(f"[FETCH LIST] source=baostock attempt={attempt+1}")
             return fetch_stock_list_from_baostock()
         except Exception as e:
             log(f"[WARN] baostock stock list failed attempt={attempt+1}: {e}")
+            time.sleep(5)
+
+    for attempt in range(3):
+        try:
+            log(f"[FETCH LIST] source=akshare attempt={attempt+1}")
+            return fetch_stock_list_from_akshare()
+        except Exception as e:
+            log(f"[WARN] akshare stock list failed attempt={attempt+1}: {e}")
             time.sleep(5)
 
     raise RuntimeError("all stock list sources failed")
@@ -94,12 +123,12 @@ def clean_daily_df(df):
     if df is None or df.empty:
         return None
 
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
     for col in ["open", "close", "high", "low", "volume", "amount"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["open", "close", "high", "low", "volume"])
+    df = df.dropna(subset=["date", "open", "close", "high", "low", "volume"])
     df = df.sort_values("date").reset_index(drop=True)
 
     if len(df) < MIN_BARS:
@@ -108,35 +137,10 @@ def clean_daily_df(df):
     return df
 
 
-def fetch_daily_from_akshare(code):
-    df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
-        adjust="qfq"
-    )
-
-    if df is None or df.empty:
-        return None
-
-    df = df.rename(columns={
-        "日期": "date",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume",
-        "成交额": "amount",
-        "涨跌幅": "pct_chg",
-    })
-
-    return clean_daily_df(df)
-
-
 def fetch_daily_from_baostock(code):
-    bs_code = "sh." + code if code.startswith("6") else "sz." + code
+    bs_code = baostock_code(code)
 
     lg = bs.login()
-    log(f"[BAOSTOCK LOGIN DAILY] code={code} {lg.error_code} {lg.error_msg}")
 
     rs = bs.query_history_k_data_plus(
         bs_code,
@@ -159,11 +163,96 @@ def fetch_daily_from_baostock(code):
         return None
 
     df = pd.DataFrame(data, columns=fields)
+    return clean_daily_df(df)
+
+
+def fetch_daily_from_akshare(code):
+    df = ak.stock_zh_a_hist(
+        symbol=str(code).zfill(6),
+        period="daily",
+        adjust="qfq"
+    )
+
+    if df is None or df.empty:
+        return None
+
+    df = df.rename(columns={
+        "日期": "date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "成交额": "amount",
+    })
 
     return clean_daily_df(df)
 
 
+def fetch_daily_from_eastmoney(code):
+    secid = eastmoney_secid(code)
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "klt": "101",
+        "fqt": "1",
+        "beg": "20230101",
+        "end": datetime.now().strftime("%Y%m%d"),
+        "lmt": "1000000",
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r.raise_for_status()
+
+    js = r.json()
+
+    data = js.get("data") or {}
+    klines = data.get("klines") or []
+
+    if not klines:
+        return None
+
+    rows = []
+
+    for item in klines:
+        parts = item.split(",")
+        if len(parts) < 7:
+            continue
+
+        rows.append({
+            "date": parts[0],
+            "open": parts[1],
+            "close": parts[2],
+            "high": parts[3],
+            "low": parts[4],
+            "volume": parts[5],
+            "amount": parts[6],
+        })
+
+    df = pd.DataFrame(rows)
+    return clean_daily_df(df)
+
+
 def fetch_daily(code, name):
+    # 1）BaoStock 主源
+    for attempt in range(2):
+        try:
+            df = fetch_daily_from_baostock(code)
+            if df is not None:
+                return df, "baostock"
+        except Exception as e:
+            log(f"[WARN] source=baostock code={code} name={name} attempt={attempt+1} err={e}")
+            time.sleep(1.5 + attempt)
+
+    # 2）AkShare 兜底
     for attempt in range(2):
         try:
             df = fetch_daily_from_akshare(code)
@@ -173,13 +262,14 @@ def fetch_daily(code, name):
             log(f"[WARN] source=akshare code={code} name={name} attempt={attempt+1} err={e}")
             time.sleep(2 + attempt * 2)
 
+    # 3）东方财富直连兜底
     for attempt in range(2):
         try:
-            df = fetch_daily_from_baostock(code)
+            df = fetch_daily_from_eastmoney(code)
             if df is not None:
-                return df, "baostock"
+                return df, "eastmoney"
         except Exception as e:
-            log(f"[WARN] source=baostock code={code} name={name} attempt={attempt+1} err={e}")
+            log(f"[WARN] source=eastmoney code={code} name={name} attempt={attempt+1} err={e}")
             time.sleep(2 + attempt * 2)
 
     FAILED_ROWS.append({
@@ -206,9 +296,11 @@ def find_highest_close_line(df, lookback):
         return None
 
     idx = recent["close"].idxmax()
+
     line_price = float(df.loc[idx, "close"])
     line_date = df.loc[idx, "date"]
 
+    # 不能是最近几天刚冒出来的孤立点
     if idx > len(df) - 5:
         return None
 
@@ -327,6 +419,7 @@ def find_highest_close_line(df, lookback):
 
 
 def main():
+    start_ts = time.time()
     today = datetime.now().strftime("%Y-%m-%d")
 
     out_path = os.path.join(
@@ -344,9 +437,11 @@ def main():
     rows = []
     success = 0
     failed = 0
+
     source_count = {
-        "akshare": 0,
         "baostock": 0,
+        "akshare": 0,
+        "eastmoney": 0,
         "failed": 0,
     }
 
@@ -396,6 +491,7 @@ def main():
 
         except Exception as e:
             failed += 1
+            source_count["failed"] += 1
             FAILED_ROWS.append({
                 "股票代码": code,
                 "股票名称": name,
@@ -404,14 +500,25 @@ def main():
             log(f"[ERROR] code={code} name={name}: {e}")
             traceback.print_exc(limit=1)
 
-        if (i + 1) % 100 == 0:
+        done = i + 1
+
+        if done % 50 == 0 or done == total:
+            elapsed = time.time() - start_ts
+            avg = elapsed / max(done, 1)
+            remain = avg * (total - done)
+            pct = done / total * 100
+
             log(
-                f"[PROGRESS] {i+1}/{total}, "
-                f"success={success}, failed={failed}, "
-                f"candidates={len(rows)}, sources={source_count}"
+                f"[PROGRESS] {done}/{total} "
+                f"({pct:.2f}%) | "
+                f"success={success} failed={failed} "
+                f"candidates={len(rows)} | "
+                f"sources={source_count} | "
+                f"elapsed={fmt_seconds(elapsed)} "
+                f"eta={fmt_seconds(remain)}"
             )
 
-        time.sleep(0.08)
+        time.sleep(0.03)
 
     out = pd.DataFrame(rows)
 
@@ -467,9 +574,12 @@ def main():
             encoding="utf-8-sig"
         )
 
+    elapsed = time.time() - start_ts
+
     log(
         f"[DONE] success={success}, failed={failed}, "
-        f"candidates={len(rows)}, sources={source_count}"
+        f"candidates={len(rows)}, sources={source_count}, "
+        f"elapsed={fmt_seconds(elapsed)}"
     )
 
     log(f"[CSV] {out_path}")
