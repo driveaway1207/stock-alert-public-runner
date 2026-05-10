@@ -4,15 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       full_rebuild:
-        description: "是否强制回补/重建全历史缓存：0=不强制，1=强制"
+        description: "是否允许全历史回补/首次建档：0=不允许，1=允许"
         required: true
         default: "1"
       min_cache_files_required:
         description: "非重建模式下，至少需要恢复多少个缓存CSV"
         required: true
         default: "3000"
+      max_full_backfill_per_run:
+        description: "本轮最多回补多少只非全量/无缓存股票；小批次先用30"
+        required: true
+        default: "30"
+      max_runtime_minutes:
+        description: "本轮目标最大运行分钟数；小批次先用60"
+        required: true
+        default: "60"
 
   schedule:
+    # 北京时间约 21:30，对应 UTC 13:30
     - cron: "30 13 * * 1-5"
 
 permissions:
@@ -50,7 +59,7 @@ jobs:
           mkdir -p outputs
           mkdir -p kline_cache
           echo "Initial kline_cache count before restore:"
-          find kline_cache -type f -name "*.csv" | wc -l || true
+          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
 
       - name: Restore A-share kline cache
         id: restore-kline-cache
@@ -66,29 +75,49 @@ jobs:
           echo "Cache hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
           echo "Cache primary key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
           echo "Cache matched key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
-          echo "Restored kline_cache count:"
-          find kline_cache -type f -name "*.csv" | wc -l || true
+          echo "Restored kline_cache stock csv count:"
+          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
+          echo "Meta file:"
+          ls -lah kline_cache/_full_history_meta.csv || true
           echo "Sample cache files:"
-          find kline_cache -type f -name "*.csv" | head -30 || true
+          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | head -30 || true
           echo "Cache dir size:"
           du -sh kline_cache || true
 
       - name: Run full kline cache health script
         env:
           PYTHONUNBUFFERED: "1"
+
           FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '1' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
+          MAX_FULL_BACKFILL_PER_RUN: ${{ github.event.inputs.max_full_backfill_per_run || '30' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '60' }}
+          SAFE_STOP_MINUTES: "10"
+
+          # 小批次验证阶段：允许今天/最近交易日差异，避免节假日反复增量；确认后可调成0
+          FRESH_MAX_NATURAL_DAYS: "5"
+
+          BAOSTOCK_SLEEP_SECONDS: "1.5"
+
           FULL_MIN_ROWS_STRONG: "1800"
           FULL_MIN_ROWS_MEDIUM: "1200"
           FULL_EARLY_DATE: "2016-01-01"
+
           SOURCE_FAIL_THRESHOLD: "5"
           SOURCE_COOLDOWN_SECONDS: "900"
+
           EASTMONEY_TIMEOUT: "20"
           AKSHARE_TIMEOUT: "35"
-          BAOSTOCK_TIMEOUT: "60"
+          BAOSTOCK_TIMEOUT: "70"
+
+          INCREMENTAL_DAYS: "90"
         run: |
           echo "[RUN] FULL_REBUILD=$FULL_REBUILD"
           echo "[RUN] MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
+          echo "[RUN] MAX_FULL_BACKFILL_PER_RUN=$MAX_FULL_BACKFILL_PER_RUN"
+          echo "[RUN] MAX_RUNTIME_MINUTES=$MAX_RUNTIME_MINUTES"
+          echo "[RUN] SAFE_STOP_MINUTES=$SAFE_STOP_MINUTES"
+          echo "[RUN] FRESH_MAX_NATURAL_DAYS=$FRESH_MAX_NATURAL_DAYS"
           echo "[RUN] python -u tools/export_neckline_candidates.py"
           python -u tools/export_neckline_candidates.py
 
@@ -97,12 +126,16 @@ jobs:
         run: |
           echo "Outputs directory:"
           ls -lah outputs || true
-          echo "Kline cache count after run:"
-          find kline_cache -type f -name "*.csv" | wc -l || true
+          echo "Kline cache stock csv count after run:"
+          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
           echo "Kline cache size after run:"
           du -sh kline_cache || true
+          echo "Meta file after run:"
+          ls -lah kline_cache/_full_history_meta.csv || true
           echo "Largest output files:"
           find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
+          echo "Progress output preview:"
+          ls outputs/full_history_progress_*.csv 2>/dev/null || true
 
       - name: Upload output CSV files
         if: always()
@@ -126,14 +159,12 @@ jobs:
         if: always()
         id: cache-save-gate
         env:
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '1' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
-          COUNT=$(find kline_cache -type f -name "*.csv" | wc -l || echo 0)
+          COUNT=$(find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || echo 0)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Current cache_count=$COUNT"
+          echo "Current stock cache_count=$COUNT"
           echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
-          echo "FULL_REBUILD=$FULL_REBUILD"
 
           if [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
