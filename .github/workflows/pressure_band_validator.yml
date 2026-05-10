@@ -1,0 +1,44 @@
+name: Pressure Band Validator
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Limit symbols for test run"
+        required: false
+        default: "50"
+
+jobs:
+  run-pressure-band-validator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pressure band validator
+        run: |
+          mkdir -p output
+          python modules/pressure_band_validator.py \
+            --all \
+            --limit ${{ github.event.inputs.limit }} \
+            --out output/pressure_band_candidates.csv \
+            --failed-out output/pressure_band_failed.csv
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: pressure-band-output
+          path: |
+            output/pressure_band_candidates.csv
+            output/pressure_band_failed.csv
