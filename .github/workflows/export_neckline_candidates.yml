@@ -1,42 +1,105 @@
-name: Export Neckline Candidates
+name: A Stock Full Kline Cache Health Check
 
 on:
   workflow_dispatch:
+  schedule:
+    # 北京时间大约晚上 21:30，对应 UTC 13:30
+    - cron: "30 13 * * 1-5"
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  export:
+  cache-health-check:
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore Full Kline Cache
-        uses: actions/cache@v4
-        with:
-          path: kline_cache
-          key: a-kline-full-history-cache-${{ github.run_id }}
-          restore-keys: |
-            a-kline-full-history-cache-
+      - name: Show workspace
+        run: |
+          pwd
+          ls -la
+          echo "Python files:"
+          find . -maxdepth 3 -type f -name "*.py" | sort
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install baostock akshare pandas openpyxl requests
+          python -m pip install --upgrade pip
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib
 
-      - name: Run Export Script
+      - name: Prepare directories
         run: |
-          python tools/export_neckline_candidates.py
+          mkdir -p outputs
+          mkdir -p kline_cache
+          echo "Initial kline_cache count:"
+          find kline_cache -type f -name "*.csv" | wc -l
 
-      - name: Upload CSV
+      - name: Restore full kline cache
+        id: restore-kline-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: full-kline-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            full-kline-cache-${{ runner.os }}-
+
+      - name: Show restored cache status
+        run: |
+          echo "Cache hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
+          echo "Restored kline_cache count:"
+          find kline_cache -type f -name "*.csv" | wc -l
+          echo "Sample cache files:"
+          find kline_cache -type f -name "*.csv" | head -20 || true
+
+      - name: Run full kline cache health script
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "[RUN] python -u tools/export_neckline_candidates.py"
+          python -u tools/export_neckline_candidates.py
+
+      - name: Show outputs
+        if: always()
+        run: |
+          echo "Outputs directory:"
+          ls -lah outputs || true
+          echo "Kline cache count after run:"
+          find kline_cache -type f -name "*.csv" | wc -l
+          echo "Largest output files:"
+          find outputs -type f -maxdepth 1 -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
+
+      - name: Upload output CSV files
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-cache-health
-          path: outputs/*.csv
+          name: data-cache-health-outputs
+          path: outputs
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload failed symbols if any
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-cache-failed-symbols
+          path: outputs/data_cache_failed_*.csv
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Save updated full kline cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: kline_cache
+          key: full-kline-cache-${{ runner.os }}-${{ github.run_id }}
