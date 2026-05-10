@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-A股上市以来全历史K线缓存建设 + 数据缓存体检表
+A股全历史K线缓存自动补齐 + 可续跑 + 进度条版
 
-核心逻辑：
-1. 缓存层尽量保存所有A股：ST、新股、低质量股都缓存。
-2. 缓存层不做选股过滤，只做数据获取、增量更新、全历史回补、健康标记。
-3. 全历史起点：1990-01-01，让数据源返回股票上市以来全部可得日K。
-4. 不能只判断“缓存新鲜”，必须同时判断“历史是否足够长 / 是否已确认全历史”。
-5. rows=807 这种旧股近几年缓存，即使最新日期新鲜，也进入全历史回补队列。
-6. 新股/短历史股票：一旦执行过从1990开始的全历史拉取，会写入 meta，后续不反复误判为非全量。
-7. 已确认全历史的股票，后续每天只做增量更新，不会从1990重复拉。
-8. GitHub Actions 单次不贴近6小时上限，本脚本默认小批次试运行。
-9. 单线程低速请求，保护 BaoStock。
+目标：
+1. 把所有A股K线缓存尽量整理成“全历史缓存”。
+2. 已经全历史的股票自动跳过。
+3. 只有2023年以来/明显短缓存的股票，自动拉全历史回补。
+4. 没有缓存的股票，自动建立全历史缓存。
+5. 每轮只跑4-5小时，快到时间自动收尾，避免GitHub Actions强杀。
+6. 下次运行自动跳过已完成股票，继续补剩下的。
+7. 输出小白可读的进度条和summary。
 """
 
 import os
-import re
+import json
 import time
 import signal
 import traceback
@@ -28,80 +26,63 @@ import baostock as bs
 import akshare as ak
 
 
+# =========================
+# 基础配置
+# =========================
+
 OUT_DIR = "outputs"
 KLINE_CACHE_DIR = "kline_cache"
-META_PATH = os.path.join(KLINE_CACHE_DIR, "_full_history_meta.csv")
+STATUS_META_PATH = os.path.join(KLINE_CACHE_DIR, "_full_history_status.csv")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(KLINE_CACHE_DIR, exist_ok=True)
 
 FULL_HISTORY_START = "1990-01-01"
 FULL_HISTORY_START_EM = "19900101"
-INCREMENTAL_DAYS = int(os.getenv("INCREMENTAL_DAYS", "90"))
+INCREMENTAL_DAYS = 90
 
-FULL_REBUILD = os.getenv("FULL_REBUILD", "1").strip() in ("1", "true", "True", "yes", "YES")
+FULL_REBUILD = os.getenv("FULL_REBUILD", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+# 如果恢复出的缓存文件太少，默认不允许盲目从0重建；但 full_rebuild=1 时允许。
 MIN_CACHE_FILES_REQUIRED = int(os.getenv("MIN_CACHE_FILES_REQUIRED", "3000"))
 
-# 小批次测试默认值：30只 / 60分钟
-MAX_FULL_BACKFILL_PER_RUN = int(os.getenv("MAX_FULL_BACKFILL_PER_RUN", "30"))
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "60"))
-SAFE_STOP_MINUTES = int(os.getenv("SAFE_STOP_MINUTES", "10"))
+# 每轮最多运行分钟数。建议 270，也就是4.5小时。
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "270"))
 
-BAOSTOCK_SLEEP_SECONDS = float(os.getenv("BAOSTOCK_SLEEP_SECONDS", "1.5"))
+# 快到时间前多少分钟收尾，避免GitHub强杀导致缓存没保存。
+SOFT_STOP_BUFFER_MINUTES = int(os.getenv("SOFT_STOP_BUFFER_MINUTES", "15"))
 
+# 数据源超时
 EASTMONEY_TIMEOUT = int(os.getenv("EASTMONEY_TIMEOUT", "20"))
 AKSHARE_TIMEOUT = int(os.getenv("AKSHARE_TIMEOUT", "35"))
-BAOSTOCK_TIMEOUT = int(os.getenv("BAOSTOCK_TIMEOUT", "70"))
+BAOSTOCK_TIMEOUT = int(os.getenv("BAOSTOCK_TIMEOUT", "45"))
 
+# 数据源连续失败熔断
 SOURCE_FAIL_THRESHOLD = int(os.getenv("SOURCE_FAIL_THRESHOLD", "5"))
 SOURCE_COOLDOWN_SECONDS = int(os.getenv("SOURCE_COOLDOWN_SECONDS", "900"))
 
-PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "50"))
+# 打印频率
 DETAIL_FIRST_N = int(os.getenv("DETAIL_FIRST_N", "20"))
 DETAIL_EVERY = int(os.getenv("DETAIL_EVERY", "20"))
+PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "50"))
 
-FULL_MIN_ROWS_STRONG = int(os.getenv("FULL_MIN_ROWS_STRONG", "1800"))
-FULL_MIN_ROWS_MEDIUM = int(os.getenv("FULL_MIN_ROWS_MEDIUM", "1200"))
-FULL_EARLY_DATE = os.getenv("FULL_EARLY_DATE", "2016-01-01")
-
-# 0 = 要求最新日期至少是今天；适合A股收盘后晚间跑，确保每日新K能补齐。
-# 如果节假日/周末运行，可临时调成 3~5。
-FRESH_MAX_NATURAL_DAYS = int(os.getenv("FRESH_MAX_NATURAL_DAYS", "0"))
+# 自动续跑控制
+RUN_ROUND = int(os.getenv("RUN_ROUND", "1"))
+MAX_AUTO_ROUNDS = int(os.getenv("MAX_AUTO_ROUNDS", "6"))
 
 BAOSTOCK_READY = False
-FAILED_ROWS = []
 
-RUN_STATE = {
-    "processed": 0,
-    "success": 0,
-    "failed": 0,
-
-    "cache_full_ready": 0,
-    "cache_full_but_stale": 0,
-    "cache_partial": 0,
-    "no_cache": 0,
-
-    "incremental_attempted": 0,
-    "incremental_success": 0,
-    "incremental_failed": 0,
-
-    "backfill_attempted": 0,
-    "backfill_success": 0,
-    "backfill_failed": 0,
-    "backfill_skipped_limit": 0,
-    "backfill_skipped_time": 0,
-    "backfill_skipped_full_rebuild_off": 0,
-
-    "safe_stop": False,
-    "safe_stop_reason": "",
-}
 
 SOURCE_STATE = {
-    "EastMoney": {"success": 0, "failed": 0, "consecutive_fail": 0, "open_until": 0.0, "skipped": 0},
-    "AkShare": {"success": 0, "failed": 0, "consecutive_fail": 0, "open_until": 0.0, "skipped": 0},
-    "BaoStock": {"success": 0, "failed": 0, "consecutive_fail": 0, "open_until": 0.0, "skipped": 0},
+    "EastMoney": {"ok": 0, "fail": 0, "consecutive_fail": 0, "open_until": 0.0, "skip": 0},
+    "AkShare": {"ok": 0, "fail": 0, "consecutive_fail": 0, "open_until": 0.0, "skip": 0},
+    "BaoStock": {"ok": 0, "fail": 0, "consecutive_fail": 0, "open_until": 0.0, "skip": 0},
 }
 
+
+# =========================
+# 工具函数
+# =========================
 
 class FetchTimeoutError(Exception):
     pass
@@ -113,16 +94,16 @@ def time_limit(seconds, label="operation"):
         yield
         return
 
-    def handler(signum, frame):
+    def signal_handler(signum, frame):
         raise FetchTimeoutError(f"{label} timeout after {seconds}s")
 
-    old = signal.signal(signal.SIGALRM, handler)
+    old_handler = signal.signal(signal.SIGALRM, signal_handler)
     signal.alarm(seconds)
     try:
         yield
     finally:
         signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def log(msg):
@@ -143,6 +124,17 @@ def fmt_seconds(sec):
     if m:
         return f"{m}m{s}s"
     return f"{s}s"
+
+
+def progress_bar(done, total, width=24):
+    if total <= 0:
+        ratio = 0
+    else:
+        ratio = min(max(done / total, 0), 1)
+
+    filled = int(round(ratio * width))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar} {ratio * 100:6.2f}%"
 
 
 def stock_code(code):
@@ -168,54 +160,101 @@ def count_cache_files():
     try:
         return len([
             f for f in os.listdir(KLINE_CACHE_DIR)
-            if re.match(r"^\d{6}\.csv$", f.lower())
+            if f.lower().endswith(".csv") and not f.startswith("_")
         ])
     except Exception:
         return 0
 
 
-def should_safe_stop(start_ts):
-    elapsed_minutes = (time.time() - start_ts) / 60
-    if elapsed_minutes >= max(1, MAX_RUNTIME_MINUTES - SAFE_STOP_MINUTES):
-        RUN_STATE["safe_stop"] = True
-        RUN_STATE["safe_stop_reason"] = (
-            f"elapsed={elapsed_minutes:.1f}m reached safe stop window "
-            f"(MAX_RUNTIME_MINUTES={MAX_RUNTIME_MINUTES}, SAFE_STOP_MINUTES={SAFE_STOP_MINUTES})"
-        )
-        return True
-    return False
+def elapsed_seconds(start_ts):
+    return time.time() - start_ts
+
+
+def should_soft_stop(start_ts):
+    budget = MAX_RUNTIME_MINUTES * 60
+    buffer_sec = SOFT_STOP_BUFFER_MINUTES * 60
+    return elapsed_seconds(start_ts) >= max(60, budget - buffer_sec)
 
 
 def source_available(source):
     state = SOURCE_STATE[source]
     now = time.time()
     if now < state["open_until"]:
-        state["skipped"] += 1
+        state["skip"] += 1
         return False
     return True
 
 
 def record_source_success(source):
-    state = SOURCE_STATE[source]
-    state["success"] += 1
-    state["consecutive_fail"] = 0
-    state["open_until"] = 0.0
+    s = SOURCE_STATE[source]
+    s["ok"] += 1
+    s["consecutive_fail"] = 0
+    s["open_until"] = 0.0
 
 
 def record_source_failure(source, err):
-    state = SOURCE_STATE[source]
-    state["failed"] += 1
-    state["consecutive_fail"] += 1
+    s = SOURCE_STATE[source]
+    s["fail"] += 1
+    s["consecutive_fail"] += 1
 
-    if state["consecutive_fail"] >= SOURCE_FAIL_THRESHOLD:
-        state["open_until"] = time.time() + SOURCE_COOLDOWN_SECONDS
+    if s["consecutive_fail"] >= SOURCE_FAIL_THRESHOLD:
+        s["open_until"] = time.time() + SOURCE_COOLDOWN_SECONDS
         log(
-            f"[CIRCUIT OPEN] source={source} "
-            f"consecutive_fail={state['consecutive_fail']} "
-            f"cooldown={fmt_seconds(SOURCE_COOLDOWN_SECONDS)} "
-            f"last_err={repr(err)}"
+            f"[数据源熔断] {source} 连续失败{s['consecutive_fail']}次，"
+            f"暂停 {fmt_seconds(SOURCE_COOLDOWN_SECONDS)}，最后错误={repr(err)}"
         )
 
+
+# =========================
+# 缓存状态meta
+# =========================
+
+def load_status_meta():
+    if not os.path.exists(STATUS_META_PATH):
+        return {}
+
+    try:
+        df = pd.read_csv(STATUS_META_PATH, dtype={"code": str})
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        return {r["code"]: dict(r) for _, r in df.iterrows()}
+    except Exception as e:
+        log(f"[WARN] read status meta failed: {repr(e)}")
+        return {}
+
+
+def save_status_meta(meta):
+    try:
+        rows = list(meta.values())
+        if not rows:
+            return
+        df = pd.DataFrame(rows)
+        if "code" in df.columns:
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            df = df.sort_values("code")
+        df.to_csv(STATUS_META_PATH, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        log(f"[WARN] save status meta failed: {repr(e)}")
+
+
+def update_meta(meta, code, name, status, reason, rows=0, first_date="", last_date="", source="", note=""):
+    code = str(code).zfill(6)
+    meta[code] = {
+        "code": code,
+        "name": name,
+        "status": status,
+        "reason": reason,
+        "rows": int(rows or 0),
+        "first_date": first_date,
+        "last_date": last_date,
+        "source": source,
+        "note": note,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+# =========================
+# K线读写与标准化
+# =========================
 
 def normalize_daily_columns(df):
     if df is None or df.empty:
@@ -228,22 +267,28 @@ def normalize_daily_columns(df):
         "Date": "date",
         "datetime": "date",
         "time": "date",
+
         "开盘": "open",
         "开盘价": "open",
         "Open": "open",
+
         "收盘": "close",
         "收盘价": "close",
         "Close": "close",
+
         "最高": "high",
         "最高价": "high",
         "High": "high",
+
         "最低": "low",
         "最低价": "low",
         "Low": "low",
+
         "成交量": "volume",
         "成交量(手)": "volume",
         "vol": "volume",
         "Volume": "volume",
+
         "成交额": "amount",
         "成交额(元)": "amount",
         "turnover": "amount",
@@ -308,136 +353,63 @@ def merge_kline(old_df, new_df):
     if new_df is None or new_df.empty:
         return old_df
 
-    df = pd.concat([old_df, new_df], ignore_index=True)
-    return normalize_daily_columns(df)
+    return normalize_daily_columns(pd.concat([old_df, new_df], ignore_index=True))
 
 
-def load_meta():
-    if not os.path.exists(META_PATH):
-        return {}
-
-    try:
-        df = pd.read_csv(META_PATH, dtype={"code": str})
-        df["code"] = df["code"].astype(str).str.zfill(6)
-        meta = {}
-        for _, r in df.iterrows():
-            code = str(r["code"]).zfill(6)
-            meta[code] = {
-                "code": code,
-                "full_confirmed": int(r.get("full_confirmed", 0) or 0),
-                "last_full_fetch_date": str(r.get("last_full_fetch_date", "")),
-                "full_source": str(r.get("full_source", "")),
-                "first_date": str(r.get("first_date", "")),
-                "last_date": str(r.get("last_date", "")),
-                "rows": int(r.get("rows", 0) or 0),
-                "updated_at": str(r.get("updated_at", "")),
-            }
-        return meta
-    except Exception as e:
-        log(f"[WARN] load meta failed err={repr(e)}")
-        return {}
-
-
-def save_meta(meta):
-    rows = []
-    for code, item in sorted(meta.items()):
-        rows.append({
-            "code": str(code).zfill(6),
-            "full_confirmed": int(item.get("full_confirmed", 0) or 0),
-            "last_full_fetch_date": item.get("last_full_fetch_date", ""),
-            "full_source": item.get("full_source", ""),
-            "first_date": item.get("first_date", ""),
-            "last_date": item.get("last_date", ""),
-            "rows": int(item.get("rows", 0) or 0),
-            "updated_at": item.get("updated_at", ""),
-        })
-
-    try:
-        pd.DataFrame(rows).to_csv(META_PATH, index=False, encoding="utf-8-sig")
-        log(f"[META] saved {META_PATH} rows={len(rows)}")
-    except Exception as e:
-        log(f"[WARN] save meta failed err={repr(e)}")
-
-
-def update_full_meta(meta, code, df, source):
-    df = normalize_daily_columns(df)
+def df_first_date(df):
     if df is None or df.empty:
-        return
-
-    code = str(code).zfill(6)
-    meta[code] = {
-        "code": code,
-        "full_confirmed": 1,
-        "last_full_fetch_date": today_str(),
-        "full_source": source,
-        "first_date": pd.to_datetime(df["date"].min()).strftime("%Y-%m-%d"),
-        "last_date": pd.to_datetime(df["date"].max()).strftime("%Y-%m-%d"),
-        "rows": int(len(df)),
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+        return ""
+    return pd.to_datetime(df["date"].min()).strftime("%Y-%m-%d")
 
 
-def update_meta_after_increment(meta, code, df):
-    df = normalize_daily_columns(df)
+def df_last_date(df):
     if df is None or df.empty:
-        return
-
-    code = str(code).zfill(6)
-    old = meta.get(code, {})
-    if int(old.get("full_confirmed", 0) or 0) != 1:
-        return
-
-    old.update({
-        "first_date": pd.to_datetime(df["date"].min()).strftime("%Y-%m-%d"),
-        "last_date": pd.to_datetime(df["date"].max()).strftime("%Y-%m-%d"),
-        "rows": int(len(df)),
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    meta[code] = old
+        return ""
+    return pd.to_datetime(df["date"].max()).strftime("%Y-%m-%d")
 
 
-def cache_is_current(df):
-    df = normalize_daily_columns(df)
+def cache_is_fresh(df):
     if df is None or df.empty:
         return False
 
     last_date = pd.to_datetime(df["date"].max()).date()
     now_date = datetime.now().date()
-    return (now_date - last_date).days <= FRESH_MAX_NATURAL_DAYS
+    return (now_date - last_date).days <= 5
 
 
-def cache_history_is_full_enough(code, df, meta):
+def likely_short_cache(df, meta_row=None):
     """
-    判断缓存是否接近“上市以来全历史”。
-
-    关键：
-    1. meta full_confirmed=1 的股票，说明已经从1990发起过全历史拉取；
-       即使是新股/短历史，也不再反复回补。
-    2. 没有 meta 的旧缓存，必须靠 rows / first_date 判断。
-    3. rows=807 且 first_date很晚，属于历史不足，需要回补。
+    判断是否明显不是全历史缓存。
+    注意：新股本身可能只有几百根，因此如果meta已经确认过source全历史，就不重复回补。
     """
-    code = str(code).zfill(6)
-    df = normalize_daily_columns(df)
     if df is None or df.empty:
-        return False, "无缓存"
+        return True, "无缓存或缓存不可读"
 
-    n = len(df)
-    first_date = pd.to_datetime(df["date"].min()).date()
-    last_date = pd.to_datetime(df["date"].max()).date()
-    early_date = datetime.strptime(FULL_EARLY_DATE, "%Y-%m-%d").date()
+    if meta_row and str(meta_row.get("status", "")) == "full_history_confirmed":
+        return False, "meta已确认全历史"
 
-    m = meta.get(code, {})
-    if int(m.get("full_confirmed", 0) or 0) == 1:
-        return True, f"meta已确认全历史 rows={n} first={first_date} last={last_date}"
+    rows = len(df)
+    first = pd.to_datetime(df["date"].min()).date()
+    first_str = first.strftime("%Y-%m-%d")
 
-    if n >= FULL_MIN_ROWS_STRONG:
-        return True, f"历史充足 rows={n} first={first_date} last={last_date}"
+    # 典型问题：2023开始，800根左右
+    if first_str >= "2020-01-01" and rows < 1600:
+        return True, f"起始日期过晚且根数偏少 first={first_str} rows={rows}"
 
-    if first_date <= early_date and n >= FULL_MIN_ROWS_MEDIUM:
-        return True, f"历史基本充足 rows={n} first={first_date} last={last_date}"
+    # 老股票如果只有几百根，明显需要回补
+    if rows < 500:
+        return True, f"K线根数过少 rows={rows}"
 
-    return False, f"历史不足 rows={n} first={first_date} last={last_date}"
+    # 2015以后开始且不足2500根，优先回补确认
+    if first_str >= "2015-01-01" and rows < 2500:
+        return True, f"疑似非全量 first={first_str} rows={rows}"
 
+    return False, "缓存看起来已足够长"
+
+
+# =========================
+# 股票列表
+# =========================
 
 def baostock_login_once():
     global BAOSTOCK_READY
@@ -489,6 +461,7 @@ def fetch_stock_list_from_baostock():
         rs = bs.query_all_stock(day=today_str())
         rows = []
         fields = rs.fields
+
         while rs.next():
             rows.append(rs.get_row_data())
 
@@ -530,6 +503,10 @@ def fetch_stock_list():
 
     raise RuntimeError("all stock list sources failed")
 
+
+# =========================
+# 数据源拉取
+# =========================
 
 def fetch_daily_from_eastmoney(code, beg=FULL_HISTORY_START_EM):
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -616,51 +593,92 @@ def fetch_daily_from_baostock(code, start_date=FULL_HISTORY_START):
 
 def fetch_from_source(code, source, mode, start_str, em_start):
     if not source_available(source):
-        log(f"[FETCH KLINE SKIP] code={code} source={source} reason=circuit_open")
+        log(f"[数据源跳过] code={code} source={source} reason=熔断冷却中")
         return None
 
     try:
         t0 = time.time()
 
         if source == "EastMoney":
-            log(f"[FETCH KLINE START] code={code} source=EastMoney mode={mode} start={em_start}")
+            log(f"[拉取开始] code={code} source=EastMoney mode={mode} start={em_start}")
             df = fetch_daily_from_eastmoney(code, em_start)
 
         elif source == "AkShare":
-            log(f"[FETCH KLINE START] code={code} source=AkShare mode={mode}")
+            log(f"[拉取开始] code={code} source=AkShare mode={mode}")
             df = fetch_daily_from_akshare(code)
 
         elif source == "BaoStock":
-            log(f"[FETCH KLINE START] code={code} source=BaoStock mode={mode} start={start_str}")
+            log(f"[拉取开始] code={code} source=BaoStock mode={mode} start={start_str}")
             df = fetch_daily_from_baostock(code, start_str)
-            if BAOSTOCK_SLEEP_SECONDS > 0:
-                time.sleep(BAOSTOCK_SLEEP_SECONDS)
 
         else:
-            raise ValueError(f"unknown source={source}")
+            raise ValueError(f"unknown source: {source}")
 
         cost = fmt_seconds(time.time() - t0)
 
         if df is not None and not df.empty:
             record_source_success(source)
-            log(f"[FETCH KLINE OK] code={code} source={source} rows={len(df)} cost={cost}")
+            log(f"[拉取成功] code={code} source={source} rows={len(df)} cost={cost}")
             return df
 
         record_source_failure(source, "empty dataframe")
-        log(f"[FETCH KLINE EMPTY] code={code} source={source} cost={cost}")
+        log(f"[拉取为空] code={code} source={source} cost={cost}")
         return None
 
     except Exception as e:
         record_source_failure(source, e)
-        log(f"[WARN] {source.lower()} fetch failed code={code} err={repr(e)}")
+        log(f"[拉取失败] code={code} source={source} err={repr(e)}")
         return None
 
 
-def fetch_incremental(code, cache_df):
-    cache_df = normalize_daily_columns(cache_df)
-    if cache_df is None or cache_df.empty:
-        return None, "全部失败"
+def fetch_full_history(code, old_df=None):
+    """
+    全历史回补：从1990开始拉。
+    如果某个源拉到的结果没有比旧缓存更早，也继续尝试下一个源。
+    """
+    old_first = df_first_date(old_df)
+    old_rows = 0 if old_df is None else len(old_df)
 
+    start_str = FULL_HISTORY_START
+    em_start = FULL_HISTORY_START_EM
+    mode = "full_backfill"
+
+    best_df = None
+    best_source = "全部失败"
+    best_improved = False
+
+    for source in ["EastMoney", "AkShare", "BaoStock"]:
+        df = fetch_from_source(code, source, mode, start_str, em_start)
+        if df is None or df.empty:
+            continue
+
+        new_first = df_first_date(df)
+        new_rows = len(df)
+
+        improved = False
+        if old_df is None or old_df.empty:
+            improved = True
+        else:
+            if new_first and old_first and new_first < old_first:
+                improved = True
+            if new_rows > old_rows + 100:
+                improved = True
+
+        if improved:
+            return df, source, True
+
+        if best_df is None or len(df) > len(best_df):
+            best_df = df
+            best_source = source
+            best_improved = False
+
+    if best_df is not None:
+        return best_df, best_source, best_improved
+
+    return None, "全部失败", False
+
+
+def fetch_incremental(code, cache_df):
     last_date = pd.to_datetime(cache_df["date"].max()).date()
     start_date = last_date - timedelta(days=INCREMENTAL_DAYS)
     start_str = start_date.strftime("%Y-%m-%d")
@@ -675,124 +693,9 @@ def fetch_incremental(code, cache_df):
     return None, "全部失败"
 
 
-def fetch_full_history(code):
-    start_str = FULL_HISTORY_START
-    em_start = FULL_HISTORY_START_EM
-    mode = "force_full"
-
-    for source in ["EastMoney", "AkShare", "BaoStock"]:
-        df = fetch_from_source(code, source, mode, start_str, em_start)
-        if df is not None and not df.empty:
-            return df, source
-
-    return None, "全部失败"
-
-
-def can_backfill_more(start_ts):
-    if not FULL_REBUILD:
-        RUN_STATE["backfill_skipped_full_rebuild_off"] += 1
-        return False, "FULL_REBUILD=0"
-
-    if should_safe_stop(start_ts):
-        RUN_STATE["backfill_skipped_time"] += 1
-        return False, RUN_STATE["safe_stop_reason"]
-
-    if RUN_STATE["backfill_attempted"] >= MAX_FULL_BACKFILL_PER_RUN:
-        RUN_STATE["backfill_skipped_limit"] += 1
-        return False, f"本轮全历史回补额度已满 MAX_FULL_BACKFILL_PER_RUN={MAX_FULL_BACKFILL_PER_RUN}"
-
-    return True, "允许回补"
-
-
-def get_daily_kline(code, name, meta, start_ts):
-    code = str(code).zfill(6)
-
-    cache_df = read_cache(code)
-    cache_exists = cache_df is not None and not cache_df.empty
-    current = cache_is_current(cache_df) if cache_exists else False
-    full_enough, history_reason = cache_history_is_full_enough(code, cache_df, meta)
-
-    # A类：已全历史 + 最新
-    if cache_exists and full_enough and current:
-        RUN_STATE["cache_full_ready"] += 1
-        return cache_df, "有", "最新", f"无需更新:{history_reason}", "缓存"
-
-    # B类：已全历史 + 不最新 -> 增量更新
-    if cache_exists and full_enough and not current:
-        RUN_STATE["cache_full_but_stale"] += 1
-
-        if should_safe_stop(start_ts):
-            return cache_df, "有", "偏旧", f"安全收尾，跳过增量:{history_reason}", "缓存"
-
-        log(f"[CACHE STALE] code={code} reason={history_reason} action=incremental_update")
-        RUN_STATE["incremental_attempted"] += 1
-
-        new_df, source = fetch_incremental(code, cache_df)
-        merged = merge_kline(cache_df, new_df)
-
-        if merged is not None and not merged.empty:
-            save_cache(code, merged)
-            update_meta_after_increment(meta, code, merged)
-            RUN_STATE["incremental_success"] += 1
-            freshness = "最新" if cache_is_current(merged) else "偏旧"
-            full_after, reason_after = cache_history_is_full_enough(code, merged, meta)
-            return merged, "有", freshness, f"已增量更新:{source}:{reason_after}", source
-
-        RUN_STATE["incremental_failed"] += 1
-        return cache_df, "有", "偏旧", f"增量更新失败，保留旧缓存:{history_reason}", "缓存"
-
-    # C类：缓存存在但历史不足 -> 限量全历史回补
-    if cache_exists and not full_enough:
-        RUN_STATE["cache_partial"] += 1
-        log(
-            f"[CACHE PARTIAL] code={code} name={name} current={current} "
-            f"reason={history_reason} action=full_backfill_queue"
-        )
-
-        allowed, reason = can_backfill_more(start_ts)
-        if not allowed:
-            return cache_df, "有", "非全量", f"待全历史回补:{reason}:{history_reason}", "缓存"
-
-        RUN_STATE["backfill_attempted"] += 1
-        full_df, source = fetch_full_history(code)
-        merged = merge_kline(cache_df, full_df)
-
-        if merged is not None and not merged.empty:
-            save_cache(code, merged)
-            update_full_meta(meta, code, merged, source)
-            RUN_STATE["backfill_success"] += 1
-            freshness = "最新" if cache_is_current(merged) else "偏旧"
-            full_after, reason_after = cache_history_is_full_enough(code, merged, meta)
-            status = "全历史回补完成" if full_after else "已回补但仍需复核"
-            return merged, "有", freshness, f"{status}:{source}:{reason_after}", source
-
-        RUN_STATE["backfill_failed"] += 1
-        return cache_df, "有", "非全量", f"全历史回补失败，保留旧缓存:{history_reason}", "缓存"
-
-    # D类：无缓存 -> 限量首次全历史建档
-    if not cache_exists:
-        RUN_STATE["no_cache"] += 1
-        allowed, reason = can_backfill_more(start_ts)
-        if not allowed:
-            return None, "无", "待建立", f"待首次全历史建立:{reason}", "未联网"
-
-        RUN_STATE["backfill_attempted"] += 1
-        full_df, source = fetch_full_history(code)
-
-        if full_df is not None and not full_df.empty:
-            save_cache(code, full_df)
-            update_full_meta(meta, code, full_df, source)
-            RUN_STATE["backfill_success"] += 1
-            freshness = "最新" if cache_is_current(full_df) else "偏旧"
-            full_after, reason_after = cache_history_is_full_enough(code, full_df, meta)
-            status = "首次全历史建立完成" if full_after else "首次建立但仍需复核"
-            return full_df, "无", freshness, f"{status}:{source}:{reason_after}", source
-
-        RUN_STATE["backfill_failed"] += 1
-        return None, "无", "不可用", "首次全历史建立失败", "全部失败"
-
-    return cache_df, "有", "未知", "未命中逻辑分支", "缓存"
-
+# =========================
+# 体检字段
+# =========================
 
 def max_calendar_gap_days(df):
     if df is None or df.empty or len(df) < 2:
@@ -822,7 +725,7 @@ def first_bad_date(df, mask):
     return bad.iloc[0]["date"].strftime("%Y-%m-%d")
 
 
-def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_source, meta):
+def inspect_kline(df, code, name, cache_exists, completeness, update_status, fetch_source, action):
     item = {
         "股票代码": stock_code(code),
         "股票名称": name,
@@ -831,7 +734,8 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
         "是否N/C新股": "是" if str(name).startswith(("N", "C")) else "否",
 
         "缓存是否存在": cache_exists,
-        "缓存是否最新": freshness,
+        "缓存完整性": completeness,
+        "本轮动作": action,
         "缓存更新状态": update_status,
         "本次使用数据源": fetch_source,
 
@@ -840,13 +744,6 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
         "距离今天自然日": "",
         "K线总根数": 0,
         "最大自然日断档": "",
-
-        "是否已确认全历史": "否",
-        "数据长度等级": "数据不可用",
-        "可用于日线短周期": "否",
-        "可用于年度结构": "否",
-        "可用于长周期时间模型": "否",
-        "可用于月线季线模型": "否",
 
         "开高低收缺失数": 0,
         "价格为0数量": 0,
@@ -857,9 +754,10 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
 
         "成交量缺失数": 0,
         "成交量为0数量": 0,
+        "成交量缺失日期示例": "",
+        "零成交/疑似停牌日期示例": "",
         "成交额缺失数": 0,
-        "最近20根K零成交天数": 0,
-        "成交量异常日期示例": "",
+        "成交额缺失日期示例": "",
 
         "数据体检结论": "不通过",
         "机器备注": "K线数据不可用",
@@ -868,40 +766,17 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
     df = normalize_daily_columns(df)
 
     if df is None or df.empty:
-        if freshness == "待建立":
-            item["数据体检结论"] = "待建立缓存"
-            item["机器备注"] = update_status
         return item
 
     n = len(df)
     first_date = pd.to_datetime(df["date"].min())
     last_date = pd.to_datetime(df["date"].max())
 
-    full_enough, history_reason = cache_history_is_full_enough(code, df, meta)
-
     item["K线起始日期"] = first_date.strftime("%Y-%m-%d")
     item["K线最新日期"] = last_date.strftime("%Y-%m-%d")
     item["距离今天自然日"] = latest_gap_days(df)
     item["K线总根数"] = n
     item["最大自然日断档"] = max_calendar_gap_days(df)
-    item["是否已确认全历史"] = "是" if full_enough else "否"
-
-    if n < 120:
-        item["数据长度等级"] = "少于120根，仅保留缓存"
-    elif n < 250:
-        item["数据长度等级"] = "120-249根，仅短周期观察"
-        item["可用于日线短周期"] = "是"
-    elif n < 2000:
-        item["数据长度等级"] = "250-1999根，可做基础结构"
-        item["可用于日线短周期"] = "是"
-        item["可用于年度结构"] = "是"
-        item["可用于月线季线模型"] = "视月线数量"
-    else:
-        item["数据长度等级"] = "2000根以上，适合长周期模型"
-        item["可用于日线短周期"] = "是"
-        item["可用于年度结构"] = "是"
-        item["可用于长周期时间模型"] = "是"
-        item["可用于月线季线模型"] = "是"
 
     missing_ohlc = df[["open", "high", "low", "close"]].isna().any(axis=1)
     zero_price = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
@@ -922,45 +797,28 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
     volume_zero = df["volume"] <= 0
     amount_missing = df["amount"].isna()
 
-    recent20 = df.tail(20)
-    recent20_zero = int((recent20["volume"] <= 0).sum()) if not recent20.empty else 0
-
-    volume_error = volume_missing | volume_zero | amount_missing
-
     item["成交量缺失数"] = int(volume_missing.sum())
     item["成交量为0数量"] = int(volume_zero.sum())
+    item["成交量缺失日期示例"] = first_bad_date(df, volume_missing)
+    item["零成交/疑似停牌日期示例"] = first_bad_date(df, volume_zero)
     item["成交额缺失数"] = int(amount_missing.sum())
-    item["最近20根K零成交天数"] = recent20_zero
-    item["成交量异常日期示例"] = first_bad_date(df, volume_error)
+    item["成交额缺失日期示例"] = first_bad_date(df, amount_missing)
 
     hard_errors = []
     warnings = []
 
     if price_error.any():
         hard_errors.append("存在价格硬错误")
-    if n == 0:
-        hard_errors.append("无K线")
-    if freshness == "不可用":
-        hard_errors.append("缓存不可用")
+    if volume_missing.any() or amount_missing.any():
+        warnings.append("存在成交量/成交额缺失记录")
+    if volume_zero.any():
+        warnings.append("存在零成交/疑似停牌记录")
 
-    if not full_enough:
-        warnings.append(f"历史长度不足或疑似非全量：{history_reason}")
-
-    if "ST" in str(name).upper():
-        warnings.append("ST，仅缓存，模型层过滤")
-    if str(name).startswith(("N", "C")):
-        warnings.append("N/C新股，仅缓存，模型层限制使用")
-    if n < 120:
-        warnings.append("K线少于120根")
-    elif n < 250:
-        warnings.append("K线少于250根")
-    elif n < 2000:
-        warnings.append("K线少于2000根，长周期时间模型慎用")
-
-    if recent20_zero >= 10:
-        warnings.append("最近20根K中零成交过多")
     if item["距离今天自然日"] != "" and item["距离今天自然日"] > 10:
         warnings.append("最新K距离今天超过10个自然日，可能停牌或数据未更新")
+
+    if completeness != "全历史":
+        warnings.append("缓存尚未确认全历史")
 
     if hard_errors:
         item["数据体检结论"] = "不通过"
@@ -970,277 +828,389 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
         item["机器备注"] = "；".join(warnings)
     else:
         item["数据体检结论"] = "通过"
-        item["机器备注"] = f"数据层可用；{history_reason}"
+        item["机器备注"] = "数据层可用"
 
     return item
 
 
-def save_outputs(rows, failed_rows, elapsed, success, failed, progress_rows):
+# =========================
+# 单票处理
+# =========================
+
+def process_one_stock(code, name, meta):
+    code = str(code).zfill(6)
+    old_df = read_cache(code)
+    cache_exists = old_df is not None and not old_df.empty
+
+    meta_row = meta.get(code)
+
+    if cache_exists:
+        short, short_reason = likely_short_cache(old_df, meta_row)
+    else:
+        short, short_reason = True, "无缓存"
+
+    # 已确认全历史 + 新鲜：直接跳过
+    if cache_exists and not short and cache_is_fresh(old_df):
+        df = old_df
+        update_meta(
+            meta, code, name, "full_history_confirmed", "缓存已确认全历史且新鲜",
+            len(df), df_first_date(df), df_last_date(df), "缓存", "无需联网"
+        )
+        return df, "有", "全历史", "无需更新", "缓存", "跳过-已全量"
+
+    # 已确认全历史但偏旧：增量更新
+    if cache_exists and not short and not cache_is_fresh(old_df):
+        new_df, source = fetch_incremental(code, old_df)
+        merged = merge_kline(old_df, new_df)
+        if merged is not None and not merged.empty:
+            save_cache(code, merged)
+            update_meta(
+                meta, code, name, "full_history_confirmed", "全历史缓存增量更新",
+                len(merged), df_first_date(merged), df_last_date(merged), source, ""
+            )
+            return merged, "有", "全历史", f"已增量更新:{source}", source, "增量更新"
+
+        update_meta(
+            meta, code, name, "full_history_confirmed", "增量更新失败但保留旧缓存",
+            len(old_df), df_first_date(old_df), df_last_date(old_df), "缓存", ""
+        )
+        return old_df, "有", "全历史", "增量失败保留旧缓存", "缓存", "增量失败"
+
+    # 无缓存或非全量：全历史回补/建立
+    if not cache_exists and not FULL_REBUILD and count_cache_files() < MIN_CACHE_FILES_REQUIRED:
+        return None, "无", "待建立", "保护停止:缓存恢复过少且FULL_REBUILD=0", "未联网", "跳过-保护"
+
+    full_df, source, improved = fetch_full_history(code, old_df)
+
+    if full_df is not None and not full_df.empty:
+        merged = merge_kline(old_df, full_df)
+        if merged is not None and not merged.empty:
+            save_cache(code, merged)
+
+            note = "全历史回补有改善" if improved else "数据源未提供更早历史，按当前源确认"
+            update_meta(
+                meta, code, name, "full_history_confirmed", note,
+                len(merged), df_first_date(merged), df_last_date(merged), source, short_reason
+            )
+
+            completeness = "全历史"
+            status = f"已全历史回补:{source}" if cache_exists else f"首次建立全历史:{source}"
+            action = "回补成功" if cache_exists else "首次建立成功"
+            return merged, "有" if cache_exists else "无", completeness, status, source, action
+
+    # 回补失败：保留旧缓存
+    if cache_exists:
+        update_meta(
+            meta, code, name, "backfill_failed", "全历史回补失败但保留旧缓存",
+            len(old_df), df_first_date(old_df), df_last_date(old_df), "缓存", short_reason
+        )
+        return old_df, "有", "非全量", "回补失败保留旧缓存", "缓存", "回补失败"
+
+    update_meta(meta, code, name, "backfill_failed", "无缓存且建立失败", 0, "", "", "全部失败", short_reason)
+    return None, "无", "不可用", "建立失败", "全部失败", "建立失败"
+
+
+# =========================
+# 输出
+# =========================
+
+def save_csv(path, rows):
+    if rows:
+        pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame([{"诊断": "无数据"}]).to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def save_outputs(
+    rows,
+    done_rows,
+    need_rows,
+    failed_rows,
+    summary,
+):
     today = today_str()
 
-    out_path = os.path.join(OUT_DIR, f"data_cache_health_full_{today}.csv")
+    health_path = os.path.join(OUT_DIR, f"data_cache_health_full_{today}.csv")
+    done_path = os.path.join(OUT_DIR, f"full_history_backfill_done_{today}.csv")
+    need_path = os.path.join(OUT_DIR, f"need_full_history_backfill_{today}.csv")
     failed_path = os.path.join(OUT_DIR, f"data_cache_failed_{today}.csv")
-    progress_path = os.path.join(OUT_DIR, f"full_history_progress_{today}.csv")
+    summary_path = os.path.join(OUT_DIR, f"backfill_summary_{today}.csv")
+    state_path = os.path.join(OUT_DIR, "backfill_state.json")
 
-    df = pd.DataFrame(rows)
+    save_csv(health_path, rows)
+    save_csv(done_path, done_rows)
+    save_csv(need_path, need_rows)
+    save_csv(failed_path, failed_rows)
+    save_csv(summary_path, [summary])
 
-    cols = [
-        "股票代码",
-        "股票名称",
-        "市场",
-        "是否ST",
-        "是否N/C新股",
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
 
-        "缓存是否存在",
-        "缓存是否最新",
-        "缓存更新状态",
-        "本次使用数据源",
-
-        "K线起始日期",
-        "K线最新日期",
-        "距离今天自然日",
-        "K线总根数",
-        "最大自然日断档",
-        "是否已确认全历史",
-
-        "数据长度等级",
-        "可用于日线短周期",
-        "可用于年度结构",
-        "可用于长周期时间模型",
-        "可用于月线季线模型",
-
-        "开高低收缺失数",
-        "价格为0数量",
-        "high_low错误数",
-        "high小于开收数量",
-        "low大于开收数量",
-        "价格异常日期示例",
-
-        "成交量缺失数",
-        "成交量为0数量",
-        "成交额缺失数",
-        "最近20根K零成交天数",
-        "成交量异常日期示例",
-
-        "数据体检结论",
-        "机器备注",
-    ]
-
-    if not df.empty:
-        df = df[cols]
-        df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    else:
-        pd.DataFrame([{
-            "诊断": "未生成数据缓存体检结果",
-            "success": success,
-            "failed": failed,
-            "elapsed": fmt_seconds(elapsed),
-        }]).to_csv(out_path, index=False, encoding="utf-8-sig")
-
-    if failed_rows:
-        pd.DataFrame(failed_rows).to_csv(failed_path, index=False, encoding="utf-8-sig")
-    else:
-        pd.DataFrame([{"诊断": "无失败股票"}]).to_csv(failed_path, index=False, encoding="utf-8-sig")
-
-    pd.DataFrame(progress_rows).to_csv(progress_path, index=False, encoding="utf-8-sig")
-
-    log(f"[CSV] {out_path}")
-    log(f"[FAILED CSV] {failed_path}")
-    log(f"[PROGRESS CSV] {progress_path}")
+    log(f"[输出] 体检表: {health_path}")
+    log(f"[输出] 本轮回补成功: {done_path}")
+    log(f"[输出] 待回补清单: {need_path}")
+    log(f"[输出] 失败清单: {failed_path}")
+    log(f"[输出] 总结: {summary_path}")
+    log(f"[输出] 自动续跑状态: {state_path}")
 
 
-def save_cache_restore_guard(existing_cache_count):
-    path = os.path.join(OUT_DIR, f"cache_restore_guard_{today_str()}.csv")
-    pd.DataFrame([{
-        "诊断": "缓存恢复数量过少，已停止，避免从零全量重建",
-        "existing_csv": existing_cache_count,
-        "required": MIN_CACHE_FILES_REQUIRED,
-        "FULL_REBUILD": FULL_REBUILD,
-        "建议": "先确认 actions/cache 是否恢复了 a-kline-cache。如果确认要从0重建，手动运行时设置 full_rebuild=1。",
-    }]).to_csv(path, index=False, encoding="utf-8-sig")
-    log(f"[GUARD CSV] {path}")
-
-
-def make_progress_row(total, elapsed):
-    ready = RUN_STATE["cache_full_ready"] + RUN_STATE["cache_full_but_stale"] + RUN_STATE["backfill_success"]
-    pending_est = max(total - ready, 0)
-
-    avg_backfill_seconds = ""
-    estimated_remaining_hours = ""
-    if RUN_STATE["backfill_success"] > 0:
-        avg_backfill_seconds = elapsed / max(RUN_STATE["backfill_success"], 1)
-        estimated_remaining_hours = round((pending_est * float(avg_backfill_seconds)) / 3600, 2)
-
-    estimated_remaining_runs = ""
-    if MAX_FULL_BACKFILL_PER_RUN > 0:
-        estimated_remaining_runs = (pending_est + MAX_FULL_BACKFILL_PER_RUN - 1) // MAX_FULL_BACKFILL_PER_RUN
-
-    return {
-        "日期": today_str(),
-        "全市场股票数": total,
-        "已处理数量": RUN_STATE["processed"],
-        "成功体检数量": RUN_STATE["success"],
-        "失败数量": RUN_STATE["failed"],
-        "缓存文件数量": count_cache_files(),
-
-        "已全历史且最新数量": RUN_STATE["cache_full_ready"],
-        "已全历史但需增量数量": RUN_STATE["cache_full_but_stale"],
-        "历史不足数量": RUN_STATE["cache_partial"],
-        "无缓存数量": RUN_STATE["no_cache"],
-
-        "本轮增量尝试": RUN_STATE["incremental_attempted"],
-        "本轮增量成功": RUN_STATE["incremental_success"],
-        "本轮增量失败": RUN_STATE["incremental_failed"],
-
-        "本轮全历史回补尝试": RUN_STATE["backfill_attempted"],
-        "本轮全历史回补成功": RUN_STATE["backfill_success"],
-        "本轮全历史回补失败": RUN_STATE["backfill_failed"],
-        "回补因额度跳过": RUN_STATE["backfill_skipped_limit"],
-        "回补因时间跳过": RUN_STATE["backfill_skipped_time"],
-        "回补因FULL_REBUILD关闭跳过": RUN_STATE["backfill_skipped_full_rebuild_off"],
-
-        "预计仍待全历史处理数量": pending_est,
-        "预计剩余轮数": estimated_remaining_runs,
-        "预计剩余BaoStock小时": estimated_remaining_hours,
-
-        "是否安全收尾": RUN_STATE["safe_stop"],
-        "安全收尾原因": RUN_STATE["safe_stop_reason"],
-        "已运行时间": fmt_seconds(elapsed),
-        "SOURCE_STATE": str(SOURCE_STATE),
-        "RUN_STATE": str(RUN_STATE),
-    }
-
+# =========================
+# 主流程
+# =========================
 
 def main():
     start_ts = time.time()
+    meta = load_status_meta()
 
     rows = []
-    progress_rows = []
-    success = 0
-    failed = 0
+    done_rows = []
+    need_rows = []
+    failed_rows = []
 
-    meta = load_meta()
+    processed = 0
+    skipped_full = 0
+    backfill_success = 0
+    backfill_failed = 0
+    built_success = 0
+    stopped_by_time = False
 
     try:
         existing_cache_count = count_cache_files()
-
-        log(f"[CONFIG] FULL_REBUILD={FULL_REBUILD}")
-        log(f"[CONFIG] MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
-        log(f"[CONFIG] MAX_FULL_BACKFILL_PER_RUN={MAX_FULL_BACKFILL_PER_RUN}")
-        log(f"[CONFIG] MAX_RUNTIME_MINUTES={MAX_RUNTIME_MINUTES}")
-        log(f"[CONFIG] SAFE_STOP_MINUTES={SAFE_STOP_MINUTES}")
-        log(f"[CONFIG] BAOSTOCK_SLEEP_SECONDS={BAOSTOCK_SLEEP_SECONDS}")
-        log(f"[CONFIG] FRESH_MAX_NATURAL_DAYS={FRESH_MAX_NATURAL_DAYS}")
-        log(f"[CONFIG] FULL_MIN_ROWS_STRONG={FULL_MIN_ROWS_STRONG}")
-        log(f"[CONFIG] FULL_MIN_ROWS_MEDIUM={FULL_MIN_ROWS_MEDIUM}")
-        log(f"[CONFIG] FULL_EARLY_DATE={FULL_EARLY_DATE}")
-        log(f"[CACHE FILES] dir={KLINE_CACHE_DIR} existing_csv={existing_cache_count}")
-        log(f"[META] loaded rows={len(meta)} path={META_PATH}")
+        log("")
+        log("========== A股全历史缓存自动补齐任务 ==========")
+        log(f"[轮次] 当前第 {RUN_ROUND} 轮 / 最多自动 {MAX_AUTO_ROUNDS} 轮")
+        log(f"[配置] 每轮最多运行 {MAX_RUNTIME_MINUTES} 分钟，提前 {SOFT_STOP_BUFFER_MINUTES} 分钟收尾")
+        log(f"[配置] FULL_REBUILD={FULL_REBUILD}, MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
+        log(f"[缓存] 当前缓存CSV数量={existing_cache_count}")
+        log("==============================================")
+        log("")
 
         if existing_cache_count < MIN_CACHE_FILES_REQUIRED and not FULL_REBUILD:
             log(
-                f"[FATAL] restored cache too small: existing_csv={existing_cache_count}, "
-                f"required>={MIN_CACHE_FILES_REQUIRED}. "
-                f"This run will NOT rebuild all stocks from scratch. "
-                f"Set FULL_REBUILD=1 only if you really want full rebuild."
+                f"[保护停止] 恢复出的缓存数量过少 existing={existing_cache_count}, "
+                f"required={MIN_CACHE_FILES_REQUIRED}。为避免从0误重建，本轮停止。"
             )
-            save_cache_restore_guard(existing_cache_count)
+
+            summary = {
+                "run_round": RUN_ROUND,
+                "cache_files": existing_cache_count,
+                "full_history_count": 0,
+                "need_backfill_count": 0,
+                "processed_this_run": 0,
+                "backfill_success_this_run": 0,
+                "backfill_failed_this_run": 0,
+                "built_success_this_run": 0,
+                "stopped_by_time": False,
+                "should_continue": False,
+                "continue_reason": "cache_restore_too_small",
+                "elapsed": fmt_seconds(elapsed_seconds(start_ts)),
+            }
+
+            save_outputs(rows, done_rows, need_rows, failed_rows, summary)
             return
 
         stocks = fetch_stock_list()
         total = len(stocks)
 
-        log(f"[START] full-history cache build/health stocks={total}")
-        log(
-            f"[NOTE] run policy: single-thread, max backfill={MAX_FULL_BACKFILL_PER_RUN}, "
-            f"safe stop before {SAFE_STOP_MINUTES}m, target runtime={MAX_RUNTIME_MINUTES}m"
-        )
+        log(f"[股票池] total={total}")
+        log(f"[整体进度] {progress_bar(0, total)} 0/{total}")
+        log("")
 
         for idx, row in stocks.iterrows():
-            done = idx + 1
+            if should_soft_stop(start_ts):
+                stopped_by_time = True
+                log("")
+                log("[时间保护] 快到本轮时间上限，开始安全收尾，已完成的缓存会保存。")
+                log("")
+                break
+
+            processed += 1
+            done_index = idx + 1
             code = str(row["code"]).zfill(6)
             name = str(row["name"])
 
-            RUN_STATE["processed"] = done
+            should_detail = (
+                processed <= DETAIL_FIRST_N
+                or processed % DETAIL_EVERY == 0
+                or done_index == total
+            )
 
-            elapsed = time.time() - start_ts
-            avg = elapsed / max(done, 1)
-            remain = avg * (total - done)
-
-            should_print_detail = done <= DETAIL_FIRST_N or done % DETAIL_EVERY == 0 or done == total
-
-            if should_print_detail:
+            if should_detail:
                 log(
-                    f"[CACHE CHECK START] {done}/{total} "
-                    f"code={code} name={name} "
-                    f"elapsed={fmt_seconds(elapsed)} eta_scan={fmt_seconds(remain)} "
-                    f"backfill={RUN_STATE['backfill_success']}/{MAX_FULL_BACKFILL_PER_RUN}"
+                    f"[开始] {done_index}/{total} {code} {name} | "
+                    f"整体 {progress_bar(done_index - 1, total)} | "
+                    f"耗时={fmt_seconds(elapsed_seconds(start_ts))}"
                 )
 
             try:
                 t0 = time.time()
-                df, cache_exists, freshness, update_status, fetch_source = get_daily_kline(code, name, meta, start_ts)
-                item = inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_source, meta)
+                df, cache_exists, completeness, status, source, action = process_one_stock(code, name, meta)
+                item = inspect_kline(df, code, name, cache_exists, completeness, status, source, action)
                 rows.append(item)
-                success += 1
-                RUN_STATE["success"] = success
 
-                if should_print_detail:
-                    row_count = 0 if df is None else len(df)
+                row_count = 0 if df is None else len(df)
+                first = "" if df is None or df.empty else df_first_date(df)
+                last = "" if df is None or df.empty else df_last_date(df)
+
+                if completeness == "全历史" and action.startswith("跳过"):
+                    skipped_full += 1
+                elif action in ("回补成功",):
+                    backfill_success += 1
+                    done_rows.append({
+                        "股票代码": stock_code(code),
+                        "股票名称": name,
+                        "动作": action,
+                        "数据源": source,
+                        "K线起始日期": first,
+                        "K线最新日期": last,
+                        "K线总根数": row_count,
+                    })
+                elif action in ("首次建立成功",):
+                    built_success += 1
+                    done_rows.append({
+                        "股票代码": stock_code(code),
+                        "股票名称": name,
+                        "动作": action,
+                        "数据源": source,
+                        "K线起始日期": first,
+                        "K线最新日期": last,
+                        "K线总根数": row_count,
+                    })
+                elif "失败" in action:
+                    backfill_failed += 1
+                    failed_rows.append({
+                        "股票代码": stock_code(code),
+                        "股票名称": name,
+                        "动作": action,
+                        "状态": status,
+                        "数据源": source,
+                    })
+
+                if completeness != "全历史":
+                    need_rows.append({
+                        "股票代码": stock_code(code),
+                        "股票名称": name,
+                        "缓存完整性": completeness,
+                        "当前状态": status,
+                        "K线起始日期": first,
+                        "K线最新日期": last,
+                        "K线总根数": row_count,
+                    })
+
+                if should_detail:
                     log(
-                        f"[CACHE CHECK OK] {done}/{total} "
-                        f"code={code} name={name} "
-                        f"source={fetch_source} cache={cache_exists} "
-                        f"freshness={freshness} status={update_status} "
-                        f"rows={row_count} cost={fmt_seconds(time.time() - t0)} "
-                        f"backfill_success={RUN_STATE['backfill_success']}"
+                        f"[完成] {done_index}/{total} {code} {name} | "
+                        f"动作={action} 完整性={completeness} source={source} "
+                        f"rows={row_count} first={first} last={last} "
+                        f"cost={fmt_seconds(time.time() - t0)}"
                     )
 
             except Exception as e:
-                failed += 1
-                RUN_STATE["failed"] = failed
-                FAILED_ROWS.append({
+                backfill_failed += 1
+                failed_rows.append({
                     "股票代码": stock_code(code),
                     "股票名称": name,
-                    "失败原因": repr(e),
+                    "动作": "异常失败",
+                    "状态": repr(e),
+                    "数据源": "未知",
                 })
-                log(f"[ERROR] {done}/{total} code={code} name={name}: {repr(e)}")
+                log(f"[异常] {done_index}/{total} {code} {name}: {repr(e)}")
                 traceback.print_exc(limit=1)
 
-            if done % PROGRESS_EVERY == 0 or done == total:
-                elapsed = time.time() - start_ts
-                progress = make_progress_row(total, elapsed)
-                progress_rows.append(progress)
+            if processed % PROGRESS_EVERY == 0 or done_index == total:
+                elapsed = elapsed_seconds(start_ts)
+                avg = elapsed / max(processed, 1)
+                remain = avg * (total - done_index)
 
-                pct = done / total * 100
-                log(
-                    f"[PROGRESS] {done}/{total} ({pct:.2f}%) | "
-                    f"success={success} failed={failed} | "
-                    f"full_ready={RUN_STATE['cache_full_ready']} partial={RUN_STATE['cache_partial']} "
-                    f"no_cache={RUN_STATE['no_cache']} | "
-                    f"inc_ok={RUN_STATE['incremental_success']} "
-                    f"backfill_ok={RUN_STATE['backfill_success']}/{MAX_FULL_BACKFILL_PER_RUN} | "
-                    f"elapsed={fmt_seconds(elapsed)} cache_files={count_cache_files()} | "
-                    f"safe_stop={RUN_STATE['safe_stop']}"
-                )
+                log("")
+                log("---------- 本轮进度条 ----------")
+                log(f"整体扫描: {progress_bar(done_index, total)} {done_index}/{total}")
+                log(f"本轮时间: {progress_bar(elapsed, MAX_RUNTIME_MINUTES * 60)} {fmt_seconds(elapsed)} / {MAX_RUNTIME_MINUTES}m")
+                log(f"已确认跳过全历史: {skipped_full}")
+                log(f"本轮回补成功: {backfill_success}")
+                log(f"本轮首次建立: {built_success}")
+                log(f"本轮失败: {backfill_failed}")
+                log(f"当前缓存文件数: {count_cache_files()}")
+                log(f"按当前速度估算剩余扫描时间: {fmt_seconds(remain)}")
+                log("--------------------------------")
+                log("")
 
             time.sleep(0.003)
 
-        elapsed = time.time() - start_ts
-        progress_rows.append(make_progress_row(total, elapsed))
+        save_status_meta(meta)
+
+        # 根据meta统计全历史与待回补
+        full_history_count = 0
+        confirmed_codes = set()
+        for code, m in meta.items():
+            if str(m.get("status", "")) == "full_history_confirmed":
+                full_history_count += 1
+                confirmed_codes.add(code)
+
+        all_codes = set(stocks["code"].astype(str).str.zfill(6).tolist())
+        need_backfill_codes = all_codes - confirmed_codes
+        need_backfill_count = len(need_backfill_codes)
+
+        should_continue = (
+            need_backfill_count > 0
+            and RUN_ROUND < MAX_AUTO_ROUNDS
+            and (backfill_success + built_success + backfill_failed > 0 or stopped_by_time)
+        )
+
+        if need_backfill_count <= 0:
+            continue_reason = "全部完成"
+            should_continue = False
+        elif RUN_ROUND >= MAX_AUTO_ROUNDS:
+            continue_reason = "达到最大自动轮数"
+            should_continue = False
+        elif should_continue:
+            continue_reason = "仍有待回补，允许自动续跑"
+        else:
+            continue_reason = "无有效推进或保护停止"
+
+        summary = {
+            "run_round": RUN_ROUND,
+            "max_auto_rounds": MAX_AUTO_ROUNDS,
+            "cache_files": count_cache_files(),
+            "stock_total": total,
+            "processed_this_run": processed,
+            "skipped_full_this_run": skipped_full,
+            "backfill_success_this_run": backfill_success,
+            "built_success_this_run": built_success,
+            "backfill_failed_this_run": backfill_failed,
+            "full_history_count": full_history_count,
+            "need_backfill_count": need_backfill_count,
+            "stopped_by_time": stopped_by_time,
+            "should_continue": should_continue,
+            "continue_reason": continue_reason,
+            "elapsed": fmt_seconds(elapsed_seconds(start_ts)),
+            "source_EastMoney_ok": SOURCE_STATE["EastMoney"]["ok"],
+            "source_EastMoney_fail": SOURCE_STATE["EastMoney"]["fail"],
+            "source_AkShare_ok": SOURCE_STATE["AkShare"]["ok"],
+            "source_AkShare_fail": SOURCE_STATE["AkShare"]["fail"],
+            "source_BaoStock_ok": SOURCE_STATE["BaoStock"]["ok"],
+            "source_BaoStock_fail": SOURCE_STATE["BaoStock"]["fail"],
+        }
+
+        log("")
+        log("========== 本轮总结 ==========")
+        log(f"缓存文件数: {summary['cache_files']}")
+        log(f"全历史确认数: {summary['full_history_count']}")
+        log(f"仍需回补数: {summary['need_backfill_count']}")
+        log(f"本轮回补成功: {summary['backfill_success_this_run']}")
+        log(f"本轮首次建立: {summary['built_success_this_run']}")
+        log(f"本轮失败: {summary['backfill_failed_this_run']}")
+        log(f"是否需要自动下一轮: {summary['should_continue']}")
+        log(f"原因: {summary['continue_reason']}")
+        log("==============================")
+        log("")
+
+        save_outputs(rows, done_rows, need_rows, failed_rows, summary)
 
     finally:
-        elapsed = time.time() - start_ts
-        save_meta(meta)
-        save_outputs(rows, FAILED_ROWS, elapsed, success, failed, progress_rows)
+        save_status_meta(meta)
         baostock_logout_once()
-
-        log(f"[SOURCE STATE] {SOURCE_STATE}")
-        log(f"[RUN STATE] {RUN_STATE}")
-        log(
-            f"[DONE] success={success}, failed={failed}, "
-            f"elapsed={fmt_seconds(elapsed)}, cache_files={count_cache_files()}, meta_rows={len(meta)}"
-        )
+        log(f"[DONE] 本轮结束，总耗时={fmt_seconds(elapsed_seconds(start_ts))}, cache_files={count_cache_files()}")
 
 
 if __name__ == "__main__":
