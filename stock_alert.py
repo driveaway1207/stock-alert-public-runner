@@ -108,6 +108,18 @@ warnings.filterwarnings("ignore")
 # 4）最终三选不再被“优先池/80分/买点未到封顶”机械杀光，财务硬雷区仍一票否决，普通缺点只扣分。
 # ===========================================================================
 
+
+# ========================= V15 选股模型多周期供需压力带突破模型说明 =========================
+# 本版继续遵守“原主模型完整底座 + 手术式增量优化”：不删除V12/V14任何有效逻辑。
+# 新增 Multi-Timeframe Supply-Demand Zone Engine：
+# 1）用百分比/对数价格桶构建日/周/月/季/年 Volume Profile，识别HVN/POC/价值区；
+# 2）把上影线共振、下影线共振、跳空缺口共振、假突破记忆、凹口/平台/峰值/次高/次低、AVWAP成本共振
+#    作为结构反应与边界校准，不再机械用单点画线；
+# 3）各周期独立生成压力密集区后，投影到统一百分比价格桶，寻找多周期重叠最密集核心压力带；
+# 4）同时保留各周期压力区并集后的最终压力上沿。S级必须同一根日K同时突破核心重叠压力带与最终上沿；
+# 5）压力带本身分级、突破日K分级、模型分级三层矩阵融合；A/S才可作为选股模型模型正式候选资格，B/C/D最多观察。
+# ===========================================================================
+
 # ========================= V9.1 追高闸门增量优化说明 =========================
 # 本文件基于用户提供的V8/V9源码继续做“手术式增量优化”，原则是：
 # 1）BaoStock数据源、主流程、Telegram变量、缓存、基础评分底座不动；
@@ -123,7 +135,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V14原主模型完整底座+增量体系版"
+MODEL_VERSION = "V16一号员工选股模型机构级20维机会评分版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -216,6 +228,14 @@ V14_MIN_ABSOLUTE_SCORE = float(os.environ.get("V14_MIN_ABSOLUTE_SCORE", "70"))
 V14_PREFERRED_SCORE = float(os.environ.get("V14_PREFERRED_SCORE", "75"))
 V14_IGNORE_HISTORY_FOR_RERUN = os.environ.get("V14_IGNORE_HISTORY_FOR_RERUN", "1")
 V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
+
+# V15：选股模型多周期供需压力带突破模型开关与参数。
+ENABLE_XHU_PRESSURE_BREAKOUT = os.environ.get("ENABLE_XHU_PRESSURE_BREAKOUT", "1")
+XHU_PRESSURE_MIN_QUALITY = float(os.environ.get("XHU_PRESSURE_MIN_QUALITY", "35"))
+XHU_PRESSURE_DEFAULT_BUCKET_PCT = float(os.environ.get("XHU_PRESSURE_DEFAULT_BUCKET_PCT", "0.005"))
+XHU_PRESSURE_MAX_ZONES_PER_PERIOD = int(os.environ.get("XHU_PRESSURE_MAX_ZONES_PER_PERIOD", "5"))
+XHU_PRESSURE_ENABLE_YEARLY = os.environ.get("XHU_PRESSURE_ENABLE_YEARLY", "1")
+
 VR1_MIN = 1.8
 VR1_MAX = 2.5
 
@@ -4104,6 +4124,601 @@ def _v12_human_level(value, low_text="偏弱", mid_text="一般", high_text="较
     return low_text
 
 
+
+# ========================= V15：选股模型多周期供需压力带/支撑带生成引擎 =========================
+
+def _xhu_clip(v, lo, hi):
+    return max(lo, min(hi, safe_float(v, 0.0)))
+
+
+def _xhu_letter_grade(score, cuts=(75, 60, 42, 25)):
+    score = safe_float(score, 0.0)
+    if score >= cuts[0]:
+        return "S"
+    if score >= cuts[1]:
+        return "A"
+    if score >= cuts[2]:
+        return "B"
+    if score >= cuts[3]:
+        return "C"
+    return "D"
+
+
+def _xhu_period_weight(period):
+    return {"D": 1.0, "W": 1.6, "M": 2.3, "Q": 3.0, "Y": 3.8}.get(str(period), 1.0)
+
+
+def _xhu_bucket_pct_for_df(pdf, period="D"):
+    """百分比/对数价格桶：默认0.5%，再按周期和波动率自适应。"""
+    if pdf is None or pdf.empty:
+        return XHU_PRESSURE_DEFAULT_BUCKET_PCT
+    d = pdf.copy()
+    for c in ["high", "low", "close"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["high", "low", "close"])
+    if d.empty:
+        return XHU_PRESSURE_DEFAULT_BUCKET_PCT
+    tr_pct = ((d["high"] - d["low"]) / d["close"].replace(0, pd.NA)).tail(20).mean()
+    tr_pct = safe_float(tr_pct, 0.02)
+    base = {"D": 0.005, "W": 0.007, "M": 0.010, "Q": 0.015, "Y": 0.020}.get(str(period), 0.005)
+    lo = {"D": 0.003, "W": 0.005, "M": 0.008, "Q": 0.010, "Y": 0.015}.get(str(period), 0.003)
+    hi = {"D": 0.012, "W": 0.018, "M": 0.025, "Q": 0.035, "Y": 0.045}.get(str(period), 0.012)
+    return _xhu_clip(max(base, tr_pct * 0.22), lo, hi)
+
+
+def _xhu_make_log_edges(min_price, max_price, bucket_pct):
+    min_price = max(0.01, safe_float(min_price, 0.01))
+    max_price = max(min_price * 1.01, safe_float(max_price, min_price * 1.01))
+    step = max(0.001, np.log1p(bucket_pct))
+    lo = np.floor(np.log(min_price) / step) * step
+    hi = np.ceil(np.log(max_price) / step) * step
+    edges = np.exp(np.arange(lo, hi + step * 1.5, step))
+    if len(edges) < 4:
+        edges = np.linspace(min_price, max_price, 8)
+    return edges
+
+
+def _xhu_gap_zones(pdf):
+    gaps = []
+    if pdf is None or len(pdf) < 2:
+        return gaps
+    d = pdf.reset_index(drop=True)
+    for i in range(1, len(d)):
+        prev = d.iloc[i - 1]
+        cur = d.iloc[i]
+        ph = safe_float(prev.get("high", 0)); pl = safe_float(prev.get("low", 0))
+        ch = safe_float(cur.get("high", 0)); cl = safe_float(cur.get("low", 0))
+        if cl > ph * 1.002:
+            gaps.append({"type": "gap_up", "lower": ph, "upper": cl, "date": str(cur.get("date", ""))})
+        elif ch < pl * 0.998:
+            gaps.append({"type": "gap_down", "lower": ch, "upper": pl, "date": str(cur.get("date", ""))})
+    return gaps
+
+
+def _xhu_assign_ohlcv_to_profile(pdf, edges):
+    """OHLCV近似分配到对数价格桶：实体/收盘加权，上下影参与反应证据。"""
+    n = len(edges) - 1
+    prof = pd.DataFrame({
+        "lower": edges[:-1], "upper": edges[1:],
+        "volume": np.zeros(n), "amount": np.zeros(n), "bar_count": np.zeros(n),
+        "close_count": np.zeros(n), "body_weight": np.zeros(n),
+        "upper_wick_hits": np.zeros(n), "lower_wick_hits": np.zeros(n),
+        "gap_up_hits": np.zeros(n), "gap_down_hits": np.zeros(n),
+        "recent_volume": np.zeros(n),
+    })
+    if pdf is None or pdf.empty:
+        return prof
+    d = pdf.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    if "amount" not in d.columns:
+        d["amount"] = d["close"] * d["volume"]
+    d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(d["close"] * d["volume"])
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"])
+    total_len = max(1, len(d))
+    for i, r in d.iterrows():
+        op = safe_float(r["open"]); hi = safe_float(r["high"]); lo = safe_float(r["low"]); cl = safe_float(r["close"])
+        vol = max(0.0, safe_float(r["volume"])); amt = max(0.0, safe_float(r.get("amount", cl * vol)))
+        if min(op, hi, lo, cl) <= 0 or hi < lo or vol <= 0:
+            continue
+        a = max(0, np.searchsorted(edges, lo, side="right") - 1)
+        b = min(n - 1, np.searchsorted(edges, hi, side="left"))
+        if b < a:
+            continue
+        idxs = np.arange(a, b + 1)
+        # 基础覆盖权重：实体权重高，收盘桶权重高，影线权重低。
+        weights = np.ones(len(idxs)) * 0.35
+        body_lo = min(op, cl); body_hi = max(op, cl)
+        for k, idx in enumerate(idxs):
+            bl = edges[idx]; bu = edges[idx + 1]
+            overlap_body = max(0.0, min(bu, body_hi) - max(bl, body_lo))
+            overlap_all = max(1e-9, min(bu, hi) - max(bl, lo))
+            if overlap_body > 0:
+                weights[k] += 1.1 * (overlap_body / max(overlap_all, 1e-9))
+            if bl <= cl <= bu:
+                weights[k] += 0.75
+        if weights.sum() <= 0:
+            weights = np.ones(len(idxs))
+        weights = weights / weights.sum()
+        age_weight = 0.35 + 0.65 * ((i + 1) / total_len) ** 1.5
+        prof.loc[idxs, "volume"] += vol * weights
+        prof.loc[idxs, "amount"] += amt * weights
+        prof.loc[idxs, "recent_volume"] += vol * weights * age_weight
+        prof.loc[idxs, "bar_count"] += 1
+        close_idx = np.searchsorted(edges, cl, side="right") - 1
+        if 0 <= close_idx < n:
+            prof.loc[close_idx, "close_count"] += 1
+        body_a = max(0, np.searchsorted(edges, body_lo, side="right") - 1)
+        body_b = min(n - 1, np.searchsorted(edges, body_hi, side="left"))
+        if body_b >= body_a:
+            prof.loc[body_a:body_b, "body_weight"] += 1
+        rng = max(hi - lo, 1e-9)
+        upper_len = hi - max(op, cl)
+        lower_len = min(op, cl) - lo
+        # 长上/下影共振：记录上影/下影所在区间触碰，不直接当成交密度。
+        if upper_len / rng >= 0.35:
+            ua = max(0, np.searchsorted(edges, max(op, cl), side="right") - 1)
+            ub = min(n - 1, np.searchsorted(edges, hi, side="left"))
+            if ub >= ua:
+                prof.loc[ua:ub, "upper_wick_hits"] += 1
+        if lower_len / rng >= 0.35:
+            la = max(0, np.searchsorted(edges, lo, side="right") - 1)
+            lb = min(n - 1, np.searchsorted(edges, min(op, cl), side="left"))
+            if lb >= la:
+                prof.loc[la:lb, "lower_wick_hits"] += 1
+    for g in _xhu_gap_zones(pdf):
+        a = max(0, np.searchsorted(edges, g["lower"], side="right") - 1)
+        b = min(n - 1, np.searchsorted(edges, g["upper"], side="left"))
+        if b >= a:
+            col = "gap_up_hits" if g["type"] == "gap_up" else "gap_down_hits"
+            prof.loc[a:b, col] += 1
+    prof["mid"] = (prof["lower"] + prof["upper"]) / 2
+    return prof
+
+
+def _xhu_structural_anchors(pdf, period="D"):
+    anchors = []
+    if pdf is None or pdf.empty:
+        return anchors
+    d = pdf.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"])
+    if d.empty:
+        return anchors
+    # 最大量有效阳K、阶段最高/次高、平台上沿/凹口、假突破高点。
+    mv = _find_valid_max_volume_bull_levels(d, f"{period}线", lookback=min(len(d), 120 if period in ("D", "W") else 100))
+    if mv.get("valid"):
+        anchors.append({"price": safe_float(mv.get("high")), "type": "有效最大量阳K高点", "weight": 2.2})
+        anchors.append({"price": safe_float(mv.get("floor")), "type": "有效最大量阳K实底", "weight": 1.0})
+    highs = d["high"].tail(min(len(d), 120)).dropna()
+    if len(highs) >= 10:
+        anchors.append({"price": safe_float(highs.max()), "type": "阶段最高点", "weight": 1.6})
+        anchors.append({"price": safe_float(highs.quantile(0.92)), "type": "次高密集区", "weight": 1.4})
+    try:
+        plat = evaluate_platform_quality(d.tail(min(len(d), 80)))
+        if safe_float(plat.get("score", 0)) >= 4 and safe_float(plat.get("top", 0)) > 0:
+            anchors.append({"price": safe_float(plat.get("top")), "type": "平台/凹口上沿", "weight": 1.8})
+    except Exception:
+        pass
+    # 假突破/上影高点：高点越过近60日分位但收盘回落，作为供应记忆。
+    if len(d) >= 30:
+        roll_high = d["high"].rolling(30).max().shift(1)
+        rng = (d["high"] - d["low"]).replace(0, pd.NA)
+        body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
+        upper_ratio = (d["high"] - body_top) / rng
+        fb = d[(d["high"] >= roll_high * 1.003) & (d["close"] < d["high"] * 0.985) & (upper_ratio >= 0.30)]
+        for _, r in fb.tail(3).iterrows():
+            anchors.append({"price": safe_float(r.get("high")), "type": "假突破/长上影高点", "weight": 1.9})
+    return [a for a in anchors if safe_float(a.get("price", 0)) > 0]
+
+
+def _xhu_score_zone_reaction(prof_seg):
+    if prof_seg is None or prof_seg.empty:
+        return 0.0, ""
+    uw = safe_float(prof_seg["upper_wick_hits"].sum())
+    lw = safe_float(prof_seg["lower_wick_hits"].sum())
+    gd = safe_float(prof_seg["gap_down_hits"].sum())
+    gu = safe_float(prof_seg["gap_up_hits"].sum())
+    supply = min(18.0, uw * 1.4 + gd * 2.2)
+    demand = min(10.0, lw * 1.0 + gu * 1.5)
+    desc = []
+    if uw >= 2:
+        desc.append(f"上影共振{int(uw)}次")
+    if gd >= 1:
+        desc.append(f"向下缺口共振{int(gd)}次")
+    if lw >= 2:
+        desc.append(f"下影承接{int(lw)}次")
+    if gu >= 1:
+        desc.append(f"向上缺口承接{int(gu)}次")
+    return max(0.0, supply - demand * 0.25), "、".join(desc)
+
+
+def _xhu_extract_period_pressure_zones(period_df, period="D", lookback=250, current_close=0.0):
+    """单周期：百分比桶Volume Profile -> 高成交密集区 -> 供应反应/结构锚点校准 -> 压力区。"""
+    if period_df is None or period_df.empty:
+        return []
+    d = period_df.tail(int(lookback)).copy().reset_index(drop=True)
+    if len(d) < 8:
+        return []
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 8:
+        return []
+    cur = current_close if current_close > 0 else safe_float(d.iloc[-1].get("close", 0))
+    minp = max(0.01, safe_float(d["low"].min()) * 0.98)
+    maxp = max(minp * 1.05, safe_float(d["high"].max()) * 1.02)
+    bucket_pct = _xhu_bucket_pct_for_df(d, period)
+    edges = _xhu_make_log_edges(minp, maxp, bucket_pct)
+    prof = _xhu_assign_ohlcv_to_profile(d, edges)
+    if prof.empty:
+        return []
+    # 成交密度：成交量、成交额、收盘/实体接受度、近期权重。
+    for col in ["volume", "amount", "recent_volume", "close_count", "body_weight"]:
+        mx = max(safe_float(prof[col].max()), 1e-9)
+        prof[col + "_rank"] = prof[col] / mx
+    prof["density_score"] = (
+        prof["volume_rank"] * 36 + prof["amount_rank"] * 24 + prof["recent_volume_rank"] * 18
+        + prof["close_count_rank"] * 12 + prof["body_weight_rank"] * 10
+    )
+    dens = prof["density_score"].replace([np.inf, -np.inf], np.nan).dropna()
+    if dens.empty:
+        return []
+    thr = max(float(dens.quantile(0.78)), float(dens.mean() + dens.std() * 0.35))
+    mask = prof["density_score"] >= thr
+    zones = []
+    start = None
+    for i, flag in enumerate(mask.tolist() + [False]):
+        if flag and start is None:
+            start = i
+        if (not flag) and start is not None:
+            end = i - 1
+            seg = prof.iloc[start:end + 1]
+            lower = safe_float(seg["lower"].min()); upper = safe_float(seg["upper"].max())
+            if upper <= 0 or lower <= 0:
+                start = None; continue
+            # 只关心当前价上方/附近的供应区；已经远在下方的归为支撑，不参与压力突破。
+            if upper < cur * 0.965:
+                start = None; continue
+            density = safe_float(seg["density_score"].mean())
+            peak = safe_float(seg["density_score"].max())
+            reaction, rdesc = _xhu_score_zone_reaction(seg)
+            anchors = _xhu_structural_anchors(d, period)
+            anchor_hits = []
+            tol = max(bucket_pct * 2.2, 0.012)
+            adj_lower, adj_upper = lower, upper
+            anchor_score = 0.0
+            for a in anchors:
+                price = safe_float(a.get("price", 0)); wt = safe_float(a.get("weight", 1.0))
+                if lower * (1 - tol) <= price <= upper * (1 + tol):
+                    anchor_hits.append(a.get("type", "锚点"))
+                    anchor_score += wt * 4.0
+                    # 锚点可校准边界，但不能把区间无限拉宽。
+                    if price >= upper * 0.985 and price <= upper * (1 + tol):
+                        adj_upper = max(adj_upper, price)
+                    if price <= lower * 1.015 and price >= lower * (1 - tol):
+                        adj_lower = min(adj_lower, price)
+            width = adj_upper / max(adj_lower, 1e-9) - 1
+            width_score = 8.0 if width <= bucket_pct * 8 else (4.0 if width <= bucket_pct * 14 else -4.0)
+            freshness = 4.0 if period in ("M", "Q", "Y") else 2.0
+            quality = max(0.0, min(100.0, density * 0.55 + peak * 0.25 + reaction + anchor_score + width_score + freshness))
+            if quality >= max(18.0, XHU_PRESSURE_MIN_QUALITY * 0.45):
+                zones.append({
+                    "period": period,
+                    "lower": float(adj_lower), "upper": float(adj_upper), "mid": float((adj_lower + adj_upper) / 2),
+                    "density_score": float(density), "peak_density": float(peak),
+                    "reaction_score": float(reaction), "anchor_score": float(anchor_score),
+                    "quality_score": float(quality), "width_pct": float(width),
+                    "bucket_pct": float(bucket_pct), "anchor_hits": list(sorted(set(anchor_hits))),
+                    "reaction_desc": rdesc, "period_weight": float(_xhu_period_weight(period)),
+                })
+            start = None
+    # 保留离当前近且质量高的压力区。当前正在内部的也保留。
+    zones = sorted(zones, key=lambda z: (safe_float(z["quality_score"]) - max(0.0, z["lower"] / max(cur, 1e-9) - 1) * 20), reverse=True)
+    return zones[:max(1, XHU_PRESSURE_MAX_ZONES_PER_PERIOD)]
+
+
+def _xhu_period_dfs(df):
+    out = [("D", df.copy(), 500)]
+    try:
+        out.append(("W", _resample_ohlcv(df, "W-FRI"), 220))
+        out.append(("M", _resample_ohlcv(df, "M"), 120))
+        out.append(("Q", _resample_ohlcv(df, "Q"), 60))
+        if XHU_PRESSURE_ENABLE_YEARLY == "1":
+            out.append(("Y", _resample_ohlcv(df, "Y"), 25))
+    except Exception:
+        pass
+    return out
+
+
+def _xhu_merge_multi_period_zones(zones, current_close):
+    """核心：投影各周期压力区到统一百分比桶，找多周期重叠最密集核心压力带，同时计算并集最高上沿。"""
+    empty = {
+        "valid": False, "core_lower": 0.0, "core_upper": 0.0, "union_lower": 0.0, "union_upper": 0.0,
+        "final_union_upper": 0.0, "core_periods": [], "dominant_period": "", "overlap_score": 0.0,
+        "pressure_zone_grade": "D", "pressure_quality_score": 0.0, "period_count": 0, "desc": "无有效多周期压力带"
+    }
+    if not zones or current_close <= 0:
+        return empty
+    minp = min(z["lower"] for z in zones) * 0.995
+    maxp = max(z["upper"] for z in zones) * 1.005
+    edges = _xhu_make_log_edges(minp, maxp, max(0.0035, min(0.008, XHU_PRESSURE_DEFAULT_BUCKET_PCT)))
+    n = len(edges) - 1
+    scores = np.zeros(n)
+    period_sets = [set() for _ in range(n)]
+    zone_ids = [set() for _ in range(n)]
+    for zi, z in enumerate(zones):
+        a = max(0, np.searchsorted(edges, z["lower"], side="right") - 1)
+        b = min(n - 1, np.searchsorted(edges, z["upper"], side="left"))
+        if b < a:
+            continue
+        add = safe_float(z.get("period_weight", 1.0)) * max(1.0, safe_float(z.get("quality_score", 0.0)) / 25.0)
+        for i in range(a, b + 1):
+            scores[i] += add
+            period_sets[i].add(z.get("period", ""))
+            zone_ids[i].add(zi)
+    if scores.max() <= 0:
+        return empty
+    max_score = scores.max()
+    # 核心重叠区：得分最高的连续区间；至少取最高桶，避免交集为空。
+    mask = scores >= max(max_score * 0.74, max_score - 1e-9 if max_score < 2 else max_score * 0.74)
+    # 优先选择当前价上方或当前所在的核心区。
+    best = None
+    start = None
+    for i, flag in enumerate(mask.tolist() + [False]):
+        if flag and start is None:
+            start = i
+        if (not flag) and start is not None:
+            end = i - 1
+            lower = edges[start]; upper = edges[end + 1]
+            seg_score = float(scores[start:end + 1].mean())
+            if upper >= current_close * 0.97:
+                dist_penalty = max(0.0, lower / current_close - 1) * 2
+                cand = (seg_score - dist_penalty, start, end, lower, upper)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+            start = None
+    if best is None:
+        i = int(np.argmax(scores)); best = (scores[i], i, i, edges[i], edges[i+1])
+    _, s, e, core_lower, core_upper = best
+    core_periods = sorted(set().union(*period_sets[s:e+1]))
+    related_ids = set().union(*zone_ids[s:e+1])
+    # 相关压力区：与核心区有重叠或边界距离较近的周期带。用其并集计算最终压力上沿。
+    for zi, z in enumerate(zones):
+        if z["upper"] >= core_lower * 0.985 and z["lower"] <= core_upper * 1.04:
+            related_ids.add(zi)
+    related = [zones[i] for i in sorted(related_ids)] if related_ids else zones
+    union_lower = min(z["lower"] for z in related)
+    union_upper = max(z["upper"] for z in related)
+    period_count = len(sorted(set(z["period"] for z in related)))
+    raw_quality = (
+        max_score * 11.0 + period_count * 8.0 + sum(safe_float(z.get("quality_score", 0)) for z in related) / max(1, len(related)) * 0.35
+    )
+    # 年线只做终极压力校验：若年线参与相关区，增加等级但不让过宽区间失真。
+    if "Y" in [z.get("period") for z in related]:
+        raw_quality += 6.0
+    pressure_quality = max(0.0, min(100.0, raw_quality))
+    grade = _xhu_letter_grade(pressure_quality)
+    dominant = sorted(related, key=lambda z: safe_float(z.get("period_weight", 1)) * safe_float(z.get("quality_score", 0)), reverse=True)[0].get("period", "")
+    desc = (
+        f"核心重叠压力带{core_lower:.2f}-{core_upper:.2f}，整体压力区{union_lower:.2f}-{union_upper:.2f}，"
+        f"最终上沿{union_upper:.2f}，参与周期{','.join(sorted(set(z['period'] for z in related)))}，等级{grade}"
+    )
+    return {
+        "valid": True,
+        "core_lower": float(core_lower), "core_upper": float(core_upper),
+        "union_lower": float(union_lower), "union_upper": float(union_upper), "final_union_upper": float(union_upper),
+        "core_periods": core_periods, "dominant_period": dominant,
+        "overlap_score": float(max_score), "pressure_quality_score": float(pressure_quality),
+        "pressure_zone_grade": grade, "period_count": int(period_count), "desc": desc,
+        "related_zones": related[:8],
+    }
+
+
+def _xhu_detect_fake_breakout_memory(df, level):
+    if df is None or df.empty or level <= 0:
+        return {"count": 0, "high": 0.0, "desc": ""}
+    d = df.tail(180).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"])
+    if len(d) < 5:
+        return {"count": 0, "high": 0.0, "desc": ""}
+    rng = (d["high"] - d["low"]).replace(0, pd.NA)
+    body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
+    upper_ratio = (d["high"] - body_top) / rng
+    vol_ma = d["volume"].rolling(20).mean()
+    mask = (d["high"] >= level * 1.002) & ((d["close"] < level * 1.003) | (upper_ratio >= 0.35))
+    mask = mask & ((d["volume"] >= vol_ma * 1.05) | (upper_ratio >= 0.40))
+    hits = d[mask]
+    if hits.empty:
+        return {"count": 0, "high": 0.0, "desc": ""}
+    h = safe_float(hits["high"].max())
+    return {"count": int(len(hits)), "high": float(h), "desc": f"假突破/长上影记忆{len(hits)}次，高点{h:.2f}"}
+
+
+def _xhu_grade_breakout_day(df, composite):
+    empty = {"breakout_day_grade": "D", "breakout_score": 0.0, "setup_grade": "D", "setup_score": 0.0, "desc": "无有效突破"}
+    if df is None or df.empty or not composite.get("valid"):
+        return empty
+    cur = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else cur
+    op = safe_float(cur.get("open", 0)); cl = safe_float(cur.get("close", 0)); hi = safe_float(cur.get("high", 0)); lo = safe_float(cur.get("low", 0))
+    vol = safe_float(cur.get("volume", 0)); prev_vol = safe_float(prev.get("volume", 0))
+    core_upper = safe_float(composite.get("core_upper", 0)); union_upper = safe_float(composite.get("final_union_upper", 0))
+    if min(op, cl, hi, lo, core_upper, union_upper) <= 0:
+        return empty
+    fake = _xhu_detect_fake_breakout_memory(df.iloc[:-1], union_upper)
+    fake_high = safe_float(fake.get("high", 0.0))
+    must_high = max(union_upper, fake_high)
+    rng = max(hi - lo, 1e-9)
+    body_top = max(op, cl); body_bottom = min(op, cl); body_len = max(body_top - body_bottom, 1e-9)
+    close_pos = (cl - lo) / rng
+    upper_shadow_ratio = (hi - body_top) / rng
+    body_above_union = max(0.0, body_top - max(body_bottom, union_upper)) / body_len
+    body_above_core = max(0.0, body_top - max(body_bottom, core_upper)) / body_len
+    vr1 = vol / prev_vol if prev_vol > 0 else 0.0
+    vol_ma20 = safe_float(df["volume"].tail(20).mean()) if "volume" in df.columns and len(df) >= 20 else 0.0
+    volr = vol / vol_ma20 if vol_ma20 > 0 else 0.0
+    healthy_vol = ((1.45 <= vr1 <= 3.2) or (1.35 <= volr <= 4.2)) and not (vr1 > 4.5 and volr > 5.5)
+    is_limit = safe_float(cur.get("pct_chg", 0)) >= 9.3
+    if is_limit and cl >= union_upper * 1.003 and close_pos >= 0.85:
+        healthy_vol = healthy_vol or (volr >= 1.1 and vr1 <= 5.5)
+    breakout_core = cl >= core_upper * 1.003
+    breakout_union = cl >= union_upper * 1.003
+    breakout_fake = (fake_high <= 0) or (cl >= fake_high * 1.002)
+    wick_probe = hi >= core_upper and (not breakout_core or close_pos < 0.60 or upper_shadow_ratio > 0.35)
+    score = 0.0
+    reasons = []
+    if breakout_core:
+        score += 18; reasons.append("突破核心重叠压力带")
+    if breakout_union:
+        score += 26; reasons.append("突破最终压力上沿")
+    if breakout_fake and fake_high > 0:
+        score += 12; reasons.append("突破前次假突破高点")
+    elif fake_high > 0 and cl < fake_high:
+        score -= 8; reasons.append("仍未突破前次假突破高点")
+    if body_above_union >= 0.65:
+        score += 12; reasons.append("实体大部在最终上沿之上")
+    elif body_above_core >= 0.55:
+        score += 6; reasons.append("实体站上核心压力")
+    if close_pos >= 0.85:
+        score += 8; reasons.append("强收盘")
+    elif close_pos >= 0.70:
+        score += 4; reasons.append("较强收盘")
+    if upper_shadow_ratio <= 0.18:
+        score += 5
+    elif upper_shadow_ratio >= 0.35:
+        score -= 7; reasons.append("上影偏长")
+    if healthy_vol:
+        score += 10; reasons.append("量能健康确认")
+    else:
+        score -= 6; reasons.append("量能未达健康突破")
+    if wick_probe:
+        score -= 18; reasons.append("影线试探/冲关不稳")
+    if cl < union_upper and hi >= union_upper:
+        score -= 20; reasons.append("冲击最终上沿失败")
+    score = max(0.0, min(100.0, score))
+    # 日K等级严格看是否完整穿透。
+    if breakout_core and breakout_union and breakout_fake and score >= 72:
+        day_grade = "S"
+    elif ((breakout_core and score >= 58) or (breakout_union and score >= 55)):
+        day_grade = "A"
+    elif (hi >= core_upper or cl >= composite.get("union_lower", 0) * 1.003):
+        day_grade = "B" if score >= 36 else "C"
+    elif wick_probe:
+        day_grade = "D"
+    else:
+        day_grade = "D"
+    return {
+        "breakout_day_grade": day_grade,
+        "breakout_score": float(score),
+        "breakout_core": bool(breakout_core),
+        "breakout_union_upper": bool(breakout_union),
+        "breakout_fake_high": bool(breakout_fake),
+        "fake_breakout_count": int(fake.get("count", 0)),
+        "fake_breakout_high": float(fake_high),
+        "body_above_union_ratio": float(body_above_union),
+        "close_position": float(close_pos),
+        "upper_shadow_ratio": float(upper_shadow_ratio),
+        "volume_confirm": bool(healthy_vol),
+        "desc": "；".join(reasons[:8]) + ("；" + fake.get("desc", "") if fake.get("desc") else ""),
+    }
+
+
+def _xhu_combine_pressure_setup_grade(zone_grade, day_grade, zone_score, day_score):
+    order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+    z = order.get(zone_grade, 0); d = order.get(day_grade, 0)
+    # 高等级压力带 + 高质量日K才可S；低级压力带即使日K强也不直接S。
+    if z >= 4 and d >= 4:
+        return "S", 18.0
+    if z >= 3 and d >= 4:
+        return "A", 15.0
+    if z >= 4 and d >= 3:
+        return "A", 14.0
+    if z >= 3 and d >= 3:
+        return "A", 12.0
+    if z >= 2 and d >= 4:
+        return "B", 9.0
+    if z >= 2 and d >= 3:
+        return "B", 7.0
+    if d <= 0:
+        return "D", 0.0
+    return "C", 3.0
+
+
+def detect_xuanhu_pressure_band_breakout_model(df, code=""):
+    """V15选股模型压力带突破主模型：底层压力区生成 -> 多周期重叠合并 -> 日K突破评级 -> 模型评级。"""
+    empty = {
+        "score_xhu_pressure_breakout": 0.0,
+        "xhu_pressure_model_grade": "D",
+        "xhu_pressure_zone_grade": "D",
+        "xhu_breakout_day_grade": "D",
+        "xhu_pressure_core_lower": 0.0,
+        "xhu_pressure_core_upper": 0.0,
+        "xhu_pressure_union_lower": 0.0,
+        "xhu_pressure_union_upper": 0.0,
+        "xhu_final_union_upper": 0.0,
+        "xhu_pressure_quality_score": 0.0,
+        "xhu_pressure_overlap_score": 0.0,
+        "xhu_pressure_periods": "",
+        "xhu_pressure_desc": "无有效多周期压力带",
+        "xhu_breakout_desc": "无有效突破",
+        "xhu_fake_breakout_count": 0,
+        "xhu_fake_breakout_high": 0.0,
+        "xhu_pressure_json": "[]",
+    }
+    if ENABLE_XHU_PRESSURE_BREAKOUT != "1" or df is None or len(df) < 180:
+        return empty
+    cur_close = safe_float(df.iloc[-1].get("close", 0))
+    if cur_close <= 0:
+        return empty
+    zones = []
+    for period, pdf, lookback in _xhu_period_dfs(df):
+        try:
+            zones.extend(_xhu_extract_period_pressure_zones(pdf, period=period, lookback=lookback, current_close=cur_close))
+        except Exception as e:
+            print(f"V15压力带单周期生成失败：period={period} code={code} error={str(e)[:80]}")
+    if not zones:
+        return empty
+    composite = _xhu_merge_multi_period_zones(zones, cur_close)
+    if not composite.get("valid"):
+        return empty
+    day = _xhu_grade_breakout_day(df, composite)
+    setup_grade, setup_score = _xhu_combine_pressure_setup_grade(
+        composite.get("pressure_zone_grade", "D"), day.get("breakout_day_grade", "D"),
+        composite.get("pressure_quality_score", 0), day.get("breakout_score", 0)
+    )
+    # 空间与过热修正：完整穿透后若上方仍有年线/远端压力贴脸，不能过度抬分；这里先轻度修正，V14继续降级。
+    close = cur_close
+    final_upper = safe_float(composite.get("final_union_upper", 0))
+    dist_after = close / final_upper - 1 if final_upper > 0 else 0.0
+    if setup_grade == "S" and dist_after < 0.003:
+        setup_score -= 1.0
+    # 输出给一号员工：A/S可作为正式候选资格之一；B/C/D只观察。
+    score = max(0.0, min(18.0, setup_score))
+    related = composite.get("related_zones", [])
+    return {
+        "score_xhu_pressure_breakout": float(score),
+        "xhu_pressure_model_grade": setup_grade,
+        "xhu_pressure_zone_grade": composite.get("pressure_zone_grade", "D"),
+        "xhu_breakout_day_grade": day.get("breakout_day_grade", "D"),
+        "xhu_pressure_core_lower": float(composite.get("core_lower", 0.0)),
+        "xhu_pressure_core_upper": float(composite.get("core_upper", 0.0)),
+        "xhu_pressure_union_lower": float(composite.get("union_lower", 0.0)),
+        "xhu_pressure_union_upper": float(composite.get("union_upper", 0.0)),
+        "xhu_final_union_upper": float(composite.get("final_union_upper", 0.0)),
+        "xhu_pressure_quality_score": float(composite.get("pressure_quality_score", 0.0)),
+        "xhu_pressure_overlap_score": float(composite.get("overlap_score", 0.0)),
+        "xhu_pressure_periods": ",".join(sorted(set(z.get("period", "") for z in related))),
+        "xhu_pressure_desc": composite.get("desc", ""),
+        "xhu_breakout_desc": day.get("desc", ""),
+        "xhu_fake_breakout_count": int(day.get("fake_breakout_count", 0)),
+        "xhu_fake_breakout_high": float(day.get("fake_breakout_high", 0.0)),
+        "xhu_pressure_json": json.dumps(related, ensure_ascii=False)[:1800],
+    }
+
 def calc_deep_rows(df, code):
     if df is None or len(df) < 260:
         return pd.DataFrame()
@@ -4771,6 +5386,13 @@ def calc_deep_rows(df, code):
         extra[_k] = _v
     multi_tf_floor = pd.Series(float(multi_tf_ctx.get("multi_tf_best_floor", 0.0)), index=df.index)
     multi_tf_high = pd.Series(float(multi_tf_ctx.get("multi_tf_best_high", 0.0)), index=df.index)
+
+    # ========================= V15：选股模型多周期供需压力带突破模型 =========================
+    # 先用百分比/对数价格桶生成日/周/月/季/年供需密集区，再找多周期重叠核心压力带和最终压力上沿；
+    # 只有A/S级压力带突破才作为选股模型正式候选资格之一，B/C/D只进入观察。
+    xhu_pressure_ctx = detect_xuanhu_pressure_band_breakout_model(df, code)
+    for _k, _v in xhu_pressure_ctx.items():
+        extra[_k] = _v
     # 若多周期关键实底线存在，将它纳入“回踩关键位”体系，但只作为同源关键位之一，后面有封顶。
     struct_key = pd.concat([struct_key, multi_tf_floor.where(multi_tf_floor > 0, 0)], axis=1).max(axis=1)
 
@@ -4880,9 +5502,14 @@ def calc_deep_rows(df, code):
         & (df["long_pos_250"] <= 0.82),
         "v12_formal_push_ok"
     ] = True
+    # V15：压力带突破模型是选股模型主战法之一。
+    # S级完整穿透可直接作为正式候选资格；A级核心压力突破/消化突破也可入候选，但仍受V14/雷区/RR二次审核。
+    extra.loc[extra["xhu_pressure_model_grade"].isin(["S", "A"]) & (extra["score_xhu_pressure_breakout"] >= 12), "v12_formal_push_ok"] = True
+    extra.loc[extra["xhu_pressure_model_grade"].eq("S"), "v12_entry_label"] = "V15压力带完整穿透，选股模型S级突破候选"
+    extra.loc[extra["xhu_pressure_model_grade"].eq("A") & (extra["score_xhu_pressure_breakout"] >= 12), "v12_entry_label"] = "V15压力带核心突破/消化突破，选股模型A级候选"
 
 
-    # 承接结构总分：涨停后三日实体承接 + 普通关键位回踩承接。
+    # 承接结构总分：涨停后三日实体承接 + 普通关键位回踩承接.
     # 如果两者来自同一阶段，普通关键位回踩按60%权重，最终封顶10分，避免一根涨停重复堆分。
     extra["score_carry_structure"] = (
         extra["score_limitup_hold_3d"]
@@ -5325,6 +5952,7 @@ def calc_deep_rows(df, code):
         + extra["score_advanced_ao_kou"].clip(lower=0)
         + extra["score_fibo_reclaim"].clip(lower=0)
         + extra["score_multi_tf_key_structure"].clip(lower=0)
+        + extra["score_xhu_pressure_breakout"].fillna(0) * 1.15
         + extra["score_v124_probe_second_confirm"].fillna(0) * 0.85
         + extra["score_v125_timing_window"].fillna(0) * 0.35
         + extra["score_v125_step_platform_lift"].fillna(0) * 0.45
@@ -5337,6 +5965,7 @@ def calc_deep_rows(df, code):
         extra["score_advanced_ao_kou"].clip(lower=0),
         extra["score_fibo_reclaim"].clip(lower=0),
         extra["score_multi_tf_key_structure"].clip(lower=0),
+        extra["score_xhu_pressure_breakout"].fillna(0) * 1.15,
         extra["score_break_k_quality"].clip(lower=0) * 1.5,
     ], axis=1).max(axis=1)
     _structure_hits = (pd.concat([
@@ -5423,6 +6052,7 @@ def calc_deep_rows(df, code):
         + extra["score_v121_volume_confirm_block"]
         + extra["score_v121_activity_elasticity_block"]
         + extra["score_v121_trade_quality_block"]
+        + extra["score_xhu_pressure_breakout"].fillna(0) * 0.85
         + extra["score_v125_timing_block"] * 0.55
         + extra["score_v121_risk_gate_block"]
     )
@@ -5451,6 +6081,7 @@ def calc_deep_rows(df, code):
         + extra["score_advanced_ao_kou"]
         + extra["score_fibo_reclaim"]
         + extra["score_multi_tf_key_structure"] * 0.75
+        + extra["score_xhu_pressure_breakout"].fillna(0) * 0.85
         + extra["score_monthly_cycle"] * 0.8
         + extra["score_carry_structure"] * 0.6
     )
@@ -5472,6 +6103,9 @@ def calc_deep_rows(df, code):
         + extra["score_penalty"] * 0.90
     ).clip(-30, 40)
     extra["total_score"] = extra["total_score"] + extra["score_trade_quality"] + extra["score_monthly_height_space"] + extra["trade_priority_score"] * 0.35
+    # V15：压力带突破A/S属于选股模型明确主战法，参与综合分与交易优先级；B/C/D只轻度提示，不可靠堆分入正式池。
+    extra["total_score"] = extra["total_score"] + extra["score_xhu_pressure_breakout"].fillna(0) * 0.65
+    extra.loc[extra["xhu_pressure_model_grade"].isin(["B", "C", "D"]), "total_score"] = extra.loc[extra["xhu_pressure_model_grade"].isin(["B", "C", "D"]), "total_score"].clip(upper=84.0)
 
     # V11.1：交易优先级不能轻易打满。高位回抽100%、月线高位、真实防守过远必须封顶。
     fibo_pullback_pressure_v111 = extra["fibo_reclaim_type"].astype(str).str.contains("高扩展位回落", na=False)
@@ -5528,7 +6162,7 @@ def calc_deep_rows(df, code):
 
     # V12：突破当天/买点未到的票进入后台跟踪池，不作为正式推送；舒服买点才保留优先候选。
     if "candidate_pool" in merged.columns:
-        v12_no_entry = (~merged.get("v12_formal_push_ok", False)) & (merged.get("v12_break_today_weak", False) | ((merged.get("score_structure_core", 0) + merged.get("score_monthly_cycle", 0) + merged.get("score_multi_tf_key_structure", 0)) >= 8))
+        v12_no_entry = (~merged.get("v12_formal_push_ok", False)) & (~merged.get("xhu_pressure_model_grade", "D").astype(str).isin(["S", "A"])) & (merged.get("v12_break_today_weak", False) | ((merged.get("score_structure_core", 0) + merged.get("score_monthly_cycle", 0) + merged.get("score_multi_tf_key_structure", 0) + merged.get("score_xhu_pressure_breakout", 0)) >= 8))
         merged.loc[v12_no_entry, "candidate_pool"] = "后台跟踪池"
         merged.loc[v12_no_entry, "candidate_pool_reason"] = (merged.loc[v12_no_entry, "candidate_pool_reason"].astype(str) + "；V12买点未到：突破当天或尚未回踩确认").str.strip("；")
         merged.loc[v12_no_entry, "total_score"] = merged.loc[v12_no_entry, "total_score"].clip(upper=79.0)
@@ -5864,6 +6498,21 @@ def process_stock_deep(row):
             "structure_flags": str(r["structure_flags"]) if pd.notna(r["structure_flags"]) else "",
             "structure_neckline": float(r["structure_neckline"]) if pd.notna(r["structure_neckline"]) else 0,
             "score_multi_tf_key_structure": float(r.get("score_multi_tf_key_structure", 0)) if pd.notna(r.get("score_multi_tf_key_structure", 0)) else 0,
+            "score_xhu_pressure_breakout": float(r.get("score_xhu_pressure_breakout", 0)) if pd.notna(r.get("score_xhu_pressure_breakout", 0)) else 0,
+            "xhu_pressure_model_grade": str(r.get("xhu_pressure_model_grade", "")) if pd.notna(r.get("xhu_pressure_model_grade", "")) else "",
+            "xhu_pressure_zone_grade": str(r.get("xhu_pressure_zone_grade", "")) if pd.notna(r.get("xhu_pressure_zone_grade", "")) else "",
+            "xhu_breakout_day_grade": str(r.get("xhu_breakout_day_grade", "")) if pd.notna(r.get("xhu_breakout_day_grade", "")) else "",
+            "xhu_pressure_core_lower": float(r.get("xhu_pressure_core_lower", 0)) if pd.notna(r.get("xhu_pressure_core_lower", 0)) else 0,
+            "xhu_pressure_core_upper": float(r.get("xhu_pressure_core_upper", 0)) if pd.notna(r.get("xhu_pressure_core_upper", 0)) else 0,
+            "xhu_pressure_union_lower": float(r.get("xhu_pressure_union_lower", 0)) if pd.notna(r.get("xhu_pressure_union_lower", 0)) else 0,
+            "xhu_pressure_union_upper": float(r.get("xhu_pressure_union_upper", 0)) if pd.notna(r.get("xhu_pressure_union_upper", 0)) else 0,
+            "xhu_final_union_upper": float(r.get("xhu_final_union_upper", 0)) if pd.notna(r.get("xhu_final_union_upper", 0)) else 0,
+            "xhu_pressure_quality_score": float(r.get("xhu_pressure_quality_score", 0)) if pd.notna(r.get("xhu_pressure_quality_score", 0)) else 0,
+            "xhu_pressure_periods": str(r.get("xhu_pressure_periods", "")) if pd.notna(r.get("xhu_pressure_periods", "")) else "",
+            "xhu_pressure_desc": str(r.get("xhu_pressure_desc", "")) if pd.notna(r.get("xhu_pressure_desc", "")) else "",
+            "xhu_breakout_desc": str(r.get("xhu_breakout_desc", "")) if pd.notna(r.get("xhu_breakout_desc", "")) else "",
+            "xhu_fake_breakout_count": float(r.get("xhu_fake_breakout_count", 0)) if pd.notna(r.get("xhu_fake_breakout_count", 0)) else 0,
+            "xhu_fake_breakout_high": float(r.get("xhu_fake_breakout_high", 0)) if pd.notna(r.get("xhu_fake_breakout_high", 0)) else 0,
             "score_multi_tf_break_quality": float(r.get("score_multi_tf_break_quality", 0)) if pd.notna(r.get("score_multi_tf_break_quality", 0)) else 0,
             "multi_tf_key_desc": str(r.get("multi_tf_key_desc", "")) if pd.notna(r.get("multi_tf_key_desc", "")) else "",
             "multi_tf_best_floor": float(r.get("multi_tf_best_floor", 0)) if pd.notna(r.get("multi_tf_best_floor", 0)) else 0,
@@ -6474,6 +7123,8 @@ def build_reason_v12(s):
         watch.append(str(s.get("multi_tf_high_break_desc", "日线高质量突破多周期关键高点")))
     if safe_float(s.get("score_v124_probe_second_confirm", 0)) >= 6:
         watch.append("远期绿线/9号线二次确认模型：" + str(s.get("v124_probe_desc", "")))
+    if safe_float(s.get("score_xhu_pressure_breakout", 0)) >= 7:
+        watch.append("V15压力带突破：" + str(s.get("xhu_pressure_desc", "")) + "；" + str(s.get("xhu_breakout_desc", "")))
     if safe_float(s.get("score_v12_activity", 0)) >= 2:
         watch.append(str(s.get("v12_activity_label", "活跃度较好")))
     if safe_float(s.get("score_v12_pullback_entry", 0)) >= 5:
@@ -6497,6 +7148,10 @@ def build_reason_v12(s):
         problems.append(str(s.get("v12_activity_label", "活跃度偏低")))
     if safe_float(s.get("near_pressure_dist", 0)) > 0 and safe_float(s.get("near_pressure_dist", 0)) < 0.08:
         problems.append("上方近端压力偏近")
+    if str(s.get("xhu_pressure_model_grade", "")) in ["B", "C"] and safe_float(s.get("xhu_pressure_core_upper", 0)) > 0:
+        problems.append("V15压力带尚未完整穿透，当前只是进入/试探复合压力区")
+    if str(s.get("xhu_pressure_model_grade", "")) == "D" and safe_float(s.get("xhu_fake_breakout_count", 0)) > 0:
+        problems.append("复合压力区存在假突破记忆，本次未完成强实体确认")
     if safe_float(s.get("v124_parent_distance", 0)) > 0 and safe_float(s.get("v124_parent_distance", 0)) < 0.08:
         problems.append("9号线/绿线上方仍有更大父级凹口压力贴脸，突破小门不等于打穿大门")
     if safe_float(s.get("rsi", 0)) >= 80 or safe_float(s.get("cci", 0)) >= 250:
@@ -6535,6 +7190,159 @@ def _v14_clip(value, low=0.0, high=100.0):
     except Exception:
         return low
 
+def _grade_rank_v151(g):
+    order = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1, "NONE": 0, "": 0}
+    return order.get(str(g).upper(), 0)
+
+
+def _v151_grade_from_score(score, s_line, a_line, b_line, c_line=0):
+    score = safe_float(score, 0)
+    if score >= s_line:
+        return "S"
+    if score >= a_line:
+        return "A"
+    if score >= b_line:
+        return "B"
+    if c_line and score >= c_line:
+        return "C"
+    return "D"
+
+
+def evaluate_v151_holistic_model_grade(r):
+    """
+    V16整体模型评级融合：
+    不是只把压力带突破评级塞进V14，而是把原一号员工所有主模型一起纳入“选股模型正式模型门槛”。
+
+    输出含义：
+    - strongest_model_grade：当前股票命中的最强主模型等级。
+    - formal_model_ok：是否至少命中一个A/S主模型。
+    - holistic_bonus：对总分的后置校准，不替代原深度总分。
+    - model_cap：无A/S主模型时的综合分封顶，避免靠零碎小优点堆进前三。
+    """
+    models = []
+
+    def add_model(name, grade, score, reason):
+        grade = str(grade or "D").upper()
+        if grade not in ["S", "A", "B", "C", "D"]:
+            grade = "D"
+        models.append({
+            "name": name,
+            "grade": grade,
+            "score": round(safe_float(score, 0), 2),
+            "reason": str(reason or ""),
+            "rank": _grade_rank_v151(grade),
+        })
+
+    # 1）V15压力带突破主战法：已经内部融合“压力带等级 × 日K等级 × 模型等级”。
+    p_grade = str(r.get("xhu_pressure_model_grade", "") or "D").upper()
+    p_score = safe_float(r.get("score_xhu_pressure_breakout", 0))
+    if p_grade in ["S", "A", "B", "C", "D"] and (p_score > 0 or p_grade in ["S", "A", "B"]):
+        add_model("V15多周期压力带突破", p_grade, p_score, str(r.get("xhu_breakout_desc", "")))
+
+    # 2）V12舒服买点/突破后回踩确认：这是原模型最符合“可下单”的主模型之一。
+    pull = safe_float(r.get("score_v12_pullback_entry", 0))
+    carry = safe_float(r.get("score_carry_structure", 0))
+    trade = safe_float(r.get("score_trade_quality", 0))
+    formal = bool(r.get("v12_formal_push_ok", False))
+    pull_combo = pull + max(0, carry) * 0.35 + max(0, trade) * 0.20
+    if formal and pull_combo >= 13:
+        add_model("V12突破后回踩确认/舒服买点", "S", pull_combo, str(r.get("v12_entry_label", "")))
+    elif formal or pull_combo >= 9:
+        add_model("V12突破后回踩确认/舒服买点", "A", pull_combo, str(r.get("v12_entry_label", "")))
+    elif pull_combo >= 6:
+        add_model("V12回踩承接观察", "B", pull_combo, str(r.get("v12_entry_label", "")))
+
+    # 3）黄金倍量/首次倍量高点二次确认。
+    fibo = safe_float(r.get("score_fibo_reclaim", 0))
+    fibo_type = str(r.get("fibo_reclaim_type", ""))
+    if fibo > 0:
+        if "高扩展位回落" in fibo_type:
+            add_model("黄金倍量高位回抽风险", "C", fibo, fibo_type)
+        else:
+            add_model("黄金倍量二次确认", _v151_grade_from_score(fibo, 10.5, 7.5, 5.5), fibo, fibo_type)
+
+    # 4）高级凹口二次倍量/平台级别突破。
+    adv = safe_float(r.get("score_advanced_ao_kou", 0))
+    if adv > 0:
+        add_model("高级凹口二次倍量", _v151_grade_from_score(adv, 12.0, 8.0, 6.0), adv, str(r.get("advanced_ao_kou_reason", "")))
+
+    # 5）多周期关键结构位：最大量阳K实底/高点、远期绿线/9号线二次确认等。
+    mtf = safe_float(r.get("score_multi_tf_key_structure", 0))
+    mtf_break = safe_float(r.get("score_multi_tf_break_quality", 0))
+    v124 = safe_float(r.get("score_v124_probe_second_confirm", 0))
+    mtf_combo = mtf + mtf_break * 0.55 + v124 * 0.45
+    if mtf_combo > 0:
+        if mtf >= 14 and (mtf_break >= 8 or v124 >= 10):
+            grade = "S"
+        elif mtf_combo >= 13:
+            grade = "A"
+        elif mtf_combo >= 8:
+            grade = "B"
+        else:
+            grade = "C"
+        add_model("多周期关键结构位突破/确认", grade, mtf_combo, str(r.get("multi_tf_key_desc", "")))
+
+    # 6）月线BBI/BOLL中轨修复 + 日线触发。月线只是底座，必须结合日线动作。
+    monthly = safe_float(r.get("score_monthly_cycle", 0))
+    structure = safe_float(r.get("score_structure_core", 0))
+    if monthly >= 8 and (structure >= 6 or pull >= 6 or p_grade in ["S", "A"]):
+        m_combo = monthly + max(structure, pull, p_score) * 0.35
+        add_model("月线中轨修复+日线触发", "A" if m_combo < 14 else "S", m_combo, str(r.get("monthly_midline_detail", r.get("monthly_cycle_detail", ""))))
+    elif monthly >= 6:
+        add_model("月线中轨修复观察", "B", monthly, str(r.get("monthly_midline_detail", "")))
+
+    # 7）破底翻/圆弧底/凹口/平台等原结构核心。
+    if structure > 0:
+        s_grade = _v151_grade_from_score(structure, 20.0, 13.0, 8.0, 4.0)
+        add_model("原结构核心模型", s_grade, structure, str(r.get("structure_reason", r.get("pattern_desc", ""))))
+
+    # 8）时间窗口/爆发前夜只能作为放大器，不能单独成为A/S正式模型。
+    timing = safe_float(r.get("score_v125_timing_window", 0)) + safe_float(r.get("score_v126_timing_sufficiency", 0)) * 0.45
+    if timing >= 8:
+        add_model("爆发前夜时间窗口辅助", "B", timing, str(r.get("v125_timing_desc", "")))
+
+    if not models:
+        add_model("无明确主模型", "D", 0, "未命中A/S主战法")
+
+    models = sorted(models, key=lambda x: (x["rank"], x["score"]), reverse=True)
+    strongest = models[0]
+    grade = strongest["grade"]
+    formal_ok = _grade_rank_v151(grade) >= _grade_rank_v151("A")
+
+    # 总分校准：奖励明确主模型，限制无主模型堆分。
+    if grade == "S":
+        bonus = 5.0
+        cap = 100.0
+    elif grade == "A":
+        bonus = 3.0
+        cap = 96.0
+    elif grade == "B":
+        bonus = 0.5
+        cap = 82.0
+    elif grade == "C":
+        bonus = -1.5
+        cap = 78.0
+    else:
+        bonus = -3.0
+        cap = 75.0
+
+    # 多模型共振：两个以上A/S可以再加，但封顶，避免重复堆分。
+    as_count = sum(1 for m in models if m["rank"] >= _grade_rank_v151("A"))
+    if as_count >= 2:
+        bonus += min(2.0, 0.8 * (as_count - 1))
+
+    return {
+        "strongest_model_name": strongest["name"],
+        "strongest_model_grade": grade,
+        "strongest_model_score": strongest["score"],
+        "formal_model_ok": formal_ok,
+        "holistic_bonus": float(bonus),
+        "model_cap": float(cap),
+        "as_model_count": int(as_count),
+        "models": models[:8],
+        "summary": "；".join([f"{m['name']}={m['grade']}({m['score']})" for m in models[:5]]),
+    }
+
 
 def v14_candidate_audit(s):
     """
@@ -6561,6 +7369,19 @@ def v14_candidate_audit(s):
     entry_hold = _v14_clip(safe_float(r.get("score_v12_pullback_entry", 0)) * 0.70 + safe_float(r.get("score_behavior", 0)) * 0.35 + safe_float(r.get("score_limitup_hold_3d", 0)) * 0.45 + safe_float(r.get("score_carry_structure", 0)) * 0.30, 0, 20)
     operability = _v14_clip(safe_float(r.get("score_trade_quality", 0)) * 0.55 + safe_float(r.get("trade_priority_score", 0)) * 0.35 + safe_float(r.get("score_pressure_space", 0)) * 0.35 + safe_float(r.get("score_key_distance", 0)) * 0.45, 0, 12)
     activity_aux = _v14_clip(safe_float(r.get("score_v12_activity", 0)) * 0.50 + safe_float(r.get("score_v125_timing_window", 0)) * 0.30 + safe_float(r.get("score_v126_timing_sufficiency", 0)) * 0.30, 0, 5)
+    pressure_breakout = _v14_clip(safe_float(r.get("score_xhu_pressure_breakout", 0)) + safe_float(r.get("xhu_pressure_quality_score", 0)) * 0.03, 0, 14)
+
+    # V16整体模型融合：压力带只是主战法之一；原模型里的回踩确认、黄金倍量、凹口、
+    # 多周期关键位、月线修复等，都必须一起进入“选股模型主模型评级”。
+    holistic = evaluate_v151_holistic_model_grade(r)
+    holistic_bonus = safe_float(holistic.get("holistic_bonus", 0))
+    model_cap = safe_float(holistic.get("model_cap", 100))
+    pressure_grade = str(r.get("xhu_pressure_model_grade", ""))
+    pressure_bonus = 0.0
+    if pressure_grade == "S":
+        pressure_bonus = 0.8
+    elif pressure_grade == "A":
+        pressure_bonus = 0.4
 
     # V14阳包阴细项：作为K线质量解释与少量校准，已纳入原行为分，不重复重奖。
     engulf_score = safe_float(r.get("v14_bull_engulf_score_current", 0))
@@ -6639,8 +7460,12 @@ def v14_candidate_audit(s):
     if pool and pool != "优先候选池":
         pool_penalty = 3.0
 
-    v14_adjustment = engulf_bonus - chase_penalty - op_penalty - volume_penalty - pool_penalty
+    # 总分不再只做“压力带小加分”，而是做整体主模型门槛校准。
+    # 有A/S主模型：允许原主模型分数释放；无A/S主模型：限制靠零碎因子堆分进前三。
+    v14_adjustment = engulf_bonus + pressure_bonus + holistic_bonus - chase_penalty - op_penalty - volume_penalty - pool_penalty
     final_score = original + v14_adjustment
+    if model_cap < 100:
+        final_score = min(final_score, model_cap)
 
     # 严重追高/无防守可封顶，但默认不剔除，避免全市场0只。
     severe_chase = (bias20 > 0.25 and dist_key > 0.12) or (pct > 9 and defense_dist > 0.15)
@@ -6666,19 +7491,35 @@ def v14_candidate_audit(s):
     r["v14_volume_penalty"] = -volume_penalty
     r["v14_pool_penalty"] = -pool_penalty
     r["v14_engulf_bonus"] = engulf_bonus
+    r["v15_pressure_bonus"] = pressure_bonus
+    r["v151_holistic_model_bonus"] = holistic_bonus
+    r["v151_model_cap"] = model_cap
+    r["v151_strongest_model_name"] = holistic.get("strongest_model_name", "")
+    r["v151_strongest_model_grade"] = holistic.get("strongest_model_grade", "")
+    r["v151_formal_model_ok"] = bool(holistic.get("formal_model_ok", False))
+    r["v151_as_model_count"] = int(holistic.get("as_model_count", 0))
+    r["v151_model_summary"] = holistic.get("summary", "")
+    try:
+        r["v151_models_json"] = json.dumps(holistic.get("models", []), ensure_ascii=False)
+    except Exception:
+        r["v151_models_json"] = "[]"
     r["v14_chase_reasons"] = "；".join(chase_reasons) if chase_reasons else "无明显追高扣分"
     r["v14_operability_reasons"] = "；".join(op_reasons) if op_reasons else "可操作性未触发明显扣分"
     r["v14_volume_reasons"] = "；".join(volume_reasons) if volume_reasons else "量能未触发明显扣分"
 
-    if final_score >= 80:
-        level = "A类强候选"
-    elif final_score >= 75:
-        level = "B类合格候选"
+    model_grade = str(holistic.get("strongest_model_grade", ""))
+    model_name = str(holistic.get("strongest_model_name", ""))
+    if final_score >= 82 and model_grade == "S":
+        level = "S类核心候选"
+    elif final_score >= 78 and model_grade in ["S", "A"]:
+        level = "A类主模型候选"
+    elif final_score >= 72 and model_grade in ["A", "B"]:
+        level = "B类合格/跟踪候选"
     elif final_score >= 70:
         level = "C类弱候选/需确认"
     else:
         level = "低于正式三选底线"
-    r["v14_level"] = level
+    r["v14_level"] = f"{level}｜主模型:{model_name}{model_grade}"
 
     r["v14_score_breakdown"] = {
         "原主模型深度分": round(original, 2),
@@ -6689,6 +7530,10 @@ def v14_candidate_audit(s):
         "承接买点": round(entry_hold, 2),
         "可操作性/RR": round(operability, 2),
         "活跃度/时间辅助": round(activity_aux, 2),
+        "V15压力带突破": round(pressure_breakout, 2),
+        "V15压力带校准": round(pressure_bonus, 2),
+        "V16主模型融合": round(holistic_bonus, 2),
+        "V16模型封顶": round(model_cap, 2),
         "阳包阴细项": round(engulf_score, 2),
         "V14阳包阴校准": round(engulf_bonus, 2),
         "追高惩罚": round(-chase_penalty, 2),
@@ -6705,7 +7550,7 @@ def v14_score_table_text(s):
     b = s.get("v14_score_breakdown", {}) or {}
     order = [
         "原主模型深度分", "大周期结构", "多周期最大阳量K/关键位", "近区结构/精准线", "量能资金", "承接买点", "可操作性/RR",
-        "活跃度/时间辅助", "阳包阴细项", "V14阳包阴校准", "追高惩罚", "可操作性惩罚", "量能不足惩罚", "池子降级", "V14最终分"
+        "活跃度/时间辅助", "V15压力带突破", "V15压力带校准", "V16主模型融合", "V16模型封顶", "阳包阴细项", "V14阳包阴校准", "追高惩罚", "可操作性惩罚", "量能不足惩罚", "池子降级", "V14最终分"
     ]
     parts = []
     for k in order:
@@ -6728,6 +7573,8 @@ def select_final_signals_v14(deep_rows, history=None, limit=None):
     eligible = sorted(
         eligible,
         key=lambda x: (
+            _grade_rank_v151(x.get("v151_strongest_model_grade", "")),
+            int(bool(x.get("v151_formal_model_ok", False))),
             safe_float(x.get("v14_final_score", x.get("total_score", 0))),
             safe_float(x.get("trade_priority_score", 0)),
             safe_float(x.get("score_trade_quality", 0)),
@@ -6774,12 +7621,12 @@ def v14_diagnostics_text(rows, n=8):
 
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
     lines = []
-    lines.append("📊 <b>一号员工V14原主模型完整底座+增量体系三选报告</b>")
+    lines.append("📊 <b>一号员工V16机构级20维机会评分三选报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
-    lines.append(f"V14三选口径：财务/审计/监管硬雷区一票否决；普通缺点只扣分/降级；原V12.6深度总分为主，V14后置校准为辅，尽量选出相对最优{V14_TARGET_PUSH_COUNT}只。")
+    lines.append(f"V16三选口径：财务/审计/监管硬雷区一票否决；原V12.6/V14深度分保留，但必须融合主模型等级。压力带、回踩确认、黄金倍量、凹口、多周期关键位、月线修复等统一评级，尽量选出相对最优{V14_TARGET_PUSH_COUNT}只。")
     lines.append("保留底座：倍量/倍量后平量/分散健康倍量/凹口/平台/破底翻/BBI-BOLL中轨修复/近区精准线/缺口/阳包阴/双阳夹阴/台阶/多周期最大阳量K/不追高/RR等均不删除。")
     lines.append("V14新增：阳包阴按跳空越过前阴开盘、实体内高开收复、低/平开完全反包、仅修复中位四档，并纳入上下影线、收盘位置、量能质量。")
     lines.append("说明：一号员工只做结构分析，不提供复制代码；最终可操作代码由三号员工输出。")
@@ -6818,7 +7665,8 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
             f"买点：{s.get('score_v12_pullback_entry', 0):.1f} | 台阶：{s.get('score_v125_step_platform_lift', 0):.1f} | 活跃度：{s.get('score_v12_activity', 0):.1f} | "
             f"日线结构：{s.get('score_structure_core', 0):.1f} | 月线：{s.get('score_monthly_cycle', 0):.1f} | 量价：{s.get('score_volume_structure', 0):.1f} | 雷区：{s.get('score_regulatory_risk', 0):.1f}"
         )
-        lines.append("V14打分表：" + html.escape(v14_score_table_text(s)))
+        lines.append("V16主模型融合：" + html.escape(str(s.get("v151_model_summary", ""))))
+        lines.append("V14/V15打分表：" + html.escape(v14_score_table_text(s)))
         if safe_float(s.get('v14_bull_engulf_score_current', 0)) > 0:
             lines.append(
                 "阳包阴细项："
@@ -6842,6 +7690,584 @@ def build_error_message(error_text):
     lines.append(html.escape(str(error_text))[:3000])
     return "\n".join(lines)
 
+
+# ========================= V16：一号员工选股模型 20维机构级机会评分 + Telegram真表格 =========================
+# 说明：本段为后置增量覆盖层，不删除原V12/V14/V15任何有效逻辑。
+# 原有战法均作为信号库，统一映射到20维机会评分：
+# 数据/可交易/雷区/供需带/结构/长周期/量能/趋势/修复/时间/突破/回踩/分时/日K/空间/下行/过热/执行/环境/组合。
+# 最终按风险调整后的机会分和封顶规则输出 S/A/B+/观察；Telegram正文保持简洁，表格以PNG图片发送。
+# ==================================================================================================
+
+MODEL_VERSION = "V16一号员工选股模型机构级20维机会评分版"
+TELEGRAM_PENDING_IMAGES = []
+
+try:
+    _ORIGINAL_SEND_TELEGRAM = send_telegram
+except Exception:
+    _ORIGINAL_SEND_TELEGRAM = None
+
+
+def _v16_clip(x, lo=0.0, hi=100.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return lo
+
+
+def _v16_grade_rank(g):
+    g = str(g or "").upper()
+    return {"S": 5, "A": 4, "B+": 3, "B": 2, "C": 1, "D": 0}.get(g, 0)
+
+
+def _v16_score_to_grade(score):
+    score = safe_float(score, 0)
+    if score >= 90:
+        return "S"
+    if score >= 82:
+        return "A"
+    if score >= 75:
+        return "B+"
+    if score >= 68:
+        return "B"
+    if score >= 60:
+        return "C"
+    return "D"
+
+
+def _v16_text_short(x, n=32):
+    s = str(x or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n-1] + "…"
+
+
+def _v16_has_text(r, field, keywords):
+    text = str(r.get(field, "") or "")
+    return any(k in text for k in keywords)
+
+
+def _v16_eval_dimensions(r):
+    """把原V12/V14/V15全部信号映射到20维机构级机会评分。每维0~100，分数越高越好。"""
+    dims = []
+
+    def add(key, name, score, weight, reason):
+        dims.append({
+            "key": key,
+            "name": name,
+            "score": round(_v16_clip(score), 1),
+            "weight": float(weight),
+            "reason": _v16_text_short(reason, 42),
+        })
+
+    # 常用字段
+    risk_hard = bool(r.get("risk_hard_exclude", False)) or bool(r.get("v14_blocked", False))
+    risk_flags = str(r.get("risk_flags", "") or "") + "；" + str(r.get("v14_block_reason", "") or "")
+    amount = safe_float(r.get("amount", 0))
+    turnover = safe_float(r.get("turnover", 0))
+    pct = safe_float(r.get("pct_chg", 0))
+    vr1 = safe_float(r.get("vr1", 0))
+    volr = safe_float(r.get("volr", 0))
+    pos = safe_float(r.get("pos", 0.5))
+    entity_pct = safe_float(r.get("entity_pct", 0))
+    bias20 = safe_float(r.get("bias20", 0))
+    bias60 = safe_float(r.get("bias60", 0))
+    rsi = safe_float(r.get("rsi", r.get("base_rsi", 50)))
+    cci = safe_float(r.get("cci", r.get("base_cci", 0)))
+    rr = safe_float(r.get("risk_reward_ratio", 0))
+    defense_dist = safe_float(r.get("defense_dist", 0))
+    near_p = safe_float(r.get("near_pressure_dist", 0))
+    mid_p = safe_float(r.get("mid_pressure_dist", 0))
+    overhead_p = safe_float(r.get("overhead_pressure_dist", 0))
+    long_pos = safe_float(r.get("long_pos_250", 0))
+
+    # 1 数据质量：深度样本已经过主流程，这里默认较高；月线/长周期缺失时略降。
+    data_score = 82
+    if safe_float(r.get("score_monthly_cycle", 0)) <= 0 and safe_float(r.get("score_long_cycle", 0)) <= 0:
+        data_score -= 8
+    if not str(r.get("date", "")):
+        data_score -= 15
+    add("data_quality", "数据质量", data_score, 0.02, "样本与近期K线完整性")
+
+    # 2 可交易性：成交额/换手/非一字可买性。无成交额字段时保持中性。
+    trad_score = 68
+    if amount >= 500000000:
+        trad_score += 18
+    elif amount >= 150000000:
+        trad_score += 12
+    elif amount >= 50000000:
+        trad_score += 6
+    elif amount > 0:
+        trad_score -= 8
+    if turnover >= 1.0:
+        trad_score += 5
+    if bool(r.get("limit_up", False)) and str(r.get("limit_volume_mode", "")).find("锁量") >= 0:
+        trad_score -= 4
+    add("tradability", "可交易性", trad_score, 0.03, "成交额/换手/涨停可买性")
+
+    # 3 雷区硬过滤：不是普通扣分，后续还会封顶。
+    hard_score = 0 if risk_hard else 100
+    if risk_flags and not risk_hard:
+        hard_score = 78
+    add("hard_risk", "雷区约束", hard_score, 0.08, "未命中硬雷区" if not risk_hard else _v16_text_short(risk_flags, 42))
+
+    # 4 供需压力/支撑带：V15复合压力带 + 多周期重叠。
+    pressure_quality = safe_float(r.get("xhu_pressure_quality_score", 0))
+    pressure_score = pressure_quality
+    pg = str(r.get("xhu_pressure_model_grade", "") or "").upper()
+    if pg == "S": pressure_score = max(pressure_score, 92)
+    elif pg == "A": pressure_score = max(pressure_score, 80)
+    elif pg == "B": pressure_score = max(pressure_score, 65)
+    pressure_score += min(8, safe_float(r.get("score_xhu_pressure_breakout", 0)) * 0.25)
+    add("supply_demand", "供需压力带", pressure_score, 0.10, str(r.get("xhu_pressure_desc", "复合压力带/成交密集区")))
+
+    # 5 市场结构：凹口/平台/最大量K/近区结构。
+    structure_score = (
+        safe_float(r.get("score_structure_core", 0)) * 3.2 +
+        safe_float(r.get("score_multi_tf_key_structure", 0)) * 2.6 +
+        safe_float(r.get("score_advanced_ao_kou", 0)) * 2.2 +
+        safe_float(r.get("score_pattern", 0)) * 1.8 +
+        safe_float(r.get("score_fibo_reclaim", 0)) * 2.0
+    )
+    add("market_structure", "结构优势", structure_score, 0.08, "凹口/平台/最大量K/黄金倍量等结构")
+
+    # 6 长周期修复：月线/季线/年线、BBI/BOLL中轨修复。
+    long_score = (
+        safe_float(r.get("score_monthly_cycle", 0)) * 4.2 +
+        safe_float(r.get("score_long_cycle", 0)) * 1.8 +
+        safe_float(r.get("score_monthly_height_space", 0)) * 2.0 +
+        safe_float(r.get("score_v124_probe_second_confirm", 0)) * 2.0
+    )
+    add("long_cycle", "长周期修复", long_score, 0.05, str(r.get("monthly_midline_detail", "月线/季线/年线结构修复")))
+
+    # 7 量能结构。
+    volume_score = (
+        safe_float(r.get("score_volume_structure", 0)) * 3.4 +
+        safe_float(r.get("score_yang_yin_volume", 0)) * 2.6 +
+        safe_float(r.get("score_count", 0)) * 1.6 +
+        safe_float(r.get("score_v125_step_platform_lift", 0)) * 2.4
+    )
+    if 1.8 <= vr1 <= 2.5:
+        volume_score += 8
+    elif vr1 >= 3.5 or volr >= 5:
+        volume_score -= 10
+    add("volume_structure", "量能参与", volume_score, 0.06, "倍量/倍平/阳量压阴量/平台均量")
+
+    # 8 趋势动量。
+    trend_score = 55
+    if safe_float(r.get("ma20_slope_5", 0)) >= 0: trend_score += 8
+    if safe_float(r.get("score_trend", 0)) > 0: trend_score += safe_float(r.get("score_trend", 0)) * 2.0
+    if entity_pct >= 3 and pos >= 0.7: trend_score += 10
+    if pct >= 7 and bias20 > 0.18: trend_score -= 8
+    add("trend_momentum", "趋势动量", trend_score, 0.05, "趋势斜率/强阳/收盘位置")
+
+    # 9 修复反转。
+    reversal_score = (
+        safe_float(r.get("score_bottom_reclaim", 0)) * 4.0 +
+        safe_float(r.get("score_arc_bottom", 0)) * 3.0 +
+        safe_float(r.get("score_v12_pullback_entry", 0)) * 2.0 +
+        safe_float(r.get("score_key_pullback_hold", 0)) * 2.0
+    )
+    add("reversal_repair", "修复反转", reversal_score, 0.04, "破底翻/月线修复/回踩转强")
+
+    # 10 时间窗口。
+    timing_score = safe_float(r.get("score_v125_timing_window", 0)) * 4.0 + safe_float(r.get("score_v126_timing_sufficiency", 0)) * 3.5
+    add("timing_window", "时间窗口", timing_score, 0.03, str(r.get("v125_timing_desc", "时间窗口/爆发前夜")))
+
+    # 11 突破触发：压力带最终上沿、假突破高点、关键位突破。
+    trigger_score = safe_float(r.get("score_xhu_pressure_breakout", 0)) * 5.5 + safe_float(r.get("score_multi_tf_break_quality", 0)) * 3.5
+    dg = str(r.get("xhu_breakout_day_grade", "") or "").upper()
+    if dg == "S": trigger_score = max(trigger_score, 90)
+    elif dg == "A": trigger_score = max(trigger_score, 78)
+    elif dg == "B": trigger_score = max(trigger_score, 62)
+    if safe_float(r.get("break_rate", 0)) > 0.005 and safe_float(r.get("break_rate", 0)) <= 0.06:
+        trigger_score += 8
+    add("breakout_trigger", "突破触发", trigger_score, 0.10, str(r.get("xhu_breakout_desc", "关键位/压力带突破")))
+
+    # 12 回踩承接。
+    retest_score = (
+        safe_float(r.get("score_v12_pullback_entry", 0)) * 4.0 +
+        safe_float(r.get("score_limitup_hold_3d", 0)) * 4.0 +
+        safe_float(r.get("score_carry_structure", 0)) * 2.5 +
+        safe_float(r.get("score_key_pullback_hold", 0)) * 3.0
+    )
+    add("retest_confirmation", "回踩承接", retest_score, 0.06, "突破后回踩/涨停后三日/关键位承接")
+
+    # 13 分时确认：暂未必有分时数据，默认中性；有字段则使用。
+    intraday_score = safe_float(r.get("intraday_breakout_quality_score", 55), 55)
+    if intraday_score == 0:
+        intraday_score = 55
+    add("intraday", "分时确认", intraday_score, 0.02, "未取分时则中性；后续用VWAP/突破时间校验")
+
+    # 14 日K质量。
+    candle_score = 50 + min(25, max(0, entity_pct) * 2.8) + min(18, pos * 20)
+    if pos >= 0.85: candle_score += 8
+    if pos < 0.55 and pct > 0: candle_score -= 10
+    if _v16_has_text(r, "xhu_breakout_desc", ["长上影", "假突破", "试探"]): candle_score -= 15
+    add("candle_quality", "日K质量", candle_score, 0.05, "实体/收盘位置/上影/缺口")
+
+    # 15 上方空间。
+    target_dist = safe_float(r.get("target_dist", 0))
+    if target_dist <= 0:
+        target_dist = near_p if near_p > 0 else (mid_p if mid_p > 0 else overhead_p)
+    upside_score = 50
+    if target_dist >= 0.25: upside_score += 30
+    elif target_dist >= 0.15: upside_score += 22
+    elif target_dist >= 0.08: upside_score += 12
+    elif 0 < target_dist < 0.05: upside_score -= 20
+    if safe_float(r.get("xhu_pressure_union_upper", 0)) > 0 and safe_float(r.get("close", 0)) > safe_float(r.get("xhu_pressure_union_upper", 0)):
+        upside_score += 6
+    add("upside_reward", "上方空间", upside_score, 0.06, f"下一压力/目标距离约{target_dist:.1%}")
+
+    # 16 下行风险/防守。
+    downside_score = 78
+    if defense_dist > 0.18: downside_score -= 28
+    elif defense_dist > 0.12: downside_score -= 18
+    elif 0 < defense_dist <= 0.06: downside_score += 8
+    if rr >= 2.0: downside_score += 10
+    elif 0 < rr < 1.2: downside_score -= 20
+    add("downside_risk", "下行防守", downside_score, 0.08, f"防守距离{defense_dist:.1%}，RR={rr:.2f}")
+
+    # 17 过热风险，分数越高越安全。
+    overheat_score = 85
+    if bias20 > 0.25: overheat_score -= 32
+    elif bias20 > 0.18: overheat_score -= 22
+    elif bias20 > 0.12: overheat_score -= 12
+    if bias60 > 0.25: overheat_score -= 15
+    if rsi >= 85 or cci >= 300: overheat_score -= 25
+    elif rsi >= 80 or cci >= 250: overheat_score -= 12
+    if vr1 >= 3.5 or volr >= 5: overheat_score -= 12
+    add("overheat_risk", "过热安全", overheat_score, 0.04, f"乖离20={bias20:.1%}, RSI={rsi:.0f}, CCI={cci:.0f}")
+
+    # 18 执行成本。
+    exec_score = trad_score
+    if bool(r.get("limit_up", False)) and pct >= 9.3:
+        exec_score -= 5
+    if amount > 0 and amount < 30000000:
+        exec_score -= 12
+    add("execution_cost", "执行成本", exec_score, 0.03, "成交额/换手/涨停可买性/滑点")
+
+    # 19 市场环境/板块：当前无板块实时强度时，用活跃度和涨停次数近似。
+    regime_score = 55 + safe_float(r.get("score_v12_activity", 0)) * 4.0
+    if safe_float(r.get("limit_count_100", 0)) >= 3: regime_score += 8
+    add("regime_theme", "市场环境", regime_score, 0.02, "板块/活跃度/市场风格；无板块数据时弱化")
+
+    # 20 组合约束：单票阶段先中性；三选后可做同板块/同题材去重。
+    portfolio_score = safe_float(r.get("portfolio_constraint_score", 82), 82)
+    add("portfolio", "组合约束", portfolio_score, 0.02, "三只候选之间题材/风险暴露去重")
+
+    return dims
+
+
+def _v16_composite_score_and_caps(r, dims):
+    total_weight = sum(float(d.get("weight", 0)) for d in dims) or 1.0
+    raw_score = sum(float(d.get("score", 0)) * float(d.get("weight", 0)) for d in dims) / total_weight
+    cap = 100.0
+    cap_reasons = []
+    ds = {d["key"]: float(d["score"]) for d in dims}
+
+    if ds.get("hard_risk", 100) < 50:
+        cap = min(cap, 59); cap_reasons.append("硬雷区/重大约束")
+    if ds.get("breakout_trigger", 100) < 45 and ds.get("retest_confirmation", 100) < 55:
+        cap = min(cap, 69); cap_reasons.append("触发确认不足")
+    if ds.get("downside_risk", 100) < 50:
+        cap = min(cap, 79); cap_reasons.append("下行防守不足")
+    if ds.get("upside_reward", 100) < 45:
+        cap = min(cap, 78); cap_reasons.append("上方空间不足")
+    if ds.get("tradability", 100) < 40 or ds.get("execution_cost", 100) < 40:
+        cap = min(cap, 78); cap_reasons.append("流动性/执行成本不足")
+    if ds.get("overheat_risk", 100) < 45:
+        cap = min(cap, 76); cap_reasons.append("过热风险封顶")
+    if str(r.get("xhu_pressure_model_grade", "")).upper() == "D" and safe_float(r.get("xhu_fake_breakout_count", 0)) > 0:
+        cap = min(cap, 68); cap_reasons.append("压力带冲关失败/假突破记忆")
+
+    final_score = min(raw_score, cap)
+    grade = _v16_score_to_grade(final_score)
+    if cap < 75 and grade in ["S", "A", "B+"]:
+        grade = _v16_score_to_grade(cap)
+    return float(round(final_score, 2)), grade, float(cap), "；".join(cap_reasons) if cap_reasons else "无硬封顶"
+
+
+def _v16_main_signal_summary(r):
+    signals = []
+    if safe_float(r.get("score_xhu_pressure_breakout", 0)) >= 10 or str(r.get("xhu_pressure_model_grade", "")).upper() in ["S", "A"]:
+        signals.append(f"复合压力带{str(r.get('xhu_pressure_model_grade',''))}")
+    if safe_float(r.get("score_fibo_reclaim", 0)) >= 7:
+        signals.append("黄金倍量二次确认")
+    if safe_float(r.get("score_advanced_ao_kou", 0)) >= 7:
+        signals.append("高级凹口二次倍量")
+    if safe_float(r.get("score_v12_pullback_entry", 0)) >= 6:
+        signals.append("回踩确认")
+    if safe_float(r.get("score_monthly_cycle", 0)) >= 8:
+        signals.append("月线中轨修复")
+    if safe_float(r.get("score_multi_tf_key_structure", 0)) >= 8:
+        signals.append("多周期关键K结构")
+    if not signals:
+        signals.append(str(r.get("v151_strongest_model_name", "原模型综合优选")) or "原模型综合优选")
+    return " + ".join(signals[:4])
+
+
+def v16_candidate_audit(s):
+    """在原V14/V15审核之后，增加20维机构级机会评分、封顶和统一评级。"""
+    r = v14_candidate_audit(s)
+    dims = _v16_eval_dimensions(r)
+    score, grade, cap, cap_reason = _v16_composite_score_and_caps(r, dims)
+
+    # 不完全抹掉原主模型分：如果原V14最终分明显更高但20维未触发，作为B+观察上限；如果20维更高，以20维为准。
+    original_final = safe_float(r.get("v14_final_score", r.get("total_score", 0)))
+    blended = score * 0.78 + original_final * 0.22
+    blended = min(blended, cap)
+    final_grade = _v16_score_to_grade(blended)
+
+    # A/S必须有较强Alpha或触发，不允许单靠安全分堆出来。
+    ds = {d["key"]: float(d["score"]) for d in dims}
+    if final_grade in ["S", "A"] and not ((ds.get("supply_demand", 0) >= 75 or ds.get("market_structure", 0) >= 75 or ds.get("long_cycle", 0) >= 75) and (ds.get("breakout_trigger", 0) >= 65 or ds.get("retest_confirmation", 0) >= 65)):
+        final_grade = "B+"
+        blended = min(blended, 81.9)
+        cap_reason = (cap_reason + "；" if cap_reason != "无硬封顶" else "") + "A/S缺少强结构+强触发共振"
+
+    r["v16_final_score"] = round(float(blended), 2)
+    r["v16_final_grade"] = final_grade
+    r["v16_raw_20d_score"] = round(float(score), 2)
+    r["v16_cap"] = cap
+    r["v16_cap_reason"] = cap_reason
+    r["v16_main_signal"] = _v16_main_signal_summary(r)
+    r["v16_dimensions_json"] = json.dumps(dims, ensure_ascii=False)
+    r["v16_dimension_summary"] = "；".join([f"{d['name']}:{d['score']}" for d in dims[:20]])
+    r["total_score"] = r["v16_final_score"]
+    r["v14_final_score"] = r["v16_final_score"]
+    r["v14_level"] = f"{final_grade}｜主导:{r['v16_main_signal']}"
+    return r
+
+
+def select_final_signals_v14(deep_rows, history=None, limit=None):
+    """V16最终三选：按20维风险调整后机会分排序。尽量推3只，S/A优先，B+可补位，硬雷区不推。"""
+    if history is None:
+        history = {}
+    limit = int(limit or V14_TARGET_PUSH_COUNT or RESULT_LIMIT or 3)
+    audited = [v16_candidate_audit(r) for r in deep_rows]
+    blocked = [r for r in audited if r.get("v14_blocked") or safe_float(r.get("v16_final_score", 0)) < V14_MIN_ABSOLUTE_SCORE]
+    eligible = [r for r in audited if not r.get("v14_blocked") and safe_float(r.get("v16_final_score", 0)) >= V14_MIN_ABSOLUTE_SCORE]
+    eligible = sorted(
+        eligible,
+        key=lambda x: (
+            _v16_grade_rank(x.get("v16_final_grade", "")),
+            safe_float(x.get("v16_final_score", 0)),
+            safe_float(x.get("v16_raw_20d_score", 0)),
+            safe_float(x.get("trade_priority_score", 0)),
+            safe_float(x.get("score_trade_quality", 0)),
+        ),
+        reverse=True,
+    )
+    final = []
+    diagnostics = []
+    for r in eligible:
+        key = f"{r.get('date','')}_{r.get('code','')}"
+        if V14_IGNORE_HISTORY_FOR_RERUN != "1" and key in history:
+            rr = dict(r); rr["v14_skip_reason"] = "signals_history已推送过"; diagnostics.append(rr); continue
+        final.append(r)
+        if len(final) >= limit:
+            break
+    selected_codes = {str(r.get("code")) for r in final}
+    for r in eligible:
+        if str(r.get("code")) not in selected_codes:
+            rr = dict(r); rr["v14_skip_reason"] = "未进入三选，20维机会分/等级靠后"; diagnostics.append(rr)
+    for r in blocked[:20]:
+        rr = dict(r); rr["v14_skip_reason"] = rr.get("v14_block_reason") or rr.get("v16_cap_reason") or "低于V16底线/硬约束"; diagnostics.append(rr)
+    return final, diagnostics[:20], audited
+
+
+def _v16_load_font(size=18, bold=False):
+    try:
+        from matplotlib import font_manager
+        candidates = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+        ]
+        for fp in candidates:
+            if os.path.exists(fp):
+                return font_manager.FontProperties(fname=fp, size=size)
+    except Exception:
+        pass
+    return None
+
+
+def _v16_render_table_png(title, columns, rows, output_path, max_col_chars=None):
+    """生成Telegram真正表格图片。若matplotlib不可用则写CSV兜底。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.table import Table
+        font_prop = _v16_load_font(12)
+        title_font = _v16_load_font(18)
+        max_col_chars = max_col_chars or [16] * len(columns)
+        clean_rows = []
+        for row in rows:
+            clean_rows.append([_v16_text_short(cell, max_col_chars[i] if i < len(max_col_chars) else 16) for i, cell in enumerate(row)])
+        nrows = len(clean_rows) + 1
+        fig_h = max(2.6, 0.42 * nrows + 1.2)
+        fig_w = 15.5
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=180)
+        ax.set_axis_off()
+        if title_font:
+            ax.set_title(title, fontproperties=title_font, fontsize=18, pad=14)
+        else:
+            ax.set_title(title, fontsize=18, pad=14)
+        table = ax.table(cellText=clean_rows, colLabels=columns, loc="center", cellLoc="left")
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 1.35)
+        for (r, c), cell in table.get_celld().items():
+            cell.set_linewidth(0.6)
+            if r == 0:
+                cell.set_text_props(weight="bold")
+                cell.set_facecolor("#e9eef6")
+            elif r % 2 == 0:
+                cell.set_facecolor("#f8f9fb")
+            if font_prop:
+                cell.get_text().set_fontproperties(font_prop)
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
+    except Exception as e:
+        print(f"V16表格图片生成失败，改写CSV：{output_path} error={e}")
+        csv_path = str(output_path).rsplit(".", 1)[0] + ".csv"
+        try:
+            import csv
+            os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                writer.writerows(rows)
+            return csv_path
+        except Exception:
+            return ""
+
+
+def _v16_signal_dimensions(s):
+    try:
+        return json.loads(s.get("v16_dimensions_json", "[]"))
+    except Exception:
+        return []
+
+
+def render_v16_summary_table_png(final_signals, output_path="telegram_tables/v16_summary.png"):
+    rows = []
+    for i, s in enumerate(final_signals, 1):
+        rows.append([
+            i,
+            f"{s.get('name','')}({s.get('code','')})",
+            s.get("v16_final_grade", ""),
+            f"{safe_float(s.get('v16_final_score', 0)):.1f}",
+            _v16_text_short(s.get("v16_main_signal", ""), 28),
+            _v16_text_short(s.get("v16_cap_reason", ""), 24),
+            _v16_text_short(build_confirm_condition(s), 30),
+            _v16_text_short(build_giveup_condition(s), 30),
+        ])
+    return _v16_render_table_png(
+        "一号员工选股模型 V16 今日三选总览",
+        ["序号", "股票", "等级", "总分", "主导信号", "封顶/风险", "确认条件", "放弃条件"],
+        rows,
+        output_path,
+        [4, 20, 5, 6, 30, 28, 34, 34],
+    )
+
+
+def render_v16_dimension_table_png(signal, output_path):
+    dims = _v16_signal_dimensions(signal)
+    rows = []
+    for d in dims:
+        rows.append([d.get("name", ""), d.get("score", ""), f"{float(d.get('weight',0))*100:.0f}%", d.get("reason", "")])
+    title = f"{signal.get('name','')}({signal.get('code','')}) V16 20维评分｜{signal.get('v16_final_grade','')} {safe_float(signal.get('v16_final_score',0)):.1f}"
+    return _v16_render_table_png(title, ["维度", "分数", "权重", "原因"], rows, output_path, [14, 6, 6, 44])
+
+
+def send_telegram_photo(image_path, caption=""):
+    if not image_path or not os.path.exists(image_path):
+        return False
+    if ENABLE_TELEGRAM != "1":
+        print(f"[Telegram图片未发送: ENABLE_TELEGRAM={ENABLE_TELEGRAM}] {image_path} {caption}")
+        return False
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Telegram图片发送失败: TOKEN/CHAT_ID为空] {image_path}")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        with open(image_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000]}
+            resp = requests.post(url, data=data, files=files, timeout=45)
+        if resp.status_code == 200:
+            print(f"Telegram图片发送成功：{image_path}")
+            return True
+        print(f"Telegram图片发送失败：status={resp.status_code} body={resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"Telegram图片发送异常：{image_path} error={e}")
+        return False
+
+
+def send_telegram(message):
+    ok = _ORIGINAL_SEND_TELEGRAM(message) if _ORIGINAL_SEND_TELEGRAM else False
+    global TELEGRAM_PENDING_IMAGES
+    if TELEGRAM_PENDING_IMAGES:
+        for img, cap in TELEGRAM_PENDING_IMAGES:
+            send_telegram_photo(img, cap)
+        TELEGRAM_PENDING_IMAGES = []
+    return ok
+
+
+def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
+    global TELEGRAM_PENDING_IMAGES
+    TELEGRAM_PENDING_IMAGES = []
+    lines = []
+    lines.append("📊 <b>一号员工选股模型 V16 机构级20维机会评分报告</b>")
+    lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
+    lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
+    lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
+    lines.append(f"正式输出：<b>{len(final_signals)}</b>只，目标{V14_TARGET_PUSH_COUNT}只。")
+    lines.append("口径：原V12/V14所有有效战法保留为信号库；新增复合压力带/供需带后，统一映射到20维评分，按风险调整后的机会等级排序。")
+    lines.append("等级说明：S/A=正式高质量机会；B+=观察补位；C/D不作为正式推送。硬雷区、流动性/执行、风险收益比会封顶。")
+    lines.append("完整评分表已作为PNG图片发送，不再用杂乱文字冒充表格。")
+    lines.append("━━━━━━━━━━━━━━")
+
+    if not final_signals:
+        lines.append("⚠️ 今日暂无正式三选股票。通常代表硬雷区、数据覆盖、触发不足或风险封顶。")
+        diag = v14_diagnostics_text(v14_diagnostics or [], 10)
+        if diag:
+            lines.append(html.escape(diag))
+        return "\n".join(lines)
+
+    try:
+        summary_img = render_v16_summary_table_png(final_signals)
+        if summary_img:
+            TELEGRAM_PENDING_IMAGES.append((summary_img, "一号员工选股模型V16：今日三选总览表"))
+        for i, s in enumerate(final_signals, 1):
+            img = render_v16_dimension_table_png(s, f"telegram_tables/v16_{i}_{s.get('code','')}_20d.png")
+            if img:
+                TELEGRAM_PENDING_IMAGES.append((img, f"{i}. {s.get('name','')}({s.get('code','')}) 20维评分表"))
+    except Exception as e:
+        print(f"V16报告表格生成失败：{e}")
+
+    for i, s in enumerate(final_signals, 1):
+        lines.append(f"<b>{i}. {html.escape(str(s.get('name','')))}({html.escape(str(s.get('code','')))})</b>")
+        lines.append(f"等级/总分：<b>{html.escape(str(s.get('v16_final_grade','')))}</b> / {safe_float(s.get('v16_final_score', 0)):.1f}；原深度分{safe_float(s.get('v14_original_total_score', s.get('total_score', 0))):.1f}")
+        lines.append(f"主导信号：{html.escape(str(s.get('v16_main_signal','')))}")
+        lines.append(f"核心压力带：{safe_float(s.get('xhu_pressure_core_lower',0)):.2f}-{safe_float(s.get('xhu_pressure_core_upper',0)):.2f}；最终压力上沿：{safe_float(s.get('xhu_pressure_union_upper',0)):.2f}；压力带等级：{html.escape(str(s.get('xhu_pressure_model_grade','')))}")
+        lines.append(f"确认条件：{html.escape(build_confirm_condition(s))}")
+        lines.append(f"放弃条件：{html.escape(build_giveup_condition(s))}")
+        lines.append(f"主要封顶/风险：{html.escape(str(s.get('v16_cap_reason','无硬封顶')))}")
+        lines.append("—")
+
+    diag = v14_diagnostics_text(v14_diagnostics or [], 5)
+    if diag:
+        lines.append("落选/拦截诊断：")
+        lines.append(html.escape(diag))
+    return "\n".join(lines)
 
 def main():
     start_ts = time.time()
