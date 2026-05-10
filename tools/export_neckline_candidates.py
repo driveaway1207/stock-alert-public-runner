@@ -9,11 +9,14 @@ A股全历史K线缓存 + 数据缓存体检表
 4. 模型是否使用，由后续模型层决定。
 5. 输出给用户看的表，不混入颈线、突破、结构评分。
 
-V14缓存体检修正版：
-1. EastMoney优先，BaoStock最后兜底，避免BaoStock无timeout导致全局卡死。
-2. 增强GitHub Actions日志可观测性：逐票开始、逐票结束、阶段进度、ETA。
-3. 启动时统计本地缓存文件数量，确认Restore Cache是否生效。
-4. 每个数据源请求前后都打印source/code/start信息。
+本版重点：
+1. 优先检查 GitHub Actions 是否成功恢复昨天的 kline_cache。
+2. 如果缓存数量过少，且 FULL_REBUILD != 1，则直接停止，避免从零重拉5513只。
+3. 已有新鲜缓存直接读取，不联网。
+4. 有旧缓存则增量更新。
+5. 没有缓存时，只有 FULL_REBUILD=1 才允许首次建立。
+6. 数据源顺序：EastMoney -> AkShare -> BaoStock。
+7. 全程打印当前股票、数据源、进度、ETA、缓存数量。
 """
 
 import os
@@ -36,6 +39,14 @@ os.makedirs(KLINE_CACHE_DIR, exist_ok=True)
 FULL_HISTORY_START = "1990-01-01"
 FULL_HISTORY_START_EM = "19900101"
 INCREMENTAL_DAYS = 90
+
+FULL_REBUILD = os.getenv("FULL_REBUILD", "0").strip() in ("1", "true", "True", "yes", "YES")
+MIN_CACHE_FILES_REQUIRED = int(os.getenv("MIN_CACHE_FILES_REQUIRED", "3000"))
+
+EASTMONEY_TIMEOUT = int(os.getenv("EASTMONEY_TIMEOUT", "20"))
+PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "50"))
+DETAIL_FIRST_N = int(os.getenv("DETAIL_FIRST_N", "20"))
+DETAIL_EVERY = int(os.getenv("DETAIL_EVERY", "20"))
 
 BAOSTOCK_READY = False
 FAILED_ROWS = []
@@ -82,11 +93,10 @@ def cache_path(code):
 
 def count_cache_files():
     try:
-        files = [
+        return len([
             f for f in os.listdir(KLINE_CACHE_DIR)
             if f.lower().endswith(".csv")
-        ]
-        return len(files)
+        ])
     except Exception:
         return 0
 
@@ -102,22 +112,28 @@ def normalize_daily_columns(df):
         "Date": "date",
         "datetime": "date",
         "time": "date",
+
         "开盘": "open",
         "开盘价": "open",
         "Open": "open",
+
         "收盘": "close",
         "收盘价": "close",
         "Close": "close",
+
         "最高": "high",
         "最高价": "high",
         "High": "high",
+
         "最低": "low",
         "最低价": "low",
         "Low": "low",
+
         "成交量": "volume",
         "成交量(手)": "volume",
         "vol": "volume",
         "Volume": "volume",
+
         "成交额": "amount",
         "成交额(元)": "amount",
         "turnover": "amount",
@@ -141,6 +157,9 @@ def normalize_daily_columns(df):
 
     df = df.dropna(subset=["date"])
     df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+    if df.empty:
+        return None
 
     return df
 
@@ -228,6 +247,10 @@ def fetch_stock_list_from_akshare():
     df = ak.stock_info_a_code_name()
     df["code"] = df["code"].astype(str).str.zfill(6)
     df["name"] = df["name"].astype(str)
+
+    df = df[df["code"].str.match(r"^\d{6}$", na=False)].copy()
+    df = df[df["code"].str.startswith(("0", "3", "6"))].copy()
+
     return df[["code", "name"]]
 
 
@@ -249,6 +272,7 @@ def fetch_stock_list_from_baostock():
     df = df[df["code"].str.startswith(("sh.6", "sz.0", "sz.3"))].copy()
     df["code"] = df["code"].str[-6:]
     df["name"] = df.get("code_name", df["code"])
+
     return df[["code", "name"]]
 
 
@@ -297,8 +321,12 @@ def fetch_daily_from_eastmoney(code, beg=FULL_HISTORY_START_EM):
     r = requests.get(
         url,
         params=params,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json,text/plain,*/*",
+        },
+        timeout=EASTMONEY_TIMEOUT,
     )
     r.raise_for_status()
 
@@ -369,7 +397,6 @@ def fetch_incremental_or_full(code, cache_df):
         em_start = FULL_HISTORY_START_EM
         mode = "full"
 
-    # 1. EastMoney优先：有requests timeout，不容易卡死全局
     try:
         log(f"[FETCH KLINE START] code={code} source=EastMoney mode={mode} start={em_start}")
         t0 = time.time()
@@ -382,7 +409,6 @@ def fetch_incremental_or_full(code, cache_df):
     except Exception as e:
         log(f"[WARN] eastmoney fetch failed code={code} err={repr(e)}")
 
-    # 2. AkShare第二
     try:
         log(f"[FETCH KLINE START] code={code} source=AkShare mode={mode}")
         t0 = time.time()
@@ -395,7 +421,6 @@ def fetch_incremental_or_full(code, cache_df):
     except Exception as e:
         log(f"[WARN] akshare fetch failed code={code} err={repr(e)}")
 
-    # 3. BaoStock最后兜底：它没有明确单票timeout，不能放第一
     try:
         log(f"[FETCH KLINE START] code={code} source=BaoStock mode={mode} start={start_str}")
         t0 = time.time()
@@ -417,11 +442,9 @@ def get_daily_kline(code):
     cache_df = read_cache(code)
     cache_exists = cache_df is not None and not cache_df.empty
 
-    # 已有全历史缓存且新鲜，直接使用
     if cache_exists and cache_is_fresh(cache_df):
         return cache_df, "有", "新鲜", "无需更新", "缓存"
 
-    # 有缓存但偏旧，增量更新
     if cache_exists:
         new_df, source = fetch_incremental_or_full(code, cache_df)
         merged = merge_kline(cache_df, new_df)
@@ -433,7 +456,9 @@ def get_daily_kline(code):
 
         return cache_df, "有", "偏旧", "更新失败但保留旧缓存", "缓存"
 
-    # 没有缓存，全历史建立
+    if not FULL_REBUILD:
+        return None, "无", "待建立", "跳过建立:FULL_REBUILD=0且无本地缓存", "未联网"
+
     full_df, source = fetch_incremental_or_full(code, None)
 
     if full_df is not None and not full_df.empty:
@@ -517,6 +542,9 @@ def inspect_kline(df, code, name, cache_exists, freshness, update_status, fetch_
     df = normalize_daily_columns(df)
 
     if df is None or df.empty:
+        if freshness == "待建立":
+            item["数据体检结论"] = "待建立缓存"
+            item["机器备注"] = update_status
         return item
 
     n = len(df)
@@ -684,6 +712,18 @@ def save_outputs(rows, failed_rows, elapsed, success, failed):
     log(f"[FAILED CSV] {failed_path}")
 
 
+def save_cache_restore_guard(existing_cache_count):
+    path = os.path.join(OUT_DIR, f"cache_restore_guard_{today_str()}.csv")
+    pd.DataFrame([{
+        "诊断": "缓存恢复数量过少，已停止，避免从零全量重建",
+        "existing_csv": existing_cache_count,
+        "required": MIN_CACHE_FILES_REQUIRED,
+        "FULL_REBUILD": FULL_REBUILD,
+        "建议": "先检查 Restore full kline cache / Show restored cache status；确认昨天缓存是否被恢复。如果确认要从0重建，手动运行时设置 full_rebuild=1。",
+    }]).to_csv(path, index=False, encoding="utf-8-sig")
+    log(f"[GUARD CSV] {path}")
+
+
 def main():
     start_ts = time.time()
 
@@ -693,13 +733,28 @@ def main():
 
     try:
         existing_cache_count = count_cache_files()
+        log(f"[CONFIG] FULL_REBUILD={FULL_REBUILD}")
+        log(f"[CONFIG] MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
         log(f"[CACHE FILES] dir={KLINE_CACHE_DIR} existing_csv={existing_cache_count}")
+
+        if existing_cache_count < MIN_CACHE_FILES_REQUIRED and not FULL_REBUILD:
+            log(
+                f"[FATAL] restored cache too small: existing_csv={existing_cache_count}, "
+                f"required>={MIN_CACHE_FILES_REQUIRED}. "
+                f"This run will NOT rebuild all stocks from scratch. "
+                f"Set FULL_REBUILD=1 only if you really want full rebuild."
+            )
+            save_cache_restore_guard(existing_cache_count)
+            return
 
         stocks = fetch_stock_list()
         total = len(stocks)
 
         log(f"[START] full-history data cache health stocks={total}")
-        log("[NOTE] progress policy: first 20 stocks print every stock, then every 20 stocks; summary every 50 stocks")
+        log(
+            f"[NOTE] detail policy: first {DETAIL_FIRST_N} stocks print every stock, "
+            f"then every {DETAIL_EVERY}; summary every {PROGRESS_EVERY}"
+        )
 
         for idx, row in stocks.iterrows():
             done = idx + 1
@@ -710,7 +765,7 @@ def main():
             avg = elapsed / max(done, 1)
             remain = avg * (total - done)
 
-            should_print_detail = done <= 20 or done % 20 == 0 or done == total
+            should_print_detail = done <= DETAIL_FIRST_N or done % DETAIL_EVERY == 0 or done == total
 
             if should_print_detail:
                 log(
@@ -746,7 +801,7 @@ def main():
                 log(f"[ERROR] {done}/{total} code={code} name={name}: {repr(e)}")
                 traceback.print_exc(limit=1)
 
-            if done % 50 == 0 or done == total:
+            if done % PROGRESS_EVERY == 0 or done == total:
                 elapsed = time.time() - start_ts
                 avg = elapsed / max(done, 1)
                 remain = avg * (total - done)
@@ -755,7 +810,8 @@ def main():
                 log(
                     f"[PROGRESS] {done}/{total} ({pct:.2f}%) | "
                     f"success={success} failed={failed} | "
-                    f"elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(remain)}"
+                    f"elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(remain)} | "
+                    f"cache_files={count_cache_files()}"
                 )
 
             time.sleep(0.003)
@@ -764,7 +820,10 @@ def main():
         elapsed = time.time() - start_ts
         save_outputs(rows, FAILED_ROWS, elapsed, success, failed)
         baostock_logout_once()
-        log(f"[DONE] success={success}, failed={failed}, elapsed={fmt_seconds(elapsed)}")
+        log(
+            f"[DONE] success={success}, failed={failed}, "
+            f"elapsed={fmt_seconds(elapsed)}, cache_files={count_cache_files()}"
+        )
 
 
 if __name__ == "__main__":
