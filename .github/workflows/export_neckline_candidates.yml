@@ -104,7 +104,7 @@ jobs:
           FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '270' }}
-          SOFT_STOP_BUFFER_MINUTES: "15"
+          SOFT_STOP_BUFFER_MINUTES: "20"
           EASTMONEY_TIMEOUT: "20"
           AKSHARE_TIMEOUT: "35"
           BAOSTOCK_TIMEOUT: "45"
@@ -142,15 +142,6 @@ jobs:
           path: outputs
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload kline cache snapshot as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kline-cache-snapshot-round-${{ github.event.inputs.round || '1' }}
-          path: kline_cache
-          if-no-files-found: warn
-          retention-days: 7
 
       - name: Decide whether to save cache
         if: always()
