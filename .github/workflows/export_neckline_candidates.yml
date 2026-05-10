@@ -1,35 +1,43 @@
-name: A Stock Full Kline Cache Health Check
+name: A Stock Full Kline Cache Auto Backfill
 
 on:
   workflow_dispatch:
     inputs:
-      full_rebuild:
-        description: "是否允许全历史回补/首次建档：0=不允许，1=允许"
+      round:
+        description: "当前轮次，第一次填 1"
         required: true
         default: "1"
+      max_auto_rounds:
+        description: "最多自动续跑多少轮"
+        required: true
+        default: "6"
+      auto_continue:
+        description: "是否允许 10 分钟后自动开下一轮：1=允许，0=不允许"
+        required: true
+        default: "1"
+      full_rebuild:
+        description: "缓存过少时是否允许从 0 全量建立：0=不允许，1=允许"
+        required: true
+        default: "0"
       min_cache_files_required:
-        description: "非重建模式下，至少需要恢复多少个缓存CSV"
+        description: "非从 0 重建时，至少需要恢复多少个缓存 CSV"
         required: true
         default: "3000"
-      max_full_backfill_per_run:
-        description: "本轮最多回补多少只非全量/无缓存股票；小批次先用30"
-        required: true
-        default: "30"
       max_runtime_minutes:
-        description: "本轮目标最大运行分钟数；小批次先用60"
+        description: "每轮最多运行分钟数，建议 270"
         required: true
-        default: "60"
-
-  schedule:
-    # 北京时间约 21:30，对应 UTC 13:30
-    - cron: "30 13 * * 1-5"
+        default: "270"
 
 permissions:
   contents: read
   actions: write
 
+concurrency:
+  group: a-stock-kline-cache-backfill
+  cancel-in-progress: false
+
 jobs:
-  cache-health-check:
+  cache-backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -59,65 +67,56 @@ jobs:
           mkdir -p outputs
           mkdir -p kline_cache
           echo "Initial kline_cache count before restore:"
-          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
 
-      - name: Restore A-share kline cache
-        id: restore-kline-cache
+      - name: Restore full kline cache
+        id: restore_kline_cache
         uses: actions/cache/restore@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
 
       - name: Show restored cache status
         run: |
-          echo "Cache hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
-          echo "Cache primary key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
-          echo "Cache matched key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
+          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
           echo "Restored kline_cache stock csv count:"
-          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
-          echo "Meta file:"
-          ls -lah kline_cache/_full_history_meta.csv || true
-          echo "Sample cache files:"
-          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | head -30 || true
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
           echo "Cache dir size:"
           du -sh kline_cache || true
+          echo "Sample cache files:"
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | sed -n '1,30p' || true
+          echo "Meta file:"
+          ls -lah kline_cache/_full_history_status.csv || true
 
-      - name: Run full kline cache health script
+      - name: Run full-history cache auto backfill
         env:
           PYTHONUNBUFFERED: "1"
-
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '1' }}
+          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
+          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
-          MAX_FULL_BACKFILL_PER_RUN: ${{ github.event.inputs.max_full_backfill_per_run || '30' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '60' }}
-          SAFE_STOP_MINUTES: "10"
-
-          # 小批次验证阶段：允许今天/最近交易日差异，避免节假日反复增量；确认后可调成0
-          FRESH_MAX_NATURAL_DAYS: "5"
-
-          BAOSTOCK_SLEEP_SECONDS: "1.5"
-
-          FULL_MIN_ROWS_STRONG: "1800"
-          FULL_MIN_ROWS_MEDIUM: "1200"
-          FULL_EARLY_DATE: "2016-01-01"
-
-          SOURCE_FAIL_THRESHOLD: "5"
-          SOURCE_COOLDOWN_SECONDS: "900"
-
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '270' }}
+          SOFT_STOP_BUFFER_MINUTES: "15"
           EASTMONEY_TIMEOUT: "20"
           AKSHARE_TIMEOUT: "35"
-          BAOSTOCK_TIMEOUT: "70"
-
-          INCREMENTAL_DAYS: "90"
+          BAOSTOCK_TIMEOUT: "45"
+          SOURCE_FAIL_THRESHOLD: "5"
+          SOURCE_COOLDOWN_SECONDS: "900"
         run: |
-          echo "[RUN] FULL_REBUILD=$FULL_REBUILD"
-          echo "[RUN] MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
-          echo "[RUN] MAX_FULL_BACKFILL_PER_RUN=$MAX_FULL_BACKFILL_PER_RUN"
-          echo "[RUN] MAX_RUNTIME_MINUTES=$MAX_RUNTIME_MINUTES"
-          echo "[RUN] SAFE_STOP_MINUTES=$SAFE_STOP_MINUTES"
-          echo "[RUN] FRESH_MAX_NATURAL_DAYS=$FRESH_MAX_NATURAL_DAYS"
+          echo "[RUN CONFIG]"
+          echo "RUN_ROUND=$RUN_ROUND"
+          echo "MAX_AUTO_ROUNDS=$MAX_AUTO_ROUNDS"
+          echo "FULL_REBUILD=$FULL_REBUILD"
+          echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
+          echo "MAX_RUNTIME_MINUTES=$MAX_RUNTIME_MINUTES"
           echo "[RUN] python -u tools/export_neckline_candidates.py"
           python -u tools/export_neckline_candidates.py
 
@@ -126,22 +125,20 @@ jobs:
         run: |
           echo "Outputs directory:"
           ls -lah outputs || true
-          echo "Kline cache stock csv count after run:"
-          find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || true
+          echo "Kline cache count after run:"
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
           echo "Kline cache size after run:"
           du -sh kline_cache || true
-          echo "Meta file after run:"
-          ls -lah kline_cache/_full_history_meta.csv || true
           echo "Largest output files:"
           find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
-          echo "Progress output preview:"
-          ls outputs/full_history_progress_*.csv 2>/dev/null || true
+          echo "Backfill state:"
+          cat outputs/backfill_state.json || true
 
       - name: Upload output CSV files
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-cache-health-outputs
+          name: data-cache-backfill-outputs-round-${{ github.event.inputs.round || '1' }}
           path: outputs
           if-no-files-found: warn
           retention-days: 14
@@ -150,33 +147,94 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kline-cache-snapshot
+          name: kline-cache-snapshot-round-${{ github.event.inputs.round || '1' }}
           path: kline_cache
           if-no-files-found: warn
           retention-days: 7
 
       - name: Decide whether to save cache
         if: always()
-        id: cache-save-gate
+        id: cache_save_gate
         env:
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
-          COUNT=$(find kline_cache -type f -name "[0-9][0-9][0-9][0-9][0-9][0-9].csv" | wc -l || echo 0)
+          COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Current stock cache_count=$COUNT"
-          echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
 
-          if [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
+          if [ "$FULL_REBUILD" = "1" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED, allow saving cache."
+            echo "Reason: FULL_REBUILD=1, allow saving cache."
+          elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED."
           else
             echo "save_cache=false" >> "$GITHUB_OUTPUT"
-            echo "Reason: cache_count=$COUNT < required=$MIN_CACHE_FILES_REQUIRED, do not save small/empty cache."
+            echo "Reason: cache_count=$COUNT < required=$MIN_CACHE_FILES_REQUIRED, do not save small or empty cache."
           fi
 
-      - name: Save updated A-share kline cache
-        if: always() && steps.cache-save-gate.outputs.save_cache == 'true'
+      - name: Save updated full kline cache
+        if: always() && steps.cache_save_gate.outputs.save_cache == 'true'
         uses: actions/cache/save@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Decide auto continue
+        if: always()
+        id: continue_gate
+        env:
+          AUTO_CONTINUE: ${{ github.event.inputs.auto_continue || '1' }}
+          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
+          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
+        run: |
+          SHOULD_CONTINUE="false"
+          NEED_BACKFILL="unknown"
+          REASON="no_state"
+
+          if [ -f outputs/backfill_state.json ]; then
+            SHOULD_CONTINUE=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(str(d.get('should_continue', False)).lower())")
+            NEED_BACKFILL=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(d.get('need_backfill_count', 'unknown'))")
+            REASON=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(d.get('continue_reason', 'unknown'))")
+          fi
+
+          echo "should_continue=$SHOULD_CONTINUE" >> "$GITHUB_OUTPUT"
+          echo "need_backfill=$NEED_BACKFILL" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+          echo "AUTO_CONTINUE=$AUTO_CONTINUE"
+          echo "RUN_ROUND=$RUN_ROUND"
+          echo "MAX_AUTO_ROUNDS=$MAX_AUTO_ROUNDS"
+          echo "SHOULD_CONTINUE=$SHOULD_CONTINUE"
+          echo "NEED_BACKFILL=$NEED_BACKFILL"
+          echo "REASON=$REASON"
+
+      - name: Wait 10 minutes before next round
+        if: always() && github.event.inputs.auto_continue == '1' && steps.continue_gate.outputs.should_continue == 'true'
+        run: |
+          echo "还有待回补股票：${{ steps.continue_gate.outputs.need_backfill }}"
+          echo "10分钟后自动启动下一轮。"
+          sleep 600
+
+      - name: Trigger next round
+        if: always() && github.event.inputs.auto_continue == '1' && steps.continue_gate.outputs.should_continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
+          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
+          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '270' }}
+          AUTO_CONTINUE: ${{ github.event.inputs.auto_continue || '1' }}
+        run: |
+          NEXT_ROUND=$((RUN_ROUND + 1))
+          echo "Triggering next round: $NEXT_ROUND / $MAX_AUTO_ROUNDS"
+
+          gh workflow run "a_stock_full_kline_cache_health_check.yml" \
+            --ref "$GITHUB_REF_NAME" \
+            -f round="$NEXT_ROUND" \
+            -f max_auto_rounds="$MAX_AUTO_ROUNDS" \
+            -f auto_continue="$AUTO_CONTINUE" \
+            -f full_rebuild="$FULL_REBUILD" \
+            -f min_cache_files_required="$MIN_CACHE_FILES_REQUIRED" \
+            -f max_runtime_minutes="$MAX_RUNTIME_MINUTES"
