@@ -10,6 +10,7 @@ A股全历史K线缓存自动补齐 + 可续跑 + 小白进度条版
 5. 每轮只跑4-5小时，快到时间自动收尾，避免 GitHub Actions 强杀。
 6. 下一轮自动跳过已完成股票，继续补剩下的。
 7. 全历史回补阶段优先 BaoStock，避免 EastMoney/AkShare 连续失败浪费时间。
+8. 如果 BaoStock / EastMoney / AkShare 三个数据源全部熔断，立刻安全收尾，等待下一轮再继续。
 """
 
 import os
@@ -121,7 +122,6 @@ def progress_bar(done, total, width=24):
         ratio = 0
     else:
         ratio = min(max(done / total, 0), 1)
-
     filled = int(round(ratio * width))
     bar = "█" * filled + "░" * (width - filled)
     return f"{bar} {ratio * 100:6.2f}%"
@@ -173,6 +173,28 @@ def source_available(source):
         state["skip"] += 1
         return False
     return True
+
+
+def all_sources_in_cooldown():
+    """
+    三个数据源全部进入熔断冷却时，本轮继续扫股票没有意义。
+    直接安全收尾，让下一轮再继续。
+    """
+    now = time.time()
+    return all(now < SOURCE_STATE[s]["open_until"] for s in SOURCE_STATE)
+
+
+def source_cooldown_text():
+    now = time.time()
+    parts = []
+    for source, state in SOURCE_STATE.items():
+        remain = int(max(0, state["open_until"] - now))
+        parts.append(
+            f"{source}: ok={state['ok']} fail={state['fail']} "
+            f"consecutive_fail={state['consecutive_fail']} "
+            f"cooldown_left={fmt_seconds(remain)}"
+        )
+    return " | ".join(parts)
 
 
 def record_source_success(source):
@@ -890,7 +912,7 @@ def process_one_stock(code, name, meta):
         )
         return old_df, "有", "全历史", "增量失败保留旧缓存", "缓存", "增量失败"
 
-    # 无缓存时，如果缓存恢复数量太少且不允许从0重建，保护停止该票
+    # 无缓存时，如果缓存恢复数量太少且不允许从0重建，保护跳过该票
     if not cache_exists and not FULL_REBUILD and count_cache_files() < MIN_CACHE_FILES_REQUIRED:
         return None, "无", "待建立", "保护跳过:缓存恢复过少且FULL_REBUILD=0", "未联网", "跳过-保护"
 
@@ -1033,6 +1055,7 @@ def main():
     built_success = 0
     backfill_failed = 0
     stopped_by_time = False
+    stopped_by_circuit = False
 
     try:
         existing_cache_count = count_cache_files()
@@ -1044,6 +1067,7 @@ def main():
         log(f"[配置] FULL_REBUILD={FULL_REBUILD}, MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
         log(f"[缓存] 当前缓存CSV数量={existing_cache_count}")
         log("[策略] 全历史回补优先 BaoStock；增量更新优先 EastMoney/AkShare")
+        log("[保护] 三个数据源全部熔断时，本轮立刻安全收尾")
         log("==============================================")
         log("")
 
@@ -1066,6 +1090,7 @@ def main():
                 "full_history_count": 0,
                 "need_backfill_count": 0,
                 "stopped_by_time": False,
+                "stopped_by_circuit": False,
                 "should_continue": False,
                 "continue_reason": "cache_restore_too_small",
                 "elapsed": fmt_seconds(elapsed_seconds(start_ts)),
@@ -1086,6 +1111,15 @@ def main():
                 stopped_by_time = True
                 log("")
                 log("[时间保护] 快到本轮时间上限，开始安全收尾。已补好的缓存会保存，下轮自动继续。")
+                log("")
+                break
+
+            if all_sources_in_cooldown():
+                stopped_by_circuit = True
+                log("")
+                log("[熔断保护] BaoStock / EastMoney / AkShare 三个数据源全部进入冷却。")
+                log("[熔断保护] 本轮继续扫描已经没有意义，开始安全收尾，等待下一轮再继续。")
+                log(f"[熔断状态] {source_cooldown_text()}")
                 log("")
                 break
 
@@ -1209,6 +1243,10 @@ def main():
         elif RUN_ROUND >= MAX_AUTO_ROUNDS:
             continue_reason = "达到最大自动轮数"
             should_continue = False
+        elif stopped_by_circuit and should_continue:
+            continue_reason = "三个数据源全部熔断，本轮提前收尾，10分钟后自动下一轮"
+        elif stopped_by_time and should_continue:
+            continue_reason = "达到本轮时间保护，本轮提前收尾，10分钟后自动下一轮"
         elif should_continue:
             continue_reason = "仍有待回补，10分钟后自动下一轮"
         else:
@@ -1227,6 +1265,7 @@ def main():
             "full_history_count": full_history_count,
             "need_backfill_count": need_backfill_count,
             "stopped_by_time": stopped_by_time,
+            "stopped_by_circuit": stopped_by_circuit,
             "should_continue": should_continue,
             "continue_reason": continue_reason,
             "elapsed": fmt_seconds(elapsed_seconds(start_ts)),
@@ -1246,6 +1285,7 @@ def main():
         log(f"本轮回补成功: {summary['backfill_success_this_run']}")
         log(f"本轮首次建立: {summary['built_success_this_run']}")
         log(f"本轮失败: {summary['backfill_failed_this_run']}")
+        log(f"是否因数据源熔断提前收尾: {summary['stopped_by_circuit']}")
         log(f"是否需要自动下一轮: {summary['should_continue']}")
         log(f"原因: {summary['continue_reason']}")
         log("==============================")
