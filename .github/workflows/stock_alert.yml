@@ -2,8 +2,16 @@ name: stock-alert
 
 on:
   schedule:
+    # UTC 08:00 = 北京时间 16:00，适合A股收盘后运行
     - cron: '0 8 * * 1-5'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-alert
+  cancel-in-progress: false
 
 jobs:
   stock-alert:
@@ -18,57 +26,83 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install system fonts for Chinese tables
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          fc-cache -fv
+
+      - name: Restore kline cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            kline_cache/
+          key: kline-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            kline-cache-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas requests baostock numpy
+          pip install akshare pandas requests baostock numpy matplotlib pillow
 
       - name: Run stock script
         env:
           ENABLE_TELEGRAM: 1
+
+          # V16：每天正式推3只；RESULT_LIMIT可保留20，但最终由TOP_PUSH_LIMIT限制为3
           RESULT_LIMIT: 20
+          TOP_PUSH_LIMIT: 3
+          V14_TARGET_PUSH_COUNT: 3
+
+          # 深度候选数量：新版20维和压力带模型较重，150是质量和速度的折中
           DEEP_SCORE_LIMIT: 500
           DEEP_SCORE_HARD_CAP: 150
 
-          # V10.1：默认只扫描最新有行情交易日，不再回看近3天，提升速度并避免旧信号挤占名额
+          # 默认只扫描最新有行情交易日
           CHECK_DAYS: 1
 
           MAX_WORKERS: 1
           REQUEST_SLEEP: 0.12
 
-          # 公共仓库标准runner单job最长6小时，这里给收尾和artifact上传预留时间
+          # 公共runner单job最长6小时，预留收尾和artifact上传时间
           MAX_RUNTIME_SECONDS: 21300
-
-          # 基础评分最多5小时；CHECK_DAYS=1后理论上会明显提前完成
           BASIC_RUNTIME_SECONDS: 18000
-
-          # 深度评分数量仍保持150条不变
           DEEP_RUNTIME_SECONDS: 7200
 
           SINGLE_STOCK_TIMEOUT_SECONDS: 35
           MIN_VALID_KLINE: 1000
           PROGRESS_INTERVAL: 100
 
+          # PNG表格生成必备：无界面环境使用Agg后端
+          MPLBACKEND: Agg
           PYTHONUNBUFFERED: 1
+          TZ: Asia/Shanghai
 
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: python -u stock_alert.py
 
-      - name: Upload stock candidates
+      - name: Upload stock candidates and reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-candidates
+          name: stock-candidates-and-reports
           path: |
             stock_candidates.json
             failed_kline_symbols.json
             signals_history.json
+            risk_flags.json
+            *.png
+            reports/
+            report_images/
+            v16_reports/
           if-no-files-found: warn
 
-      - name: Upload kline cache
+      - name: Upload kline cache artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
