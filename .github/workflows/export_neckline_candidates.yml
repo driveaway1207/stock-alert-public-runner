@@ -51,6 +51,8 @@ jobs:
           ls -la
           echo "Python files:"
           find . -maxdepth 3 -type f -name "*.py" | sort || true
+          echo "Workflow files:"
+          find .github/workflows -maxdepth 1 -type f | sort || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -220,8 +222,10 @@ jobs:
         run: |
           NEXT_ROUND=$((RUN_ROUND + 1))
           echo "Triggering next round: $NEXT_ROUND / $MAX_AUTO_ROUNDS"
+          echo "Current workflow name: $GITHUB_WORKFLOW"
+          echo "Current branch: $GITHUB_REF_NAME"
 
-          gh workflow run "a_stock_full_kline_cache_health_check.yml" \
+          gh workflow run "$GITHUB_WORKFLOW" \
             --ref "$GITHUB_REF_NAME" \
             -f round="$NEXT_ROUND" \
             -f max_auto_rounds="$MAX_AUTO_ROUNDS" \
