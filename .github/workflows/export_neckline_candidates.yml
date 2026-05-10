@@ -4,16 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       full_rebuild:
-        description: "是否允许从0全量重建缓存：0=不允许，1=允许"
+        description: "是否强制回补/重建全历史缓存：0=不强制，1=强制"
         required: true
-        default: "0"
+        default: "1"
       min_cache_files_required:
         description: "非重建模式下，至少需要恢复多少个缓存CSV"
         required: true
         default: "3000"
 
   schedule:
-    # 北京时间约 21:30，对应 UTC 13:30
     - cron: "30 13 * * 1-5"
 
 permissions:
@@ -77,8 +76,16 @@ jobs:
       - name: Run full kline cache health script
         env:
           PYTHONUNBUFFERED: "1"
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '1' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
+          FULL_MIN_ROWS_STRONG: "1800"
+          FULL_MIN_ROWS_MEDIUM: "1200"
+          FULL_EARLY_DATE: "2016-01-01"
+          SOURCE_FAIL_THRESHOLD: "5"
+          SOURCE_COOLDOWN_SECONDS: "900"
+          EASTMONEY_TIMEOUT: "20"
+          AKSHARE_TIMEOUT: "35"
+          BAOSTOCK_TIMEOUT: "60"
         run: |
           echo "[RUN] FULL_REBUILD=$FULL_REBUILD"
           echo "[RUN] MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
@@ -119,7 +126,7 @@ jobs:
         if: always()
         id: cache-save-gate
         env:
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '1' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
           COUNT=$(find kline_cache -type f -name "*.csv" | wc -l || echo 0)
@@ -128,10 +135,7 @@ jobs:
           echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
           echo "FULL_REBUILD=$FULL_REBUILD"
 
-          if [ "$FULL_REBUILD" = "1" ]; then
-            echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "Reason: FULL_REBUILD=1, allow saving rebuilt cache."
-          elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
+          if [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
             echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED, allow saving cache."
           else
