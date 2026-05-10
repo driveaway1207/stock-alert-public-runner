@@ -2,6 +2,16 @@ name: A Stock Full Kline Cache Health Check
 
 on:
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "是否允许从0全量重建缓存：0=不允许，1=允许"
+        required: true
+        default: "0"
+      min_cache_files_required:
+        description: "非重建模式下，至少需要恢复多少个缓存CSV"
+        required: true
+        default: "3000"
+
   schedule:
     # 北京时间约 21:30，对应 UTC 13:30
     - cron: "30 13 * * 1-5"
@@ -13,7 +23,6 @@ permissions:
 jobs:
   cache-health-check:
     runs-on: ubuntu-latest
-
     timeout-minutes: 360
 
     steps:
@@ -41,7 +50,7 @@ jobs:
         run: |
           mkdir -p outputs
           mkdir -p kline_cache
-          echo "Initial kline_cache count:"
+          echo "Initial kline_cache count before restore:"
           find kline_cache -type f -name "*.csv" | wc -l
 
       - name: Restore full kline cache
@@ -49,22 +58,32 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: kline_cache
-          key: full-kline-cache-${{ runner.os }}-${{ github.run_id }}
+          key: full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
             full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
 
       - name: Show restored cache status
         run: |
           echo "Cache hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
           echo "Restored kline_cache count:"
           find kline_cache -type f -name "*.csv" | wc -l
           echo "Sample cache files:"
-          find kline_cache -type f -name "*.csv" | head -20 || true
+          find kline_cache -type f -name "*.csv" | head -30 || true
+          echo "Cache dir size:"
+          du -sh kline_cache || true
 
       - name: Run full kline cache health script
         env:
           PYTHONUNBUFFERED: "1"
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
+          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
+          echo "[RUN] FULL_REBUILD=$FULL_REBUILD"
+          echo "[RUN] MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
           echo "[RUN] python -u tools/export_neckline_candidates.py"
           python -u tools/export_neckline_candidates.py
 
@@ -75,6 +94,8 @@ jobs:
           ls -lah outputs || true
           echo "Kline cache count after run:"
           find kline_cache -type f -name "*.csv" | wc -l
+          echo "Kline cache size after run:"
+          du -sh kline_cache || true
           echo "Largest output files:"
           find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
 
@@ -87,18 +108,39 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Upload failed symbols if any
+      - name: Upload kline cache snapshot as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-cache-failed-symbols
-          path: outputs/data_cache_failed_*.csv
+          name: kline-cache-snapshot
+          path: kline_cache
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
+
+      - name: Decide whether to save cache
+        if: always()
+        id: cache-save-gate
+        env:
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
+          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
+        run: |
+          COUNT=$(find kline_cache -type f -name "*.csv" | wc -l)
+          echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$FULL_REBUILD" = "1" ]; then
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: FULL_REBUILD=1, allow saving cache."
+          elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED."
+          else
+            echo "save_cache=false" >> "$GITHUB_OUTPUT"
+            echo "Reason: cache_count=$COUNT < required=$MIN_CACHE_FILES_REQUIRED, do not save small/empty cache."
+          fi
 
       - name: Save updated full kline cache
-        if: always()
+        if: always() && steps.cache-save-gate.outputs.save_cache == 'true'
         uses: actions/cache/save@v4
         with:
           path: kline_cache
-          key: full-kline-cache-${{ runner.os }}-${{ github.run_id }}
+          key: full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
