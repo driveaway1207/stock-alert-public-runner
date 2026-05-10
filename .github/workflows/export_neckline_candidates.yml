@@ -3,7 +3,7 @@ name: A Stock Full Kline Cache Health Check
 on:
   workflow_dispatch:
   schedule:
-    # 北京时间大约晚上 21:30，对应 UTC 13:30
+    # 北京时间约 21:30，对应 UTC 13:30
     - cron: "30 13 * * 1-5"
 
 permissions:
@@ -25,18 +25,17 @@ jobs:
           pwd
           ls -la
           echo "Python files:"
-          find . -maxdepth 3 -type f -name "*.py" | sort
+          find . -maxdepth 3 -type f -name "*.py" | sort || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
       - name: Prepare directories
         run: |
@@ -77,7 +76,7 @@ jobs:
           echo "Kline cache count after run:"
           find kline_cache -type f -name "*.csv" | wc -l
           echo "Largest output files:"
-          find outputs -type f -maxdepth 1 -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
+          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -20 || true
 
       - name: Upload output CSV files
         if: always()
