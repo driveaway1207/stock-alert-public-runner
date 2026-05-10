@@ -51,18 +51,16 @@ jobs:
           mkdir -p outputs
           mkdir -p kline_cache
           echo "Initial kline_cache count before restore:"
-          find kline_cache -type f -name "*.csv" | wc -l
+          find kline_cache -type f -name "*.csv" | wc -l || true
 
-      - name: Restore full kline cache
+      - name: Restore A-share kline cache
         id: restore-kline-cache
         uses: actions/cache/restore@v4
         with:
           path: kline_cache
-          key: full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: a-kline-cache-${{ github.run_id }}
           restore-keys: |
-            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
-            full-kline-cache-${{ runner.os }}-
-            full-kline-cache-
+            a-kline-cache-
 
       - name: Show restored cache status
         run: |
@@ -70,7 +68,7 @@ jobs:
           echo "Cache primary key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
           echo "Cache matched key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
           echo "Restored kline_cache count:"
-          find kline_cache -type f -name "*.csv" | wc -l
+          find kline_cache -type f -name "*.csv" | wc -l || true
           echo "Sample cache files:"
           find kline_cache -type f -name "*.csv" | head -30 || true
           echo "Cache dir size:"
@@ -93,7 +91,7 @@ jobs:
           echo "Outputs directory:"
           ls -lah outputs || true
           echo "Kline cache count after run:"
-          find kline_cache -type f -name "*.csv" | wc -l
+          find kline_cache -type f -name "*.csv" | wc -l || true
           echo "Kline cache size after run:"
           du -sh kline_cache || true
           echo "Largest output files:"
@@ -124,23 +122,26 @@ jobs:
           FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
           MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
-          COUNT=$(find kline_cache -type f -name "*.csv" | wc -l)
+          COUNT=$(find kline_cache -type f -name "*.csv" | wc -l || echo 0)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Current cache_count=$COUNT"
+          echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
+          echo "FULL_REBUILD=$FULL_REBUILD"
 
           if [ "$FULL_REBUILD" = "1" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "Reason: FULL_REBUILD=1, allow saving cache."
+            echo "Reason: FULL_REBUILD=1, allow saving rebuilt cache."
           elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED."
+            echo "Reason: cache_count=$COUNT >= required=$MIN_CACHE_FILES_REQUIRED, allow saving cache."
           else
             echo "save_cache=false" >> "$GITHUB_OUTPUT"
             echo "Reason: cache_count=$COUNT < required=$MIN_CACHE_FILES_REQUIRED, do not save small/empty cache."
           fi
 
-      - name: Save updated full kline cache
+      - name: Save updated A-share kline cache
         if: always() && steps.cache-save-gate.outputs.save_cache == 'true'
         uses: actions/cache/save@v4
         with:
           path: kline_cache
-          key: full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: a-kline-cache-${{ github.run_id }}
