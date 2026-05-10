@@ -12,13 +12,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore Kline Cache
+      - name: Restore Full Kline Cache
         uses: actions/cache@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.run_id }}
+          key: a-kline-full-history-cache-${{ github.run_id }}
           restore-keys: |
-            a-kline-cache-
+            a-kline-full-history-cache-
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,5 +38,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: neckline-candidates
+          name: data-cache-health
           path: outputs/*.csv
