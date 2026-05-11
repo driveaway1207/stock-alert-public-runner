@@ -1,112 +1,126 @@
-name: stock-alert
+name: 一号员工A股选股每日推送
 
 on:
-  schedule:
-    # UTC 08:00 = 北京时间 16:00，适合A股收盘后运行
-    - cron: '0 8 * * 1-5'
   workflow_dispatch:
+  schedule:
+    # GitHub cron 使用 UTC；09:10 UTC = 北京时间 17:10。
+    # A股收盘后运行，目标是在北京时间18:00前完成Telegram推送。
+    - cron: "10 9 * * 1-5"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: stock-alert
+  group: a-stock-employee-1-daily-push
   cancel-in-progress: false
 
 jobs:
-  stock-alert:
+  employee1-a-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 55
+
+    env:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+
+      # Telegram：请在仓库 Settings > Secrets and variables > Actions 里配置这两个 secret。
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ENABLE_TELEGRAM: "1"
+
+      # 一号员工 V16.1：只读全历史缓存，不再全市场联网拉历史K线。
+      USE_FULL_HISTORY_CACHE: "1"
+      FULL_HISTORY_CACHE_DIR: "kline_cache"
+      FULL_CACHE_MAX_STALE_DAYS: "7"
+      FULL_CACHE_BASE_TAIL_ROWS: "760"
+      FULL_CACHE_DEEP_USE_ALL: "1"
+      EXCLUDE_MODEL_CODES: "600415,603407"
+
+      # 每日正式推送前5只；后台候选池仍可保留更多。
+      RESULT_LIMIT: "5"
+      TOP_PUSH_LIMIT: "5"
+      V14_TARGET_PUSH_COUNT: "5"
+      CHECK_DAYS: "1"
+
+      # 运行时间保护：只读缓存后应明显提速，留足安全边界，避免晚于18:00。
+      MAX_RUNTIME_SECONDS: "2400"
+      BASIC_RUNTIME_SECONDS: "1500"
+      DEEP_RUNTIME_SECONDS: "900"
+      DEEP_SCORE_LIMIT: "500"
+      DEEP_SCORE_HARD_CAP: "120"
+      MIN_VALID_KLINE: "1000"
+      PROGRESS_INTERVAL: "300"
+
+      # 只读缓存失败时的兜底，不作为主路径。
+      ALLOW_STALE_KLINE_CACHE: "1"
+      STALE_CACHE_MAX_DAYS: "10"
+      KLINE_FALLBACK_AKSHARE: "1"
+      STOCK_LIST_FALLBACK_AKSHARE: "1"
 
     steps:
-      - name: Checkout code
+      - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 显示工作目录
+        run: |
+          pwd
+          ls -la
+          echo "Python files:"
+          find . -maxdepth 3 -type f -name "*.py" | sort || true
+          echo "Workflow files:"
+          find .github/workflows -maxdepth 1 -type f | sort || true
+
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
+          python-version: "3.11"
 
-      - name: Install system fonts for Chinese tables
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-          fc-cache -fv
-
-      - name: Restore kline cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            kline_cache/
-          key: kline-cache-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            kline-cache-${{ runner.os }}-
-
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas requests baostock numpy matplotlib pillow
+          pip install pandas numpy requests baostock akshare openpyxl lxml beautifulsoup4 html5lib tqdm
 
-      - name: Run stock script
-        env:
-          ENABLE_TELEGRAM: 1
+      - name: 准备目录
+        run: |
+          mkdir -p outputs
+          mkdir -p kline_cache
 
-          # V16：每天正式推3只；RESULT_LIMIT可保留20，但最终由TOP_PUSH_LIMIT限制为3
-          RESULT_LIMIT: 20
-          TOP_PUSH_LIMIT: 3
-          V14_TARGET_PUSH_COUNT: 3
+      - name: 恢复A股全历史K线缓存
+        id: restore_kline_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-employee1-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
 
-          # 深度候选数量：新版20维和压力带模型较重，150是质量和速度的折中
-          DEEP_SCORE_LIMIT: 500
-          DEEP_SCORE_HARD_CAP: 150
+      - name: 检查缓存状态
+        run: |
+          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
+          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
+          echo "Restored kline_cache stock csv count:"
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
+          echo "Cache dir size:"
+          du -sh kline_cache || true
+          echo "Meta file:"
+          ls -lah kline_cache/_full_history_status.csv || true
 
-          # 默认只扫描最新有行情交易日
-          CHECK_DAYS: 1
+      - name: 运行一号员工A股选股并推送Telegram
+        run: |
+          echo "北京时间：$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "目标：北京时间18:00前完成今日推荐股票推送。"
+          echo "运行：python -u stock_alert.py"
+          python -u stock_alert.py
 
-          MAX_WORKERS: 1
-          REQUEST_SLEEP: 0.12
-
-          # 公共runner单job最长6小时，预留收尾和artifact上传时间
-          MAX_RUNTIME_SECONDS: 21300
-          BASIC_RUNTIME_SECONDS: 18000
-          DEEP_RUNTIME_SECONDS: 7200
-
-          SINGLE_STOCK_TIMEOUT_SECONDS: 35
-          MIN_VALID_KLINE: 1000
-          PROGRESS_INTERVAL: 100
-
-          # PNG表格生成必备：无界面环境使用Agg后端
-          MPLBACKEND: Agg
-          PYTHONUNBUFFERED: 1
-          TZ: Asia/Shanghai
-
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-        run: python -u stock_alert.py
-
-      - name: Upload stock candidates and reports
+      - name: 上传一号员工输出文件
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-candidates-and-reports
+          name: employee1-a-stock-outputs
           path: |
-            stock_candidates.json
-            failed_kline_symbols.json
-            signals_history.json
-            risk_flags.json
-            *.png
-            reports/
-            report_images/
-            v16_reports/
+            *.json
+            outputs
           if-no-files-found: warn
-
-      - name: Upload kline cache artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kline-cache
-          path: |
-            kline_cache/
-          if-no-files-found: ignore
+          retention-days: 14
