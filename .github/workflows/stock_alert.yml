@@ -3,20 +3,21 @@ name: 一号员工A股每日增量更新并推送
 on:
   workflow_dispatch:
     inputs:
+      run_stock_alert:
+        description: "是否运行一号员工选股：1=运行，0=只更新缓存"
+        required: true
+        default: "1"
+      lookback_days:
+        description: "落后股票增量回看自然日"
+        required: true
+        default: "7"
       max_runtime_minutes:
         description: "每日增量更新最多运行分钟数"
         required: true
         default: "45"
-      lookback_days:
-        description: "每只股票从最后K线日期往前回退多少自然日"
-        required: true
-        default: "7"
-      run_stock_alert:
-        description: "是否运行一号员工推送：1=运行，0=只更新缓存"
-        required: true
-        default: "1"
+
   schedule:
-    # 北京时间 17:00，UTC 09:00；周一到周五
+    # 北京时间 17:00 = UTC 09:00
     - cron: "0 9 * * 1-5"
 
 permissions:
@@ -24,7 +25,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: 一号员工A股每日增量更新并推送
+  group: employee1-a-stock-daily-update-and-alert
   cancel-in-progress: false
 
 jobs:
@@ -53,14 +54,12 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm matplotlib
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm numpy
 
       - name: 准备目录
         run: |
           mkdir -p outputs
           mkdir -p kline_cache
-          echo "Initial kline_cache count before restore:"
-          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
 
       - name: 恢复A股K线缓存
         id: restore_kline_cache
@@ -71,14 +70,10 @@ jobs:
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
-            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
-            full-kline-cache-${{ runner.os }}-
-            full-kline-cache-
 
       - name: 显示缓存恢复状态
         run: |
           echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
-          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
           echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
           echo "Restored kline_cache stock csv count:"
           find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
@@ -91,22 +86,18 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
-          STALE_LOOKBACK_DAYS: "15"
-          DAILY_UPDATE_MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '45' }}
-          DAILY_UPDATE_SOFT_STOP_BUFFER_MINUTES: "5"
-          DAILY_SOURCE_ORDER: "EastMoney,AkShare,BaoStock"
-          EASTMONEY_TIMEOUT: "12"
-          AKSHARE_TIMEOUT: "18"
-          BAOSTOCK_TIMEOUT: "20"
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '45' }}
+          SOFT_STOP_BUFFER_MINUTES: "5"
+          PER_STOCK_TIMEOUT: "20"
+          PROGRESS_EVERY: "100"
         run: |
-          echo "[RUN] 每日增量更新A股K线缓存"
+          echo "[RUN] 每日增量更新A股K线缓存 V3"
           python -u tools/update_kline_cache_daily.py
 
-      - name: 运行一号员工A股选股并推送
-        if: ${{ github.event.inputs.run_stock_alert == '1' || github.event_name == 'schedule' }}
+      - name: 运行一号员工A股选股并推送Telegram
+        if: ${{ github.event.inputs.run_stock_alert != '0' }}
         env:
           PYTHONUNBUFFERED: "1"
-          ENABLE_TELEGRAM: "1"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -116,20 +107,18 @@ jobs:
       - name: 显示输出文件
         if: always()
         run: |
-          echo "Outputs directory:"
+          echo "Outputs:"
           ls -lah outputs || true
-          echo "Kline cache count after run:"
-          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
-          echo "Kline cache size after run:"
-          du -sh kline_cache || true
           echo "Daily update state:"
           cat outputs/daily_kline_update_state.json || true
+          echo "Latest output files:"
+          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -30 || true
 
       - name: 上传输出结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 一号员工A股每日增量更新并推送输出
+          name: employee1-a-stock-daily-outputs
           path: outputs
           if-no-files-found: warn
           retention-days: 14
@@ -140,12 +129,13 @@ jobs:
         run: |
           COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
-          if [ "$COUNT" -ge "3000" ]; then
+
+          if [ "$COUNT" -ge 3000 ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "Reason: cache_count=$COUNT >= 3000, save cache."
+            echo "缓存文件数 $COUNT >= 3000，允许保存缓存。"
           else
             echo "save_cache=false" >> "$GITHUB_OUTPUT"
-            echo "Reason: cache_count=$COUNT < 3000, do not save small cache."
+            echo "缓存文件数 $COUNT < 3000，不保存，避免覆盖好缓存。"
           fi
 
       - name: 保存更新后的A股K线缓存
@@ -153,4 +143,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-daily-${{ github.run_id }}
