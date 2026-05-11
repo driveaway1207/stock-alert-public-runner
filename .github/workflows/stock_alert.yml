@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_stock_alert:
-        description: "是否运行一号员工选股：1=运行，0=只更新/验收缓存"
+        description: "是否运行一号员工选股：1=运行，0=只更新缓存"
         required: true
         default: "1"
       lookback_days:
@@ -15,10 +15,6 @@ on:
         description: "每日增量更新最多运行分钟数"
         required: true
         default: "45"
-      min_fresh_coverage:
-        description: "最新K覆盖率闸门，例如0.965"
-        required: true
-        default: "0.965"
 
   schedule:
     # 北京时间 17:00 = UTC 09:00
@@ -35,7 +31,7 @@ concurrency:
 jobs:
   daily-update-and-alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 120
 
     steps:
       - name: 拉取仓库代码
@@ -58,12 +54,13 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm numpy matplotlib pillow
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm numpy pillow matplotlib
 
       - name: 准备目录
         run: |
           mkdir -p outputs
           mkdir -p kline_cache
+          mkdir -p telegram_tables
 
       - name: 恢复A股K线缓存
         id: restore_kline_cache
@@ -92,132 +89,72 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '45' }}
           SOFT_STOP_BUFFER_MINUTES: "5"
-          PER_STOCK_TIMEOUT: "18"
+          PER_STOCK_TIMEOUT: "20"
           PROGRESS_EVERY: "100"
-          MIN_FRESH_COVERAGE: ${{ github.event.inputs.min_fresh_coverage || '0.965' }}
-          ALLOW_STOCK_ALERT_IF_STALE_ONLY: "1"
         run: |
-          echo "[RUN] 每日增量更新A股K线缓存 V16.5"
+          echo "[RUN] 每日增量更新A股K线缓存"
           python -u tools/update_kline_cache_daily.py
 
-      - name: 运行缓存验收并生成今日模型股票池
+      - name: 缓存验收并生成模型股票池
         env:
           PYTHONUNBUFFERED: "1"
-          EXCLUDE_MODEL_CODES: "600415,603407"
-          MODEL_MIN_ROWS: "250"
-          MAX_LATEST_GAP_DAYS: "15"
         run: |
-          echo "[RUN] 缓存验收 / 生成今日 model_usable_universe（按目标交易日过滤停牌/无新K）"
+          echo "[RUN] 缓存验收并生成 model_usable_universe"
           python -u tools/validate_kline_cache.py
 
       - name: 数据新鲜度闸门
         id: data_gate
-        if: always()
         run: |
-          CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
-          MODEL_FILE=$(ls -t outputs/model_usable_universe_*.csv 2>/dev/null | head -1 || true)
-          DAILY_STATE="outputs/daily_kline_update_state.json"
-          ACCEPT_STATE="outputs/cache_acceptance_state.json"
+          echo "[RUN] 数据新鲜度闸门"
 
-          DAILY_SHOULD=$(python -c "import json,os; p='$DAILY_STATE'; print(str(json.load(open(p,encoding='utf-8')).get('should_run_stock_alert', False)).lower() if os.path.exists(p) else 'false')")
-          TARGET_DATE=$(python -c "import json,os; p='$DAILY_STATE'; print(json.load(open(p,encoding='utf-8')).get('目标交易日','') if os.path.exists(p) else '')")
-          COVERAGE=$(python -c "import json,os; p='$DAILY_STATE'; print(json.load(open(p,encoding='utf-8')).get('fresh_coverage_pct','') if os.path.exists(p) else '')")
-          FAILED=$(python -c "import json,os; p='$DAILY_STATE'; print(json.load(open(p,encoding='utf-8')).get('failed_失败数','') if os.path.exists(p) else '')")
-          STALE=$(python -c "import json,os; p='$DAILY_STATE'; print(json.load(open(p,encoding='utf-8')).get('stale_疑似停牌或无新K数','') if os.path.exists(p) else '')")
-          MODEL_COUNT=$(python -c "import pandas as pd, os; p='$MODEL_FILE'; print(len(pd.read_csv(p)) if p and os.path.exists(p) else 0)")
+          STATE_FILE="outputs/daily_kline_update_state.json"
 
-          SHOULD_RUN="false"
-          REASON=""
-          if [ "$CACHE_COUNT" -lt 3000 ]; then
-            REASON="缓存文件数过少: $CACHE_COUNT"
-          elif [ "$DAILY_SHOULD" != "true" ]; then
-            REASON="每日增量新鲜度未通过: should_run=$DAILY_SHOULD coverage=$COVERAGE failed=$FAILED"
-          elif [ "$MODEL_COUNT" -lt 4800 ]; then
-            REASON="模型股票池数量过少: $MODEL_COUNT"
-          elif [ -z "$MODEL_FILE" ]; then
-            REASON="未找到 model_usable_universe 文件"
-          else
-            SHOULD_RUN="true"
-            REASON="数据闸门通过"
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=missing_daily_update_state" >> "$GITHUB_OUTPUT"
+            echo "❌ 缺少 daily_kline_update_state.json，不运行一号员工。"
+            exit 0
           fi
+
+          SHOULD_RUN=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(str(d.get('should_run_stock_alert', d.get('should_run', True))).lower())")
+          TARGET_DATE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('target_trade_date', d.get('目标交易日', '')))")
+          COVERAGE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('fresh_coverage_pct', d.get('最新K覆盖率', '')))")
+          REASON=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('gate_reason', d.get('reason', '')))" | head -c 500)
 
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
-          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
-          echo "model_universe_file=$MODEL_FILE" >> "$GITHUB_OUTPUT"
           echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
-          echo "model_count=$MODEL_COUNT" >> "$GITHUB_OUTPUT"
-          echo "cache_count=$CACHE_COUNT" >> "$GITHUB_OUTPUT"
-          echo "stale=$STALE" >> "$GITHUB_OUTPUT"
-          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
 
-          echo "========== 数据新鲜度闸门 =========="
+          echo "数据新鲜度闸门:"
           echo "should_run=$SHOULD_RUN"
-          echo "reason=$REASON"
           echo "target_date=$TARGET_DATE"
           echo "coverage=$COVERAGE"
-          echo "stale=$STALE failed=$FAILED"
-          echo "cache_count=$CACHE_COUNT"
-          echo "model_universe_file=$MODEL_FILE"
-          echo "model_count=$MODEL_COUNT"
-          echo "===================================="
-
-      - name: 数据闸门未通过时推送Telegram预警
-        if: always() && steps.data_gate.outputs.should_run != 'true' && github.event.inputs.run_stock_alert != '0'
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          REASON: ${{ steps.data_gate.outputs.reason }}
-          TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
-          COVERAGE: ${{ steps.data_gate.outputs.coverage }}
-          MODEL_COUNT: ${{ steps.data_gate.outputs.model_count }}
-          CACHE_COUNT: ${{ steps.data_gate.outputs.cache_count }}
-        run: |
-          MSG="⚠️ 一号员工今日未推正式股票%0A原因：${REASON}%0A目标交易日：${TARGET_DATE}%0A最新K覆盖率：${COVERAGE}%0A模型池：${MODEL_COUNT}%0A缓存文件：${CACHE_COUNT}"
-          if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            curl -sS "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-              -d "chat_id=${TELEGRAM_CHAT_ID}" \
-              -d "text=${MSG}" \
-              -d "parse_mode=HTML" || true
-          else
-            echo "Telegram secrets missing; warning not sent."
-          fi
+          echo "reason=$REASON"
 
       - name: 运行一号员工A股选股并推送Telegram
-        if: always() && steps.data_gate.outputs.should_run == 'true' && github.event.inputs.run_stock_alert != '0'
+        if: ${{ steps.data_gate.outputs.should_run == 'true' && github.event.inputs.run_stock_alert != '0' }}
         env:
           PYTHONUNBUFFERED: "1"
           ENABLE_TELEGRAM: "1"
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          USE_FULL_HISTORY_CACHE: "1"
-          FULL_HISTORY_CACHE_DIR: "kline_cache"
-          MODEL_UNIVERSE_FILE: ${{ steps.data_gate.outputs.model_universe_file }}
+          FINAL_SCORE_THRESHOLD: "80"
           DATA_GATE_TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
           DATA_GATE_COVERAGE: ${{ steps.data_gate.outputs.coverage }}
-          DATA_GATE_MODEL_COUNT: ${{ steps.data_gate.outputs.model_count }}
-          DATA_GATE_CACHE_COUNT: ${{ steps.data_gate.outputs.cache_count }}
-          DATA_GATE_STALE_COUNT: ${{ steps.data_gate.outputs.stale }}
-          DATA_GATE_FAILED_COUNT: ${{ steps.data_gate.outputs.failed }}
           DATA_GATE_REASON: ${{ steps.data_gate.outputs.reason }}
-          EXCLUDE_MODEL_CODES: "600415,603407"
-          FINAL_SCORE_THRESHOLD: "80"
-          V14_MIN_ABSOLUTE_SCORE: "80"
-          V14_PREFERRED_SCORE: "80"
-          CHECK_DAYS: "1"
-          TOP_PUSH_LIMIT: "5"
-          RESULT_LIMIT: "20"
-          DEEP_SCORE_LIMIT: "500"
-          DEEP_SCORE_HARD_CAP: "80"
-          MIN_VALID_KLINE: "1000"
-          FULL_CACHE_MAX_STALE_DAYS: "7"
-          FULL_CACHE_MIN_ROWS_BASE: "120"
-          FULL_CACHE_MIN_ROWS_DEEP: "250"
-          FULL_CACHE_DEEP_USE_ALL: "1"
         run: |
           echo "[RUN] 一号员工A股选股并推送"
-          echo "MODEL_UNIVERSE_FILE=$MODEL_UNIVERSE_FILE"
+          echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
           python -u stock_alert.py
+
+      - name: 数据未达标时不运行正式推荐
+        if: ${{ steps.data_gate.outputs.should_run != 'true' }}
+        run: |
+          echo "⚠️ 数据新鲜度闸门未通过，本次不运行正式选股。"
+          echo "target_date=${{ steps.data_gate.outputs.target_date }}"
+          echo "coverage=${{ steps.data_gate.outputs.coverage }}"
+          echo "reason=${{ steps.data_gate.outputs.reason }}"
 
       - name: 显示输出文件
         if: always()
@@ -226,10 +163,8 @@ jobs:
           ls -lah outputs || true
           echo "Daily update state:"
           cat outputs/daily_kline_update_state.json || true
-          echo "Cache acceptance state:"
-          cat outputs/cache_acceptance_state.json || true
           echo "Latest output files:"
-          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -50 || true
+          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -30 || true
 
       - name: 上传输出结果
         if: always()
@@ -246,6 +181,7 @@ jobs:
         run: |
           COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
+
           if [ "$COUNT" -ge 3000 ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
             echo "缓存文件数 $COUNT >= 3000，允许保存缓存。"
