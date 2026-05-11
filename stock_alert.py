@@ -19,7 +19,6 @@ except Exception:
     ak = None
 
 warnings.filterwarnings("ignore")
-# V16.2: pandas 2.2+ compatible; use np.nan instead of pd.NA to avoid boolean ambiguity in deep scoring.
 
 # ========================= V11 交易质量主逻辑重构说明 =========================
 # 本文件基于V10.1完整版本继续做“手术式增量优化”，原则是：
@@ -136,7 +135,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V16.2一号员工选股模型｜每日增量+数据闸门+只读全历史缓存｜Pandas兼容修正版"
+MODEL_VERSION = "V16.4一号员工选股模型｜数据闸门+只读全历史缓存+验收股票池版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -218,6 +217,15 @@ EXCLUDE_MODEL_CODES = set(
     x.strip().zfill(6) for x in os.environ.get("EXCLUDE_MODEL_CODES", "600415,603407").split(",") if x.strip()
 )
 
+# 每日数据闸门信息，由 workflow 从 daily_kline_update_state.json 传入，写入日志和Telegram报告。
+DATA_GATE_TARGET_DATE = os.environ.get("DATA_GATE_TARGET_DATE", "").strip()
+DATA_GATE_COVERAGE = os.environ.get("DATA_GATE_COVERAGE", "").strip()
+DATA_GATE_MODEL_COUNT = os.environ.get("DATA_GATE_MODEL_COUNT", "").strip()
+DATA_GATE_CACHE_COUNT = os.environ.get("DATA_GATE_CACHE_COUNT", "").strip()
+DATA_GATE_REASON = os.environ.get("DATA_GATE_REASON", "").strip()
+DATA_GATE_STALE_COUNT = os.environ.get("DATA_GATE_STALE_COUNT", "").strip()
+DATA_GATE_FAILED_COUNT = os.environ.get("DATA_GATE_FAILED_COUNT", "").strip()
+
 # V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
 STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
 STOCK_LIST_MAX_RETRIES = int(os.environ.get("STOCK_LIST_MAX_RETRIES", "2"))
@@ -226,7 +234,7 @@ STOCK_LIST_RELOGIN_ON_FAIL = os.environ.get("STOCK_LIST_RELOGIN_ON_FAIL", "1")
 
 SCORE_LIMIT = 75
 # 最终推送阈值：新评分体系下，80分以下不再推送；基础初筛仍沿用原SCORE_LIMIT，不改原模型。
-FINAL_SCORE_THRESHOLD = float(os.environ.get("FINAL_SCORE_THRESHOLD", "75"))
+FINAL_SCORE_THRESHOLD = float(os.environ.get("FINAL_SCORE_THRESHOLD", "80"))
 # V9.1：是否只推送“优先候选池”。默认1，避免一号员工把短线强攻/涨停追高票混入正式候选。
 ONLY_PUSH_PRIORITY_POOL = os.environ.get("ONLY_PUSH_PRIORITY_POOL", "0")
 # V9.1：强势观察池不作为正式推送，可在候选JSON中保留，供三号员工或人工复盘。
@@ -239,8 +247,8 @@ SAVE_STRONG_WATCH_POOL = os.environ.get("SAVE_STRONG_WATCH_POOL", "1")
 # 尽可能选出相对最优3只。普通缺点（右侧量能不足、买点不完美、日线略高）做扣分/降级，不再一刀切杀光。
 V14_ENABLE_FINAL_RESCUE = os.environ.get("V14_ENABLE_FINAL_RESCUE", "1")
 V14_TARGET_PUSH_COUNT = int(os.environ.get("V14_TARGET_PUSH_COUNT", str(RESULT_LIMIT)))
-V14_MIN_ABSOLUTE_SCORE = float(os.environ.get("V14_MIN_ABSOLUTE_SCORE", "70"))
-V14_PREFERRED_SCORE = float(os.environ.get("V14_PREFERRED_SCORE", "75"))
+V14_MIN_ABSOLUTE_SCORE = float(os.environ.get("V14_MIN_ABSOLUTE_SCORE", "80"))
+V14_PREFERRED_SCORE = float(os.environ.get("V14_PREFERRED_SCORE", "80"))
 V14_IGNORE_HISTORY_FOR_RERUN = os.environ.get("V14_IGNORE_HISTORY_FOR_RERUN", "1")
 V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 
@@ -304,6 +312,24 @@ def stock_query_timeout(seconds, label=""):
 
 def bj_time_str():
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_data_gate_header_lines():
+    """Telegram/日志展示用：让用户一眼看到今天用的K线日期、覆盖率和模型池口径。"""
+    lines = []
+    if DATA_GATE_TARGET_DATE or DATA_GATE_COVERAGE or DATA_GATE_MODEL_COUNT or DATA_GATE_CACHE_COUNT:
+        lines.append(
+            "数据口径："
+            f"使用K线目标日={DATA_GATE_TARGET_DATE or '未知'}；"
+            f"最新K覆盖率={DATA_GATE_COVERAGE or '未知'}；"
+            f"模型池={DATA_GATE_MODEL_COUNT or '未知'}；"
+            f"缓存文件={DATA_GATE_CACHE_COUNT or '未知'}"
+        )
+        if DATA_GATE_STALE_COUNT or DATA_GATE_FAILED_COUNT:
+            lines.append(f"数据限制：疑似停牌/无新K={DATA_GATE_STALE_COUNT or '0'}；增量失败={DATA_GATE_FAILED_COUNT or '0'}")
+        if DATA_GATE_REASON:
+            lines.append(f"数据闸门：{DATA_GATE_REASON}")
+    return lines
 
 
 def format_seconds(seconds):
@@ -746,6 +772,7 @@ def _load_model_universe_file():
             df = pd.read_csv(path, dtype=str)
             if df is None or df.empty:
                 continue
+            raw_count = len(df)
             code_col = None
             for c in ["原始代码", "代码", "股票代码", "code", "symbol"]:
                 if c in df.columns:
@@ -756,19 +783,45 @@ def _load_model_universe_file():
             name_col = "股票名称" if "股票名称" in df.columns else ("名称" if "名称" in df.columns else None)
             usable_col = "是否进入一号员工模型池" if "是否进入一号员工模型池" in df.columns else None
             if usable_col:
+                before = len(df)
                 df = df[df[usable_col].astype(str).str.strip() == "是"].copy()
+                excluded_unusable = before - len(df)
+            else:
+                excluded_unusable = 0
             df["代码"] = df[code_col].apply(_stock_code_to_plain)
+            before = len(df)
             df = df[df["代码"].str.match(r"^\d{6}$", na=False)].copy()
+            excluded_bad_code = before - len(df)
             df["名称"] = df[name_col].astype(str) if name_col else ""
+            # 严格使用每日目标交易日：停牌/无新K/数据未更新的票不进入当天正式扫描。
+            excluded_not_target_date = 0
+            if DATA_GATE_TARGET_DATE and "K线最新日期" in df.columns:
+                before = len(df)
+                latest = pd.to_datetime(df["K线最新日期"], errors="coerce")
+                target_ts = pd.to_datetime(DATA_GATE_TARGET_DATE, errors="coerce")
+                if not pd.isna(target_ts):
+                    df = df[latest >= target_ts].copy()
+                    excluded_not_target_date = before - len(df)
             df["bs_code"] = df["代码"].apply(_bs_code_from_plain_code)
+            before = len(df)
             df = df[df["bs_code"].astype(str).str.startswith(VALID_STOCK_PREFIXES)].copy()
+            excluded_market = before - len(df)
+            before = len(df)
             df = df[~df["代码"].isin(EXCLUDE_MODEL_CODES)].copy()
+            excluded_manual = before - len(df)
+            before = len(df)
             df = df[~df["名称"].astype(str).str.contains("ST|\\*ST|退", regex=True, na=False)].copy()
+            excluded_st = before - len(df)
             df = df.drop_duplicates("代码")
             if MAX_STOCKS > 0:
                 df = df.head(MAX_STOCKS)
             if not df.empty:
-                print(f"只读缓存股票池：使用模型验收股票池 file={path} stocks={len(df)}")
+                print(
+                    f"只读缓存股票池：使用模型验收股票池 file={path} "
+                    f"raw={raw_count} usable_excluded={excluded_unusable} bad_code={excluded_bad_code} "
+                    f"not_target_date={excluded_not_target_date} market_excluded={excluded_market} "
+                    f"manual_excluded={excluded_manual} st_excluded={excluded_st} final_stocks={len(df)}"
+                )
                 return df[["代码", "名称", "bs_code"]]
         except Exception as e:
             print(f"模型验收股票池读取失败：file={path} error={str(e)[:160]}")
@@ -1462,7 +1515,7 @@ def read_full_history_flat_cache(bs_code, cache_scope="deep", min_rows=0):
         try:
             gap_days = (datetime.now().date() - pd.to_datetime(last_date).date()).days
             if gap_days > FULL_CACHE_MAX_STALE_DAYS:
-                print(f"全历史缓存偏旧：{bs_code} last_date={last_date} gap={gap_days}d，尝试旧联网通道。")
+                print(f"全历史缓存偏旧：{bs_code} last_date={last_date} gap={gap_days}d，跳过只读缓存并进入旧通道兜底。")
                 return None
         except Exception:
             pass
@@ -2521,29 +2574,29 @@ def calc_base_rows(df):
 
     df["uptrend"] = (df["ma5"] > df["ma10"]) & (df["ma10"] > df["ma20"])
 
-    df["volscore"] = 0
+    df["volscore"] = 0.0
     df.loc[df["volr"] >= 1.2, "volscore"] = 10
     df.loc[df["volr"] >= 1.5, "volscore"] = 20
     df.loc[df["volr"] >= 2.0, "volscore"] = 25
     df.loc[df["volr"] >= 2.5, "volscore"] = 30
 
     up = df["close"] > df["open"]
-    df["bodyscore"] = 0
+    df["bodyscore"] = 0.0
     df.loc[up & (df["body"] >= df["upbody_ma"]), "bodyscore"] = 10
     df.loc[up & (df["body"] >= df["upbody_ma"] * 1.2), "bodyscore"] = 15
     df.loc[up & (df["body"] >= df["upbody_ma"] * 1.5), "bodyscore"] = 20
 
-    df["posscore"] = 0
+    df["posscore"] = 0.0
     df.loc[df["pos"] >= 0.6, "posscore"] = 10
     df.loc[df["pos"] >= 0.7, "posscore"] = 15
     df.loc[df["pos"] >= 0.8, "posscore"] = 20
 
-    df["brscore"] = 0
+    df["brscore"] = 0.0
     df.loc[df["high"] >= df["prehigh"], "brscore"] = 5
     df.loc[df["close"] > df["prehigh"], "brscore"] = 15
     df.loc[df["close"] > df["prehigh"] * 1.01, "brscore"] = 20
 
-    df["structscore"] = 0
+    df["structscore"] = 0.0
     df.loc[(df["volr"] >= 2.5) & (df["pos"] >= 0.8), "structscore"] = 2
     df.loc[df["uptrend"], "structscore"] = 5
     df.loc[df["close"] > df["prehigh"], "structscore"] = 8
@@ -3192,6 +3245,7 @@ def apply_chase_risk_gate(merged):
 
 
 def _resample_ohlcv(df, rule):
+    rule = {"M": "ME", "Q": "QE", "Y": "YE"}.get(str(rule), rule)
     """把日线聚合成周/月/季K。只在深度层对候选股调用，避免全市场重复慢扫。"""
     if df is None or df.empty or "date" not in df.columns:
         return pd.DataFrame()
@@ -5104,7 +5158,7 @@ def calc_deep_rows(df, code):
     extra["vol_price_sync"] = (df["volr"] >= 1.5) & (df["close"] > df["close"].shift(1))
     extra["extreme_vol"] = (df["volr"] > 4.5) | (df["vr1"] > 3.5)
 
-    extra["score_volume_structure"] = 0
+    extra["score_volume_structure"] = 0.0
     # 倍量必须严格为：今日成交量 / 昨日成交量 > 1.8 且 < 2.5。超过2.5不是健康倍量，不能继续按倍量高分奖励。
     extra.loc[extra["is_beiliang"], "score_volume_structure"] += 4
     extra.loc[extra["beiliang_up"], "score_volume_structure"] += 4
@@ -5282,7 +5336,7 @@ def calc_deep_rows(df, code):
 
     # 兼容原模型的阳包阴频次分：用V14精细分压缩到原score_engulf_quality，保留原有滚动统计，不另起炉灶。
     extra["score_engulf_quality"] = (extra["v14_bull_engulf_score_current"] / 3.0).clip(0, 6)
-    extra.loc[~extra["bull_engulf"], "score_engulf_quality"] = 0
+    extra.loc[~extra["bull_engulf"], "score_engulf_quality"] = 0.0
 
     extra["bull_engulf_score_20"] = extra["score_engulf_quality"].rolling(20).sum().clip(0, 6)
     extra["bull_engulf_count_20"] = extra["bull_engulf"].rolling(20).sum()
@@ -5397,7 +5451,7 @@ def calc_deep_rows(df, code):
     extra.loc[extra["double_yang_sandwich_yin"] & third_recover_high, "double_yang_sandwich_desc"] = "双阳夹阴：第二阴有威慑但未有效破第一阳实底，第三阳拼量反包阴线高点"
     extra.loc[extra["double_yang_sandwich_yin"] & slight_break_first_bottom, "double_yang_sandwich_desc"] = extra.loc[extra["double_yang_sandwich_yin"] & slight_break_first_bottom, "double_yang_sandwich_desc"] + "；第二阴略破第一阳实底约0.3%以内，需看第三阳强度"
 
-    extra["score_behavior"] = 0
+    extra["score_behavior"] = 0.0
     extra.loc[extra["hold_limit_bottom"], "score_behavior"] += 3
     extra.loc[extra["hold_limit_mid"], "score_behavior"] += 5
     extra.loc[extra["hold_limit_top"], "score_behavior"] += 8
@@ -5443,7 +5497,7 @@ def calc_deep_rows(df, code):
         | df["just_cross_ma250"]
     )
 
-    extra["score_pattern"] = 0
+    extra["score_pattern"] = 0.0
     extra.loc[extra["platform_break_vol"], "score_pattern"] += 6
     extra.loc[extra["break_bottom_reversal"], "score_pattern"] += 6
     extra.loc[extra["hammer_gap_confirm"], "score_pattern"] += 7
@@ -5871,7 +5925,7 @@ def calc_deep_rows(df, code):
         & (df["ma10"].shift(3) <= df["ma20"].shift(3))
     )
 
-    extra["score_trend_stage"] = 0
+    extra["score_trend_stage"] = 0.0
     extra.loc[extra["early_ma_bull"], "score_trend_stage"] += 4
     extra.loc[(extra["ma20_slope_5"] > 0) & (extra["ma20_slope_5"] < 0.03), "score_trend_stage"] += 3
     extra.loc[extra["strong_yang"], "score_trend_stage"] += 1
@@ -5939,7 +5993,7 @@ def calc_deep_rows(df, code):
     extra["effective_gap_up"] = gap_effective
     extra["effective_gap_up_count_50"] = extra["effective_gap_up"].rolling(50).sum()
 
-    extra["score_count"] = 0
+    extra["score_count"] = 0.0
     extra.loc[extra["beiliang_count_20"] >= 2, "score_count"] += 2
     extra.loc[extra["beiliang_count_20"] >= 3, "score_count"] += 4
     extra.loc[extra["beiliang_count_20"] >= 5, "score_count"] += 6
@@ -6040,7 +6094,7 @@ def calc_deep_rows(df, code):
         & (df["long_pos_250"] >= 0.7)
     )
 
-    extra["score_penalty"] = 0
+    extra["score_penalty"] = 0.0
     extra.loc[extra["high_overheat"], "score_penalty"] -= 5
     extra.loc[df["bias20"] > 0.25, "score_penalty"] -= 3
     extra.loc[df["bias60"] > 0.50, "score_penalty"] -= 3
@@ -6065,7 +6119,7 @@ def calc_deep_rows(df, code):
     extra.loc[extra["weak_rebound_risk"], "score_penalty"] -= 8
     extra["score_penalty"] = extra["score_penalty"].clip(-22, 0)
 
-    extra["score_long_cycle"] = 0
+    extra["score_long_cycle"] = 0.0
     extra.loc[df["long_bottom_zone"], "score_long_cycle"] += 4
     extra.loc[(df["long_pos_250"] > 0.35) & (df["long_pos_250"] <= 0.55), "score_long_cycle"] += 2
     extra.loc[df["just_cross_ma120"], "score_long_cycle"] += 3
@@ -6149,7 +6203,7 @@ def calc_deep_rows(df, code):
         + (extra["score_structure_core"] > 0).astype(int)
     )
 
-    extra["score_overlap_adjustment"] = 0
+    extra["score_overlap_adjustment"] = 0.0
     extra.loc[attack_signal_count >= 3, "score_overlap_adjustment"] -= 2
     extra.loc[attack_signal_count >= 4, "score_overlap_adjustment"] -= 4
     extra.loc[attack_signal_count >= 5, "score_overlap_adjustment"] -= 7
@@ -6468,7 +6522,7 @@ def calc_base_full(df):
 
     base["uptrend"] = (base["ma5"] > base["ma10"]) & (base["ma10"] > base["ma20"])
 
-    base["volscore"] = 0
+    base["volscore"] = 0.0
     base.loc[base["volr"] >= 1.2, "volscore"] = 10
     base.loc[base["volr"] >= 1.5, "volscore"] = 20
     base.loc[base["volr"] >= 2.0, "volscore"] = 25
@@ -6476,22 +6530,22 @@ def calc_base_full(df):
 
     up = df["close"] > df["open"]
 
-    base["bodyscore"] = 0
+    base["bodyscore"] = 0.0
     base.loc[up & (base["body"] >= base["upbody_ma"]), "bodyscore"] = 10
     base.loc[up & (base["body"] >= base["upbody_ma"] * 1.2), "bodyscore"] = 15
     base.loc[up & (base["body"] >= base["upbody_ma"] * 1.5), "bodyscore"] = 20
 
-    base["posscore"] = 0
+    base["posscore"] = 0.0
     base.loc[base["pos"] >= 0.6, "posscore"] = 10
     base.loc[base["pos"] >= 0.7, "posscore"] = 15
     base.loc[base["pos"] >= 0.8, "posscore"] = 20
 
-    base["brscore"] = 0
+    base["brscore"] = 0.0
     base.loc[df["high"] >= base["prehigh"], "brscore"] = 5
     base.loc[df["close"] > base["prehigh"], "brscore"] = 15
     base.loc[df["close"] > base["prehigh"] * 1.01, "brscore"] = 20
 
-    base["structscore"] = 0
+    base["structscore"] = 0.0
     base.loc[(base["volr"] >= 2.5) & (base["pos"] >= 0.8), "structscore"] = 2
     base.loc[base["uptrend"], "structscore"] = 5
     base.loc[df["close"] > base["prehigh"], "structscore"] = 8
@@ -7885,6 +7939,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     lines.append("📊 <b>一号员工V16机构级20维机会评分三选报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
+    lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只")
     lines.append(f"深度评分：{deep_count}只 | 分析输出：<b>{len(final_signals)}</b>只")
     lines.append(f"V16三选口径：财务/审计/监管硬雷区一票否决；原V12.6/V14深度分保留，但必须融合主模型等级。压力带、回踩确认、黄金倍量、凹口、多周期关键位、月线修复等统一评级，尽量选出相对最优{V14_TARGET_PUSH_COUNT}只。")
@@ -7959,7 +8014,7 @@ def build_error_message(error_text):
 # 最终按风险调整后的机会分和封顶规则输出 S/A/B+/观察；Telegram正文保持简洁，表格以PNG图片发送。
 # ==================================================================================================
 
-MODEL_VERSION = "V16.2一号员工选股模型｜每日增量+数据闸门+只读全历史缓存｜Pandas兼容修正版"
+MODEL_VERSION = "V16.4一号员工选股模型｜数据闸门+只读全历史缓存+验收股票池版"
 TELEGRAM_PENDING_IMAGES = []
 
 try:
@@ -8416,6 +8471,58 @@ def _v16_signal_dimensions(s):
         return []
 
 
+
+
+def build_confirm_condition(s):
+    try:
+        direct = str(s.get("confirm_rule", "") or "").strip()
+        if direct:
+            return direct
+        close = safe_float(s.get("close", 0))
+        pressure_upper = safe_float(s.get("xhu_pressure_union_upper", s.get("xhu_final_union_upper", 0)))
+        structure_key = safe_float(s.get("structure_key_level", 0))
+        defense = safe_float(s.get("defense_level", s.get("real_defense_level", 0)))
+        grade = str(s.get("xhu_pressure_model_grade", "") or "")
+        parts = []
+        if pressure_upper > 0:
+            parts.append(f"放量站稳最终压力上沿{pressure_upper:.2f}，最好实体大半在压力带上方")
+        elif structure_key > 0:
+            parts.append(f"站稳关键结构位{structure_key:.2f}，回踩不有效跌破")
+        elif defense > 0:
+            parts.append(f"守住交易防守区{defense:.2f}附近，回踩缩量后重新转强")
+        else:
+            parts.append("次日不追高，等待放量确认或回踩关键位不破后再看")
+        if grade:
+            parts.append(f"压力带模型维持{grade}级或继续升级")
+        if close > 0:
+            parts.append("收盘位置保持强势，避免长上影放量滞涨")
+        return "；".join(parts)
+    except Exception:
+        return "等待放量确认、回踩关键位不破或重新转强；不满足则不追。"
+
+
+def build_giveup_condition(s):
+    try:
+        direct = str(s.get("abandon_rule", "") or "").strip()
+        if direct:
+            return direct
+        defense = safe_float(s.get("defense_level", s.get("real_defense_level", 0)))
+        structure_key = safe_float(s.get("structure_key_level", 0))
+        pressure_upper = safe_float(s.get("xhu_pressure_union_upper", s.get("xhu_final_union_upper", 0)))
+        parts = []
+        if defense > 0:
+            parts.append(f"有效跌破交易防守位{defense:.2f}")
+        elif structure_key > 0:
+            parts.append(f"跌回关键结构位{structure_key:.2f}下方且收不回")
+        elif pressure_upper > 0:
+            parts.append(f"突破失败并跌回压力上沿{pressure_upper:.2f}下方")
+        else:
+            parts.append("放量长阴、冲高回落或跌破短线承接位")
+        parts.append("若次日放量滞涨、长上影、跌破BBI/MA5且无修复，放弃")
+        return "；".join(parts)
+    except Exception:
+        return "跌破关键位、放量长阴或冲高回落不修复则放弃。"
+
 def render_v16_summary_table_png(final_signals, output_path="telegram_tables/v16_summary.png"):
     rows = []
     for i, s in enumerate(final_signals, 1):
@@ -8489,6 +8596,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     lines.append("📊 <b>一号员工选股模型 V16 机构级20维机会评分报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
+    lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
     lines.append(f"正式输出：<b>{len(final_signals)}</b>只，目标{V14_TARGET_PUSH_COUNT}只。")
     lines.append("口径：原V12/V14所有有效战法保留为信号库；新增复合压力带/供需带后，统一映射到20维评分，按风险调整后的机会等级排序。")
