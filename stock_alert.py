@@ -135,7 +135,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V16一号员工选股模型机构级20维机会评分版"
+MODEL_VERSION = "V16.1一号员工选股模型｜只读全历史缓存版｜机构级20维机会评分"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -202,6 +202,20 @@ AKSHARE_FALLBACK_SLEEP = float(os.environ.get("AKSHARE_FALLBACK_SLEEP", "0.18"))
 DATA_SOURCE_RECOVERY_PAUSE_SECONDS = int(os.environ.get("DATA_SOURCE_RECOVERY_PAUSE_SECONDS", "45"))
 BASE_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("BASE_EMPTY_CACHE_MIN_ROWS", "120"))
 DEEP_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("DEEP_EMPTY_CACHE_MIN_ROWS", "500"))
+
+# ========================= 全历史缓存只读模式 / 每日18点前推送专用配置 =========================
+# 说明：不改V16评分模型，只把数据入口改为优先读取全量缓存 kline_cache/000001.csv。
+USE_FULL_HISTORY_CACHE = os.environ.get("USE_FULL_HISTORY_CACHE", "1")
+FULL_HISTORY_CACHE_DIR = os.environ.get("FULL_HISTORY_CACHE_DIR", CACHE_DIR)
+MODEL_UNIVERSE_FILE = os.environ.get("MODEL_UNIVERSE_FILE", "")
+FULL_CACHE_MAX_STALE_DAYS = int(os.environ.get("FULL_CACHE_MAX_STALE_DAYS", "7"))
+FULL_CACHE_BASE_TAIL_ROWS = int(os.environ.get("FULL_CACHE_BASE_TAIL_ROWS", "760"))
+FULL_CACHE_DEEP_USE_ALL = os.environ.get("FULL_CACHE_DEEP_USE_ALL", "1")
+FULL_CACHE_MIN_ROWS_BASE = int(os.environ.get("FULL_CACHE_MIN_ROWS_BASE", "120"))
+FULL_CACHE_MIN_ROWS_DEEP = int(os.environ.get("FULL_CACHE_MIN_ROWS_DEEP", "250"))
+EXCLUDE_MODEL_CODES = set(
+    x.strip().zfill(6) for x in os.environ.get("EXCLUDE_MODEL_CODES", "600415,603407").split(",") if x.strip()
+)
 
 # V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
 STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
@@ -652,7 +666,7 @@ def get_a_stock_list_from_akshare():
     return pd.DataFrame(columns=["代码", "名称", "bs_code"])
 
 
-def get_a_stock_list():
+def get_a_stock_list_remote():
     global LAST_TRADE_DAY
 
     trade_day = get_last_trade_day()
@@ -677,6 +691,162 @@ def get_a_stock_list():
     print(df[["代码", "名称", "bs_code"]].head(20).to_string(index=False))
 
     return df[["代码", "名称", "bs_code"]]
+
+
+
+def _plain_code_from_bs_code(bs_code):
+    try:
+        return str(bs_code).split(".")[-1].zfill(6)
+    except Exception:
+        return ""
+
+
+def _bs_code_from_plain_code(code):
+    code = str(code).zfill(6)
+    if code.startswith(("600", "601", "603", "605", "688")):
+        return "sh." + code
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "sz." + code
+    return ""
+
+
+def _stock_code_to_plain(value):
+    text = str(value).strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:].zfill(6)
+    return ""
+
+
+def _latest_csv_by_prefix(directory, prefix):
+    try:
+        if not os.path.exists(directory):
+            return ""
+        files = [os.path.join(directory, f) for f in os.listdir(directory) if f.startswith(prefix) and f.lower().endswith(".csv")]
+        if not files:
+            return ""
+        return max(files, key=lambda x: os.path.getmtime(x))
+    except Exception:
+        return ""
+
+
+def _load_model_universe_file():
+    """优先读取验收脚本生成的 model_usable_universe_*.csv；没有则返回空。"""
+    candidates = []
+    if MODEL_UNIVERSE_FILE:
+        candidates.append(MODEL_UNIVERSE_FILE)
+    candidates.append(_latest_csv_by_prefix("outputs", "model_usable_universe_"))
+    candidates.append(_latest_csv_by_prefix(".", "model_usable_universe_"))
+
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path, dtype=str)
+            if df is None or df.empty:
+                continue
+            code_col = None
+            for c in ["原始代码", "代码", "股票代码", "code", "symbol"]:
+                if c in df.columns:
+                    code_col = c
+                    break
+            if code_col is None:
+                continue
+            name_col = "股票名称" if "股票名称" in df.columns else ("名称" if "名称" in df.columns else None)
+            usable_col = "是否进入一号员工模型池" if "是否进入一号员工模型池" in df.columns else None
+            if usable_col:
+                df = df[df[usable_col].astype(str).str.strip() == "是"].copy()
+            df["代码"] = df[code_col].apply(_stock_code_to_plain)
+            df = df[df["代码"].str.match(r"^\d{6}$", na=False)].copy()
+            df["名称"] = df[name_col].astype(str) if name_col else ""
+            df["bs_code"] = df["代码"].apply(_bs_code_from_plain_code)
+            df = df[df["bs_code"].astype(str).str.startswith(VALID_STOCK_PREFIXES)].copy()
+            df = df[~df["代码"].isin(EXCLUDE_MODEL_CODES)].copy()
+            df = df[~df["名称"].astype(str).str.contains("ST|\\*ST|退", regex=True, na=False)].copy()
+            df = df.drop_duplicates("代码")
+            if MAX_STOCKS > 0:
+                df = df.head(MAX_STOCKS)
+            if not df.empty:
+                print(f"只读缓存股票池：使用模型验收股票池 file={path} stocks={len(df)}")
+                return df[["代码", "名称", "bs_code"]]
+        except Exception as e:
+            print(f"模型验收股票池读取失败：file={path} error={str(e)[:160]}")
+    return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+
+def _load_universe_from_flat_cache():
+    """没有验收CSV时，使用 kline_cache/*.csv + _full_history_status.csv 自动生成股票池。"""
+    if not os.path.exists(FULL_HISTORY_CACHE_DIR):
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+    meta = pd.DataFrame()
+    meta_path = os.path.join(FULL_HISTORY_CACHE_DIR, "_full_history_status.csv")
+    if os.path.exists(meta_path):
+        try:
+            meta = pd.read_csv(meta_path, dtype={"code": str})
+            if not meta.empty and "code" in meta.columns:
+                meta["code"] = meta["code"].astype(str).str.zfill(6)
+        except Exception as e:
+            print(f"只读缓存股票池：状态文件读取失败 {e}")
+            meta = pd.DataFrame()
+
+    codes = []
+    for f in os.listdir(FULL_HISTORY_CACHE_DIR):
+        if f.lower().endswith(".csv") and not f.startswith("_"):
+            code = f[:6]
+            if code.isdigit():
+                codes.append(code.zfill(6))
+    df = pd.DataFrame({"代码": sorted(set(codes))})
+    if df.empty:
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+    if not meta.empty:
+        name_col = "name" if "name" in meta.columns else None
+        status_col = "status" if "status" in meta.columns else None
+        keep_cols = ["code"] + ([name_col] if name_col else []) + ([status_col] if status_col else [])
+        mm = meta[keep_cols].drop_duplicates("code").copy()
+        rename = {"code": "代码"}
+        if name_col:
+            rename[name_col] = "名称"
+        if status_col:
+            rename[status_col] = "缓存状态"
+        mm = mm.rename(columns=rename)
+        df = df.merge(mm, on="代码", how="left")
+    if "名称" not in df.columns:
+        df["名称"] = ""
+    df["名称"] = df["名称"].fillna("").astype(str)
+    df["bs_code"] = df["代码"].apply(_bs_code_from_plain_code)
+    df = df[df["bs_code"].astype(str).str.startswith(VALID_STOCK_PREFIXES)].copy()
+    df = df[~df["代码"].isin(EXCLUDE_MODEL_CODES)].copy()
+    df = df[~df["名称"].astype(str).str.contains("ST|\\*ST|退", regex=True, na=False)].copy()
+    if MAX_STOCKS > 0:
+        df = df.head(MAX_STOCKS)
+    print(f"只读缓存股票池：使用 kline_cache 扁平缓存生成股票池 stocks={len(df)} exclude={sorted(EXCLUDE_MODEL_CODES)}")
+    return df[["代码", "名称", "bs_code"]]
+
+
+def get_a_stock_list_from_full_cache_universe():
+    df = _load_model_universe_file()
+    if df is not None and not df.empty:
+        return df
+    return _load_universe_from_flat_cache()
+
+
+def get_a_stock_list():
+    """V16只读缓存版：优先使用验收股票池/全历史缓存股票池；失败才走旧联网股票池。"""
+    global LAST_TRADE_DAY
+    LAST_TRADE_DAY = datetime.now().strftime("%Y-%m-%d")
+
+    if USE_FULL_HISTORY_CACHE == "1":
+        df = get_a_stock_list_from_full_cache_universe()
+        if df is not None and not df.empty:
+            print(f"一号员工只读缓存股票池启用：stocks={len(df)}，不再联网获取全市场股票列表。")
+            print("股票池前20只：")
+            print(df[["代码", "名称", "bs_code"]].head(20).to_string(index=False))
+            return df[["代码", "名称", "bs_code"]]
+        print("只读缓存股票池为空，回退旧版联网股票池。")
+
+    return get_a_stock_list_remote()
 
 
 def cache_path(bs_code, cache_scope="deep"):
@@ -1223,10 +1393,100 @@ def save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_po
         print(f"候选池保存失败：{e}")
 
 
+
+def flat_full_cache_path(bs_code):
+    code = _plain_code_from_bs_code(bs_code)
+    if not code:
+        return ""
+    return os.path.join(FULL_HISTORY_CACHE_DIR, f"{code}.csv")
+
+
+def normalize_full_history_cache_df(df):
+    if df is None or df.empty:
+        return None
+    d = df.copy()
+    rename_map = {
+        "日期": "date", "交易日期": "date", "trade_date": "date", "Date": "date", "datetime": "date", "time": "date",
+        "开盘": "open", "开盘价": "open", "Open": "open",
+        "收盘": "close", "收盘价": "close", "Close": "close",
+        "最高": "high", "最高价": "high", "High": "high",
+        "最低": "low", "最低价": "low", "Low": "low",
+        "成交量": "volume", "成交量(手)": "volume", "vol": "volume", "Volume": "volume",
+        "成交额": "amount", "成交额(元)": "amount", "turnover": "amount", "Amount": "amount",
+    }
+    d = d.rename(columns={c: rename_map.get(c, c) for c in d.columns})
+    required = ["date", "open", "high", "low", "close", "volume"]
+    if not all(c in d.columns for c in required):
+        return None
+    if "amount" not in d.columns:
+        d["amount"] = 0
+    d = d[["date", "open", "close", "high", "low", "volume", "amount"]].copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+    d = d.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    if d.empty:
+        return None
+    # Q类股票/前复权副作用：裁剪掉早期非正价，避免均线、BOLL、压力带被污染。
+    before = len(d)
+    d = d[(d["open"] > 0) & (d["high"] > 0) & (d["low"] > 0) & (d["close"] > 0)].copy()
+    if d.empty:
+        return None
+    if len(d) < before:
+        pass
+    d["pct_chg"] = d["close"].pct_change().fillna(0) * 100
+    d["turnover"] = 0.0
+    d = d[["date", "open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover"]]
+    return normalize_kline_df(d)
+
+
+def read_full_history_flat_cache(bs_code, cache_scope="deep", min_rows=0):
+    if USE_FULL_HISTORY_CACHE != "1":
+        return None
+    code = _plain_code_from_bs_code(bs_code)
+    if code in EXCLUDE_MODEL_CODES:
+        return None
+    path = flat_full_cache_path(bs_code)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, dtype={"date": str})
+        df = normalize_full_history_cache_df(df)
+        if df is None or df.empty:
+            return None
+        if min_rows and len(df) < int(min_rows):
+            return None
+        last_date = str(df["date"].max())
+        try:
+            gap_days = (datetime.now().date() - pd.to_datetime(last_date).date()).days
+            if gap_days > FULL_CACHE_MAX_STALE_DAYS:
+                print(f"全历史缓存偏旧：{bs_code} last_date={last_date} gap={gap_days}d，尝试旧联网通道。")
+                return None
+        except Exception:
+            pass
+        if str(cache_scope).lower() == "base" and FULL_CACHE_BASE_TAIL_ROWS > 0:
+            return df.tail(max(FULL_CACHE_BASE_TAIL_ROWS, int(min_rows or 0))).reset_index(drop=True)
+        if str(cache_scope).lower() == "deep" and FULL_CACHE_DEEP_USE_ALL != "1":
+            # 如需极速深评，可通过环境变量关闭全量深评，只取最近约3000根。
+            return df.tail(3000).reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"读取全历史扁平缓存失败 {bs_code}: {e}")
+        return None
+
+
 def get_daily_kline(bs_code, lookback_days=None, cache_scope="deep"):
-    """V12.7：支持基础轻扫短周期、深度精算长周期；增强BaoStock失败兜底与旧缓存。"""
+    """V16只读缓存版：优先读取全历史扁平缓存；失败才走旧联网/旧缓存通道。"""
     if lookback_days is None:
         lookback_days = DEEP_KLINE_LOOKBACK_DAYS if cache_scope == "deep" else BASE_KLINE_LOOKBACK_DAYS
+    min_rows = FULL_CACHE_MIN_ROWS_BASE if cache_scope == "base" else FULL_CACHE_MIN_ROWS_DEEP
+
+    full_cached = read_full_history_flat_cache(bs_code, cache_scope=cache_scope, min_rows=min_rows)
+    if full_cached is not None:
+        return full_cached
+
+    # 回退旧版分层缓存/联网通道，保留原有稳定性保护。
     min_rows = 180 if cache_scope == "base" else 700
     cached = read_cached_kline(bs_code, cache_scope=cache_scope, min_rows=min_rows)
 
@@ -7698,7 +7958,7 @@ def build_error_message(error_text):
 # 最终按风险调整后的机会分和封顶规则输出 S/A/B+/观察；Telegram正文保持简洁，表格以PNG图片发送。
 # ==================================================================================================
 
-MODEL_VERSION = "V16一号员工选股模型机构级20维机会评分版"
+MODEL_VERSION = "V16.1一号员工选股模型｜只读全历史缓存版｜机构级20维机会评分"
 TELEGRAM_PENDING_IMAGES = []
 
 try:
