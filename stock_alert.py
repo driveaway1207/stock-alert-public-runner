@@ -9,6 +9,22 @@ from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta
 
 import baostock as bs
+
+
+def fmt_seconds(sec):
+    """把秒数格式化成人能看懂的耗时，供进度日志/深度评分watchdog使用。"""
+    try:
+        sec = int(max(float(sec), 0))
+    except Exception:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    ss = sec % 60
+    if h > 0:
+        return f"{h}小时{m}分{ss}秒"
+    if m > 0:
+        return f"{m}分{ss}秒"
+    return f"{ss}秒"
 import pandas as pd
 import numpy as np
 import requests
