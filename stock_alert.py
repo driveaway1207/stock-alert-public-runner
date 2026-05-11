@@ -177,6 +177,8 @@ DEEP_RUNTIME_SECONDS = int(os.environ.get("DEEP_RUNTIME_SECONDS", "3600"))
 MIN_VALID_KLINE = int(os.environ.get("MIN_VALID_KLINE", "1000"))
 PROGRESS_INTERVAL = int(os.environ.get("PROGRESS_INTERVAL", "100"))
 SINGLE_STOCK_TIMEOUT_SECONDS = int(os.environ.get("SINGLE_STOCK_TIMEOUT_SECONDS", "12"))
+# 深度评分单票总超时：防止某个深度模块/个股卡死整个流程。0表示关闭。
+DEEP_SINGLE_STOCK_TIMEOUT_SECONDS = int(os.environ.get("DEEP_SINGLE_STOCK_TIMEOUT_SECONDS", "90"))
 
 # V11.4：数据源稳定性保护。公开行情源偶发 Broken pipe / 接收异常时，先暂停重登，再补拉失败样本。
 KLINE_MAX_RETRIES = int(os.environ.get("KLINE_MAX_RETRIES", "2"))
@@ -8826,9 +8828,22 @@ def main():
         deep_skip = 0
         deep_start_ts = time.time()
 
+        deep_failed_records = []
+
         for idx, r in enumerate(deep_targets, 1):
-            if idx % max(1, PROGRESS_INTERVAL // 2) == 0:
-                progress_line("深度评分", idx, len(deep_targets), deep_start_ts, len(deep_rows), 0)
+            # V16.6：深度评分阶段必须高频打印，否则GitHub日志看起来像卡死。
+            if idx == 1 or idx % 1 == 0:
+                elapsed_deep = time.time() - deep_start_ts
+                avg_deep = elapsed_deep / max(idx - 1, 1)
+                remain_deep = avg_deep * max(len(deep_targets) - idx + 1, 0)
+                print(
+                    f"深度评分进度：{idx}/{len(deep_targets)} "
+                    f"({idx / max(len(deep_targets), 1) * 100:.1f}%) | "
+                    f"当前={r.get('code', '')} {r.get('name', '')} | "
+                    f"成功={deep_success} 失败={deep_fail} 跳过={deep_skip} | "
+                    f"已耗时={fmt_seconds(elapsed_deep)} | 预计剩余={fmt_seconds(remain_deep)}",
+                    flush=True
+                )
 
             if time.time() - deep_start_ts > DEEP_RUNTIME_SECONDS:
                 print("达到深度评分阶段最大运行时间，停止深度评分，使用已有深度评分结果。")
@@ -8839,7 +8854,10 @@ def main():
                 break
 
             try:
-                rows = process_stock_deep(r)
+                # V16.6：深度评分单票总超时保护。即使某个模块/某只票卡住，也不能拖死全局。
+                with stock_query_timeout(DEEP_SINGLE_STOCK_TIMEOUT_SECONDS, f"deep:{r.get('code', '')}"):
+                    rows = process_stock_deep(r)
+
                 if rows:
                     deep_success += 1
                 else:
@@ -8850,7 +8868,21 @@ def main():
 
             except Exception as e:
                 deep_fail += 1
-                print(f"深度处理失败: {r.get('code', '')} {r.get('name', '')} {e}")
+                err_msg = str(e)[:500]
+                deep_failed_records.append({
+                    "code": r.get("code", ""),
+                    "name": r.get("name", ""),
+                    "error": err_msg,
+                })
+                print(f"深度处理失败/超时: {r.get('code', '')} {r.get('name', '')} {err_msg}", flush=True)
+
+        if deep_failed_records:
+            try:
+                os.makedirs("outputs", exist_ok=True)
+                pd.DataFrame(deep_failed_records).to_csv("outputs/deep_failed_symbols.csv", index=False, encoding="utf-8-sig")
+                print(f"深度失败清单已保存: outputs/deep_failed_symbols.csv rows={len(deep_failed_records)}")
+            except Exception as _e:
+                print(f"深度失败清单保存失败: {_e}")
 
         deep_rows = sorted(
             deep_rows,
