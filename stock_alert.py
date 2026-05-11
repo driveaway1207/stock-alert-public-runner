@@ -19,6 +19,7 @@ except Exception:
     ak = None
 
 warnings.filterwarnings("ignore")
+# V16.2: pandas 2.2+ compatible; use np.nan instead of pd.NA to avoid boolean ambiguity in deep scoring.
 
 # ========================= V11 交易质量主逻辑重构说明 =========================
 # 本文件基于V10.1完整版本继续做“手术式增量优化”，原则是：
@@ -135,7 +136,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V16.1一号员工选股模型｜只读全历史缓存版｜机构级20维机会评分"
+MODEL_VERSION = "V16.2一号员工选股模型｜每日增量+数据闸门+只读全历史缓存｜Pandas兼容修正版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -1150,12 +1151,12 @@ def build_monthly_df(df):
 
     m = m.set_index("date").sort_index()
     monthly = pd.DataFrame()
-    monthly["open"] = m["open"].resample("M").first()
-    monthly["high"] = m["high"].resample("M").max()
-    monthly["low"] = m["low"].resample("M").min()
-    monthly["close"] = m["close"].resample("M").last()
-    monthly["volume"] = m["volume"].resample("M").sum()
-    monthly["amount"] = m["amount"].resample("M").sum() if "amount" in m.columns else 0
+    monthly["open"] = m["open"].resample("ME").first()
+    monthly["high"] = m["high"].resample("ME").max()
+    monthly["low"] = m["low"].resample("ME").min()
+    monthly["close"] = m["close"].resample("ME").last()
+    monthly["volume"] = m["volume"].resample("ME").sum()
+    monthly["amount"] = m["amount"].resample("ME").sum() if "amount" in m.columns else 0
     monthly = monthly.dropna(subset=["open", "high", "low", "close", "volume"])
 
     if monthly.empty:
@@ -1171,13 +1172,13 @@ def build_monthly_df(df):
     monthly["boll_std"] = monthly["close"].rolling(20).std()
     monthly["boll_upper"] = monthly["boll_mid"] + 2 * monthly["boll_std"]
     monthly["boll_lower"] = monthly["boll_mid"] - 2 * monthly["boll_std"]
-    monthly["boll_width"] = (monthly["boll_upper"] - monthly["boll_lower"]) / monthly["boll_mid"].replace(0, pd.NA)
+    monthly["boll_width"] = (monthly["boll_upper"] - monthly["boll_lower"]) / monthly["boll_mid"].replace(0, np.nan)
     ma_max = monthly[["ma3", "ma6", "ma12", "ma24"]].max(axis=1)
     ma_min = monthly[["ma3", "ma6", "ma12", "ma24"]].min(axis=1)
-    monthly["bbi_dispersion"] = (ma_max - ma_min) / monthly["bbi_mid"].replace(0, pd.NA)
+    monthly["bbi_dispersion"] = (ma_max - ma_min) / monthly["bbi_mid"].replace(0, np.nan)
     monthly["mid"] = monthly["bbi_mid"].where(monthly["bbi_mid"].notna(), monthly["boll_mid"])
     monthly["vol_ma5"] = monthly["volume"].rolling(5).mean()
-    monthly["body_pct"] = (monthly["close"] - monthly["open"]) / monthly["open"].replace(0, pd.NA)
+    monthly["body_pct"] = (monthly["close"] - monthly["open"]) / monthly["open"].replace(0, np.nan)
     monthly["is_up"] = monthly["close"] > monthly["open"]
     monthly["is_down"] = monthly["close"] < monthly["open"]
     monthly["above_or_near_mid"] = monthly["close"] >= monthly["mid"] * 0.98
@@ -1231,7 +1232,7 @@ def detect_monthly_midline_reclaim(df):
     shrink_label = "无有效缩口"
 
     # 缩口核心：必须是与前期相比最窄/低分位，而不是绝对值看起来窄。
-    if len(valid_width) >= 24 and pd.notna(current.get("boll_width", pd.NA)):
+    if len(valid_width) >= 24 and pd.notna(current.get("boll_width", np.nan)):
         cur_w = safe_float(current["boll_width"], None)
         if cur_w is not None:
             width_pct = float((valid_width <= cur_w).sum() / len(valid_width))
@@ -1245,7 +1246,7 @@ def detect_monthly_midline_reclaim(df):
                 shrink_score = 0.8
                 shrink_label = "轻度缩口"
 
-    if len(valid_disp) >= 24 and pd.notna(current.get("bbi_dispersion", pd.NA)):
+    if len(valid_disp) >= 24 and pd.notna(current.get("bbi_dispersion", np.nan)):
         cur_d = safe_float(current["bbi_dispersion"], None)
         if cur_d is not None:
             disp_pct = float((valid_disp <= cur_d).sum() / len(valid_disp))
@@ -1719,8 +1720,8 @@ def evaluate_platform_quality(segment):
     up_down_vol_ratio = up_vol / down_vol if down_vol > 0 else (1.5 if up_vol > 0 else 0.0)
 
     preclose = seg["close"].shift(1)
-    entity_down_pct = ((seg["open"] - seg["close"]) / preclose.replace(0, pd.NA)).where(seg["close"] < seg["open"], 0)
-    range_pos = ((seg["close"] - seg["low"]) / (seg["high"] - seg["low"]).replace(0, pd.NA)).fillna(0.5)
+    entity_down_pct = ((seg["open"] - seg["close"]) / preclose.replace(0, np.nan)).where(seg["close"] < seg["open"], 0)
+    range_pos = ((seg["close"] - seg["low"]) / (seg["high"] - seg["low"]).replace(0, np.nan)).fillna(0.5)
     vol_avg = safe_float(seg["volume"].mean())
     big_down = (seg["close"] < seg["open"]) & (entity_down_pct >= 0.03) & (seg["volume"] >= vol_avg * 1.5) & (range_pos <= 0.40)
     big_down_count = int(big_down.sum())
@@ -1903,7 +1904,7 @@ def detect_advanced_ao_kou_second_volume(hist):
     if not after_seg.empty:
         avgv = safe_float(after_seg["volume"].mean())
         preclose = after_seg["close"].shift(1)
-        down_body = ((after_seg["open"] - after_seg["close"]) / preclose.replace(0, pd.NA)).where(after_seg["close"] < after_seg["open"], 0)
+        down_body = ((after_seg["open"] - after_seg["close"]) / preclose.replace(0, np.nan)).where(after_seg["close"] < after_seg["open"], 0)
         big_down_cnt = int(((after_seg["close"] < after_seg["open"]) & (down_body >= 0.03) & (after_seg["volume"] >= avgv * 1.5)).sum())
         if big_down_cnt >= 2:
             active_score = 0.0
@@ -2496,15 +2497,15 @@ def calc_base_rows(df):
 
     # ===== 原模型底座字段保留：用于诊断，也用于V10基础攻击质量的子项 =====
     df["vol_ma"] = df["volume"].rolling(N).mean()
-    df["volr"] = df["volume"] / df["vol_ma"].replace(0, pd.NA)
+    df["volr"] = df["volume"] / df["vol_ma"].replace(0, np.nan)
 
     df["upbody"] = (df["close"] - df["open"]).where(df["close"] > df["open"], 0)
     df["upcount"] = (df["close"] > df["open"]).rolling(N).sum()
     df["upbody_sum"] = df["upbody"].rolling(N).sum()
-    df["upbody_ma"] = df["upbody_sum"] / df["upcount"].replace(0, pd.NA)
+    df["upbody_ma"] = df["upbody_sum"] / df["upcount"].replace(0, np.nan)
 
     df["body"] = df["close"] - df["open"]
-    df["body_ratio"] = df["body"] / df["upbody_ma"].replace(0, pd.NA)
+    df["body_ratio"] = df["body"] / df["upbody_ma"].replace(0, np.nan)
 
     rng = df["high"] - df["low"]
     df["pos"] = ((df["close"] - df["low"]) / rng).where(rng != 0, 0)
@@ -2551,34 +2552,34 @@ def calc_base_rows(df):
     df["score"] = df["volscore"] + df["bodyscore"] + df["posscore"] + df["brscore"] + df["structscore"]
     df["score_base_model_legacy"] = (df["score"] / 100 * 22).clip(0, 22)
 
-    df["vr1"] = df["volume"] / df["volume"].shift(1).replace(0, pd.NA)
+    df["vr1"] = df["volume"] / df["volume"].shift(1).replace(0, np.nan)
     df["xg0"] = (df["score"] >= SCORE_LIMIT) & (df["vr1"] >= VR1_MIN) & (df["vr1"] <= VR1_MAX)
     df["xg"] = df["xg0"]
 
     df["preclose"] = df["close"].shift(1)
-    df["entity_pct"] = ((df["close"] - df["open"]) / df["preclose"].replace(0, pd.NA) * 100).fillna(0)
-    df["break_rate"] = (df["close"] / df["prehigh"].replace(0, pd.NA) - 1).fillna(0)
+    df["entity_pct"] = ((df["close"] - df["open"]) / df["preclose"].replace(0, np.nan) * 100).fillna(0)
+    df["break_rate"] = (df["close"] / df["prehigh"].replace(0, np.nan) - 1).fillna(0)
 
-    df["bias20"] = (df["close"] / df["ma20"].replace(0, pd.NA) - 1).fillna(0)
-    df["bias60"] = (df["close"] / df["ma60"].replace(0, pd.NA) - 1).fillna(0)
+    df["bias20"] = (df["close"] / df["ma20"].replace(0, np.nan) - 1).fillna(0)
+    df["bias60"] = (df["close"] / df["ma60"].replace(0, np.nan) - 1).fillna(0)
 
     df["high_250"] = df["high"].rolling(250).max()
     df["low_250"] = df["low"].rolling(250).min()
-    df["long_pos_250"] = ((df["close"] - df["low_250"]) / (df["high_250"] - df["low_250"]).replace(0, pd.NA)).fillna(0)
+    df["long_pos_250"] = ((df["close"] - df["low_250"]) / (df["high_250"] - df["low_250"]).replace(0, np.nan)).fillna(0)
 
     # 压力分层前移：基础入口就要知道近端压力是不是贴脸。
     df["overhead_high_60"] = df["high"].shift(1).rolling(60).max()
     df["overhead_high_120"] = df["high"].shift(1).rolling(120).max()
     df["overhead_high_250"] = df["high"].shift(1).rolling(250).max()
-    df["near_pressure_dist"] = (df["overhead_high_60"] / df["close"].replace(0, pd.NA) - 1).fillna(0)
-    df["mid_pressure_dist"] = (df["overhead_high_120"] / df["close"].replace(0, pd.NA) - 1).fillna(0)
-    df["overhead_pressure_dist"] = (df["overhead_high_250"] / df["close"].replace(0, pd.NA) - 1).fillna(0)
+    df["near_pressure_dist"] = (df["overhead_high_60"] / df["close"].replace(0, np.nan) - 1).fillna(0)
+    df["mid_pressure_dist"] = (df["overhead_high_120"] / df["close"].replace(0, np.nan) - 1).fillna(0)
+    df["overhead_pressure_dist"] = (df["overhead_high_250"] / df["close"].replace(0, np.nan) - 1).fillna(0)
     for _c in ["near_pressure_dist", "mid_pressure_dist", "overhead_pressure_dist"]:
         df.loc[df[_c] < 0, _c] = 0
 
     df["just_cross_ma120"] = (df["close"] > df["ma120"]) & (df["close"].shift(1) <= df["ma120"].shift(1))
     df["just_cross_ma250"] = (df["close"] > df["ma250"]) & (df["close"].shift(1) <= df["ma250"].shift(1))
-    df["ma20_slope_5"] = (df["ma20"] / df["ma20"].shift(5).replace(0, pd.NA) - 1).fillna(0)
+    df["ma20_slope_5"] = (df["ma20"] / df["ma20"].shift(5).replace(0, np.nan) - 1).fillna(0)
 
     # ===== 轻量指标：供基础层判断追高、启动、承接 =====
     df["is_up"] = df["close"] > df["open"]
@@ -2599,10 +2600,10 @@ def calc_base_rows(df):
     for _w in [20, 40, 60]:
         up_days = df["is_up"].rolling(_w).sum()
         down_days = df["is_down"].rolling(_w).sum()
-        up_vol = df["volume"].where(df["is_up"], 0).rolling(_w).sum() / up_days.replace(0, pd.NA)
-        down_vol = df["volume"].where(df["is_down"], 0).rolling(_w).sum() / down_days.replace(0, pd.NA)
+        up_vol = df["volume"].where(df["is_up"], 0).rolling(_w).sum() / up_days.replace(0, np.nan)
+        down_vol = df["volume"].where(df["is_down"], 0).rolling(_w).sum() / down_days.replace(0, np.nan)
         df[f"base_up_days_{_w}"] = up_days.fillna(0)
-        df[f"base_up_down_vol_ratio_{_w}"] = (up_vol / down_vol.replace(0, pd.NA)).fillna(0)
+        df[f"base_up_down_vol_ratio_{_w}"] = (up_vol / down_vol.replace(0, np.nan)).fillna(0)
 
     # 涨停板量能特殊处理：没有分时数据时，不能把早盘锁量涨停误判为量能差。
     df["limit_up_base"] = df["pct_chg"] >= 9.3
@@ -2646,8 +2647,8 @@ def calc_base_rows(df):
     df["low_20_prev"] = df["low"].shift(1).rolling(20).min()
     df["high_40_prev"] = df["high"].shift(1).rolling(40).max()
     df["low_40_prev"] = df["low"].shift(1).rolling(40).min()
-    df["amp20"] = ((df["high_20_prev"] - df["low_20_prev"]) / df["close"].replace(0, pd.NA)).fillna(0)
-    df["amp40"] = ((df["high_40_prev"] - df["low_40_prev"]) / df["close"].replace(0, pd.NA)).fillna(0)
+    df["amp20"] = ((df["high_20_prev"] - df["low_20_prev"]) / df["close"].replace(0, np.nan)).fillna(0)
+    df["amp40"] = ((df["high_40_prev"] - df["low_40_prev"]) / df["close"].replace(0, np.nan)).fillna(0)
     df["platform20_break_base"] = (df["amp20"] <= 0.14) & (df["close"] > df["high_20_prev"] * 1.005)
     df["platform40_break_base"] = (df["amp40"] <= 0.22) & (df["close"] > df["high_40_prev"] * 1.005)
     df["break_bottom_reclaim_base"] = (
@@ -2657,7 +2658,7 @@ def calc_base_rows(df):
         & (df["pos"] >= 0.60)
     )
     df["key_level_base"] = df["high_40_prev"].where(df["platform40_break_base"], df["prehigh"])
-    df["distance_to_key_base"] = (df["close"] / df["key_level_base"].replace(0, pd.NA) - 1).fillna(0)
+    df["distance_to_key_base"] = (df["close"] / df["key_level_base"].replace(0, np.nan) - 1).fillna(0)
 
     # V11.1 基础版黄金倍量入口模型：
     # 第一倍量必须在明显平台/凹口上沿干净突破，不能只用“左侧高点±5%”宽松识别；
@@ -2824,12 +2825,12 @@ def calc_base_rows(df):
     loss = -delta.where(delta < 0, 0)
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     df["base_rsi"] = (100 - (100 / (1 + rs))).fillna(50)
     tp = (df["high"] + df["low"] + df["close"]) / 3
     tp_ma = tp.rolling(14).mean()
     tp_md = (tp - tp_ma).abs().rolling(14).mean()
-    df["base_cci"] = ((tp - tp_ma) / (0.015 * tp_md.replace(0, pd.NA))).fillna(0)
+    df["base_cci"] = ((tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan))).fillna(0)
 
     # ===== V10基础评分：维度不少，但不重复 =====
     df["base_attack_quality_score"] = 0.0
@@ -2925,8 +2926,8 @@ def calc_base_rows(df):
     df.loc[df["just_cross_ma250"], "base_long_cycle_potential_score"] += 3
     df.loc[df["just_cross_ma120"], "base_long_cycle_potential_score"] += 2
     df.loc[(df["ma120"] >= df["ma120"].shift(20) * 0.98) & (df["close"] >= df["ma120"] * 0.98), "base_long_cycle_potential_score"] += 1
-    amp120 = ((df["high"].rolling(120).max() - df["low"].rolling(120).min()) / df["close"].replace(0, pd.NA)).fillna(0)
-    amp60 = ((df["high"].rolling(60).max() - df["low"].rolling(60).min()) / df["close"].replace(0, pd.NA)).fillna(0)
+    amp120 = ((df["high"].rolling(120).max() - df["low"].rolling(120).min()) / df["close"].replace(0, np.nan)).fillna(0)
+    amp60 = ((df["high"].rolling(60).max() - df["low"].rolling(60).min()) / df["close"].replace(0, np.nan)).fillna(0)
     df.loc[(amp60 < amp120 * 0.75) & (amp60 > 0), "base_long_cycle_potential_score"] += 1
     df.loc[(df["long_pos_250"] > 0.85) & ((df["vr1"] > 3.0) | (df["entity_pct"] > 6)), "base_long_cycle_potential_score"] -= 4
     df["base_long_cycle_potential_score"] = df["base_long_cycle_potential_score"].clip(-5, 10)
@@ -2934,11 +2935,11 @@ def calc_base_rows(df):
     # V11.1：大周期高度与买点质量轻量闸门。
     # 这里只做全市场低成本粗筛：不跑完整月线闭环，只识别“月线/年内偏高、远离防守位、空间不足”的不敢买问题。
     df["base_defense_level"] = df[["key_level_base", "ma20", "ma60", "ma120"]].max(axis=1).fillna(0)
-    df["base_defense_dist"] = (df["close"] / df["base_defense_level"].replace(0, pd.NA) - 1).fillna(0)
+    df["base_defense_dist"] = (df["close"] / df["base_defense_level"].replace(0, np.nan) - 1).fillna(0)
     df.loc[df["base_defense_dist"] < 0, "base_defense_dist"] = 0
     df["base_target_dist"] = df["near_pressure_dist"].where(df["near_pressure_dist"] > 0, df["mid_pressure_dist"]).fillna(0)
     df.loc[df["base_target_dist"] <= 0, "base_target_dist"] = df["overhead_pressure_dist"]
-    df["base_risk_reward_ratio"] = (df["base_target_dist"] / df["base_defense_dist"].replace(0, pd.NA)).fillna(0)
+    df["base_risk_reward_ratio"] = (df["base_target_dist"] / df["base_defense_dist"].replace(0, np.nan)).fillna(0)
 
     df["base_monthly_height_proxy_score"] = 0.0
     df.loc[df["long_pos_250"] <= 0.35, "base_monthly_height_proxy_score"] += 8
@@ -3425,8 +3426,8 @@ def detect_multi_timeframe_key_structure(df, code=""):
     tf_defs = [
         ("日线", df.copy().reset_index(drop=True), 250, 1.0),
         ("周线", _resample_ohlcv(df, "W-FRI"), 180, 1.5),
-        ("月线", _resample_ohlcv(df, "M"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.2),
-        ("季线", _resample_ohlcv(df, "Q"), 40, 2.8),
+        ("月线", _resample_ohlcv(df, "ME"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.2),
+        ("季线", _resample_ohlcv(df, "QE"), 40, 2.8),
     ]
     cur_close = safe_float(df.iloc[-1].get("close", 0))
     for tf_name, pdf, lookback, weight in tf_defs:
@@ -3598,9 +3599,9 @@ def detect_v124_probe_high_second_confirm_model(df):
     if df is None or len(df) < 700:
         return empty
     tf_defs = [
-        ("月线", _resample_ohlcv(df, "M"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.4),
+        ("月线", _resample_ohlcv(df, "ME"), MONTHLY_STRUCT_LOOKBACK_MONTHS, 2.4),
         ("周线", _resample_ohlcv(df, "W-FRI"), 220, 1.6),
-        ("季线", _resample_ohlcv(df, "Q"), 45, 3.0),
+        ("季线", _resample_ohlcv(df, "QE"), 45, 3.0),
     ]
     best = None
     cur_close = safe_float(df.iloc[-1].get("close", 0))
@@ -3883,7 +3884,7 @@ def detect_v125_timing_window_model(df, v124_ctx=None):
         if extreme_recent <= max(1, extreme_prev // 2):
             volume_stability_score += 0.7
     # 4）波动率收缩：ATR/振幅从大到小，且价格不破平台。
-    tr = (d["high"] - d["low"]) / d["close"].replace(0, pd.NA)
+    tr = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
     atr_prev = safe_float(tr.iloc[-40:-12].mean())
     atr_recent = safe_float(tr.iloc[-10:].mean())
     contraction_score = 0.0
@@ -4168,8 +4169,8 @@ def detect_v126_multiframe_center_volume_model(df):
     tf_defs = [
         ("日线", df.copy().reset_index(drop=True), 20, 16, 1.0),
         ("周线", _resample_ohlcv(df, "W-FRI"), 13, 10, 1.25),
-        ("月线", _resample_ohlcv(df, "M"), 8, 8, 1.55),
-        ("季线", _resample_ohlcv(df, "Q"), 6, 5, 1.85),
+        ("月线", _resample_ohlcv(df, "ME"), 8, 8, 1.55),
+        ("季线", _resample_ohlcv(df, "QE"), 6, 5, 1.85),
     ]
     cands = []
     for tf, pdf, w_center, w_vol, weight in tf_defs:
@@ -4289,14 +4290,14 @@ def detect_v126_bottom_exhaustion_repair_seed(df):
     close = safe_float(cur["close"])
     pos = (close - long_low) / max(long_high - long_low, 1e-9)
     low_not_new = safe_float(recent["low"].tail(20).min()) >= safe_float(recent["low"].head(40).min()) * 0.97
-    body_prev = ((prev["close"] - prev["open"]).abs() / prev["open"].replace(0, pd.NA)).dropna()
-    body_recent = ((recent["close"] - recent["open"]).abs() / recent["open"].replace(0, pd.NA)).dropna()
+    body_prev = ((prev["close"] - prev["open"]).abs() / prev["open"].replace(0, np.nan)).dropna()
+    body_recent = ((recent["close"] - recent["open"]).abs() / recent["open"].replace(0, np.nan)).dropna()
     body_shrink = safe_float(body_recent.tail(20).mean()) < safe_float(body_prev.tail(40).mean()) * 0.85 if len(body_prev) >= 10 and len(body_recent) >= 10 else False
     vol_cv_prev = _v125_volume_cv(prev["volume"].tail(40))
     vol_cv_recent = _v125_volume_cv(recent["volume"].tail(20))
     vol_stable = vol_cv_recent <= vol_cv_prev * 0.85 if vol_cv_prev < 9 else False
     vol_ma20 = safe_float(d["volume"].tail(20).mean())
-    down_long = (recent["close"] < recent["open"]) & (((recent["open"]-recent["close"]) / recent["open"].replace(0, pd.NA)) > 0.035) & (recent["volume"] > vol_ma20 * 1.4)
+    down_long = (recent["close"] < recent["open"]) & (((recent["open"]-recent["close"]) / recent["open"].replace(0, np.nan)) > 0.035) & (recent["volume"] > vol_ma20 * 1.4)
     bad_down = int(down_long.sum())
     platform = _v125_detect_platform_window(d.iloc[:-1], end_idx=len(d)-2, min_len=12, max_len=80, max_range_pct=0.26)
     platform_high = safe_float(platform.get("high", 0)) if platform else 0.0
@@ -4418,7 +4419,7 @@ def _xhu_bucket_pct_for_df(pdf, period="D"):
     d = d.dropna(subset=["high", "low", "close"])
     if d.empty:
         return XHU_PRESSURE_DEFAULT_BUCKET_PCT
-    tr_pct = ((d["high"] - d["low"]) / d["close"].replace(0, pd.NA)).tail(20).mean()
+    tr_pct = ((d["high"] - d["low"]) / d["close"].replace(0, np.nan)).tail(20).mean()
     tr_pct = safe_float(tr_pct, 0.02)
     base = {"D": 0.005, "W": 0.007, "M": 0.010, "Q": 0.015, "Y": 0.020}.get(str(period), 0.005)
     lo = {"D": 0.003, "W": 0.005, "M": 0.008, "Q": 0.010, "Y": 0.015}.get(str(period), 0.003)
@@ -4564,7 +4565,7 @@ def _xhu_structural_anchors(pdf, period="D"):
     # 假突破/上影高点：高点越过近60日分位但收盘回落，作为供应记忆。
     if len(d) >= 30:
         roll_high = d["high"].rolling(30).max().shift(1)
-        rng = (d["high"] - d["low"]).replace(0, pd.NA)
+        rng = (d["high"] - d["low"]).replace(0, np.nan)
         body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
         upper_ratio = (d["high"] - body_top) / rng
         fb = d[(d["high"] >= roll_high * 1.003) & (d["close"] < d["high"] * 0.985) & (upper_ratio >= 0.30)]
@@ -4683,10 +4684,10 @@ def _xhu_period_dfs(df):
     out = [("D", df.copy(), 500)]
     try:
         out.append(("W", _resample_ohlcv(df, "W-FRI"), 220))
-        out.append(("M", _resample_ohlcv(df, "M"), 120))
-        out.append(("Q", _resample_ohlcv(df, "Q"), 60))
+        out.append(("M", _resample_ohlcv(df, "ME"), 120))
+        out.append(("Q", _resample_ohlcv(df, "QE"), 60))
         if XHU_PRESSURE_ENABLE_YEARLY == "1":
-            out.append(("Y", _resample_ohlcv(df, "Y"), 25))
+            out.append(("Y", _resample_ohlcv(df, "YE"), 25))
     except Exception:
         pass
     return out
@@ -4785,7 +4786,7 @@ def _xhu_detect_fake_breakout_memory(df, level):
     d = d.dropna(subset=["open", "high", "low", "close", "volume"])
     if len(d) < 5:
         return {"count": 0, "high": 0.0, "desc": ""}
-    rng = (d["high"] - d["low"]).replace(0, pd.NA)
+    rng = (d["high"] - d["low"]).replace(0, np.nan)
     body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
     upper_ratio = (d["high"] - body_top) / rng
     vol_ma = d["volume"].rolling(20).mean()
@@ -5006,26 +5007,26 @@ def calc_deep_rows(df, code):
     extra["up_vol"] = df["volume"].where(extra["is_up"], 0)
     extra["down_vol"] = df["volume"].where(extra["is_down"], 0)
 
-    extra["up_vol_avg_20"] = extra["up_vol"].rolling(20).sum() / extra["up_days_20"].replace(0, pd.NA)
-    extra["down_vol_avg_20"] = extra["down_vol"].rolling(20).sum() / extra["down_days_20"].replace(0, pd.NA)
-    extra["up_down_vol_ratio_20"] = extra["up_vol_avg_20"] / extra["down_vol_avg_20"].replace(0, pd.NA)
+    extra["up_vol_avg_20"] = extra["up_vol"].rolling(20).sum() / extra["up_days_20"].replace(0, np.nan)
+    extra["down_vol_avg_20"] = extra["down_vol"].rolling(20).sum() / extra["down_days_20"].replace(0, np.nan)
+    extra["up_down_vol_ratio_20"] = extra["up_vol_avg_20"] / extra["down_vol_avg_20"].replace(0, np.nan)
 
     # 20/40/60日阳阴量价结构：真实参与后台评分，而不是只在报告中展示。
     for _w in [40, 60]:
         extra[f"up_days_{_w}"] = extra["is_up"].rolling(_w).sum()
         extra[f"down_days_{_w}"] = extra["is_down"].rolling(_w).sum()
-        extra[f"up_vol_avg_{_w}"] = extra["up_vol"].rolling(_w).sum() / extra[f"up_days_{_w}"].replace(0, pd.NA)
-        extra[f"down_vol_avg_{_w}"] = extra["down_vol"].rolling(_w).sum() / extra[f"down_days_{_w}"].replace(0, pd.NA)
-        extra[f"up_down_vol_ratio_{_w}"] = extra[f"up_vol_avg_{_w}"] / extra[f"down_vol_avg_{_w}"].replace(0, pd.NA)
+        extra[f"up_vol_avg_{_w}"] = extra["up_vol"].rolling(_w).sum() / extra[f"up_days_{_w}"].replace(0, np.nan)
+        extra[f"down_vol_avg_{_w}"] = extra["down_vol"].rolling(_w).sum() / extra[f"down_days_{_w}"].replace(0, np.nan)
+        extra[f"up_down_vol_ratio_{_w}"] = extra[f"up_vol_avg_{_w}"] / extra[f"down_vol_avg_{_w}"].replace(0, np.nan)
 
     extra["up_ratio_20"] = extra["up_days_20"] / 20
     extra["up_ratio_40"] = extra["up_days_40"] / 40
     extra["up_ratio_60"] = extra["up_days_60"] / 60
 
-    up_body_pct = ((df["close"] - df["open"]) / df["open"].replace(0, pd.NA)).where(extra["is_up"], 0)
-    down_body_pct = ((df["open"] - df["close"]) / df["open"].replace(0, pd.NA)).where(extra["is_down"], 0)
-    extra["up_body_avg_60"] = up_body_pct.rolling(60).sum() / extra["up_days_60"].replace(0, pd.NA)
-    extra["down_body_avg_60"] = down_body_pct.rolling(60).sum() / extra["down_days_60"].replace(0, pd.NA)
+    up_body_pct = ((df["close"] - df["open"]) / df["open"].replace(0, np.nan)).where(extra["is_up"], 0)
+    down_body_pct = ((df["open"] - df["close"]) / df["open"].replace(0, np.nan)).where(extra["is_down"], 0)
+    extra["up_body_avg_60"] = up_body_pct.rolling(60).sum() / extra["up_days_60"].replace(0, np.nan)
+    extra["down_body_avg_60"] = down_body_pct.rolling(60).sum() / extra["down_days_60"].replace(0, np.nan)
 
     extra["score_yang_yin_volume"] = 0.0
     extra.loc[extra["up_ratio_20"] >= 0.55, "score_yang_yin_volume"] += 0.6
@@ -5069,7 +5070,7 @@ def calc_deep_rows(df, code):
     # 按用户要求：连续倍倍量本身不加分，也不直接扣分；关键看后续第4天/后续一日承接量能是否明显退潮。
     extra["beibeiliang"] = extra["is_beiliang"] & extra["is_beiliang"].shift(1).fillna(False)
     extra["beibeiliang_peak_volume"] = pd.concat([df["volume"], df["volume"].shift(1)], axis=1).max(axis=1)
-    extra["beibeiliang_shrink_rate_after"] = 1 - (df["volume"] / extra["beibeiliang_peak_volume"].shift(2).replace(0, pd.NA))
+    extra["beibeiliang_shrink_rate_after"] = 1 - (df["volume"] / extra["beibeiliang_peak_volume"].shift(2).replace(0, np.nan))
     extra["beibeiliang_short_pullback_risk"] = (
         extra["beibeiliang"].shift(2).fillna(False)
         & (extra["beibeiliang_shrink_rate_after"] > 0.30)
@@ -5188,8 +5189,8 @@ def calc_deep_rows(df, code):
 
     today_body_top = df[["open", "close"]].max(axis=1)
     today_body_bottom = df[["open", "close"]].min(axis=1)
-    today_range = (df["high"] - df["low"]).replace(0, pd.NA)
-    prev_range = (prev_high - prev_low).replace(0, pd.NA)
+    today_range = (df["high"] - df["low"]).replace(0, np.nan)
+    prev_range = (prev_high - prev_low).replace(0, np.nan)
     today_upper_shadow = (df["high"] - today_body_top).clip(lower=0)
     today_lower_shadow = (today_body_bottom - df["low"]).clip(lower=0)
     prev_upper_shadow = (prev_high - prev_body_top).clip(lower=0)
@@ -5203,7 +5204,7 @@ def calc_deep_rows(df, code):
     today_bull = df["close"] > df["open"]
     # 宽口径：至少修复前阴实体中位才纳入阳包阴候选；强弱由grade分层。
     extra["bull_engulf"] = today_bull & prev_bear & (df["close"] > prev_body_mid)
-    extra["engulf_vol_ratio"] = df["volume"] / df["volume"].shift(1).replace(0, pd.NA)
+    extra["engulf_vol_ratio"] = df["volume"] / df["volume"].shift(1).replace(0, np.nan)
 
     extra["v14_bull_engulf_grade"] = 0
     # 4档最强：跳空/高开直接越过前阴开盘价（前阴实体实顶），开盘即站到空头成本上方。
@@ -5347,7 +5348,7 @@ def calc_deep_rows(df, code):
     first_real_mid = (first_real_bottom + first_real_top) / 2
     middle_entity_top = pd.concat([df["open"].shift(1), df["close"].shift(1)], axis=1).max(axis=1)
     middle_entity_bottom = pd.concat([df["open"].shift(1), df["close"].shift(1)], axis=1).min(axis=1)
-    middle_body_pct = ((df["open"].shift(1) - df["close"].shift(1)) / df["close"].shift(2).replace(0, pd.NA) * 100).fillna(0)
+    middle_body_pct = ((df["open"].shift(1) - df["close"].shift(1)) / df["close"].shift(2).replace(0, np.nan) * 100).fillna(0)
 
     # 威慑：允许跌破第一阳实体中位；若第二阴实体较大，也视为有威慑。
     middle_has_threat = (df["close"].shift(1) < first_real_mid) | (df["low"].shift(1) < first_real_mid) | (middle_body_pct >= 1.2)
@@ -5529,7 +5530,7 @@ def calc_deep_rows(df, code):
         extra.iloc[idx, extra.columns.get_loc("structure_neckline")] = neckline_value
 
     # V9：关键结构突破K线质量。不是单独大模型，只在平台/凹口/颈线/箱体等关键位突破时作为子项加分。
-    body_range = (df["high"] - df["low"]).replace(0, pd.NA)
+    body_range = (df["high"] - df["low"]).replace(0, np.nan)
     entity_ratio = ((df["close"] - df["open"]).abs() / body_range).fillna(0)
     upper_shadow_ratio = ((df["high"] - df[["open", "close"]].max(axis=1)) / body_range).fillna(1)
     lower_shadow_ratio = ((df[["open", "close"]].min(axis=1) - df["low"]) / body_range).fillna(1)
@@ -5703,7 +5704,7 @@ def calc_deep_rows(df, code):
     )
     extra["v12_pullback_small_body"] = (
         ((df["high"] - df["low"]) > 0)
-        & ((df["close"] - df["open"]).abs() / (df["high"] - df["low"]).replace(0, pd.NA) <= 0.55)
+        & ((df["close"] - df["open"]).abs() / (df["high"] - df["low"]).replace(0, np.nan) <= 0.55)
     ).fillna(False)
     extra["v12_pullback_turning"] = (close >= openp) | (df["pos"] >= 0.58) | (close >= close.shift(1) * 0.995)
 
@@ -5819,7 +5820,7 @@ def calc_deep_rows(df, code):
             min_low = safe_float(seg["low"].min())
             ev_vol = safe_float(df["volume"].iloc[ev])
             avg_vol = safe_float(seg["volume"].mean())
-            down_body = ((seg["open"] - seg["close"]) / seg["open"].replace(0, pd.NA)).where(seg["close"] < seg["open"], 0).max()
+            down_body = ((seg["open"] - seg["close"]) / seg["open"].replace(0, np.nan)).where(seg["close"] < seg["open"], 0).max()
             q = 0.0
             if min_close >= top * 0.995:
                 q += 1.5
@@ -5887,13 +5888,13 @@ def calc_deep_rows(df, code):
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
 
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     extra["rsi"] = 100 - (100 / (1 + rs))
 
     tp = (df["high"] + df["low"] + df["close"]) / 3
     tp_ma = tp.rolling(14).mean()
     tp_md = (tp - tp_ma).abs().rolling(14).mean()
-    extra["cci"] = (tp - tp_ma) / (0.015 * tp_md.replace(0, pd.NA))
+    extra["cci"] = (tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan))
 
     # 指标状态细分：数值必须量化为好/坏/过热，而不是只在报告中罗列。
     extra["score_indicator"] = 0.0
@@ -5978,8 +5979,8 @@ def calc_deep_rows(df, code):
         (df["high"] - df["close"].shift(1)).abs(),
         (df["low"] - df["close"].shift(1)).abs(),
     ], axis=1).max(axis=1)
-    extra["atr_pct_20"] = (true_range.rolling(20).mean() / df["close"].replace(0, pd.NA)).fillna(0)
-    body_pct_abs = ((df["close"] - df["open"]).abs() / df["close"].replace(0, pd.NA)).fillna(0)
+    extra["atr_pct_20"] = (true_range.rolling(20).mean() / df["close"].replace(0, np.nan)).fillna(0)
+    body_pct_abs = ((df["close"] - df["open"]).abs() / df["close"].replace(0, np.nan)).fillna(0)
     extra["small_body_ratio_60"] = (body_pct_abs <= 0.012).rolling(60).mean().fillna(0)
     extra["score_v12_activity"] = 0.0
 
@@ -6020,7 +6021,7 @@ def calc_deep_rows(df, code):
 
     # 关键位距离/买点舒适度：不直接替三号员工下单，但用于区分刚突破和已经远离关键位。
     key_level = extra["structure_neckline"].where(extra["structure_neckline"] > 0, df["prehigh"])
-    extra["distance_to_key"] = (df["close"] / key_level.replace(0, pd.NA) - 1).fillna(0)
+    extra["distance_to_key"] = (df["close"] / key_level.replace(0, np.nan) - 1).fillna(0)
     extra["score_key_distance"] = 0.0
     extra.loc[(extra["distance_to_key"] >= 0.005) & (extra["distance_to_key"] <= 0.03), "score_key_distance"] += 4
     extra.loc[(extra["distance_to_key"] > 0.03) & (extra["distance_to_key"] <= 0.05), "score_key_distance"] += 2
@@ -6118,14 +6119,14 @@ def calc_deep_rows(df, code):
     extra["real_defense_level"] = extra["structure_key_level"] * (1 - extra["defense_buffer_pct"])
     # 兼容原字段：defense_level现在代表真实交易防守位；structure_key_level单独输出。
     extra["defense_level"] = extra["real_defense_level"]
-    extra["defense_dist"] = (df["close"] / extra["real_defense_level"].replace(0, pd.NA) - 1).fillna(0)
+    extra["defense_dist"] = (df["close"] / extra["real_defense_level"].replace(0, np.nan) - 1).fillna(0)
     extra.loc[extra["defense_dist"] < 0, "defense_dist"] = 0
     extra["target_dist"] = df["near_pressure_dist"].where(df["near_pressure_dist"] > 0, df["mid_pressure_dist"]).fillna(0)
     extra.loc[extra["target_dist"] <= 0, "target_dist"] = df["overhead_pressure_dist"]
     # 黄金扩展150%如果还在上方，也可作为第一目标；若比近端压力更近，则取更保守目标。
-    fibo_target_dist = (extra["fibo_level_150"] / df["close"].replace(0, pd.NA) - 1).fillna(0)
+    fibo_target_dist = (extra["fibo_level_150"] / df["close"].replace(0, np.nan) - 1).fillna(0)
     extra.loc[(fibo_target_dist > 0) & ((extra["target_dist"] <= 0) | (fibo_target_dist < extra["target_dist"])), "target_dist"] = fibo_target_dist
-    extra["risk_reward_ratio"] = (extra["target_dist"] / extra["defense_dist"].replace(0, pd.NA)).fillna(0)
+    extra["risk_reward_ratio"] = (extra["target_dist"] / extra["defense_dist"].replace(0, np.nan)).fillna(0)
 
     extra["score_trade_quality"] = 0.0
     extra.loc[(extra["defense_dist"] >= 0.005) & (extra["defense_dist"] <= 0.05), "score_trade_quality"] += 7
@@ -6448,7 +6449,7 @@ def calc_base_full(df):
     base["upbody"] = (df["close"] - df["open"]).where(df["close"] > df["open"], 0)
     base["upcount"] = (df["close"] > df["open"]).rolling(N).sum()
     base["upbody_sum"] = base["upbody"].rolling(N).sum()
-    base["upbody_ma"] = base["upbody_sum"] / base["upcount"].replace(0, pd.NA)
+    base["upbody_ma"] = base["upbody_sum"] / base["upcount"].replace(0, np.nan)
 
     base["body"] = df["close"] - df["open"]
     base["body_ratio"] = base["body"] / base["upbody_ma"]
@@ -7958,7 +7959,7 @@ def build_error_message(error_text):
 # 最终按风险调整后的机会分和封顶规则输出 S/A/B+/观察；Telegram正文保持简洁，表格以PNG图片发送。
 # ==================================================================================================
 
-MODEL_VERSION = "V16.1一号员工选股模型｜只读全历史缓存版｜机构级20维机会评分"
+MODEL_VERSION = "V16.2一号员工选股模型｜每日增量+数据闸门+只读全历史缓存｜Pandas兼容修正版"
 TELEGRAM_PENDING_IMAGES = []
 
 try:
