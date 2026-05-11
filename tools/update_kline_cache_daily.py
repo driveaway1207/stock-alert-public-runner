@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股K线缓存每日增量更新 V3：快速新鲜度闸门 + 快照优先 + 单票防卡死
+A股K线缓存每日增量更新 V16.5：快速新鲜度闸门 + 快照优先 + 单票防卡死
 
 目标：
 1. 每天一号员工运行前，先确认/更新最新交易日K线。
@@ -441,7 +441,7 @@ def update_one_by_network(code, old_df, target_date):
 def main():
     start_ts = time.time()
     today = today_str()
-    log("========== A股K线缓存每日增量更新 V3 ==========")
+    log("========== A股K线缓存每日增量更新 V16.5 ==========")
     log(f"[配置] LOOKBACK_DAYS={LOOKBACK_DAYS}, MAX_RUNTIME_MINUTES={MAX_RUNTIME_MINUTES}, PER_STOCK_TIMEOUT={PER_STOCK_TIMEOUT}, MIN_FRESH_COVERAGE={MIN_FRESH_COVERAGE}")
 
     codes = list_cache_codes()
@@ -602,7 +602,7 @@ def main():
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    log("========== 每日增量更新 V3 完成 ==========")
+    log("========== 每日增量更新 V16.5 完成 ==========")
     for k, v in summary.items():
         log(f"{k}: {v}")
     log(f"[输出] {out_path}")
