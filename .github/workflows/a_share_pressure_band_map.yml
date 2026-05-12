@@ -18,7 +18,7 @@ on:
       enforce_cache_freshness:
         description: "是否强制要求缓存日期达标：true/false"
         required: false
-        default: "false"
+        default: "true"
       min_fresh_ratio:
         description: "强制校验时，最新日期达标的最低比例，例如0.75"
         required: false
@@ -343,6 +343,7 @@ jobs:
           python - <<'PY'
           import os
           import pandas as pd
+          from pandas.errors import EmptyDataError
           from pathlib import Path
 
           min_valid_rows = int("${{ github.event.inputs.min_valid_rows }}" or 1000)
@@ -352,7 +353,10 @@ jobs:
           if not p.exists() or p.stat().st_size == 0:
               raise SystemExit("最终复核表不存在或为空，疑似全部批次失败。")
 
-          df = pd.read_csv(p)
+          try:
+              df = pd.read_csv(p)
+          except EmptyDataError:
+              raise SystemExit("最终复核表是空CSV：前置缓存校验未通过或全部批次失败。")
           rows = len(df)
           print(f"最终有效行数：{rows}")
           if rows < min_valid_rows:
