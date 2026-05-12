@@ -3,10 +3,10 @@ name: Pressure Band Validator
 on:
   workflow_dispatch:
     inputs:
-      limit:
-        description: "扫描数量：0=扫描全部缓存股票"
+      batch_size:
+        description: "每批扫描数量，建议500"
         required: false
-        default: "0"
+        default: "500"
       min_rr:
         description: "最低第一目标收益风险比"
         required: false
@@ -39,7 +39,6 @@ jobs:
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
-            full-kline-cache-${{ runner.os }}-
             full-kline-cache-
 
       - name: Verify restored cache
@@ -49,7 +48,6 @@ jobs:
           echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
           echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
 
-          echo "========== kline_cache 检查 =========="
           if [ ! -d "kline_cache" ]; then
             echo "没有 kline_cache 目录，终止运行。"
             exit 1
@@ -57,12 +55,7 @@ jobs:
 
           CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "kline_cache 文件数量：$CACHE_COUNT"
-
-          echo "kline_cache 目录大小："
           du -sh kline_cache || true
-
-          echo "kline_cache 前30个文件："
-          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -30 || true
 
           if [ "$CACHE_COUNT" -lt 3000 ]; then
             echo "缓存数量少于3000，说明没有恢复到完整A股缓存，终止运行。"
@@ -71,9 +64,8 @@ jobs:
 
       - name: Build full symbols file from kline cache
         run: |
-          mkdir -p output
+          mkdir -p output batches batch_outputs
 
-          echo "========== 从 kline_cache 自动生成全量股票池 =========="
           find kline_cache -type f -name "*.csv" ! -name "_*.csv" \
             | sed 's#^.*/##' \
             | sed 's#\.csv$##' \
@@ -84,14 +76,14 @@ jobs:
           echo "缓存股票池数量："
           wc -l output/symbols_from_cache.txt
 
-          echo "前50个股票代码："
-          head -50 output/symbols_from_cache.txt
+          echo "切分批次，每批 ${{ github.event.inputs.batch_size }} 只"
+          split -l ${{ github.event.inputs.batch_size }} -d -a 3 output/symbols_from_cache.txt batches/batch_
 
-          SYMBOL_COUNT=$(wc -l < output/symbols_from_cache.txt)
-          if [ "$SYMBOL_COUNT" -lt 3000 ]; then
-            echo "股票池数量少于3000，终止运行。"
-            exit 1
-          fi
+          echo "批次数量："
+          ls batches/batch_* | wc -l
+
+          echo "批次文件："
+          ls -lh batches | head -30
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -103,26 +95,83 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy akshare tqdm openpyxl
 
-      - name: Run actionable pressure band validator
+      - name: Run validator by batches
         run: |
-          mkdir -p output
+          mkdir -p batch_outputs output
 
-          if [ "${{ github.event.inputs.limit }}" = "0" ]; then
-            echo "扫描全部缓存股票"
-            python modules/pressure_band_validator.py \
-              --symbols-file output/symbols_from_cache.txt \
+          i=0
+          for f in batches/batch_*; do
+            echo "========== 开始批次 $i：$f =========="
+
+            timeout 25m python modules/pressure_band_validator.py \
+              --symbols-file "$f" \
               --cache-dir kline_cache \
-              --out-dir output \
-              --min-rr ${{ github.event.inputs.min_rr }}
-          else
-            echo "扫描前 ${{ github.event.inputs.limit }} 只缓存股票"
-            python modules/pressure_band_validator.py \
-              --symbols-file output/symbols_from_cache.txt \
-              --limit ${{ github.event.inputs.limit }} \
-              --cache-dir kline_cache \
-              --out-dir output \
-              --min-rr ${{ github.event.inputs.min_rr }}
-          fi
+              --out-dir "batch_outputs/batch_$i" \
+              --min-rr ${{ github.event.inputs.min_rr }} || echo "批次 $i 失败或超时，继续下一批"
+
+            echo "========== 批次 $i 完成 =========="
+            ls -lah "batch_outputs/batch_$i" || true
+
+            i=$((i+1))
+          done
+
+      - name: Merge batch outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          root = Path("batch_outputs")
+          out = Path("output")
+          out.mkdir(exist_ok=True)
+
+          groups = {
+              "pressure_band_actionable.csv": [],
+              "pressure_band_actionable_精简版.csv": [],
+              "pressure_band_waiting_breakout.csv": [],
+              "pressure_band_failed_breakout.csv": [],
+              "pressure_band_all_validation.csv": [],
+              "pressure_band_failed.csv": [],
+          }
+
+          for batch_dir in sorted(root.glob("batch_*")):
+              if not batch_dir.is_dir():
+                  continue
+
+              for name in groups:
+                  p = batch_dir / name
+                  if p.exists() and p.stat().st_size > 0:
+                      try:
+                          df = pd.read_csv(p)
+                          if not df.empty:
+                              df.insert(0, "批次", batch_dir.name)
+                              groups[name].append(df)
+                      except Exception as e:
+                          print(f"读取失败 {p}: {e}")
+
+          for name, dfs in groups.items():
+              if dfs:
+                  m = pd.concat(dfs, ignore_index=True)
+              else:
+                  m = pd.DataFrame()
+
+              # 可实操文件排序
+              if name in ["pressure_band_actionable.csv", "pressure_band_actionable_精简版.csv"]:
+                  if "第一目标收益风险比" in m.columns:
+                      m["_RR"] = pd.to_numeric(m["第一目标收益风险比"], errors="coerce").fillna(0)
+                      m = m.sort_values("_RR", ascending=False).drop(columns=["_RR"])
+              m.to_csv(out / name, index=False, encoding="utf-8-sig")
+              print(name, len(m))
+
+          # 额外生成一个最重要文件：正式可实操精选
+          simple = out / "pressure_band_actionable_精简版.csv"
+          if simple.exists() and simple.stat().st_size > 0:
+              df = pd.read_csv(simple)
+              df.to_csv(out / "正式可实操候选.csv", index=False, encoding="utf-8-sig")
+          else:
+              pd.DataFrame().to_csv(out / "正式可实操候选.csv", index=False, encoding="utf-8-sig")
+          PY
 
       - name: Show final summary
         if: always()
@@ -130,42 +179,23 @@ jobs:
           echo "========== 输出文件 =========="
           ls -lah output || true
 
-          echo "========== 可实操候选 =========="
-          if [ -f output/pressure_band_actionable_精简版.csv ]; then
-            wc -l output/pressure_band_actionable_精简版.csv
-            echo "前30行预览："
-            head -30 output/pressure_band_actionable_精简版.csv
+          echo "========== 正式可实操候选 =========="
+          if [ -f output/正式可实操候选.csv ]; then
+            wc -l output/正式可实操候选.csv
+            head -30 output/正式可实操候选.csv
           else
-            echo "没有 pressure_band_actionable_精简版.csv"
-          fi
-
-          echo "========== 等待突破候选 =========="
-          if [ -f output/pressure_band_waiting_breakout.csv ]; then
-            wc -l output/pressure_band_waiting_breakout.csv
-          else
-            echo "没有 pressure_band_waiting_breakout.csv"
-          fi
-
-          echo "========== 假突破/失败候选 =========="
-          if [ -f output/pressure_band_failed_breakout.csv ]; then
-            wc -l output/pressure_band_failed_breakout.csv
-          else
-            echo "没有 pressure_band_failed_breakout.csv"
+            echo "没有正式可实操候选.csv"
           fi
 
           echo "========== 全部验证数据 =========="
           if [ -f output/pressure_band_all_validation.csv ]; then
             wc -l output/pressure_band_all_validation.csv
-          else
-            echo "没有 pressure_band_all_validation.csv"
           fi
 
           echo "========== 失败清单 =========="
           if [ -f output/pressure_band_failed.csv ]; then
             wc -l output/pressure_band_failed.csv
             head -20 output/pressure_band_failed.csv
-          else
-            echo "没有 pressure_band_failed.csv"
           fi
 
       - name: Upload output
@@ -174,6 +204,7 @@ jobs:
         with:
           name: pressure-band-output
           path: |
+            output/正式可实操候选.csv
             output/pressure_band_actionable.csv
             output/pressure_band_actionable_精简版.csv
             output/pressure_band_waiting_breakout.csv
@@ -181,3 +212,4 @@ jobs:
             output/pressure_band_all_validation.csv
             output/pressure_band_failed.csv
             output/symbols_from_cache.txt
+            batch_outputs
