@@ -121,7 +121,7 @@ jobs:
           COVERAGE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('fresh_coverage_pct', d.get('最新K覆盖率', '')))")
           REASON=$(python - <<'PY'
           import json
-          d=json.load(open('$STATE_FILE', encoding='utf-8'))
+          d=json.load(open('outputs/daily_kline_update_state.json', encoding='utf-8'))
           reason=d.get('gate_reason') or d.get('reason') or ''
           if not reason:
               stopped=d.get('stopped_by_time')
