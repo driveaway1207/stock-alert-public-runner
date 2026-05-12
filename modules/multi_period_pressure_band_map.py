@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-A股多周期压力带地图生成器 V1
+A股多周期压力带地图生成器 V2 优化版
 
 生成对象：
 - 季线、月线、周线、日线：各周期本身的成交密集区/压力带
 - 多周期核心重合区
 - 多周期并集压力区
-- 当前最重要固定突破线
+- 固定核心压力上沿：相对稳定，不随当前价频繁漂移
+- 当前交易压力上沿：离当前价最近、用于短线突破确认
 - 突破买入口径
 
 核心原则：
@@ -15,6 +16,8 @@ A股多周期压力带地图生成器 V1
 2. 再用结构锚点校准：周期高点、最大量阳K、上影共振、假突破/放量滞涨。
 3. 最后做多周期合成。
 4. 当天/最近一根K线高点不自动生成核心压力带。
+5. 单独输出“固定核心压力上沿”和“当前交易压力上沿”，避免核心线随行情漂移。
+6. 支持缓存最新日期诊断，防止旧缓存误判今天是否突破。
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -44,13 +48,14 @@ class PeriodConfig:
     base_bucket_pct: float
     value_area_ratio: float
     weight: float
+    candidate_limit: int = 3
 
 
 PERIODS: Dict[str, PeriodConfig] = {
-    "Q": PeriodConfig("Q", "季线", "QE",    40, 0.015, 0.040, 0.024, 0.70, 2.20),
-    "M": PeriodConfig("M", "月线", "ME",    84, 0.010, 0.028, 0.016, 0.70, 1.75),
-    "W": PeriodConfig("W", "周线", "W-FRI",156, 0.006, 0.018, 0.010, 0.70, 1.35),
-    "D": PeriodConfig("D", "日线", None,   260, 0.004, 0.012, 0.006, 0.70, 1.00),
+    "Q": PeriodConfig("Q", "季线", "QE",    40, 0.015, 0.040, 0.024, 0.70, 2.20, 5),
+    "M": PeriodConfig("M", "月线", "ME",    84, 0.010, 0.028, 0.016, 0.70, 1.75, 5),
+    "W": PeriodConfig("W", "周线", "W-FRI",156, 0.006, 0.018, 0.010, 0.70, 1.35, 4),
+    "D": PeriodConfig("D", "日线", None,   260, 0.004, 0.012, 0.006, 0.70, 1.00, 3),
 }
 PERIOD_ORDER = ["Q", "M", "W", "D"]
 
@@ -170,20 +175,42 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return d[["date", "open", "high", "low", "close", "volume", "amount"]]
 
 
-def load_kline_from_cache(symbol: str, cache_dir: Path) -> pd.DataFrame:
+def find_kline_file(symbol: str, cache_dir: Path) -> Optional[Path]:
+    """
+    兼容多种缓存文件名：
+    000001.csv / 000001_daily.csv / 000001_daily_qfq.csv / SZ_000001.csv / SZ_000001_daily_qfq.csv。
+    若缓存放在子目录，最后用 rglob 做一次兜底。
+    """
     ns = normalize_symbol(symbol)
     c = code6(ns)
+    prefix = ns.replace('.', '_')
     possible = [
         cache_dir / f"{c}.csv",
         cache_dir / f"{c}_daily.csv",
         cache_dir / f"{c}_daily_qfq.csv",
-        cache_dir / f"{ns.replace('.', '_')}.csv",
-        cache_dir / f"{ns.replace('.', '_')}_daily_qfq.csv",
+        cache_dir / f"{prefix}.csv",
+        cache_dir / f"{prefix}_daily.csv",
+        cache_dir / f"{prefix}_daily_qfq.csv",
     ]
     for p in possible:
         if p.exists():
-            return normalize_ohlcv(pd.read_csv(p))
-    raise FileNotFoundError(f"未找到缓存K线: {symbol}")
+            return p
+
+    # 兜底：只在直接路径未命中时做递归，避免正常情况拖慢。
+    patterns = [f"*{c}*.csv", f"*{prefix}*.csv"]
+    for pat in patterns:
+        hits = sorted(cache_dir.rglob(pat))
+        hits = [x for x in hits if x.is_file() and not x.name.startswith('_')]
+        if hits:
+            return hits[0]
+    return None
+
+
+def load_kline_from_cache(symbol: str, cache_dir: Path) -> pd.DataFrame:
+    p = find_kline_file(symbol, cache_dir)
+    if p is None:
+        raise FileNotFoundError(f"未找到缓存K线: {symbol}")
+    return normalize_ohlcv(pd.read_csv(p))
 
 
 def resample_ohlcv(daily: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -424,12 +451,12 @@ def structural_anchors(df: pd.DataFrame, current: float, period: str, pcfg: Peri
         out.append(PressureCandidate(period, p*0.995, p*1.005, p, 70*pcfg.weight, "周期最高点", f"{pcfg.cn}最高点{fmt_price(p)}"))
 
     # 最大量阳K高点
-    bull = d[(d["close"] > d["open"]) & (d["body_ratio"].fillna(0) >= 0.25)].copy()
+    bull = d[(d["close"] > d["open"]) & (d["body_ratio"].fillna(0) >= 0.35) & (d["close_pos"].fillna(0) >= 0.60) & (d["upper_wick_ratio"].fillna(1) <= 0.45)].copy()
     if not bull.empty:
         r = bull.sort_values("volume", ascending=False).iloc[0]
         p = safe_float(r["high"])
         if near_relevant(p):
-            out.append(PressureCandidate(period, p*0.99, p*1.01, p, 60*pcfg.weight, "最大量阳K高点", f"{pcfg.cn}最大量阳K高点{fmt_price(p)}"))
+            out.append(PressureCandidate(period, p*0.99, p*1.01, p, 60*pcfg.weight, "最大量阳K高点", f"{pcfg.cn}有效最大量阳K高点{fmt_price(p)}"))
 
     # 上影线共振：至少2次相近
     wick = d[(d["upper_wick_ratio"].fillna(0) >= 0.35) & (d["close_pos"].fillna(1) <= 0.70)].copy()
@@ -598,6 +625,46 @@ def choose_current_key_zone(zones: List[Dict], current: float) -> Optional[Dict]
     return sorted(above, key=score, reverse=True)[0]
 
 
+
+def choose_fixed_core_zone(zones: List[Dict], current: float) -> Optional[Dict]:
+    """
+    选择相对稳定的“固定核心压力带”。
+    与当前交易压力带不同，这里更看重多周期重合、结构锚点、质量分和宽度合理性，
+    只轻度考虑离当前价的距离，避免每天因为当前价变化而频繁漂移。
+    """
+    if not zones:
+        return None
+
+    valid = [z for z in zones if z["union_upper"] >= current * 0.97]
+    if not valid:
+        valid = zones
+
+    def score(z):
+        periods = set(z.get("periods", []))
+        long_bonus = 0
+        if "Q" in periods:
+            long_bonus += 16
+        if "M" in periods:
+            long_bonus += 12
+        if "W" in periods:
+            long_bonus += 5
+        width_pct = (z["union_upper"] / max(z["union_lower"], 1e-9) - 1)
+        width_penalty = max(0, width_pct - 0.12) * 80
+        dist = abs(z["union_upper"] / current - 1) if current > 0 else 0
+        # 固定核心线只轻惩罚距离；过远仍降权，但不会被近端小压力轻易替代。
+        dist_penalty = min(dist, 0.60) * 18
+        return (
+            z.get("quality", 0)
+            + z.get("core_overlap_period_count", 1) * 11
+            + z.get("period_count", len(periods)) * 6
+            + len(z.get("sources", [])) * 3
+            + long_bonus
+            - width_penalty
+            - dist_penalty
+        )
+
+    return sorted(valid, key=score, reverse=True)[0]
+
 def pressure_state(current: float, zone: Optional[Dict]) -> str:
     if zone is None:
         return "无有效压力带"
@@ -625,18 +692,44 @@ def build_period_frames(daily: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return frames
 
 
-def analyze_symbol(symbol: str, name: str, daily: pd.DataFrame) -> Dict:
+
+def zone_periods_cn(zone: Optional[Dict]) -> str:
+    if not zone:
+        return ""
+    return "/".join(PERIODS[p].cn for p in zone.get("periods", []) if p in PERIODS)
+
+
+def zone_sources(zone: Optional[Dict]) -> str:
+    if not zone:
+        return ""
+    return "、".join(zone.get("sources", []))
+
+
+def cache_age_days(daily: pd.DataFrame, expected_latest_date: Optional[str]) -> str:
+    if not expected_latest_date or daily is None or daily.empty:
+        return ""
+    try:
+        latest = pd.to_datetime(daily["date"].iloc[-1]).date()
+        expected = pd.to_datetime(expected_latest_date).date()
+        return int((expected - latest).days)
+    except Exception:
+        return ""
+
+def analyze_symbol(symbol: str, name: str, daily: pd.DataFrame, expected_latest_date: Optional[str] = None) -> Dict:
     ns = normalize_symbol(symbol)
     if daily.empty or len(daily) < 120:
         raise ValueError("日线数据不足")
 
     current = safe_float(daily["close"].iloc[-1])
     frames = build_period_frames(daily)
+    latest_date = str(pd.to_datetime(daily["date"].iloc[-1]).date())
     row: Dict = {
         "股票代码": ns,
         "股票名称": name,
         "当前价": round4(current),
-        "最新日期": str(pd.to_datetime(daily["date"].iloc[-1]).date()),
+        "最新日期": latest_date,
+        "缓存目标日期": expected_latest_date or "",
+        "数据滞后天数": cache_age_days(daily, expected_latest_date),
     }
 
     all_cands: List[PressureCandidate] = []
@@ -658,9 +751,10 @@ def analyze_symbol(symbol: str, name: str, daily: pd.DataFrame) -> Dict:
             row[f"{pcfg.cn}_主成交密集带"] = ""
             row[f"{pcfg.cn}_POC成交占比"] = ""
 
-        cands = period_pressure_candidates(dfp, current, p, pcfg, profile)
-        cands = [x for x in cands if x.upper >= current * 0.985]
-        cands = sorted(cands, key=lambda x: (max(x.lower - current, 0), -x.score))[:2]
+        raw_cands = period_pressure_candidates(dfp, current, p, pcfg, profile)
+        # 保留更多大周期候选，避免真正核心压力带被近端小压力挤掉。
+        cands = [x for x in raw_cands if x.upper >= current * 0.97 and x.lower <= current * 2.20]
+        cands = sorted(cands, key=lambda x: (max(x.lower - current, 0), -x.score))[:pcfg.candidate_limit]
         all_cands.extend(cands)
 
         first = cands[0] if cands else None
@@ -677,23 +771,50 @@ def analyze_symbol(symbol: str, name: str, daily: pd.DataFrame) -> Dict:
         row[f"{pcfg.cn}_第二压力说明"] = second.detail if second else ""
 
     zones = cluster_multi_period_candidates(all_cands, current)
-    key_zone = choose_current_key_zone(zones, current)
+    fixed_zone = choose_fixed_core_zone(zones, current)
+    trade_zone = choose_current_key_zone(zones, current)
 
-    if key_zone:
-        row["多周期核心重合区"] = fmt_band(key_zone["core_lower"], key_zone["core_upper"])
-        row["多周期并集压力区"] = fmt_band(key_zone["union_lower"], key_zone["union_upper"])
-        row["当前最重要固定突破线"] = round4(key_zone["break_line"])
-        row["当前压力状态"] = pressure_state(current, key_zone)
-        row["压力带质量分"] = round4(key_zone["quality"])
-        row["参与周期"] = "/".join(PERIODS[p].cn for p in key_zone["periods"])
-        row["核心重合周期数"] = key_zone["core_overlap_period_count"]
-        row["压力来源组合"] = "、".join(key_zone["sources"])
-        row["压力带明细"] = key_zone["details"]
-        row["突破买入口径"] = buy_condition(current, key_zone)
+    # 旧字段保留，但语义修正为“固定核心压力线”，避免下游表格断裂。
+    if fixed_zone:
+        row["多周期核心重合区"] = fmt_band(fixed_zone["core_lower"], fixed_zone["core_upper"])
+        row["多周期并集压力区"] = fmt_band(fixed_zone["union_lower"], fixed_zone["union_upper"])
+        row["当前最重要固定突破线"] = round4(fixed_zone["break_line"])
+        row["固定核心压力带"] = fmt_band(fixed_zone["union_lower"], fixed_zone["union_upper"])
+        row["固定核心重合区"] = fmt_band(fixed_zone["core_lower"], fixed_zone["core_upper"])
+        row["固定核心压力上沿"] = round4(fixed_zone["break_line"])
+        row["固定核心压力状态"] = pressure_state(current, fixed_zone)
+        row["固定核心压力质量分"] = round4(fixed_zone["quality"])
+        row["固定核心参与周期"] = zone_periods_cn(fixed_zone)
+        row["固定核心来源组合"] = zone_sources(fixed_zone)
+        row["固定核心明细"] = fixed_zone["details"]
     else:
         row["多周期核心重合区"] = ""
         row["多周期并集压力区"] = ""
         row["当前最重要固定突破线"] = ""
+        row["固定核心压力带"] = ""
+        row["固定核心重合区"] = ""
+        row["固定核心压力上沿"] = ""
+        row["固定核心压力状态"] = "无有效压力带"
+        row["固定核心压力质量分"] = ""
+        row["固定核心参与周期"] = ""
+        row["固定核心来源组合"] = ""
+        row["固定核心明细"] = ""
+
+    if trade_zone:
+        row["当前交易压力带"] = fmt_band(trade_zone["union_lower"], trade_zone["union_upper"])
+        row["当前交易核心重合区"] = fmt_band(trade_zone["core_lower"], trade_zone["core_upper"])
+        row["当前交易突破线"] = round4(trade_zone["break_line"])
+        row["当前压力状态"] = pressure_state(current, trade_zone)
+        row["压力带质量分"] = round4(trade_zone["quality"])
+        row["参与周期"] = zone_periods_cn(trade_zone)
+        row["核心重合周期数"] = trade_zone["core_overlap_period_count"]
+        row["压力来源组合"] = zone_sources(trade_zone)
+        row["压力带明细"] = trade_zone["details"]
+        row["突破买入口径"] = buy_condition(current, trade_zone)
+    else:
+        row["当前交易压力带"] = ""
+        row["当前交易核心重合区"] = ""
+        row["当前交易突破线"] = ""
         row["当前压力状态"] = "无有效压力带"
         row["压力带质量分"] = ""
         row["参与周期"] = ""
@@ -737,7 +858,7 @@ def parse_symbols(symbols: Optional[str], symbols_file: Optional[str], limit: Op
     return df.reset_index(drop=True)
 
 
-def scan(symbol_df: pd.DataFrame, cache_dir: Path, quiet: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def scan(symbol_df: pd.DataFrame, cache_dir: Path, quiet: bool = False, expected_latest_date: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows, failed = [], []
     n = len(symbol_df)
     for i, r in symbol_df.iterrows():
@@ -745,7 +866,7 @@ def scan(symbol_df: pd.DataFrame, cache_dir: Path, quiet: bool = False) -> Tuple
         name = r.get("name", "")
         try:
             daily = load_kline_from_cache(symbol, cache_dir)
-            rows.append(analyze_symbol(symbol, name, daily))
+            rows.append(analyze_symbol(symbol, name, daily, expected_latest_date=expected_latest_date))
         except Exception as e:
             failed.append({"symbol": symbol, "name": name, "reason": str(e)[:1000]})
         if not quiet and ((i + 1) % 200 == 0 or i + 1 == n):
@@ -773,12 +894,14 @@ def write_outputs(df: pd.DataFrame, failed: pd.DataFrame, out_dir: Path):
     df.to_csv(out_dir / "a_share_pressure_band_full.csv", index=False, encoding="utf-8-sig")
 
     simple_cols = [
-        "股票代码", "股票名称", "当前价", "最新日期",
+        "股票代码", "股票名称", "当前价", "最新日期", "缓存目标日期", "数据滞后天数",
         "季线_POC公允中枢", "季线_主成交密集带", "季线_第一压力带", "季线_第一突破线",
         "月线_POC公允中枢", "月线_主成交密集带", "月线_第一压力带", "月线_第一突破线",
         "周线_POC公允中枢", "周线_主成交密集带", "周线_第一压力带", "周线_第一突破线",
         "日线_POC公允中枢", "日线_主成交密集带", "日线_第一压力带", "日线_第一突破线",
-        "多周期核心重合区", "多周期并集压力区", "当前最重要固定突破线", "当前压力状态",
+        "固定核心压力带", "固定核心重合区", "固定核心压力上沿", "固定核心压力状态",
+        "固定核心压力质量分", "固定核心参与周期", "固定核心来源组合",
+        "当前交易压力带", "当前交易核心重合区", "当前交易突破线", "当前压力状态",
         "压力带质量分", "参与周期", "核心重合周期数", "压力来源组合", "突破买入口径",
     ]
     simple_cols = [c for c in simple_cols if c in df.columns]
@@ -807,6 +930,7 @@ def build_parser():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--cache-dir", default="kline_cache")
     p.add_argument("--out-dir", default="output")
+    p.add_argument("--expected-latest-date", default=None, help="可选：期望缓存最新交易日，YYYY-MM-DD，用于输出数据滞后天数")
     p.add_argument("--quiet", action="store_true")
     return p
 
@@ -819,7 +943,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.quiet:
         print(f"[INFO] symbols={len(symbols)} cache_dir={cache_dir} out_dir={out_dir}")
         print("[INFO] 生成季/月/周/日 Volume Profile 压力带地图")
-    df, failed = scan(symbols, cache_dir, quiet=args.quiet)
+    df, failed = scan(symbols, cache_dir, quiet=args.quiet, expected_latest_date=args.expected_latest_date)
     write_outputs(df, failed, out_dir)
     return 0
 
