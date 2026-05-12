@@ -11,6 +11,22 @@ on:
         description: "扫描数量：0=扫描全部缓存股票"
         required: false
         default: "0"
+      expected_latest_date:
+        description: "期望缓存最新交易日，留空=自动用缓存内最大日期诊断；格式 YYYY-MM-DD"
+        required: false
+        default: ""
+      enforce_cache_freshness:
+        description: "是否强制要求缓存日期达标：true/false"
+        required: false
+        default: "false"
+      min_fresh_ratio:
+        description: "强制校验时，最新日期达标的最低比例，例如0.75"
+        required: false
+        default: "0.75"
+      min_valid_rows:
+        description: "最终复核表最低有效行数，防止空结果假成功"
+        required: false
+        default: "1000"
 
 permissions:
   contents: read
@@ -36,55 +52,11 @@ jobs:
           path: kline_cache
           key: a-kline-cache-${{ github.ref_name }}-pressure-band-map
           restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-daily-
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
             full-kline-cache-
-
-      - name: Verify restored cache
-        run: |
-          echo "========== 恢复到的缓存 =========="
-          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
-          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
-          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
-
-          if [ ! -d "kline_cache" ]; then
-            echo "没有 kline_cache 目录，终止运行。"
-            exit 1
-          fi
-
-          CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
-          echo "kline_cache 文件数量：$CACHE_COUNT"
-          du -sh kline_cache || true
-
-          if [ "$CACHE_COUNT" -lt 3000 ]; then
-            echo "缓存数量少于3000，说明没有恢复到完整A股缓存，终止运行。"
-            exit 1
-          fi
-
-      - name: Build symbols file
-        run: |
-          mkdir -p output batches batch_outputs
-
-          find kline_cache -type f -name "*.csv" ! -name "_*.csv" \
-            | sed 's#^.*/##' \
-            | sed 's#\.csv$##' \
-            | grep -E '^[0-9]{6}$' \
-            | sort \
-            > output/symbols_from_cache_all.txt
-
-          if [ "${{ github.event.inputs.limit }}" = "0" ]; then
-            cp output/symbols_from_cache_all.txt output/symbols_from_cache.txt
-          else
-            head -n ${{ github.event.inputs.limit }} output/symbols_from_cache_all.txt > output/symbols_from_cache.txt
-          fi
-
-          echo "本次股票池数量："
-          wc -l output/symbols_from_cache.txt
-
-          split -l ${{ github.event.inputs.batch_size }} -d -a 3 output/symbols_from_cache.txt batches/batch_
-          echo "批次数量："
-          ls batches/batch_* | wc -l
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -96,18 +68,176 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy openpyxl
 
+      - name: Verify restored cache and freshness
+        env:
+          EXPECTED_LATEST_DATE: ${{ github.event.inputs.expected_latest_date }}
+          ENFORCE_CACHE_FRESHNESS: ${{ github.event.inputs.enforce_cache_freshness }}
+          MIN_FRESH_RATIO: ${{ github.event.inputs.min_fresh_ratio }}
+        run: |
+          echo "========== 恢复到的缓存 =========="
+          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
+
+          if [ ! -d "kline_cache" ]; then
+            echo "没有 kline_cache 目录，终止运行。"
+            exit 1
+          fi
+
+          mkdir -p output batches batch_outputs
+
+          CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "kline_cache 文件数量：$CACHE_COUNT"
+          du -sh kline_cache || true
+
+          if [ "$CACHE_COUNT" -lt 3000 ]; then
+            echo "缓存数量少于3000，说明没有恢复到完整A股缓存，终止运行。"
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from collections import Counter
+          from pathlib import Path
+
+          import pandas as pd
+
+          cache = Path("kline_cache")
+          expected_raw = (os.environ.get("EXPECTED_LATEST_DATE") or "").strip()
+          enforce = (os.environ.get("ENFORCE_CACHE_FRESHNESS") or "false").strip().lower() == "true"
+          min_fresh_ratio = float(os.environ.get("MIN_FRESH_RATIO") or 0.75)
+
+          files = [p for p in cache.rglob("*.csv") if p.is_file() and not p.name.startswith("_")]
+          dates = []
+          bad = []
+          symbols = []
+
+          def extract_symbol(name: str):
+              base = name.rsplit(".", 1)[0].upper()
+              m = re.search(r"(?:^|[_\.])(SZ|SH|BJ)[_\.]?(\d{6})(?:_|$)", base)
+              if m:
+                  return f"{m.group(1)}.{m.group(2)}"
+              m = re.search(r"(\d{6})", base)
+              if not m:
+                  return None
+              code = m.group(1)
+              if code.startswith(("6", "9")):
+                  return f"SH.{code}"
+              if code.startswith(("8", "4")):
+                  return f"BJ.{code}"
+              return f"SZ.{code}"
+
+          for p in files:
+              sym = extract_symbol(p.name)
+              if sym:
+                  symbols.append(sym)
+              try:
+                  df = pd.read_csv(p, usecols=lambda c: c in ["date", "日期", "时间"])
+                  if df.empty:
+                      bad.append(str(p))
+                      continue
+                  col = "date" if "date" in df.columns else ("日期" if "日期" in df.columns else "时间")
+                  dt = pd.to_datetime(df[col], errors="coerce").dropna()
+                  if dt.empty:
+                      bad.append(str(p))
+                      continue
+                  dates.append(str(dt.max().date()))
+              except Exception:
+                  bad.append(str(p))
+
+          symbols = sorted(set(symbols))
+          Path("output/symbols_from_cache_all.txt").write_text("\n".join(symbols) + ("\n" if symbols else ""), encoding="utf-8")
+
+          cnt = Counter(dates)
+          latest = max(dates) if dates else ""
+          expected = expected_raw or latest
+          fresh_count = sum(1 for d in dates if expected and d >= expected)
+          fresh_ratio = fresh_count / len(dates) if dates else 0
+
+          report = {
+              "csv_count": len(files),
+              "symbol_count": len(symbols),
+              "latest_date_in_cache": latest,
+              "expected_latest_date": expected_raw,
+              "effective_expected_date": expected,
+              "fresh_count": fresh_count,
+              "fresh_ratio": round(fresh_ratio, 4),
+              "bad_file_count": len(bad),
+              "top_dates": cnt.most_common(10),
+              "cache_matched_key": "${{ steps.restore_kline_cache.outputs.cache-matched-key }}",
+          }
+          Path("output/cache_health_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          print("========== 缓存健康诊断 ==========")
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+
+          if len(symbols) < 3000:
+              raise SystemExit(f"可识别股票代码少于3000：{len(symbols)}，可能是文件命名/缓存异常")
+
+          if enforce and expected:
+              if fresh_ratio < min_fresh_ratio:
+                  raise SystemExit(
+                      f"缓存最新日期不达标：expected={expected}, fresh_ratio={fresh_ratio:.2%}, "
+                      f"min_fresh_ratio={min_fresh_ratio:.2%}。请先重跑K线缓存。"
+                  )
+          PY
+
+      - name: Build symbols file and batches
+        run: |
+          mkdir -p output batches batch_outputs
+
+          if [ ! -s output/symbols_from_cache_all.txt ]; then
+            echo "symbols_from_cache_all.txt 为空，终止运行。"
+            exit 1
+          fi
+
+          if [ "${{ github.event.inputs.limit }}" = "0" ]; then
+            cp output/symbols_from_cache_all.txt output/symbols_from_cache.txt
+          else
+            head -n ${{ github.event.inputs.limit }} output/symbols_from_cache_all.txt > output/symbols_from_cache.txt
+          fi
+
+          echo "本次股票池数量："
+          wc -l output/symbols_from_cache.txt
+          head -10 output/symbols_from_cache.txt || true
+
+          rm -f batches/batch_*
+          split -l ${{ github.event.inputs.batch_size }} -d -a 3 output/symbols_from_cache.txt batches/batch_
+          echo "批次数量："
+          ls batches/batch_* | wc -l
+
+      - name: Resolve pressure band script path
+        run: |
+          if [ -f "modules/multi_period_pressure_band_map.py" ]; then
+            echo "PRESSURE_SCRIPT=modules/multi_period_pressure_band_map.py" >> "$GITHUB_ENV"
+          elif [ -f "multi_period_pressure_band_map.py" ]; then
+            echo "PRESSURE_SCRIPT=multi_period_pressure_band_map.py" >> "$GITHUB_ENV"
+          else
+            echo "找不到 multi_period_pressure_band_map.py，请放在 modules/ 或仓库根目录。"
+            exit 1
+          fi
+
       - name: Run pressure band map by batches
+        env:
+          EXPECTED_LATEST_DATE: ${{ github.event.inputs.expected_latest_date }}
         run: |
           mkdir -p batch_outputs output
+          rm -f output/failed_batches.txt
           i=0
           for f in batches/batch_*; do
             echo "========== 开始批次 $i：$f =========="
 
-            timeout 25m python modules/multi_period_pressure_band_map.py \
-              --symbols-file "$f" \
-              --cache-dir kline_cache \
-              --out-dir "batch_outputs/batch_$i" \
-              --quiet || echo "批次 $i 失败或超时，继续下一批"
+            ARGS=(python "$PRESSURE_SCRIPT" --symbols-file "$f" --cache-dir kline_cache --out-dir "batch_outputs/batch_$i" --quiet)
+            if [ -n "$EXPECTED_LATEST_DATE" ]; then
+              ARGS+=(--expected-latest-date "$EXPECTED_LATEST_DATE")
+            fi
+
+            if ! timeout 25m "${ARGS[@]}"; then
+              echo "批次 $i 失败或超时，继续下一批，但记录失败批次。"
+              echo "batch_$i $f" >> output/failed_batches.txt
+            fi
 
             echo "========== 批次 $i 完成 =========="
             if [ -f "batch_outputs/batch_$i/a_share_pressure_band_review.csv" ]; then
@@ -163,15 +293,33 @@ jobs:
                       dfs.append(df)
               m = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-              if not m.empty and "压力带质量分" in m.columns:
-                  m["_q"] = pd.to_numeric(m["压力带质量分"], errors="coerce").fillna(0)
-                  if "当前最重要固定突破线" in m.columns and "当前价" in m.columns:
+              if not m.empty:
+                  sort_cols = []
+                  ascending = []
+                  if "固定核心压力质量分" in m.columns:
+                      m["_fixed_q"] = pd.to_numeric(m["固定核心压力质量分"], errors="coerce").fillna(0)
+                      sort_cols.append("_fixed_q")
+                      ascending.append(False)
+                  if "压力带质量分" in m.columns:
+                      m["_trade_q"] = pd.to_numeric(m["压力带质量分"], errors="coerce").fillna(0)
+                      sort_cols.append("_trade_q")
+                      ascending.append(False)
+                  if "当前交易突破线" in m.columns and "当前价" in m.columns:
+                      price = pd.to_numeric(m["当前价"], errors="coerce")
+                      line = pd.to_numeric(m["当前交易突破线"], errors="coerce")
+                      m["_trade_dist"] = ((line / price - 1) * 100).clip(lower=-999, upper=999)
+                      sort_cols.append("_trade_dist")
+                      ascending.append(True)
+                  elif "当前最重要固定突破线" in m.columns and "当前价" in m.columns:
                       price = pd.to_numeric(m["当前价"], errors="coerce")
                       line = pd.to_numeric(m["当前最重要固定突破线"], errors="coerce")
-                      m["_dist"] = ((line / price - 1) * 100).clip(lower=-999, upper=999)
-                  else:
-                      m["_dist"] = 999
-                  m = m.sort_values(["_q", "_dist"], ascending=[False, True]).drop(columns=["_q", "_dist"], errors="ignore")
+                      m["_trade_dist"] = ((line / price - 1) * 100).clip(lower=-999, upper=999)
+                      sort_cols.append("_trade_dist")
+                      ascending.append(True)
+                  if sort_cols:
+                      m = m.sort_values(sort_cols, ascending=ascending).drop(
+                          columns=["_fixed_q", "_trade_q", "_trade_dist"], errors="ignore"
+                      )
 
               m.to_csv(out / name, index=False, encoding="utf-8-sig")
               merged[name] = m
@@ -189,11 +337,43 @@ jobs:
           print("完整版:", len(merged.get("a_share_pressure_band_full.csv", [])))
           PY
 
+      - name: Validate final outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+
+          min_valid_rows = int("${{ github.event.inputs.min_valid_rows }}" or 1000)
+          p = Path("output/a_share_pressure_band_review.csv")
+          failed_batches = Path("output/failed_batches.txt")
+
+          if not p.exists() or p.stat().st_size == 0:
+              raise SystemExit("最终复核表不存在或为空，疑似全部批次失败。")
+
+          df = pd.read_csv(p)
+          rows = len(df)
+          print(f"最终有效行数：{rows}")
+          if rows < min_valid_rows:
+              raise SystemExit(f"最终有效行数 {rows} 小于阈值 {min_valid_rows}，疑似缓存/脚本/批次异常。")
+
+          if failed_batches.exists() and failed_batches.stat().st_size > 0:
+              print("存在失败批次，内容如下：")
+              print(failed_batches.read_text(encoding="utf-8"))
+              # 不直接失败：只要有效行数达标，允许少数批次失败；但报告会上传失败清单。
+          PY
+
       - name: Show final summary
         if: always()
         run: |
           echo "========== 输出文件 =========="
           ls -lah output || true
+
+          echo "========== 缓存健康报告 =========="
+          if [ -f output/cache_health_report.json ]; then
+            cat output/cache_health_report.json
+          fi
 
           echo "========== 复核表前20行 =========="
           if [ -f output/A股多周期压力带_复核表.csv ]; then
@@ -201,7 +381,14 @@ jobs:
             head -20 output/A股多周期压力带_复核表.csv
           fi
 
-          echo "========== 失败前20行 =========="
+          echo "========== 失败批次 =========="
+          if [ -f output/failed_batches.txt ]; then
+            cat output/failed_batches.txt
+          else
+            echo "无失败批次记录"
+          fi
+
+          echo "========== 失败股票前20行 =========="
           if [ -f output/a_share_pressure_band_failed.csv ]; then
             wc -l output/a_share_pressure_band_failed.csv
             head -20 output/a_share_pressure_band_failed.csv
@@ -213,6 +400,8 @@ jobs:
         with:
           name: a-share-pressure-band-map
           path: |
+            output/cache_health_report.json
+            output/failed_batches.txt
             output/A股多周期压力带_复核表.csv
             output/A股多周期压力带_完整版.csv
             output/a_share_pressure_band_full.csv
@@ -221,4 +410,6 @@ jobs:
             output/a_share_pressure_inside_band.csv
             output/a_share_pressure_broken.csv
             output/a_share_pressure_band_failed.csv
+            output/symbols_from_cache_all.txt
             output/symbols_from_cache.txt
+          if-no-files-found: warn
