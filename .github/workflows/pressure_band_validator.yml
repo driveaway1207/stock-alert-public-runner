@@ -17,17 +17,27 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Restore A-share kline cache
-        uses: actions/cache@v4
+        id: restore-kline-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             data/cache/kline
             data/cache
             cache
-          key: pressure-band-kline-cache-${{ github.run_id }}
+            kline_cache
+            data/kline_cache
+            data
+          key: a-kline-cache-main-daily-latest
           restore-keys: |
             a-kline-cache-main-daily-
             a-kline-cache-main-
-            pressure-band-kline-cache-
+
+      - name: Show restored cache key
+        run: |
+          echo "========== 恢复到的缓存 key =========="
+          echo "cache-hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
+          echo "cache-primary-key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
+          echo "cache-matched-key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
 
       - name: Check restored cache files
         run: |
@@ -35,12 +45,8 @@ jobs:
           echo "当前目录："
           pwd
 
-          echo "---------- data 目录 ----------"
-          if [ -d "data" ]; then
-            find data -maxdepth 4 -type f | head -50
-          else
-            echo "没有 data 目录"
-          fi
+          echo "---------- 全部 csv 文件前100个 ----------"
+          find . -type f -name "*.csv" | head -100 || true
 
           echo "---------- data/cache/kline 目录 ----------"
           if [ -d "data/cache/kline" ]; then
@@ -50,10 +56,24 @@ jobs:
             echo "data/cache/kline 前50个文件："
             find data/cache/kline -type f | head -50
 
-            echo "缓存目录大小："
+            echo "data/cache/kline 目录大小："
             du -sh data/cache/kline || true
           else
             echo "没有 data/cache/kline 目录"
+          fi
+
+          echo "---------- data/cache 目录 ----------"
+          if [ -d "data/cache" ]; then
+            echo "data/cache 文件数量："
+            find data/cache -type f | wc -l
+
+            echo "data/cache 前50个文件："
+            find data/cache -type f | head -50
+
+            echo "data/cache 目录大小："
+            du -sh data/cache || true
+          else
+            echo "没有 data/cache 目录"
           fi
 
           echo "---------- cache 目录 ----------"
@@ -68,6 +88,34 @@ jobs:
             du -sh cache || true
           else
             echo "没有 cache 目录"
+          fi
+
+          echo "---------- data/kline_cache 目录 ----------"
+          if [ -d "data/kline_cache" ]; then
+            echo "data/kline_cache 文件数量："
+            find data/kline_cache -type f | wc -l
+
+            echo "data/kline_cache 前50个文件："
+            find data/kline_cache -type f | head -50
+
+            echo "data/kline_cache 目录大小："
+            du -sh data/kline_cache || true
+          else
+            echo "没有 data/kline_cache 目录"
+          fi
+
+          echo "---------- kline_cache 目录 ----------"
+          if [ -d "kline_cache" ]; then
+            echo "kline_cache 文件数量："
+            find kline_cache -type f | wc -l
+
+            echo "kline_cache 前50个文件："
+            find kline_cache -type f | head -50
+
+            echo "kline_cache 目录大小："
+            du -sh kline_cache || true
+          else
+            echo "没有 kline_cache 目录"
           fi
 
       - name: Set up Python
@@ -92,6 +140,9 @@ jobs:
       - name: Check cache after run
         run: |
           echo "========== 运行后检查缓存 =========="
+          echo "全部 csv 文件前100个："
+          find . -type f -name "*.csv" | head -100 || true
+
           if [ -d "data/cache/kline" ]; then
             echo "data/cache/kline 文件数量："
             find data/cache/kline -type f | wc -l
@@ -99,7 +150,7 @@ jobs:
             echo "data/cache/kline 前50个文件："
             find data/cache/kline -type f | head -50
 
-            echo "缓存目录大小："
+            echo "data/cache/kline 目录大小："
             du -sh data/cache/kline || true
           else
             echo "运行后仍然没有 data/cache/kline 目录"
