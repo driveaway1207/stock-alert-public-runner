@@ -4,17 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Limit symbols for test run"
+        description: "扫描数量：0=扫描全部缓存股票"
         required: false
-        default: "50"
+        default: "0"
+      min_rr:
+        description: "最低第一目标收益风险比"
+        required: false
+        default: "1.5"
 
 permissions:
   contents: read
   actions: write
 
+concurrency:
+  group: pressure-band-validator
+  cancel-in-progress: false
+
 jobs:
   run-pressure-band-validator:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -33,7 +42,7 @@ jobs:
             full-kline-cache-${{ runner.os }}-
             full-kline-cache-
 
-      - name: Show restored cache status
+      - name: Verify restored cache
         run: |
           echo "========== 恢复到的缓存 =========="
           echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
@@ -41,20 +50,47 @@ jobs:
           echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
 
           echo "========== kline_cache 检查 =========="
-          if [ -d "kline_cache" ]; then
-            echo "kline_cache 文件数量："
-            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
+          if [ ! -d "kline_cache" ]; then
+            echo "没有 kline_cache 目录，终止运行。"
+            exit 1
+          fi
 
-            echo "kline_cache 目录大小："
-            du -sh kline_cache || true
+          CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "kline_cache 文件数量：$CACHE_COUNT"
 
-            echo "kline_cache 前50个文件："
-            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -50 || true
+          echo "kline_cache 目录大小："
+          du -sh kline_cache || true
 
-            echo "状态文件："
-            ls -lah kline_cache/_full_history_status.csv || true
-          else
-            echo "没有 kline_cache 目录"
+          echo "kline_cache 前30个文件："
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -30 || true
+
+          if [ "$CACHE_COUNT" -lt 3000 ]; then
+            echo "缓存数量少于3000，说明没有恢复到完整A股缓存，终止运行。"
+            exit 1
+          fi
+
+      - name: Build full symbols file from kline cache
+        run: |
+          mkdir -p output
+
+          echo "========== 从 kline_cache 自动生成全量股票池 =========="
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" \
+            | sed 's#^.*/##' \
+            | sed 's#\.csv$##' \
+            | grep -E '^[0-9]{6}$' \
+            | sort \
+            > output/symbols_from_cache.txt
+
+          echo "缓存股票池数量："
+          wc -l output/symbols_from_cache.txt
+
+          echo "前50个股票代码："
+          head -50 output/symbols_from_cache.txt
+
+          SYMBOL_COUNT=$(wc -l < output/symbols_from_cache.txt)
+          if [ "$SYMBOL_COUNT" -lt 3000 ]; then
+            echo "股票池数量少于3000，终止运行。"
+            exit 1
           fi
 
       - name: Set up Python
@@ -65,32 +101,71 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy akshare tqdm openpyxl
 
-      - name: Run pressure band validator
+      - name: Run actionable pressure band validator
         run: |
           mkdir -p output
-          python modules/pressure_band_validator.py \
-            --symbols SZ.000001,SH.600519,SZ.300750,SH.601318,SZ.002594,SH.600036,SZ.000858,SH.600900,SZ.300059,SH.601899 \
-            --cache-dir kline_cache \
-            --out output/pressure_band_candidates.csv \
-            --failed-out output/pressure_band_failed.csv
 
-      - name: Check cache after run
+          if [ "${{ github.event.inputs.limit }}" = "0" ]; then
+            echo "扫描全部缓存股票"
+            python modules/pressure_band_validator.py \
+              --symbols-file output/symbols_from_cache.txt \
+              --cache-dir kline_cache \
+              --out-dir output \
+              --min-rr ${{ github.event.inputs.min_rr }}
+          else
+            echo "扫描前 ${{ github.event.inputs.limit }} 只缓存股票"
+            python modules/pressure_band_validator.py \
+              --symbols-file output/symbols_from_cache.txt \
+              --limit ${{ github.event.inputs.limit }} \
+              --cache-dir kline_cache \
+              --out-dir output \
+              --min-rr ${{ github.event.inputs.min_rr }}
+          fi
+
+      - name: Show final summary
         if: always()
         run: |
-          echo "========== 运行后缓存检查 =========="
-          if [ -d "kline_cache" ]; then
-            echo "kline_cache 文件数量："
-            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
+          echo "========== 输出文件 =========="
+          ls -lah output || true
 
-            echo "kline_cache 目录大小："
-            du -sh kline_cache || true
-
-            echo "kline_cache 前50个文件："
-            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -50 || true
+          echo "========== 可实操候选 =========="
+          if [ -f output/pressure_band_actionable_精简版.csv ]; then
+            wc -l output/pressure_band_actionable_精简版.csv
+            echo "前30行预览："
+            head -30 output/pressure_band_actionable_精简版.csv
           else
-            echo "运行后没有 kline_cache 目录"
+            echo "没有 pressure_band_actionable_精简版.csv"
+          fi
+
+          echo "========== 等待突破候选 =========="
+          if [ -f output/pressure_band_waiting_breakout.csv ]; then
+            wc -l output/pressure_band_waiting_breakout.csv
+          else
+            echo "没有 pressure_band_waiting_breakout.csv"
+          fi
+
+          echo "========== 假突破/失败候选 =========="
+          if [ -f output/pressure_band_failed_breakout.csv ]; then
+            wc -l output/pressure_band_failed_breakout.csv
+          else
+            echo "没有 pressure_band_failed_breakout.csv"
+          fi
+
+          echo "========== 全部验证数据 =========="
+          if [ -f output/pressure_band_all_validation.csv ]; then
+            wc -l output/pressure_band_all_validation.csv
+          else
+            echo "没有 pressure_band_all_validation.csv"
+          fi
+
+          echo "========== 失败清单 =========="
+          if [ -f output/pressure_band_failed.csv ]; then
+            wc -l output/pressure_band_failed.csv
+            head -20 output/pressure_band_failed.csv
+          else
+            echo "没有 pressure_band_failed.csv"
           fi
 
       - name: Upload output
@@ -99,5 +174,10 @@ jobs:
         with:
           name: pressure-band-output
           path: |
-            output/pressure_band_candidates.csv
+            output/pressure_band_actionable.csv
+            output/pressure_band_actionable_精简版.csv
+            output/pressure_band_waiting_breakout.csv
+            output/pressure_band_failed_breakout.csv
+            output/pressure_band_all_validation.csv
             output/pressure_band_failed.csv
+            output/symbols_from_cache.txt
