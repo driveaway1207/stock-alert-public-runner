@@ -8,112 +8,51 @@ on:
         required: false
         default: "50"
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   run-pressure-band-validator:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore A-share kline cache
-        id: restore-kline-cache
+      - name: Restore full A-share kline cache
+        id: restore_kline_cache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            data/cache/kline
-            data/cache
-            cache
-            kline_cache
-            data/kline_cache
-            data
-          key: a-kline-cache-main-daily-latest
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-pressure-band-test
           restore-keys: |
-            a-kline-cache-main-daily-
-            a-kline-cache-main-
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
 
-      - name: Show restored cache key
+      - name: Show restored cache status
         run: |
-          echo "========== 恢复到的缓存 key =========="
-          echo "cache-hit: ${{ steps.restore-kline-cache.outputs.cache-hit }}"
-          echo "cache-primary-key: ${{ steps.restore-kline-cache.outputs.cache-primary-key }}"
-          echo "cache-matched-key: ${{ steps.restore-kline-cache.outputs.cache-matched-key }}"
+          echo "========== 恢复到的缓存 =========="
+          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
 
-      - name: Check restored cache files
-        run: |
-          echo "========== 检查缓存目录 =========="
-          echo "当前目录："
-          pwd
-
-          echo "---------- 全部 csv 文件前100个 ----------"
-          find . -type f -name "*.csv" | head -100 || true
-
-          echo "---------- data/cache/kline 目录 ----------"
-          if [ -d "data/cache/kline" ]; then
-            echo "data/cache/kline 文件数量："
-            find data/cache/kline -type f | wc -l
-
-            echo "data/cache/kline 前50个文件："
-            find data/cache/kline -type f | head -50
-
-            echo "data/cache/kline 目录大小："
-            du -sh data/cache/kline || true
-          else
-            echo "没有 data/cache/kline 目录"
-          fi
-
-          echo "---------- data/cache 目录 ----------"
-          if [ -d "data/cache" ]; then
-            echo "data/cache 文件数量："
-            find data/cache -type f | wc -l
-
-            echo "data/cache 前50个文件："
-            find data/cache -type f | head -50
-
-            echo "data/cache 目录大小："
-            du -sh data/cache || true
-          else
-            echo "没有 data/cache 目录"
-          fi
-
-          echo "---------- cache 目录 ----------"
-          if [ -d "cache" ]; then
-            echo "cache 文件数量："
-            find cache -type f | wc -l
-
-            echo "cache 前50个文件："
-            find cache -type f | head -50
-
-            echo "cache 目录大小："
-            du -sh cache || true
-          else
-            echo "没有 cache 目录"
-          fi
-
-          echo "---------- data/kline_cache 目录 ----------"
-          if [ -d "data/kline_cache" ]; then
-            echo "data/kline_cache 文件数量："
-            find data/kline_cache -type f | wc -l
-
-            echo "data/kline_cache 前50个文件："
-            find data/kline_cache -type f | head -50
-
-            echo "data/kline_cache 目录大小："
-            du -sh data/kline_cache || true
-          else
-            echo "没有 data/kline_cache 目录"
-          fi
-
-          echo "---------- kline_cache 目录 ----------"
+          echo "========== kline_cache 检查 =========="
           if [ -d "kline_cache" ]; then
             echo "kline_cache 文件数量："
-            find kline_cache -type f | wc -l
-
-            echo "kline_cache 前50个文件："
-            find kline_cache -type f | head -50
+            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
 
             echo "kline_cache 目录大小："
             du -sh kline_cache || true
+
+            echo "kline_cache 前50个文件："
+            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -50 || true
+
+            echo "状态文件："
+            ls -lah kline_cache/_full_history_status.csv || true
           else
             echo "没有 kline_cache 目录"
           fi
@@ -133,27 +72,25 @@ jobs:
           mkdir -p output
           python modules/pressure_band_validator.py \
             --symbols SZ.000001,SH.600519,SZ.300750,SH.601318,SZ.002594,SH.600036,SZ.000858,SH.600900,SZ.300059,SH.601899 \
-            --cache-dir data/cache/kline \
+            --cache-dir kline_cache \
             --out output/pressure_band_candidates.csv \
             --failed-out output/pressure_band_failed.csv
 
       - name: Check cache after run
+        if: always()
         run: |
-          echo "========== 运行后检查缓存 =========="
-          echo "全部 csv 文件前100个："
-          find . -type f -name "*.csv" | head -100 || true
+          echo "========== 运行后缓存检查 =========="
+          if [ -d "kline_cache" ]; then
+            echo "kline_cache 文件数量："
+            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
 
-          if [ -d "data/cache/kline" ]; then
-            echo "data/cache/kline 文件数量："
-            find data/cache/kline -type f | wc -l
+            echo "kline_cache 目录大小："
+            du -sh kline_cache || true
 
-            echo "data/cache/kline 前50个文件："
-            find data/cache/kline -type f | head -50
-
-            echo "data/cache/kline 目录大小："
-            du -sh data/cache/kline || true
+            echo "kline_cache 前50个文件："
+            find kline_cache -type f -name "*.csv" ! -name "_*.csv" | head -50 || true
           else
-            echo "运行后仍然没有 data/cache/kline 目录"
+            echo "运行后没有 kline_cache 目录"
           fi
 
       - name: Upload output
