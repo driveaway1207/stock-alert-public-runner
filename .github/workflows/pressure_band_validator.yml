@@ -16,6 +16,19 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Restore A-share kline cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/cache/kline
+            data/cache
+            cache
+          key: pressure-band-kline-cache-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-main-daily-
+            a-kline-cache-main-
+            pressure-band-kline-cache-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -32,6 +45,7 @@ jobs:
           python modules/pressure_band_validator.py \
             --all \
             --limit ${{ github.event.inputs.limit }} \
+            --cache-dir data/cache/kline \
             --out output/pressure_band_candidates.csv \
             --failed-out output/pressure_band_failed.csv
 
