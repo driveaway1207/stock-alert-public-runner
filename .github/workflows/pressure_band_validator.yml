@@ -43,14 +43,14 @@ jobs:
         run: |
           mkdir -p output
           python modules/pressure_band_validator.py \
-            --all \
-            --limit ${{ github.event.inputs.limit }} \
+            --symbols SZ.000001,SH.600519,SZ.300750,SH.601318,SZ.002594,SH.600036,SZ.000858,SH.600900,SZ.300059,SH.601899 \
             --cache-dir data/cache/kline \
             --out output/pressure_band_candidates.csv \
             --failed-out output/pressure_band_failed.csv
 
       - name: Upload output
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: pressure-band-output
           path: |
