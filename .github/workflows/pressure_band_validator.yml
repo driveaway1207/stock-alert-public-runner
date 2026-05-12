@@ -8,7 +8,7 @@ on:
         required: false
         default: "500"
       min_rr:
-        description: "最低第一目标收益风险比"
+        description: "正式可实操最低第一目标收益风险比"
         required: false
         default: "1.5"
 
@@ -82,9 +82,6 @@ jobs:
           echo "批次数量："
           ls batches/batch_* | wc -l
 
-          echo "批次文件："
-          ls -lh batches | head -30
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -107,10 +104,25 @@ jobs:
               --symbols-file "$f" \
               --cache-dir kline_cache \
               --out-dir "batch_outputs/batch_$i" \
-              --min-rr ${{ github.event.inputs.min_rr }} || echo "批次 $i 失败或超时，继续下一批"
+              --min-rr ${{ github.event.inputs.min_rr }} \
+              --quiet || echo "批次 $i 失败或超时，继续下一批"
 
             echo "========== 批次 $i 完成 =========="
-            ls -lah "batch_outputs/batch_$i" || true
+
+            if [ -f "batch_outputs/batch_$i/pressure_band_actionable.csv" ]; then
+              ACTIONABLE_LINES=$(wc -l < "batch_outputs/batch_$i/pressure_band_actionable.csv")
+              echo "正式可实操：$((ACTIONABLE_LINES > 0 ? ACTIONABLE_LINES - 1 : 0))"
+            fi
+
+            if [ -f "batch_outputs/batch_$i/pressure_band_near_actionable.csv" ]; then
+              NEAR_LINES=$(wc -l < "batch_outputs/batch_$i/pressure_band_near_actionable.csv")
+              echo "准可实操：$((NEAR_LINES > 0 ? NEAR_LINES - 1 : 0))"
+            fi
+
+            if [ -f "batch_outputs/batch_$i/pressure_band_waiting_breakout.csv" ]; then
+              WAITING_LINES=$(wc -l < "batch_outputs/batch_$i/pressure_band_waiting_breakout.csv")
+              echo "等待高级突破：$((WAITING_LINES > 0 ? WAITING_LINES - 1 : 0))"
+            fi
 
             i=$((i+1))
           done
@@ -120,57 +132,84 @@ jobs:
         run: |
           python - <<'PY'
           import pandas as pd
+          from pandas.errors import EmptyDataError
           from pathlib import Path
 
           root = Path("batch_outputs")
           out = Path("output")
           out.mkdir(exist_ok=True)
 
-          groups = {
-              "pressure_band_actionable.csv": [],
-              "pressure_band_actionable_精简版.csv": [],
-              "pressure_band_waiting_breakout.csv": [],
-              "pressure_band_failed_breakout.csv": [],
-              "pressure_band_all_validation.csv": [],
-              "pressure_band_failed.csv": [],
-          }
+          files = [
+              "pressure_band_actionable.csv",
+              "pressure_band_actionable_精简版.csv",
+              "pressure_band_near_actionable.csv",
+              "pressure_band_near_actionable_精简版.csv",
+              "pressure_band_waiting_breakout.csv",
+              "pressure_band_failed_breakout.csv",
+              "pressure_band_all_validation.csv",
+              "pressure_band_failed.csv",
+          ]
 
-          for batch_dir in sorted(root.glob("batch_*")):
-              if not batch_dir.is_dir():
-                  continue
+          def read_csv_safe(p: Path):
+              if not p.exists() or p.stat().st_size == 0:
+                  return None
+              try:
+                  df = pd.read_csv(p)
+                  if df.empty:
+                      return None
+                  return df
+              except EmptyDataError:
+                  return None
+              except Exception as e:
+                  print(f"读取失败 {p}: {e}")
+                  return None
 
-              for name in groups:
-                  p = batch_dir / name
-                  if p.exists() and p.stat().st_size > 0:
-                      try:
-                          df = pd.read_csv(p)
-                          if not df.empty:
-                              df.insert(0, "批次", batch_dir.name)
-                              groups[name].append(df)
-                      except Exception as e:
-                          print(f"读取失败 {p}: {e}")
+          merged = {}
 
-          for name, dfs in groups.items():
-              if dfs:
-                  m = pd.concat(dfs, ignore_index=True)
-              else:
-                  m = pd.DataFrame()
+          for name in files:
+              dfs = []
+              for bd in sorted(root.glob("batch_*")):
+                  p = bd / name
+                  df = read_csv_safe(p)
+                  if df is not None:
+                      df.insert(0, "批次", bd.name)
+                      dfs.append(df)
 
-              # 可实操文件排序
-              if name in ["pressure_band_actionable.csv", "pressure_band_actionable_精简版.csv"]:
-                  if "第一目标收益风险比" in m.columns:
-                      m["_RR"] = pd.to_numeric(m["第一目标收益风险比"], errors="coerce").fillna(0)
-                      m = m.sort_values("_RR", ascending=False).drop(columns=["_RR"])
+              m = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+              if not m.empty and "第一目标收益风险比" in m.columns:
+                  m["_RR"] = pd.to_numeric(m["第一目标收益风险比"], errors="coerce").fillna(0)
+                  m = m.sort_values("_RR", ascending=False).drop(columns=["_RR"])
+
               m.to_csv(out / name, index=False, encoding="utf-8-sig")
-              print(name, len(m))
+              merged[name] = m
+              print(f"{name}: {len(m)}")
 
-          # 额外生成一个最重要文件：正式可实操精选
-          simple = out / "pressure_band_actionable_精简版.csv"
-          if simple.exists() and simple.stat().st_size > 0:
-              df = pd.read_csv(simple)
-              df.to_csv(out / "正式可实操候选.csv", index=False, encoding="utf-8-sig")
-          else:
-              pd.DataFrame().to_csv(out / "正式可实操候选.csv", index=False, encoding="utf-8-sig")
+          merged.get("pressure_band_actionable_精简版.csv", pd.DataFrame()).to_csv(
+              out / "正式可实操候选.csv", index=False, encoding="utf-8-sig"
+          )
+
+          merged.get("pressure_band_near_actionable_精简版.csv", pd.DataFrame()).to_csv(
+              out / "准可实操候选.csv", index=False, encoding="utf-8-sig"
+          )
+
+          merged.get("pressure_band_waiting_breakout.csv", pd.DataFrame()).to_csv(
+              out / "等待高级突破候选.csv", index=False, encoding="utf-8-sig"
+          )
+
+          merged.get("pressure_band_failed_breakout.csv", pd.DataFrame()).to_csv(
+              out / "假突破失败候选.csv", index=False, encoding="utf-8-sig"
+          )
+
+          merged.get("pressure_band_all_validation.csv", pd.DataFrame()).to_csv(
+              out / "全部压力带验证.csv", index=False, encoding="utf-8-sig"
+          )
+
+          print("========== 合并完成 ==========")
+          print("正式可实操:", len(merged.get("pressure_band_actionable_精简版.csv", [])))
+          print("准可实操:", len(merged.get("pressure_band_near_actionable_精简版.csv", [])))
+          print("等待突破:", len(merged.get("pressure_band_waiting_breakout.csv", [])))
+          print("假突破:", len(merged.get("pressure_band_failed_breakout.csv", [])))
           PY
 
       - name: Show final summary
@@ -182,14 +221,23 @@ jobs:
           echo "========== 正式可实操候选 =========="
           if [ -f output/正式可实操候选.csv ]; then
             wc -l output/正式可实操候选.csv
-            head -30 output/正式可实操候选.csv
-          else
-            echo "没有正式可实操候选.csv"
+            head -20 output/正式可实操候选.csv
           fi
 
-          echo "========== 全部验证数据 =========="
-          if [ -f output/pressure_band_all_validation.csv ]; then
-            wc -l output/pressure_band_all_validation.csv
+          echo "========== 准可实操候选 =========="
+          if [ -f output/准可实操候选.csv ]; then
+            wc -l output/准可实操候选.csv
+            head -20 output/准可实操候选.csv
+          fi
+
+          echo "========== 等待高级突破候选 =========="
+          if [ -f output/等待高级突破候选.csv ]; then
+            wc -l output/等待高级突破候选.csv
+          fi
+
+          echo "========== 假突破失败候选 =========="
+          if [ -f output/假突破失败候选.csv ]; then
+            wc -l output/假突破失败候选.csv
           fi
 
           echo "========== 失败清单 =========="
@@ -205,11 +253,16 @@ jobs:
           name: pressure-band-output
           path: |
             output/正式可实操候选.csv
+            output/准可实操候选.csv
+            output/等待高级突破候选.csv
+            output/假突破失败候选.csv
+            output/全部压力带验证.csv
             output/pressure_band_actionable.csv
             output/pressure_band_actionable_精简版.csv
+            output/pressure_band_near_actionable.csv
+            output/pressure_band_near_actionable_精简版.csv
             output/pressure_band_waiting_breakout.csv
             output/pressure_band_failed_breakout.csv
             output/pressure_band_all_validation.csv
             output/pressure_band_failed.csv
             output/symbols_from_cache.txt
-            batch_outputs
