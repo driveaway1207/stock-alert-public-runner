@@ -1,0 +1,224 @@
+name: A-share Pressure Band Map
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "每批扫描数量，建议500"
+        required: false
+        default: "500"
+      limit:
+        description: "扫描数量：0=扫描全部缓存股票"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-share-pressure-band-map
+  cancel-in-progress: false
+
+jobs:
+  build-pressure-band-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore full A-share kline cache
+        id: restore_kline_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-pressure-band-map
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-
+
+      - name: Verify restored cache
+        run: |
+          echo "========== 恢复到的缓存 =========="
+          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.restore_kline_cache.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
+
+          if [ ! -d "kline_cache" ]; then
+            echo "没有 kline_cache 目录，终止运行。"
+            exit 1
+          fi
+
+          CACHE_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "kline_cache 文件数量：$CACHE_COUNT"
+          du -sh kline_cache || true
+
+          if [ "$CACHE_COUNT" -lt 3000 ]; then
+            echo "缓存数量少于3000，说明没有恢复到完整A股缓存，终止运行。"
+            exit 1
+          fi
+
+      - name: Build symbols file
+        run: |
+          mkdir -p output batches batch_outputs
+
+          find kline_cache -type f -name "*.csv" ! -name "_*.csv" \
+            | sed 's#^.*/##' \
+            | sed 's#\.csv$##' \
+            | grep -E '^[0-9]{6}$' \
+            | sort \
+            > output/symbols_from_cache_all.txt
+
+          if [ "${{ github.event.inputs.limit }}" = "0" ]; then
+            cp output/symbols_from_cache_all.txt output/symbols_from_cache.txt
+          else
+            head -n ${{ github.event.inputs.limit }} output/symbols_from_cache_all.txt > output/symbols_from_cache.txt
+          fi
+
+          echo "本次股票池数量："
+          wc -l output/symbols_from_cache.txt
+
+          split -l ${{ github.event.inputs.batch_size }} -d -a 3 output/symbols_from_cache.txt batches/batch_
+          echo "批次数量："
+          ls batches/batch_* | wc -l
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy openpyxl
+
+      - name: Run pressure band map by batches
+        run: |
+          mkdir -p batch_outputs output
+          i=0
+          for f in batches/batch_*; do
+            echo "========== 开始批次 $i：$f =========="
+
+            timeout 25m python modules/multi_period_pressure_band_map.py \
+              --symbols-file "$f" \
+              --cache-dir kline_cache \
+              --out-dir "batch_outputs/batch_$i" \
+              --quiet || echo "批次 $i 失败或超时，继续下一批"
+
+            echo "========== 批次 $i 完成 =========="
+            if [ -f "batch_outputs/batch_$i/a_share_pressure_band_review.csv" ]; then
+              LINES=$(wc -l < "batch_outputs/batch_$i/a_share_pressure_band_review.csv")
+              echo "本批输出：$((LINES > 0 ? LINES - 1 : 0))"
+            fi
+            i=$((i+1))
+          done
+
+      - name: Merge batch outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from pandas.errors import EmptyDataError
+          from pathlib import Path
+
+          root = Path("batch_outputs")
+          out = Path("output")
+          out.mkdir(exist_ok=True)
+
+          files = [
+              "a_share_pressure_band_full.csv",
+              "a_share_pressure_band_review.csv",
+              "a_share_pressure_not_entered.csv",
+              "a_share_pressure_inside_band.csv",
+              "a_share_pressure_broken.csv",
+              "a_share_pressure_band_failed.csv",
+          ]
+
+          def read_csv_safe(p):
+              if not p.exists() or p.stat().st_size == 0:
+                  return None
+              try:
+                  df = pd.read_csv(p)
+                  if df.empty:
+                      return None
+                  return df
+              except EmptyDataError:
+                  return None
+              except Exception as e:
+                  print(f"读取失败 {p}: {e}")
+                  return None
+
+          merged = {}
+          for name in files:
+              dfs = []
+              for bd in sorted(root.glob("batch_*")):
+                  p = bd / name
+                  df = read_csv_safe(p)
+                  if df is not None:
+                      df.insert(0, "批次", bd.name)
+                      dfs.append(df)
+              m = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+              if not m.empty and "压力带质量分" in m.columns:
+                  m["_q"] = pd.to_numeric(m["压力带质量分"], errors="coerce").fillna(0)
+                  if "当前最重要固定突破线" in m.columns and "当前价" in m.columns:
+                      price = pd.to_numeric(m["当前价"], errors="coerce")
+                      line = pd.to_numeric(m["当前最重要固定突破线"], errors="coerce")
+                      m["_dist"] = ((line / price - 1) * 100).clip(lower=-999, upper=999)
+                  else:
+                      m["_dist"] = 999
+                  m = m.sort_values(["_q", "_dist"], ascending=[False, True]).drop(columns=["_q", "_dist"], errors="ignore")
+
+              m.to_csv(out / name, index=False, encoding="utf-8-sig")
+              merged[name] = m
+              print(name, len(m))
+
+          merged.get("a_share_pressure_band_review.csv", pd.DataFrame()).to_csv(
+              out / "A股多周期压力带_复核表.csv", index=False, encoding="utf-8-sig"
+          )
+          merged.get("a_share_pressure_band_full.csv", pd.DataFrame()).to_csv(
+              out / "A股多周期压力带_完整版.csv", index=False, encoding="utf-8-sig"
+          )
+
+          print("========== 合并完成 ==========")
+          print("复核表:", len(merged.get("a_share_pressure_band_review.csv", [])))
+          print("完整版:", len(merged.get("a_share_pressure_band_full.csv", [])))
+          PY
+
+      - name: Show final summary
+        if: always()
+        run: |
+          echo "========== 输出文件 =========="
+          ls -lah output || true
+
+          echo "========== 复核表前20行 =========="
+          if [ -f output/A股多周期压力带_复核表.csv ]; then
+            wc -l output/A股多周期压力带_复核表.csv
+            head -20 output/A股多周期压力带_复核表.csv
+          fi
+
+          echo "========== 失败前20行 =========="
+          if [ -f output/a_share_pressure_band_failed.csv ]; then
+            wc -l output/a_share_pressure_band_failed.csv
+            head -20 output/a_share_pressure_band_failed.csv
+          fi
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a-share-pressure-band-map
+          path: |
+            output/A股多周期压力带_复核表.csv
+            output/A股多周期压力带_完整版.csv
+            output/a_share_pressure_band_full.csv
+            output/a_share_pressure_band_review.csv
+            output/a_share_pressure_not_entered.csv
+            output/a_share_pressure_inside_band.csv
+            output/a_share_pressure_broken.csv
+            output/a_share_pressure_band_failed.csv
+            output/symbols_from_cache.txt
