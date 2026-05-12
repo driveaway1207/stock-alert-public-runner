@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 pressure_band_validator.py
 
-独立压力带测试模块：
-- 只用于验证“压力带识别是否精准”
-- 不直接给买卖建议
-- 支持缓存 K 线
-- 支持固定股票池 --symbols
-- 支持自定义股票池 --symbols-file
-- 支持全市场 --all，但 AkShare 股票列表偶尔会失败，所以优先建议先用 --symbols 测试
-- 已修复新版 pandas 的 M/Q 频率问题：月线用 ME，季线用 QE
+固定核心压力带 V2
+目标：
+1）从日/周/月/季/年多周期中提取“固定压力锚点”；
+2）把固定锚点聚类成稳定的核心压力带，不让核心上沿每天动态漂移；
+3）最多输出两个最核心压力带：
+   - 固定核心压力带1：近端交易确认线
+   - 固定核心压力带2：大周期最终确认线
+4）判断“当前最重要突破确认线”是否被日线高级K有效突破；
+5）输出中文验证表，服务后续揉进一号员工 V16 综合评分体系。
+
+运行示例：
+python modules/pressure_band_validator.py \
+  --symbols SZ.000001,SH.600519,SZ.300750 \
+  --cache-dir kline_cache \
+  --out output/pressure_band_candidates.csv \
+  --failed-out output/pressure_band_failed.csv
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import re
 import time
 import warnings
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -49,67 +55,91 @@ except Exception:
 @dataclass
 class Config:
     daily_bars: int = 520
-    weekly_bars: int = 180
-    monthly_bars: int = 120
-    quarterly_bars: int = 60
+    weekly_bars: int = 220
+    monthly_bars: int = 160
+    quarterly_bars: int = 80
+    yearly_bars: int = 30
 
+    # 百分比/对数价格桶，仅用于成交密集区辅助，不作为最终核心线漂移依据
     base_bucket_pct: float = 0.008
     min_bucket_pct: float = 0.004
     max_bucket_pct: float = 0.018
     atr_bucket_multiplier: float = 0.35
 
-    profile_quantile: float = 0.80
-    profile_min_cover_bars: int = 3
-    recency_half_life: int = 120
+    # 固定锚点与压力带聚类
+    cross_cluster_pct: float = 0.028
+    anchor_band_width_pct: float = 0.010
+    max_above_current_pct: float = 0.45
+    max_below_current_pct: float = 0.18
+    min_anchor_score: float = 15.0
+    min_cluster_score: float = 35.0
+    top_clusters_keep: int = 8
 
-    anchor_width_pct: float = 0.012
-    same_period_merge_pct: float = 0.025
-    cross_period_merge_pct: float = 0.035
-
-    max_above_current_pct: float = 0.40
-    max_below_current_pct: float = 0.08
-
-    approach_pct: float = 0.035
+    # 日线高级突破
     broke_buffer_pct: float = 0.003
-
     strong_close_pos: float = 0.80
-    min_body_above_final_ratio: float = 0.50
-
+    min_body_above_line_ratio: float = 0.50
+    max_upper_wick_ratio_for_break: float = 0.35
     healthy_vol_ratio_min: float = 1.20
-    healthy_vol_ratio_max: float = 3.50
-
+    healthy_vol_ratio_max: float = 3.80
     standard_double_vol_min: float = 1.80
     standard_double_vol_max: float = 2.50
 
-    min_composite_quality: float = 30.0
-    top_composites_per_symbol: int = 3
-    only_interesting: bool = True
+    # 空间与风险
+    high_position_pct: float = 0.80
+    min_rr_basic: float = 1.50
+    min_rr_prefer: float = 2.00
+
+    only_interesting: bool = False
+
+
+PERIOD_NAME = {"D": "日线", "W": "周线", "M": "月线", "Q": "季线", "Y": "年线"}
+PERIOD_ORDER = {"D": 1, "W": 2, "M": 3, "Q": 4, "Y": 5}
+PERIOD_WEIGHT = {"D": 1.0, "W": 1.35, "M": 1.75, "Q": 2.10, "Y": 2.50}
+
+SOURCE_CN = {
+    "period_high": "周期最高点",
+    "swing_high": "阶段高点/前高",
+    "max_bull_volume_high": "最大量阳K高点",
+    "upper_wick_resonance": "上影线共振压力",
+    "false_break_memory": "假突破记忆压力",
+    "down_gap_pressure": "向下跳空缺口压力",
+    "large_body_supply_high": "放量滞涨/供应K高点",
+    "volume_profile_hvn": "成交密集压力区",
+}
 
 
 @dataclass
-class Band:
+class Anchor:
+    """固定压力锚点。核心上沿必须来自这些固定锚点。"""
     period: str
-    lower: float
-    upper: float
+    price: float
     source: str
-    quality: float
+    score: float
+    date: str = ""
     detail: str = ""
+    lower: Optional[float] = None
+    upper: Optional[float] = None
+
+    def __post_init__(self):
+        if self.lower is None:
+            self.lower = self.price
+        if self.upper is None:
+            self.upper = self.price
 
 
 @dataclass
-class CompositeBand:
+class FixedPressureBand:
+    """由固定锚点聚类得到的固定核心压力带。"""
     lower: float
     upper: float
-    core_lower: float
-    core_upper: float
-    final_upper: float
+    core_line: float
+    score: float
     periods: List[str]
     sources: List[str]
-    quality: float
-    bands: List[Band]
-
-
-PERIOD_ORDER = {"D": 1, "W": 2, "M": 3, "Q": 4}
+    anchors: List[Anchor] = field(default_factory=list)
+    status: str = ""
+    purpose: str = ""
 
 
 # ============================================================
@@ -126,22 +156,18 @@ def normalize_symbol(symbol: str) -> str:
     s = str(symbol).strip().upper().replace(" ", "")
     if not s:
         return s
-
     m = re.match(r"^(SZ|SH|BJ)\.(\d{6})$", s)
     if m:
         return f"{m.group(1)}.{m.group(2)}"
-
     m = re.match(r"^(\d{6})\.(SZ|SH|BJ)$", s)
     if m:
         return f"{m.group(2)}.{m.group(1)}"
-
     if re.match(r"^\d{6}$", s):
         if s.startswith(("6", "9")):
             return f"SH.{s}"
         if s.startswith(("8", "4")):
             return f"BJ.{s}"
         return f"SZ.{s}"
-
     return s
 
 
@@ -154,11 +180,32 @@ def ak_symbol(symbol: str) -> str:
 def pct(a: float, b: float) -> float:
     if b == 0 or pd.isna(a) or pd.isna(b):
         return np.nan
-    return (a / b - 1) * 100
+    return (a / b - 1.0) * 100.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def safe_float(x, default=np.nan) -> float:
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def fmt_price(x) -> str:
+    if x is None or pd.isna(x):
+        return ""
+    return f"{float(x):.2f}"
+
+
+def fmt_band(l, u) -> str:
+    if l is None or u is None or pd.isna(l) or pd.isna(u):
+        return ""
+    return f"{float(l):.2f}-{float(u):.2f}"
 
 
 def candle_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,7 +218,6 @@ def candle_features(df: pd.DataFrame) -> pd.DataFrame:
 
     d["upper_wick"] = d["high"] - d[["open", "close"]].max(axis=1)
     d["lower_wick"] = d[["open", "close"]].min(axis=1) - d["low"]
-
     d["upper_wick_ratio"] = d["upper_wick"] / rng
     d["lower_wick_ratio"] = d["lower_wick"] / rng
     d["close_pos"] = (d["close"] - d["low"]) / rng
@@ -183,17 +229,14 @@ def candle_features(df: pd.DataFrame) -> pd.DataFrame:
     d["vol_ratio20"] = d["volume"] / d["vol_ma20"].replace(0, np.nan)
     d["prev_volume"] = d["volume"].shift(1)
     d["vol_ratio_prev"] = d["volume"] / d["prev_volume"].replace(0, np.nan)
-
     return d
 
 
-def calc_atr_pct(df: pd.DataFrame, n: int = 20) -> float:
+def calc_atr(df: pd.DataFrame, n: int = 20) -> float:
     if len(df) < 5:
-        return 0.02
-
+        return np.nan
     d = df.copy()
     prev_close = d["close"].shift(1)
-
     tr = pd.concat(
         [
             d["high"] - d["low"],
@@ -202,13 +245,14 @@ def calc_atr_pct(df: pd.DataFrame, n: int = 20) -> float:
         ],
         axis=1,
     ).max(axis=1)
+    return safe_float(tr.rolling(n, min_periods=5).mean().iloc[-1])
 
-    atr = tr.rolling(n, min_periods=5).mean().iloc[-1]
-    close = d["close"].iloc[-1]
 
+def calc_atr_pct(df: pd.DataFrame, n: int = 20) -> float:
+    atr = calc_atr(df, n)
+    close = safe_float(df["close"].iloc[-1]) if not df.empty else np.nan
     if close <= 0 or pd.isna(atr):
         return 0.02
-
     return float(atr / close)
 
 
@@ -258,7 +302,6 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"K线字段缺失: {missing}; 当前字段={list(d.columns)}")
 
     d["date"] = pd.to_datetime(d["date"])
-
     for c in ["open", "high", "low", "close", "volume"]:
         d[c] = pd.to_numeric(d[c], errors="coerce")
 
@@ -271,17 +314,10 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     d = d.sort_values("date").drop_duplicates("date")
     d = d[d["volume"] > 0]
     d = d.reset_index(drop=True)
-
     return d[["date", "open", "high", "low", "close", "volume", "amount"]]
 
 
-def fetch_daily_akshare(
-    symbol: str,
-    start_date: str,
-    end_date: str,
-    retries: int = 3,
-    sleep_sec: float = 0.8,
-) -> pd.DataFrame:
+def fetch_daily_akshare(symbol: str, start_date: str, end_date: str, retries: int = 3, sleep_sec: float = 0.8) -> pd.DataFrame:
     if ak is None:
         raise RuntimeError("未安装 akshare，请先 pip install akshare")
 
@@ -302,27 +338,21 @@ def fetch_daily_akshare(
             last_err = e
             time.sleep(sleep_sec * (i + 1))
 
-    raise RuntimeError(
-        f"source=akshare stage=fetch_kline symbol={symbol} retry={retries} err={last_err}"
-    )
+    raise RuntimeError(f"source=akshare stage=fetch_kline symbol={symbol} retry={retries} err={last_err}")
 
 
-def load_daily(
-    symbol: str,
-    cache_dir: Path,
-    start_date: str,
-    end_date: str,
-    refresh: bool = False,
-) -> pd.DataFrame:
+def load_daily(symbol: str, cache_dir: Path, start_date: str, end_date: str, refresh: bool = False) -> pd.DataFrame:
     ns = normalize_symbol(symbol)
+    code = ak_symbol(ns)
     ensure_dir(cache_dir)
 
     possible_names = [
+        f"{code}.csv",
+        f"{code}_daily.csv",
+        f"{code}_daily_qfq.csv",
         f"{ns.replace('.', '_')}_daily_qfq.csv",
         f"{ns.replace('.', '_')}.csv",
-        f"{ak_symbol(ns)}.csv",
-        f"{ak_symbol(ns)}_daily.csv",
-        f"{ak_symbol(ns)}_daily_qfq.csv",
+        f"{ns}_daily_qfq.csv",
     ]
 
     if not refresh:
@@ -333,16 +363,16 @@ def load_daily(
                     d = pd.read_csv(cache_file)
                     d = normalize_ohlcv(d)
                     if not d.empty:
+                        print(f"[CACHE_HIT] {ns} <- {cache_file}")
                         return d
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[CACHE_BAD] {ns} {cache_file} err={e}")
 
+    print(f"[CACHE_MISS] {ns}; fetch from akshare")
     d = fetch_daily_akshare(ns, start_date=start_date, end_date=end_date)
-
     if not d.empty:
-        save_file = cache_dir / f"{ns.replace('.', '_')}_daily_qfq.csv"
+        save_file = cache_dir / f"{code}.csv"
         d.to_csv(save_file, index=False, encoding="utf-8-sig")
-
     return d
 
 
@@ -350,9 +380,7 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return df.copy()
 
-    d = df.copy()
-    d = d.set_index("date")
-
+    d = df.copy().set_index("date")
     out = pd.DataFrame(
         {
             "open": d["open"].resample(rule).first(),
@@ -363,368 +391,168 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
             "amount": d["amount"].resample(rule).sum(),
         }
     ).dropna().reset_index()
-
     return out
 
 
 def build_period_frames(daily: pd.DataFrame, cfg: Config) -> Dict[str, pd.DataFrame]:
     d = daily.tail(cfg.daily_bars).copy()
     w = resample_ohlcv(daily, "W-FRI").tail(cfg.weekly_bars)
-
-    # pandas 新版不再推荐 M/Q，用 ME/QE
     m = resample_ohlcv(daily, "ME").tail(cfg.monthly_bars)
     q = resample_ohlcv(daily, "QE").tail(cfg.quarterly_bars)
-
-    return {"D": d, "W": w, "M": m, "Q": q}
+    y = resample_ohlcv(daily, "YE").tail(cfg.yearly_bars)
+    return {"D": d, "W": w, "M": m, "Q": q, "Y": y}
 
 
 # ============================================================
-# 4. 单周期压力带识别
+# 4. 固定锚点提取
 # ============================================================
 
-def volume_profile_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
-    if len(df) < 30:
-        return []
-
-    d = candle_features(df).reset_index(drop=True)
-    bucket_pct = adaptive_bucket_pct(d, cfg)
-
-    bucket_stats: Dict[int, Dict[str, float]] = {}
-    n = len(d)
-
-    for idx, row in d.iterrows():
-        low = float(row["low"])
-        high = float(row["high"])
-
-        if low <= 0 or high <= 0 or high < low:
-            continue
-
-        b0 = log_bucket_id(low, bucket_pct)
-        b1 = log_bucket_id(high, bucket_pct)
-
-        if b1 < b0:
-            b0, b1 = b1, b0
-
-        bucket_ids = list(range(b0, b1 + 1))
-        if not bucket_ids:
-            continue
-
-        age = n - 1 - idx
-        recency_w = 0.5 ** (age / max(1, cfg.recency_half_life))
-
-        vol = float(row["volume"])
-        amount = float(row.get("amount", row["close"] * row["volume"]))
-
-        per_vol = vol / len(bucket_ids)
-        per_amount = amount / len(bucket_ids)
-
-        close_bid = log_bucket_id(float(row["close"]), bucket_pct)
-        body_low = min(float(row["open"]), float(row["close"]))
-        body_high = max(float(row["open"]), float(row["close"]))
-        body_b0 = log_bucket_id(body_low, bucket_pct)
-        body_b1 = log_bucket_id(body_high, bucket_pct)
-
-        for bid in bucket_ids:
-            st = bucket_stats.setdefault(
-                bid,
-                {
-                    "volume": 0.0,
-                    "amount": 0.0,
-                    "w_volume": 0.0,
-                    "cover_bars": 0.0,
-                    "close_count": 0.0,
-                    "body_count": 0.0,
-                },
-            )
-
-            st["volume"] += per_vol
-            st["amount"] += per_amount
-            st["w_volume"] += per_vol * recency_w
-            st["cover_bars"] += 1
-
-            if bid == close_bid:
-                st["close_count"] += 1
-
-            if body_b0 <= bid <= body_b1:
-                st["body_count"] += 1
-
-    if not bucket_stats:
-        return []
-
-    rows = []
-    for bid, st in bucket_stats.items():
-        lower, upper = bucket_bounds(bid, bucket_pct)
-        rows.append(
-            {
-                "bid": bid,
-                "lower": lower,
-                "upper": upper,
-                "mid": (lower + upper) / 2,
-                **st,
-            }
-        )
-
-    p = pd.DataFrame(rows).sort_values("bid")
-
-    p = p[
-        (p["upper"] >= current_price * (1 - cfg.max_below_current_pct))
-        & (p["lower"] <= current_price * (1 + cfg.max_above_current_pct))
-    ].copy()
-
-    if p.empty:
-        return []
-
-    threshold = max(
-        p["w_volume"].quantile(cfg.profile_quantile),
-        p["w_volume"].mean() + 0.20 * p["w_volume"].std(),
-    )
-
-    hvn = p[
-        (p["w_volume"] >= threshold)
-        & (p["cover_bars"] >= cfg.profile_min_cover_bars)
-    ].copy()
-
-    if hvn.empty:
-        return []
-
-    hvn = hvn.sort_values("bid")
-
-    clusters = []
-    cur = []
-    last_bid = None
-
-    for _, r in hvn.iterrows():
-        bid = int(r["bid"])
-
-        if last_bid is None or bid - last_bid <= 2:
-            cur.append(r)
-        else:
-            if cur:
-                clusters.append(pd.DataFrame(cur))
-            cur = [r]
-
-        last_bid = bid
-
-    if cur:
-        clusters.append(pd.DataFrame(cur))
-
-    bands = []
-    total_wv = max(1.0, p["w_volume"].sum())
-    max_wv = max(1.0, p["w_volume"].max())
-
-    for c in clusters:
-        lower = float(c["lower"].min())
-        upper = float(c["upper"].max())
-
-        if upper < current_price * (1 - cfg.max_below_current_pct):
-            continue
-
-        cluster_wv = float(c["w_volume"].sum())
-        volume_share = cluster_wv / total_wv
-        peak_ratio = float(c["w_volume"].max() / max_wv)
-        cover = float(c["cover_bars"].sum())
-        close_count = float(c["close_count"].sum())
-        body_count = float(c["body_count"].sum())
-
-        width = (upper - lower) / max((upper + lower) / 2, 1e-9)
-
-        quality = (
-            22
-            + 35 * volume_share
-            + 18 * peak_ratio
-            + 0.20 * cover
-            + 0.35 * close_count
-            + 0.25 * body_count
-        )
-
-        if width > 0.12:
-            quality -= 8
-        elif 0.018 <= width <= 0.09:
-            quality += 5
-
-        quality = clamp(float(quality), 10, 85)
-
-        detail = (
-            f"VolumeProfile高成交密集区; bucket={bucket_pct:.3%}; "
-            f"share={volume_share:.2%}; cover={cover:.0f}; width={width:.2%}"
-        )
-
-        bands.append(
-            Band(
-                period=period,
-                lower=lower,
-                upper=upper,
-                source="volume_profile_hvn",
-                quality=quality,
-                detail=detail,
-            )
-        )
-
-    return bands
-
-
-def make_anchor_band(
-    period: str,
-    price: float,
-    source: str,
-    quality: float,
-    cfg: Config,
-    detail: str,
-) -> Band:
-    w = cfg.anchor_width_pct
-    return Band(
+def make_anchor(period: str, price: float, source: str, score: float, cfg: Config, date: str = "", detail: str = "") -> Anchor:
+    price = float(price)
+    w = cfg.anchor_band_width_pct
+    return Anchor(
         period=period,
-        lower=float(price * (1 - w)),
-        upper=float(price * (1 + w)),
+        price=price,
+        lower=price * (1 - w),
+        upper=price * (1 + w),
         source=source,
-        quality=float(quality),
+        score=float(score),
+        date=date,
         detail=detail,
     )
 
 
-def max_bull_volume_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
-    if len(df) < 20:
+def in_relevant_range(price: float, current_price: float, cfg: Config) -> bool:
+    if price <= 0 or current_price <= 0:
+        return False
+    if price < current_price * (1 - cfg.max_below_current_pct):
+        return False
+    if price > current_price * (1 + cfg.max_above_current_pct):
+        return False
+    return True
+
+
+def extract_period_high_anchor(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    if len(df) < 10:
+        return []
+    d = candle_features(df)
+    idx = d["high"].idxmax()
+    r = d.loc[idx]
+    high = safe_float(r["high"])
+    if not in_relevant_range(high, current_price, cfg):
         return []
 
-    d = candle_features(df).copy()
+    score = 34 + 18 * PERIOD_WEIGHT.get(period, 1.0)
+    if safe_float(r.get("upper_wick_ratio", 0), 0) >= 0.30:
+        score += 8
+    if safe_float(r.get("vol_ratio20", 1), 1) >= 1.3:
+        score += 8
 
-    d["valid"] = (
-        (d["close"] > d["open"])
-        & (d["body_ratio"].fillna(0) >= 0.30)
-        & (d["upper_wick_ratio"].fillna(0) <= 0.60)
-    )
-
-    cand = d[d["valid"]].sort_values("volume", ascending=False).head(3)
-
-    bands = []
-
-    for _, r in cand.iterrows():
-        high = float(r["high"])
-
-        if high < current_price * (1 - cfg.max_below_current_pct):
-            continue
-
-        if high > current_price * (1 + cfg.max_above_current_pct):
-            continue
-
-        vol_rank = float((d["volume"] <= r["volume"]).mean())
-        body_ratio = float(r.get("body_ratio", 0) or 0)
-        close_pos = float(r.get("close_pos", 0) or 0)
-
-        quality = 28 + 30 * vol_rank + 18 * body_ratio + 10 * close_pos
-        quality = clamp(quality, 20, 90)
-
-        detail = (
-            f"最大量阳K高点; date={r['date'].date()}; "
-            f"high={high:.3f}; vol_rank={vol_rank:.2%}; "
-            f"body_ratio={body_ratio:.2f}; close_pos={close_pos:.2f}"
+    return [
+        make_anchor(
+            period,
+            high,
+            "period_high",
+            score,
+            cfg,
+            str(pd.to_datetime(r["date"]).date()),
+            f"{PERIOD_NAME.get(period, period)}窗口最高点",
         )
-
-        bands.append(
-            make_anchor_band(
-                period,
-                high,
-                "max_bull_volume_high",
-                quality,
-                cfg,
-                detail,
-            )
-        )
-
-    return bands
+    ]
 
 
-def swing_high_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
+def extract_swing_high_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
     if len(df) < 30:
         return []
 
-    d = candle_features(df).copy().reset_index(drop=True)
+    d = candle_features(df).reset_index(drop=True)
     highs = d["high"]
-
     is_swing = highs == highs.rolling(7, center=True, min_periods=3).max()
     cand = d[is_swing.fillna(False)].copy()
 
     if cand.empty:
         cand = d.nlargest(8, "high").copy()
 
-    cand = cand.sort_values(["high", "volume"], ascending=False).head(8)
-
-    bands = []
+    cand = cand.sort_values(["high", "volume"], ascending=False).head(10)
+    anchors = []
 
     for _, r in cand.iterrows():
-        high = float(r["high"])
-
-        if high < current_price * (1 - cfg.max_below_current_pct):
+        high = safe_float(r["high"])
+        if not in_relevant_range(high, current_price, cfg):
             continue
 
-        if high > current_price * (1 + cfg.max_above_current_pct):
-            continue
+        high_pct = float((d["high"] <= high).mean())
+        vol_ratio = safe_float(r.get("vol_ratio20", 1), 1)
+        upper_wick = safe_float(r.get("upper_wick_ratio", 0), 0)
+        close_pos = safe_float(r.get("close_pos", 0.5), 0.5)
 
-        high_percentile = float((d["high"] <= high).mean())
-        vol_ratio = float(r.get("vol_ratio20", 1) if not pd.isna(r.get("vol_ratio20", np.nan)) else 1)
-        upper_wick = float(r.get("upper_wick_ratio", 0) or 0)
-        close_pos = float(r.get("close_pos", 0) or 0)
+        score = 18 + 20 * high_pct + 7 * min(vol_ratio, 3) + 10 * upper_wick + 6 * (1 - close_pos)
+        score *= PERIOD_WEIGHT.get(period, 1.0)
 
-        quality = (
-            20
-            + 20 * high_percentile
-            + 16 * min(vol_ratio, 3) / 3
-            + 18 * upper_wick
-            + 8 * (1 - close_pos)
-        )
-
-        quality = clamp(quality, 15, 78)
-
-        detail = (
-            f"阶段/局部高点; date={r['date'].date()}; "
-            f"high={high:.3f}; high_percentile={high_percentile:.2%}; "
-            f"vol_ratio20={vol_ratio:.2f}"
-        )
-
-        bands.append(
-            make_anchor_band(
+        anchors.append(
+            make_anchor(
                 period,
                 high,
                 "swing_high",
-                quality,
+                score,
                 cfg,
-                detail,
+                str(pd.to_datetime(r["date"]).date()),
+                f"阶段高点/前高，高点分位{high_pct:.0%}",
             )
         )
 
-    return bands
+    return anchors
 
 
-def upper_wick_resonance_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
+def extract_max_bull_volume_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    if len(df) < 20:
+        return []
+
+    d = candle_features(df).copy()
+    d["valid"] = (
+        (d["close"] > d["open"])
+        & (d["body_ratio"].fillna(0) >= 0.28)
+        & (d["upper_wick_ratio"].fillna(0) <= 0.60)
+    )
+
+    cand = d[d["valid"]].sort_values("volume", ascending=False).head(3)
+    anchors = []
+
+    for _, r in cand.iterrows():
+        high = safe_float(r["high"])
+        if not in_relevant_range(high, current_price, cfg):
+            continue
+
+        vol_rank = float((d["volume"] <= r["volume"]).mean())
+        body_ratio = safe_float(r.get("body_ratio", 0), 0)
+        close_pos = safe_float(r.get("close_pos", 0), 0)
+
+        score = (24 + 28 * vol_rank + 14 * body_ratio + 8 * close_pos) * PERIOD_WEIGHT.get(period, 1.0)
+
+        anchors.append(
+            make_anchor(
+                period,
+                high,
+                "max_bull_volume_high",
+                score,
+                cfg,
+                str(pd.to_datetime(r["date"]).date()),
+                f"最大量阳K高点，量能分位{vol_rank:.0%}",
+            )
+        )
+
+    return anchors
+
+
+def extract_upper_wick_resonance_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
     if len(df) < 40:
         return []
 
     d = candle_features(df).copy().reset_index(drop=True)
-
     cand = d[
-        (d["upper_wick_ratio"].fillna(0) >= 0.42)
-        & (d["close_pos"].fillna(1) <= 0.62)
-        & (d["vol_ratio20"].fillna(1) >= 1.15)
+        (d["upper_wick_ratio"].fillna(0) >= 0.38)
+        & (d["close_pos"].fillna(1) <= 0.66)
+        & (d["vol_ratio20"].fillna(1) >= 1.10)
     ].copy()
 
     if cand.empty:
@@ -732,74 +560,88 @@ def upper_wick_resonance_bands(
 
     bucket_pct = adaptive_bucket_pct(d, cfg) * 1.5
     cand["bid"] = cand["high"].apply(lambda x: log_bucket_id(float(x), bucket_pct))
-
-    bands = []
+    anchors = []
 
     for bid, g in cand.groupby("bid"):
         if len(g) < 2:
             continue
 
         lower, upper = bucket_bounds(int(bid), bucket_pct)
+        high = safe_float(g["high"].max())
 
-        if upper < current_price * (1 - cfg.max_below_current_pct):
-            continue
-
-        if lower > current_price * (1 + cfg.max_above_current_pct):
+        if not in_relevant_range(high, current_price, cfg):
             continue
 
         touch = len(g)
-        avg_wick = float(g["upper_wick_ratio"].mean())
-        avg_vol_ratio = float(
-            g["vol_ratio20"].replace([np.inf, -np.inf], np.nan).fillna(1).mean()
-        )
-        avg_reject = float(
-            (g["high"] / g["close"] - 1)
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0)
-            .mean()
-        )
+        avg_wick = safe_float(g["upper_wick_ratio"].mean(), 0)
+        avg_vol_ratio = safe_float(g["vol_ratio20"].replace([np.inf, -np.inf], np.nan).fillna(1).mean(), 1)
 
-        quality = (
-            24
-            + 9 * min(touch, 5)
-            + 22 * avg_wick
-            + 8 * min(avg_vol_ratio, 3)
-            + 120 * min(avg_reject, 0.08)
-        )
+        score = (24 + 9 * min(touch, 5) + 20 * avg_wick + 7 * min(avg_vol_ratio, 3)) * PERIOD_WEIGHT.get(period, 1.0)
 
-        quality = clamp(quality, 20, 90)
-
-        detail = (
-            f"上影线共振; touch={touch}; avg_wick={avg_wick:.2f}; "
-            f"avg_vol_ratio20={avg_vol_ratio:.2f}; avg_reject={avg_reject:.2%}"
-        )
-
-        bands.append(
-            Band(
-                period=period,
-                lower=float(lower),
-                upper=float(upper),
-                source="upper_wick_resonance",
-                quality=quality,
-                detail=detail,
+        anchors.append(
+            make_anchor(
+                period,
+                high,
+                "upper_wick_resonance",
+                score,
+                cfg,
+                str(pd.to_datetime(g["date"].iloc[-1]).date()),
+                f"上影线共振{touch}次，说明该区间曾多次冲高回落",
             )
         )
 
-    return bands
+    return anchors
 
 
-def gap_pressure_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
+def extract_false_break_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    if len(df) < 50:
+        return []
+
+    d = candle_features(df).tail(220).copy().reset_index(drop=True)
+    d["rolling_high_prev"] = d["high"].shift(1).rolling(20, min_periods=8).max()
+
+    cand = d[
+        (d["high"] > d["rolling_high_prev"] * 1.003)
+        & (d["close"] < d["rolling_high_prev"] * 1.003)
+        & (d["upper_wick_ratio"].fillna(0) >= 0.30)
+        & (d["close_pos"].fillna(1) <= 0.68)
+    ].copy()
+
+    if cand.empty:
+        return []
+
+    anchors = []
+
+    for _, r in cand.sort_values("high", ascending=False).head(5).iterrows():
+        high = safe_float(r["high"])
+        if not in_relevant_range(high, current_price, cfg):
+            continue
+
+        vol_ratio = safe_float(r.get("vol_ratio20", 1), 1)
+        wick = safe_float(r.get("upper_wick_ratio", 0), 0)
+        score = (30 + 10 * min(vol_ratio, 3) + 18 * wick) * PERIOD_WEIGHT.get(period, 1.0)
+
+        anchors.append(
+            make_anchor(
+                period,
+                high,
+                "false_break_memory",
+                score,
+                cfg,
+                str(pd.to_datetime(r["date"]).date()),
+                "历史假突破/流动性扫单失败高点，后续真突破必须重点越过",
+            )
+        )
+
+    return anchors
+
+
+def extract_gap_pressure_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
     if len(df) < 20:
         return []
 
     d = df.copy().reset_index(drop=True)
     d["prev_low"] = d["low"].shift(1)
-
     gaps = d[d["high"] < d["prev_low"] * 0.995].copy()
 
     if gaps.empty:
@@ -809,379 +651,408 @@ def gap_pressure_bands(
     gaps["gap_upper"] = gaps["prev_low"]
     gaps["gap_pct"] = gaps["gap_upper"] / gaps["gap_lower"] - 1
 
-    gaps = gaps.sort_values("date", ascending=False).head(5)
+    anchors = []
 
-    bands = []
+    for _, r in gaps.sort_values("date", ascending=False).head(5).iterrows():
+        upper = safe_float(r["gap_upper"])
+        lower = safe_float(r["gap_lower"])
 
-    for _, r in gaps.iterrows():
-        lower = float(r["gap_lower"])
-        upper = float(r["gap_upper"])
-
-        if upper < current_price * (1 - cfg.max_below_current_pct):
+        if not in_relevant_range(upper, current_price, cfg):
             continue
 
-        if lower > current_price * (1 + cfg.max_above_current_pct):
-            continue
+        gap_pct = safe_float(r["gap_pct"], 0)
+        score = (18 + 350 * min(gap_pct, 0.08)) * PERIOD_WEIGHT.get(period, 1.0)
 
-        gap_pct = float(r["gap_pct"])
-        quality = 22 + 500 * min(gap_pct, 0.08)
-        quality = clamp(quality, 15, 70)
-
-        detail = (
-            f"向下跳空缺口压力区; date={r['date'].date()}; "
-            f"gap={lower:.3f}-{upper:.3f}; gap_pct={gap_pct:.2%}"
-        )
-
-        bands.append(
-            Band(
-                period=period,
-                lower=lower,
-                upper=upper,
-                source="down_gap_pressure",
-                quality=quality,
-                detail=detail,
+        anchors.append(
+            make_anchor(
+                period,
+                upper,
+                "down_gap_pressure",
+                score,
+                cfg,
+                str(pd.to_datetime(r["date"]).date()),
+                f"向下跳空缺口上沿，缺口{lower:.2f}-{upper:.2f}",
             )
         )
 
-    return bands
+    return anchors
 
 
-def false_break_memory_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
-    if len(df) < 50:
+def extract_large_body_supply_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    if len(df) < 40:
         return []
 
-    d = candle_features(df).tail(180).copy().reset_index(drop=True)
-
-    d["rolling_high_prev"] = d["high"].shift(1).rolling(20, min_periods=8).max()
-
+    d = candle_features(df).copy()
     cand = d[
-        (d["high"] > d["rolling_high_prev"] * 1.003)
-        & (d["close"] < d["rolling_high_prev"] * 1.003)
-        & (d["upper_wick_ratio"].fillna(0) >= 0.32)
-        & (d["close_pos"].fillna(1) <= 0.65)
+        (d["vol_ratio20"].fillna(0) >= 1.6)
+        & (
+            (d["upper_wick_ratio"].fillna(0) >= 0.28)
+            | (d["close_pos"].fillna(1) <= 0.62)
+        )
     ].copy()
 
     if cand.empty:
         return []
 
-    bucket_pct = adaptive_bucket_pct(d, cfg) * 1.5
-    cand["bid"] = cand["high"].apply(lambda x: log_bucket_id(float(x), bucket_pct))
+    anchors = []
 
-    bands = []
-
-    for bid, g in cand.groupby("bid"):
-        lower, upper = bucket_bounds(int(bid), bucket_pct)
-
-        if upper < current_price * (1 - cfg.max_below_current_pct):
+    for _, r in cand.sort_values(["volume", "high"], ascending=False).head(6).iterrows():
+        high = safe_float(r["high"])
+        if not in_relevant_range(high, current_price, cfg):
             continue
 
-        if lower > current_price * (1 + cfg.max_above_current_pct):
-            continue
+        vol_ratio = safe_float(r.get("vol_ratio20", 1), 1)
+        close_pos = safe_float(r.get("close_pos", 0.5), 0.5)
 
-        touch = len(g)
-        best_high = float(g["high"].max())
-        avg_wick = float(g["upper_wick_ratio"].mean())
-        avg_vol_ratio = float(
-            g["vol_ratio20"].replace([np.inf, -np.inf], np.nan).fillna(1).mean()
-        )
+        score = (18 + 10 * min(vol_ratio, 3) + 8 * (1 - close_pos)) * PERIOD_WEIGHT.get(period, 1.0)
 
-        quality = 28 + 10 * min(touch, 4) + 18 * avg_wick + 7 * min(avg_vol_ratio, 3)
-        quality = clamp(quality, 20, 88)
-
-        detail = (
-            f"假突破记忆/Liquidity Sweep; touch={touch}; "
-            f"best_high={best_high:.3f}; avg_wick={avg_wick:.2f}; "
-            f"avg_vol_ratio20={avg_vol_ratio:.2f}"
-        )
-
-        bands.append(
-            Band(
-                period=period,
-                lower=float(lower),
-                upper=float(upper),
-                source="false_break_memory",
-                quality=quality,
-                detail=detail,
+        anchors.append(
+            make_anchor(
+                period,
+                high,
+                "large_body_supply_high",
+                score,
+                cfg,
+                str(pd.to_datetime(r["date"]).date()),
+                f"放量供应K高点，量比20日均量{vol_ratio:.2f}",
             )
         )
 
-    return bands
+    return anchors
 
 
-def overlap_or_near(a: Band, b: Band, merge_pct: float) -> bool:
-    if max(a.lower, b.lower) <= min(a.upper, b.upper):
-        return True
-
-    gap = max(a.lower, b.lower) - min(a.upper, b.upper)
-    mid = (a.lower + a.upper + b.lower + b.upper) / 4
-
-    return gap / max(mid, 1e-9) <= merge_pct
-
-
-def merge_bands_same_period(bands: List[Band], cfg: Config) -> List[Band]:
-    if not bands:
+def extract_volume_profile_anchors(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    """
+    成交密集区只作为辅助锚点，不让它单独主导核心线。
+    取高成交密集区的上沿作为辅助固定锚点。
+    """
+    if len(df) < 40:
         return []
 
-    bands = sorted(bands, key=lambda x: (x.lower, x.upper))
-    groups: List[List[Band]] = []
+    d = candle_features(df).reset_index(drop=True)
+    bucket_pct = adaptive_bucket_pct(d, cfg)
+    bucket_stats: Dict[int, Dict[str, float]] = {}
+    n = len(d)
 
-    for b in bands:
-        placed = False
+    for idx, row in d.iterrows():
+        low = safe_float(row["low"])
+        high = safe_float(row["high"])
 
-        for g in groups:
-            if any(overlap_or_near(b, gb, cfg.same_period_merge_pct) for gb in g):
-                g.append(b)
-                placed = True
-                break
+        if low <= 0 or high <= 0 or high < low:
+            continue
 
-        if not placed:
-            groups.append([b])
+        b0 = log_bucket_id(low, bucket_pct)
+        b1 = log_bucket_id(high, bucket_pct)
+        bucket_ids = list(range(min(b0, b1), max(b0, b1) + 1))
 
-    merged = []
+        if not bucket_ids:
+            continue
 
-    for g in groups:
-        lower = min(x.lower for x in g)
-        upper = max(x.upper for x in g)
-        sources = sorted(set(x.source for x in g))
-        quality = sum(x.quality for x in g)
-        quality = clamp(quality * (0.72 + 0.08 * min(len(sources), 4)), 10, 100)
+        age = n - 1 - idx
+        recency_w = 0.5 ** (age / 120)
+        per_vol = safe_float(row["volume"], 0) / len(bucket_ids)
 
-        detail = " | ".join([x.detail for x in sorted(g, key=lambda z: -z.quality)[:4]])
+        for bid in bucket_ids:
+            st = bucket_stats.setdefault(bid, {"w_volume": 0.0, "cover": 0.0})
+            st["w_volume"] += per_vol * recency_w
+            st["cover"] += 1
 
-        merged.append(
-            Band(
-                period=g[0].period,
-                lower=float(lower),
-                upper=float(upper),
-                source="+".join(sources),
-                quality=float(quality),
-                detail=detail,
+    if not bucket_stats:
+        return []
+
+    rows = []
+
+    for bid, st in bucket_stats.items():
+        lower, upper = bucket_bounds(bid, bucket_pct)
+        rows.append({"bid": bid, "lower": lower, "upper": upper, **st})
+
+    p = pd.DataFrame(rows).sort_values("bid")
+    p = p[
+        (p["upper"] >= current_price * (1 - cfg.max_below_current_pct))
+        & (p["lower"] <= current_price * (1 + cfg.max_above_current_pct))
+    ].copy()
+
+    if p.empty:
+        return []
+
+    threshold = max(
+        p["w_volume"].quantile(0.82),
+        p["w_volume"].mean() + 0.25 * p["w_volume"].std(),
+    )
+
+    hvn = p[(p["w_volume"] >= threshold) & (p["cover"] >= 3)].copy()
+
+    if hvn.empty:
+        return []
+
+    hvn = hvn.sort_values("bid")
+    clusters = []
+    cur = []
+    last = None
+
+    for _, r in hvn.iterrows():
+        bid = int(r["bid"])
+
+        if last is None or bid - last <= 2:
+            cur.append(r)
+        else:
+            if cur:
+                clusters.append(pd.DataFrame(cur))
+            cur = [r]
+
+        last = bid
+
+    if cur:
+        clusters.append(pd.DataFrame(cur))
+
+    anchors = []
+    total_w = max(1.0, p["w_volume"].sum())
+
+    for c in clusters[:6]:
+        lower = safe_float(c["lower"].min())
+        upper = safe_float(c["upper"].max())
+
+        if not in_relevant_range(upper, current_price, cfg):
+            continue
+
+        share = safe_float(c["w_volume"].sum() / total_w, 0)
+        cover = safe_float(c["cover"].sum(), 0)
+        score = (14 + 45 * share + 0.20 * cover) * PERIOD_WEIGHT.get(period, 1.0)
+
+        anchors.append(
+            make_anchor(
+                period,
+                upper,
+                "volume_profile_hvn",
+                score,
+                cfg,
+                "",
+                f"成交密集区上沿，成交占比{share:.1%}",
             )
         )
 
-    return sorted(merged, key=lambda x: x.quality, reverse=True)
+    return anchors
 
 
-def generate_period_bands(
-    df: pd.DataFrame,
-    period: str,
-    current_price: float,
-    cfg: Config,
-) -> List[Band]:
-    if df is None or df.empty or len(df) < 20:
+def extract_anchors_for_period(df: pd.DataFrame, period: str, current_price: float, cfg: Config) -> List[Anchor]:
+    if df is None or df.empty or len(df) < 10:
         return []
 
-    methods = [
-        volume_profile_bands,
-        max_bull_volume_bands,
-        swing_high_bands,
-        upper_wick_resonance_bands,
-        gap_pressure_bands,
-        false_break_memory_bands,
+    funcs = [
+        extract_period_high_anchor,
+        extract_swing_high_anchors,
+        extract_max_bull_volume_anchors,
+        extract_upper_wick_resonance_anchors,
+        extract_false_break_anchors,
+        extract_gap_pressure_anchors,
+        extract_large_body_supply_anchors,
+        extract_volume_profile_anchors,
     ]
 
-    bands: List[Band] = []
+    anchors: List[Anchor] = []
 
-    for fn in methods:
+    for fn in funcs:
         try:
-            bands.extend(fn(df, period, current_price, cfg))
-        except Exception:
-            continue
+            anchors.extend(fn(df, period, current_price, cfg))
+        except Exception as e:
+            print(f"[WARN] anchor extract failed period={period} fn={fn.__name__} err={e}")
 
-    bands = [b for b in bands if b.upper > b.lower and b.upper > 0]
-    return merge_bands_same_period(bands, cfg)
+    anchors = [a for a in anchors if a.price > 0 and a.score >= cfg.min_anchor_score]
+    return anchors
 
 
 # ============================================================
-# 5. 多周期复合压力带
+# 5. 固定锚点聚类成核心压力带
 # ============================================================
 
-def intervals_core_overlap(bands: List[Band]) -> Tuple[float, float]:
-    if not bands:
-        return np.nan, np.nan
-
-    inter_l = max(b.lower for b in bands)
-    inter_u = min(b.upper for b in bands)
-
-    if inter_l <= inter_u:
-        return float(inter_l), float(inter_u)
-
-    points = sorted(set([b.lower for b in bands] + [b.upper for b in bands]))
-
-    best = None
-
-    for i in range(len(points) - 1):
-        l, u = points[i], points[i + 1]
-
-        if u <= l:
-            continue
-
-        active = [b for b in bands if b.lower <= l and b.upper >= u]
-
-        if not active:
-            continue
-
-        period_count = len(set(b.period for b in active))
-        q = sum(b.quality for b in active)
-        score = period_count * 1000 + q
-
-        if best is None or score > best[0]:
-            best = (score, l, u)
-
-    if best is None:
-        b = max(bands, key=lambda x: x.quality)
-        return b.lower, b.upper
-
-    return float(best[1]), float(best[2])
+def anchors_near(a: Anchor, b: Anchor, cfg: Config) -> bool:
+    mid = (a.price + b.price) / 2
+    if mid <= 0:
+        return False
+    return abs(a.price - b.price) / mid <= cfg.cross_cluster_pct
 
 
-def merge_cross_period_bands(
-    period_bands: Dict[str, List[Band]],
-    current_price: float,
-    cfg: Config,
-) -> List[CompositeBand]:
-    all_bands = []
-
-    for p, bs in period_bands.items():
-        filtered = []
-
-        for b in bs:
-            if b.upper < current_price * (1 - cfg.max_below_current_pct):
-                continue
-
-            if b.lower > current_price * (1 + cfg.max_above_current_pct):
-                continue
-
-            filtered.append(b)
-
-        all_bands.extend(sorted(filtered, key=lambda x: x.quality, reverse=True)[:8])
-
-    if not all_bands:
+def cluster_fixed_anchors(anchors: List[Anchor], current_price: float, cfg: Config) -> List[FixedPressureBand]:
+    if not anchors:
         return []
 
-    groups: List[List[Band]] = []
+    anchors = sorted(anchors, key=lambda a: a.price)
+    groups: List[List[Anchor]] = []
 
-    for b in sorted(all_bands, key=lambda x: x.lower):
+    for a in anchors:
         placed = False
 
         for g in groups:
-            if any(overlap_or_near(b, gb, cfg.cross_period_merge_pct) for gb in g):
-                g.append(b)
+            if any(anchors_near(a, ga, cfg) for ga in g):
+                g.append(a)
                 placed = True
                 break
 
         if not placed:
-            groups.append([b])
+            groups.append([a])
 
-    composites = []
+    clusters: List[FixedPressureBand] = []
 
     for g in groups:
-        lower = min(b.lower for b in g)
-        upper = max(b.upper for b in g)
-        core_l, core_u = intervals_core_overlap(g)
+        prices = [x.price for x in g]
+        lower = min(x.lower for x in g if x.lower is not None)
+        upper = max(x.upper for x in g if x.upper is not None)
+        core_line = max(prices)  # 核心上沿必须来自真实固定锚点
 
-        periods = sorted(set(b.period for b in g), key=lambda x: PERIOD_ORDER.get(x, 99))
-        sources = sorted(set(s for b in g for s in b.source.split("+")))
+        periods = sorted(set(x.period for x in g), key=lambda p: PERIOD_ORDER.get(p, 99))
+        sources = sorted(set(x.source for x in g))
 
-        period_bonus = {1: 0, 2: 14, 3: 28, 4: 42}.get(len(periods), 0)
+        period_bonus = sum(PERIOD_WEIGHT.get(p, 1.0) for p in periods) * 8
+        source_bonus = min(len(sources), 7) * 3
+        anchor_score = sum(x.score for x in g) * 0.42
 
-        big_period_bonus = 0
-        if "M" in periods:
-            big_period_bonus += 8
-        if "Q" in periods:
-            big_period_bonus += 10
+        dist = abs(core_line / current_price - 1) if current_price > 0 else 0
+        if dist <= 0.06:
+            distance_bonus = 18
+        elif dist <= 0.12:
+            distance_bonus = 10
+        elif dist <= 0.25:
+            distance_bonus = 3
+        else:
+            distance_bonus = -10
 
-        source_bonus = min(len(sources), 8) * 2.2
+        if core_line < current_price * (1 - cfg.max_below_current_pct):
+            distance_bonus -= 20
 
-        raw_q = sum(b.quality for b in g) * 0.38 + period_bonus + big_period_bonus + source_bonus
+        score = anchor_score + period_bonus + source_bonus + distance_bonus
 
         width_pct = (upper - lower) / max((upper + lower) / 2, 1e-9)
 
-        if width_pct > 0.18:
-            raw_q -= 18
-        elif width_pct > 0.12:
-            raw_q -= 8
-        elif 0.018 <= width_pct <= 0.09:
-            raw_q += 5
+        if width_pct > 0.10:
+            score -= 12
+        elif width_pct <= 0.045:
+            score += 6
 
-        if lower <= current_price <= upper:
-            raw_q += 8
-        elif current_price < lower:
-            dist = lower / current_price - 1
-            if dist <= cfg.approach_pct:
-                raw_q += 6
-            elif dist > 0.18:
-                raw_q -= 8
-        else:
-            if current_price / upper - 1 <= 0.08:
-                raw_q += 4
-            else:
-                raw_q -= 10
+        score = clamp(score, 0, 100)
 
-        quality = clamp(float(raw_q), 0, 100)
+        if score < cfg.min_cluster_score:
+            continue
 
-        composites.append(
-            CompositeBand(
+        clusters.append(
+            FixedPressureBand(
                 lower=float(lower),
                 upper=float(upper),
-                core_lower=float(core_l),
-                core_upper=float(core_u),
-                final_upper=float(upper),
+                core_line=float(core_line),
+                score=float(score),
                 periods=periods,
                 sources=sources,
-                quality=quality,
-                bands=sorted(g, key=lambda x: (PERIOD_ORDER.get(x.period, 99), -x.quality)),
+                anchors=sorted(g, key=lambda x: (-x.score, PERIOD_ORDER.get(x.period, 99))),
             )
         )
 
-    composites = sorted(
-        composites,
-        key=lambda x: (x.quality, len(x.periods)),
-        reverse=True,
-    )
-
-    return composites
+    return sorted(clusters, key=lambda c: (c.score, len(c.periods)), reverse=True)
 
 
-# ============================================================
-# 6. 状态判断
-# ============================================================
+def band_status(current_price: float, band: FixedPressureBand, cfg: Config) -> Tuple[str, str]:
+    line = band.core_line
 
-def latest_breakout_metrics(
-    daily: pd.DataFrame,
-    comp: CompositeBand,
+    if current_price > line * (1 + cfg.broke_buffer_pct):
+        if current_price <= line * 1.08:
+            return "已突破，近端压力转支撑观察", "回踩不破可作为承接确认；不再作为当前主要压力"
+        return "已明显突破，转为下方结构支撑", "只用于回踩/防守观察，不作为当前上方压力"
+
+    if abs(current_price / line - 1) <= 0.035:
+        return "正在接近核心上沿", "等待日线高级K线有效突破"
+
+    if current_price < line:
+        return "尚未突破，当前上方核心压力", "若被日线高级K线放量实体突破，才具备交易触发意义"
+
+    return "状态待复核", "需要人工看图确认"
+
+
+def select_two_core_bands(
+    clusters: List[FixedPressureBand],
+    current_price: float,
     cfg: Config,
-) -> Dict:
+) -> Tuple[Optional[FixedPressureBand], Optional[FixedPressureBand], Optional[FixedPressureBand]]:
+    """
+    core1：近端固定核心上沿；
+    core2：大周期/更高一级固定核心上沿；
+    most：当前最重要突破确认线，优先未突破且最近的固定核心线。
+    """
+    if not clusters:
+        return None, None, None
+
+    for c in clusters:
+        c.status, c.purpose = band_status(current_price, c, cfg)
+
+    near_sorted = sorted(
+        clusters,
+        key=lambda c: (
+            abs(c.core_line / current_price - 1),
+            -c.score,
+            -len(c.periods),
+        ),
+    )
+    core1 = near_sorted[0] if near_sorted else None
+
+    above = [c for c in clusters if c.core_line >= current_price * (1 - 0.003)]
+
+    def big_key(c: FixedPressureBand):
+        big_period_score = sum(PERIOD_WEIGHT.get(p, 1.0) for p in c.periods)
+        dist = c.core_line / current_price - 1
+        dist_penalty = abs(dist - 0.08) * 20 if dist >= 0 else 10
+        return (big_period_score * 12 + c.score - dist_penalty, c.core_line)
+
+    core2 = sorted(above, key=big_key, reverse=True)[0] if above else None
+
+    if core1 and core2 and abs(core1.core_line / core2.core_line - 1) <= 0.015:
+        alt = [c for c in above if abs(c.core_line / core1.core_line - 1) > 0.015]
+        if alt:
+            core2 = sorted(alt, key=big_key, reverse=True)[0]
+
+    unbroken = [c for c in clusters if c.core_line > current_price * (1 + cfg.broke_buffer_pct)]
+
+    if unbroken:
+        most = sorted(
+            unbroken,
+            key=lambda c: (
+                abs(c.core_line / current_price - 1),
+                -c.score,
+                -len(c.periods),
+            ),
+        )[0]
+    else:
+        most = core1
+
+    return core1, core2, most
+
+
+# ============================================================
+# 6. 日线高级突破、空间、RR
+# ============================================================
+
+def latest_daily_break_quality(daily: pd.DataFrame, line: float, cfg: Config) -> Dict:
     d = candle_features(daily).copy()
 
-    if d.empty:
+    if d.empty or line <= 0 or pd.isna(line):
         return {}
 
     r = d.iloc[-1]
 
-    final_upper = comp.final_upper
-    core_upper = comp.core_upper
-
-    open_ = float(r["open"])
-    close = float(r["close"])
-    high = float(r["high"])
-    low = float(r["low"])
+    open_ = safe_float(r["open"])
+    close = safe_float(r["close"])
+    high = safe_float(r["high"])
+    low = safe_float(r["low"])
 
     body_low = min(open_, close)
     body_high = max(open_, close)
     body_len = max(body_high - body_low, 1e-9)
 
-    body_above_final = max(0.0, body_high - max(body_low, final_upper)) / body_len
-    body_above_core = max(0.0, body_high - max(body_low, core_upper)) / body_len
+    close_above = close > line * (1 + cfg.broke_buffer_pct)
+    high_above = high > line * (1 + cfg.broke_buffer_pct)
 
-    close_pos = float(r.get("close_pos", np.nan))
-    vol_ratio_prev = float(r.get("vol_ratio_prev", np.nan))
-    vol_ratio20 = float(r.get("vol_ratio20", np.nan))
+    body_above_ratio = max(0.0, body_high - max(body_low, line)) / body_len
+
+    close_pos = safe_float(r.get("close_pos"), np.nan)
+    upper_wick_ratio = safe_float(r.get("upper_wick_ratio"), np.nan)
+    vol_ratio_prev = safe_float(r.get("vol_ratio_prev"), np.nan)
+    vol_ratio20 = safe_float(r.get("vol_ratio20"), np.nan)
 
     vol_ref = max(
         vol_ratio_prev if not pd.isna(vol_ratio_prev) else 0,
@@ -1190,260 +1061,304 @@ def latest_breakout_metrics(
 
     is_standard_double = cfg.standard_double_vol_min <= vol_ratio_prev <= cfg.standard_double_vol_max
     is_healthy_volume = cfg.healthy_vol_ratio_min <= vol_ref <= cfg.healthy_vol_ratio_max
-
-    broke_core_close = close > core_upper * (1 + cfg.broke_buffer_pct)
-    broke_final_close = close > final_upper * (1 + cfg.broke_buffer_pct)
-
-    intraday_swept_final = (
-        high > final_upper * (1 + cfg.broke_buffer_pct)
-        and close <= final_upper * (1 + cfg.broke_buffer_pct)
-    )
-
-    strong_break_final = (
-        broke_final_close
-        and body_above_final >= cfg.min_body_above_final_ratio
-        and close_pos >= cfg.strong_close_pos
-        and (is_standard_double or is_healthy_volume or vol_ratio20 >= cfg.healthy_vol_ratio_min)
-    )
-
-    return {
-        "latest_date": str(pd.to_datetime(r["date"]).date()),
-        "latest_open": open_,
-        "latest_high": high,
-        "latest_low": low,
-        "latest_close": close,
-        "latest_volume": float(r["volume"]),
-        "latest_close_pos": close_pos,
-        "latest_body_above_core_ratio": body_above_core,
-        "latest_body_above_final_ratio": body_above_final,
-        "latest_vol_ratio_prev": vol_ratio_prev,
-        "latest_vol_ratio20": vol_ratio20,
-        "is_standard_double_volume": bool(is_standard_double),
-        "is_healthy_volume": bool(is_healthy_volume),
-        "broke_core_close": bool(broke_core_close),
-        "broke_final_close": bool(broke_final_close),
-        "intraday_swept_final_failed": bool(intraday_swept_final),
-        "strong_break_final": bool(strong_break_final),
-    }
-
-
-def pressure_digestion_metrics(
-    daily: pd.DataFrame,
-    comp: CompositeBand,
-    cfg: Config,
-) -> Dict:
-    d = candle_features(daily).copy().tail(30)
-
-    if d.empty:
-        return {}
-
-    lower = comp.lower
-    upper = comp.final_upper
-
-    inside = d[
-        (d["close"] >= lower * 0.995)
-        & (d["close"] <= upper * 1.005)
-    ].copy()
-
-    last_n = d.tail(12)
-
-    in_last = last_n[
-        (last_n["close"] >= lower * 0.995)
-        & (last_n["close"] <= upper * 1.005)
-    ]
-
-    low_break = (last_n["close"] < lower * (1 - 0.035)).any()
-
-    small_body_ratio = float((last_n["body_ratio"].fillna(1) <= 0.45).mean())
-
-    rising_lows = False
-    if len(last_n) >= 6:
-        lows = last_n["low"].values
-        rising_lows = bool(np.nanmedian(lows[-3:]) >= np.nanmedian(lows[:3]) * 0.995)
-
-    vol_cv = np.nan
-    if len(last_n) >= 5 and last_n["volume"].mean() > 0:
-        vol_cv = float(last_n["volume"].std() / last_n["volume"].mean())
-
-    vol_stable = bool(not pd.isna(vol_cv) and vol_cv <= 0.45)
-
-    no_heavy_bear = bool(
-        (
-            (last_n["is_bear"])
-            & (last_n["vol_ratio20"].fillna(0) >= 1.8)
-            & (last_n["body_ratio"].fillna(0) >= 0.55)
-        ).sum() == 0
-    )
+    intraday_failed = high_above and not close_above
 
     score = 0
 
-    if len(in_last) >= 5:
+    if close_above:
         score += 25
-    if not low_break:
+    if body_above_ratio >= cfg.min_body_above_line_ratio:
         score += 20
-    if small_body_ratio >= 0.55:
+    if close_pos >= cfg.strong_close_pos:
+        score += 18
+    if upper_wick_ratio <= cfg.max_upper_wick_ratio_for_break:
+        score += 12
+    if is_standard_double:
         score += 15
-    if rising_lows:
-        score += 15
-    if vol_stable:
-        score += 15
-    if no_heavy_bear:
+    elif is_healthy_volume:
         score += 10
+    if intraday_failed:
+        score -= 35
+    if vol_ref > 5 and close_pos < 0.70:
+        score -= 18
+
+    score = clamp(score, 0, 100)
+
+    if score >= 80:
+        grade = "S级高级突破"
+    elif score >= 65:
+        grade = "A级有效突破"
+    elif score >= 45:
+        grade = "B级普通突破/待确认"
+    elif intraday_failed:
+        grade = "D级冲高回落/假突破风险"
+    else:
+        grade = "未形成有效高级突破"
 
     return {
-        "digestion_bars_30": int(len(inside)),
-        "digestion_bars_12": int(len(in_last)),
-        "digestion_low_break": bool(low_break),
-        "digestion_small_body_ratio_12": small_body_ratio,
-        "digestion_rising_lows": bool(rising_lows),
-        "digestion_volume_cv_12": vol_cv,
-        "digestion_volume_stable": bool(vol_stable),
-        "digestion_no_heavy_bear": bool(no_heavy_bear),
-        "digestion_score": float(clamp(score, 0, 100)),
+        "突破线": line,
+        "日线是否收盘站上": "是" if close_above else "否",
+        "日内是否摸过但失败": "是" if intraday_failed else "否",
+        "实体站上线比例": body_above_ratio,
+        "收盘位置": close_pos,
+        "上影线比例": upper_wick_ratio,
+        "昨比量": vol_ratio_prev,
+        "20日量比": vol_ratio20,
+        "是否标准倍量": "是" if is_standard_double else "否",
+        "是否健康放量": "是" if is_healthy_volume else "否",
+        "突破K评分": score,
+        "突破K等级": grade,
+        "最新日期": str(pd.to_datetime(r["date"]).date()),
+        "最新开盘": open_,
+        "最新最高": high,
+        "最新最低": low,
+        "最新收盘": close,
     }
 
 
-def classify_state(
+def estimate_space_and_rr(daily: pd.DataFrame, current_price: float, line: float, clusters: List[FixedPressureBand], cfg: Config) -> Dict:
+    if daily.empty or current_price <= 0 or line <= 0 or pd.isna(line):
+        return {}
+
+    d = candle_features(daily)
+    atr = calc_atr(d)
+
+    if pd.isna(atr) or atr <= 0:
+        atr = current_price * 0.035
+
+    above_lines = sorted({c.core_line for c in clusters if c.core_line > max(current_price, line) * 1.01})
+    next_pressure = above_lines[0] if above_lines else np.nan
+
+    recent_low = safe_float(d.tail(120)["low"].min(), current_price * 0.85)
+    box_height = max(line - recent_low, atr * 2)
+
+    target_1 = max(line + atr, line + 0.382 * box_height)
+    target_2 = max(line + 2 * atr, line + 0.618 * box_height)
+    target_3 = max(line + 3 * atr, line + 1.000 * box_height)
+
+    if not pd.isna(next_pressure):
+        target_1 = min(target_1, next_pressure)
+
+    latest = d.iloc[-1]
+    body_mid = (safe_float(latest["open"]) + safe_float(latest["close"])) / 2
+    line_buffer_stop = line * 0.985
+    latest_low_stop = safe_float(latest["low"]) * 0.995
+
+    if current_price > line:
+        stop = min(body_mid, line_buffer_stop, latest_low_stop)
+    else:
+        stop = line_buffer_stop
+
+    risk = max(current_price - stop, current_price * 0.01)
+    reward_1 = max(target_1 - current_price, 0)
+    rr1 = reward_1 / risk if risk > 0 else np.nan
+
+    if rr1 >= cfg.min_rr_prefer:
+        space_grade = "空间较好"
+    elif rr1 >= cfg.min_rr_basic:
+        space_grade = "空间一般但可观察"
+    else:
+        space_grade = "空间不足/不适合追"
+
+    high_252 = safe_float(d.tail(252)["high"].max(), np.nan)
+    low_252 = safe_float(d.tail(252)["low"].min(), np.nan)
+    pos_252 = (current_price - low_252) / max(high_252 - low_252, 1e-9) if not pd.isna(high_252) else np.nan
+
+    high_position_note = ""
+    if not pd.isna(pos_252) and pos_252 >= cfg.high_position_pct:
+        high_position_note = "当前处于近一年高位区，突破后必须更重视空间、承接和风险收益比"
+
+    return {
+        "ATR": atr,
+        "下一层压力": next_pressure,
+        "第一目标": target_1,
+        "第二目标": target_2,
+        "强势目标": target_3,
+        "交易防守位": stop,
+        "单股风险": risk,
+        "第一目标收益风险比": rr1,
+        "空间等级": space_grade,
+        "近一年位置": pos_252,
+        "高位提示": high_position_note,
+    }
+
+
+def period_band_summary(clusters: List[FixedPressureBand], period: str) -> str:
+    vals = []
+
+    for c in clusters:
+        if period in c.periods:
+            vals.append(f"{fmt_band(c.lower, c.upper)} 上沿{fmt_price(c.core_line)}")
+
+    return "；".join(vals[:3])
+
+
+def sources_cn(band: Optional[FixedPressureBand]) -> str:
+    if band is None:
+        return ""
+    return "、".join(SOURCE_CN.get(s, s) for s in band.sources)
+
+
+def periods_cn(band: Optional[FixedPressureBand]) -> str:
+    if band is None:
+        return ""
+    return "/".join(PERIOD_NAME.get(p, p) for p in band.periods)
+
+
+def anchor_detail_cn(band: Optional[FixedPressureBand]) -> str:
+    if band is None:
+        return ""
+
+    details = []
+
+    for a in band.anchors[:6]:
+        details.append(f"{PERIOD_NAME.get(a.period,a.period)} {SOURCE_CN.get(a.source,a.source)} {fmt_price(a.price)} {a.date}")
+
+    return "；".join(details)
+
+
+def tradable_decision(
+    break_info: Dict,
+    space: Dict,
+    most: Optional[FixedPressureBand],
     current_price: float,
-    comp: CompositeBand,
-    daily: pd.DataFrame,
-    cfg: Config,
-) -> Tuple[str, str, Dict]:
-    lower = comp.lower
-    core_u = comp.core_upper
-    final_u = comp.final_upper
+) -> Tuple[str, str, str]:
+    if most is None:
+        return "否", "无核心压力带", "没有识别到足够稳定的固定核心压力带"
 
-    metrics = latest_breakout_metrics(daily, comp, cfg)
-    digestion = pressure_digestion_metrics(daily, comp, cfg)
-    m = {**metrics, **digestion}
+    grade = break_info.get("突破K等级", "")
+    rr = safe_float(space.get("第一目标收益风险比"), np.nan)
+    high_note = space.get("高位提示", "")
 
-    if metrics.get("intraday_swept_final_failed"):
-        return "假突破失败/冲高回落", "D", m
+    if grade in ["S级高级突破", "A级有效突破"] and not pd.isna(rr) and rr >= 1.5:
+        if high_note and rr < 2.0:
+            return "谨慎观察", "突破有效但位置偏高", "历史/阶段高位票需要次日或三日承接确认"
+        return "是", "核心压力带已被高级日K有效突破", "可进入压力带突破候选，但仍需次日承接与防守位"
 
-    if current_price > final_u * (1 + cfg.broke_buffer_pct):
-        if metrics.get("strong_break_final"):
-            return "一根日K打穿最终压力上沿", "S_TEST", m
+    if current_price < most.core_line:
+        return "否", "尚未突破当前最重要压力", f"等待日线高级K线有效突破 {fmt_price(most.core_line)}"
 
-        if (
-            metrics.get("latest_body_above_final_ratio", 0) >= 0.25
-            and metrics.get("latest_close_pos", 0) >= 0.70
-        ):
-            return "突破最终压力上沿但质量待确认", "A_TEST", m
+    if grade == "B级普通突破/待确认":
+        return "观察", "普通突破，质量不足", "需要次日不跌回核心线，或回踩不破再转强"
 
-        return "站上最终压力上沿但突破质量一般", "B_PLUS", m
+    if "假突破" in grade:
+        return "否", "假突破/冲高回落风险", "收盘未站稳核心确认线，不适合追"
 
-    if current_price > core_u * (1 + cfg.broke_buffer_pct):
-        return "突破核心重叠压力带但未打穿最终上沿", "A_OBSERVE", m
-
-    if lower <= current_price <= final_u:
-        if digestion.get("digestion_score", 0) >= 70:
-            return "压力带内消化较充分", "A_DIGEST", m
-
-        return "进入复合压力带内部", "B", m
-
-    if current_price < lower:
-        dist_to_lower = lower / current_price - 1
-
-        if dist_to_lower <= cfg.approach_pct:
-            return "靠近复合压力带下沿", "C_PLUS", m
-
-        return "压力带在上方但距离较远", "C", m
-
-    return "状态待人工复核", "REVIEW", m
+    return "否", "未达到高级突破标准", "等待实体、收盘、量能同时确认"
 
 
 # ============================================================
 # 7. 单股票分析
 # ============================================================
 
-def analyze_symbol(
-    symbol: str,
-    name: str,
-    daily: pd.DataFrame,
-    cfg: Config,
-) -> List[Dict]:
+def analyze_symbol(symbol: str, name: str, daily: pd.DataFrame, cfg: Config) -> List[Dict]:
     ns = normalize_symbol(symbol)
 
     if daily is None or daily.empty or len(daily) < 120:
         return []
 
-    current_price = float(daily["close"].iloc[-1])
+    daily = normalize_ohlcv(daily)
+    current_price = safe_float(daily["close"].iloc[-1])
     frames = build_period_frames(daily, cfg)
 
-    period_bands: Dict[str, List[Band]] = {}
+    all_anchors: List[Anchor] = []
 
-    for p, f in frames.items():
-        period_bands[p] = generate_period_bands(f, p, current_price, cfg)
+    for period, frame in frames.items():
+        anchors = extract_anchors_for_period(frame, period, current_price, cfg)
+        all_anchors.extend(anchors)
 
-    composites = merge_cross_period_bands(period_bands, current_price, cfg)
+    clusters = cluster_fixed_anchors(all_anchors, current_price, cfg)[: cfg.top_clusters_keep]
+    core1, core2, most = select_two_core_bands(clusters, current_price, cfg)
 
-    rows = []
+    break_line = most.core_line if most else np.nan
+    break_info = latest_daily_break_quality(frames["D"], break_line, cfg) if most else {}
+    space = estimate_space_and_rr(frames["D"], current_price, break_line, clusters, cfg) if most else {}
 
-    for rank, comp in enumerate(composites[: cfg.top_composites_per_symbol], start=1):
-        if comp.quality < cfg.min_composite_quality:
-            continue
+    tradable, trade_reason, next_action = tradable_decision(break_info, space, most, current_price)
 
-        state, verify_grade, metrics = classify_state(current_price, comp, frames["D"], cfg)
+    if clusters:
+        composite_lower = min(c.lower for c in clusters)
+        composite_upper = max(c.upper for c in clusters)
+    else:
+        composite_lower = np.nan
+        composite_upper = np.nan
 
-        if cfg.only_interesting:
-            interesting_states = [
-                "靠近复合压力带下沿",
-                "进入复合压力带内部",
-                "压力带内消化较充分",
-                "突破核心重叠压力带但未打穿最终上沿",
-                "突破最终压力上沿但质量待确认",
-                "一根日K打穿最终压力上沿",
-                "假突破失败/冲高回落",
-                "站上最终压力上沿但突破质量一般",
-            ]
+    if most:
+        if current_price > most.core_line * (1 + cfg.broke_buffer_pct):
+            most_note = "当前价已站上该线，重点看是否回踩不破；若站稳，该线转为支撑观察。"
+        else:
+            most_note = "当前价尚未有效突破该线，只有日线高级K线实体放量站上，才具备交易触发意义。"
+    else:
+        most_note = "未识别到足够稳定的核心压力带。"
 
-            if state not in interesting_states:
-                continue
+    row = {
+        "股票代码": ns,
+        "股票名称": name,
+        "当前价": round(current_price, 4),
 
-        source_summary = ";".join(comp.sources)
-        period_summary = "/".join(comp.periods)
+        "固定核心压力带1": fmt_band(core1.lower, core1.upper) if core1 else "",
+        "核心上沿1": round(core1.core_line, 4) if core1 else "",
+        "核心上沿1状态": core1.status if core1 else "",
+        "核心上沿1周期": periods_cn(core1),
+        "核心上沿1来源": sources_cn(core1),
+        "核心上沿1说明": core1.purpose if core1 else "",
 
-        component_brief = []
-        for b in comp.bands[:8]:
-            component_brief.append(
-                f"{b.period}:{b.lower:.2f}-{b.upper:.2f}:{b.source}:q{b.quality:.0f}"
-            )
+        "固定核心压力带2": fmt_band(core2.lower, core2.upper) if core2 else "",
+        "核心上沿2": round(core2.core_line, 4) if core2 else "",
+        "核心上沿2状态": core2.status if core2 else "",
+        "核心上沿2周期": periods_cn(core2),
+        "核心上沿2来源": sources_cn(core2),
+        "核心上沿2说明": core2.purpose if core2 else "",
 
-        row = {
-            "symbol": ns,
-            "name": name,
-            "current_price": round(current_price, 4),
-            "composite_rank": rank,
-            "core_lower": round(comp.core_lower, 4),
-            "core_upper": round(comp.core_upper, 4),
-            "union_lower": round(comp.lower, 4),
-            "final_upper": round(comp.final_upper, 4),
-            "dist_to_union_lower_pct": round(pct(current_price, comp.lower), 2),
-            "dist_to_final_upper_pct": round(pct(current_price, comp.final_upper), 2),
-            "current_state": state,
-            "verify_grade": verify_grade,
-            "composite_quality": round(comp.quality, 2),
-            "period_count": len(comp.periods),
-            "periods": period_summary,
-            "sources": source_summary,
-            "has_volume_profile": any("volume_profile" in s for s in comp.sources),
-            "has_max_bull_volume_high": any("max_bull_volume" in s for s in comp.sources),
-            "has_upper_wick_resonance": any("upper_wick" in s for s in comp.sources),
-            "has_gap_pressure": any("gap" in s for s in comp.sources),
-            "has_false_break_memory": any("false_break" in s for s in comp.sources),
-            "component_brief": " | ".join(component_brief),
-        }
+        "当前最重要压力带": fmt_band(most.lower, most.upper) if most else "",
+        "当前最重要突破确认线": round(most.core_line, 4) if most else "",
+        "当前最重要压力来源": sources_cn(most),
+        "当前最重要压力周期": periods_cn(most),
+        "当前最重要压力状态": most.status if most else "",
+        "当前最重要压力解释": most_note,
 
-        row.update(
-            {
-                k: round(v, 4) if isinstance(v, float) and not pd.isna(v) else v
-                for k, v in metrics.items()
-            }
-        )
+        "日线压力带": period_band_summary(clusters, "D"),
+        "周线压力带": period_band_summary(clusters, "W"),
+        "月线压力带": period_band_summary(clusters, "M"),
+        "季线压力带": period_band_summary(clusters, "Q"),
+        "年线压力带": period_band_summary(clusters, "Y"),
 
-        rows.append(row)
+        "辅助复合压力带": fmt_band(composite_lower, composite_upper),
+        "候选压力带数量": len(clusters),
+        "核心锚点明细": anchor_detail_cn(most),
 
-    return rows
+        "是否日线收盘站上确认线": break_info.get("日线是否收盘站上", ""),
+        "是否盘中突破但失败": break_info.get("日内是否摸过但失败", ""),
+        "突破K等级": break_info.get("突破K等级", ""),
+        "突破K评分": round(safe_float(break_info.get("突破K评分")), 2) if break_info else "",
+        "实体站上线比例": round(safe_float(break_info.get("实体站上线比例")), 4) if break_info else "",
+        "收盘位置": round(safe_float(break_info.get("收盘位置")), 4) if break_info else "",
+        "上影线比例": round(safe_float(break_info.get("上影线比例")), 4) if break_info else "",
+        "昨比量": round(safe_float(break_info.get("昨比量")), 4) if break_info else "",
+        "20日量比": round(safe_float(break_info.get("20日量比")), 4) if break_info else "",
+        "是否标准倍量": break_info.get("是否标准倍量", ""),
+        "是否健康放量": break_info.get("是否健康放量", ""),
+
+        "下一层压力": round(safe_float(space.get("下一层压力")), 4) if space and not pd.isna(safe_float(space.get("下一层压力"))) else "",
+        "第一目标": round(safe_float(space.get("第一目标")), 4) if space else "",
+        "第二目标": round(safe_float(space.get("第二目标")), 4) if space else "",
+        "强势目标": round(safe_float(space.get("强势目标")), 4) if space else "",
+        "交易防守位": round(safe_float(space.get("交易防守位")), 4) if space else "",
+        "第一目标收益风险比": round(safe_float(space.get("第一目标收益风险比")), 4) if space else "",
+        "空间等级": space.get("空间等级", "") if space else "",
+        "高位提示": space.get("高位提示", "") if space else "",
+
+        "是否可交易": tradable,
+        "可交易原因": trade_reason,
+        "下一步动作": next_action,
+        "放弃条件": "冲高回落、收盘跌回核心确认线、放量长上影、次日/三日不能守住突破K实体中位或核心线上沿",
+    }
+
+    if cfg.only_interesting:
+        if tradable == "否" and most and abs(most.core_line / current_price - 1) > 0.15:
+            return []
+
+    return [row]
 
 
 # ============================================================
@@ -1457,9 +1372,7 @@ def get_a_stock_list() -> pd.DataFrame:
     try:
         df = ak.stock_info_a_code_name()
     except Exception as e:
-        raise RuntimeError(
-            f"无法通过 AkShare 获取A股股票列表，请改用 --symbols-file 输入自定义股票池。err={e}"
-        )
+        raise RuntimeError(f"无法通过 AkShare 获取A股股票列表，请改用 --symbols-file 输入自定义股票池。err={e}")
 
     col_map = {}
 
@@ -1486,12 +1399,7 @@ def get_a_stock_list() -> pd.DataFrame:
     return df[["symbol", "name"]].drop_duplicates("symbol")
 
 
-def parse_symbols_arg(
-    symbols: Optional[str],
-    symbols_file: Optional[str],
-    use_all: bool,
-    limit: Optional[int],
-) -> pd.DataFrame:
+def parse_symbols_arg(symbols: Optional[str], symbols_file: Optional[str], use_all: bool, limit: Optional[int]) -> pd.DataFrame:
     items = []
 
     if symbols:
@@ -1510,7 +1418,6 @@ def parse_symbols_arg(
                 parts = re.split(r"[,，\s]+", line)
                 sym = normalize_symbol(parts[0])
                 nm = parts[1] if len(parts) > 1 else ""
-
                 items.append({"symbol": sym, "name": nm})
 
     if use_all:
@@ -1549,66 +1456,50 @@ def scan_symbols(
     iterator = symbol_df.iterrows()
 
     if tqdm is not None:
-        iterator = tqdm(symbol_df.iterrows(), total=len(symbol_df), desc="pressure-band-scan")
+        iterator = tqdm(symbol_df.iterrows(), total=len(symbol_df), desc="fixed-pressure-band-scan")
 
     for _, item in iterator:
         symbol = item["symbol"]
         name = item.get("name", "")
 
         try:
-            daily = load_daily(
-                symbol,
-                cache_dir=cache_dir,
-                start_date=start_date,
-                end_date=end_date,
-                refresh=refresh,
-            )
+            daily = load_daily(symbol, cache_dir=cache_dir, start_date=start_date, end_date=end_date, refresh=refresh)
 
             if daily.empty or len(daily) < 120:
-                failed.append(
-                    {
-                        "symbol": symbol,
-                        "name": name,
-                        "reason": "empty_or_too_few_bars",
-                    }
-                )
+                failed.append({"symbol": symbol, "name": name, "reason": "empty_or_too_few_bars"})
                 continue
 
             result = analyze_symbol(symbol, name, daily, cfg)
             rows.extend(result)
 
         except Exception as e:
-            failed.append(
-                {
-                    "symbol": symbol,
-                    "name": name,
-                    "reason": str(e)[:800],
-                }
-            )
+            failed.append({"symbol": symbol, "name": name, "reason": str(e)[:1000]})
             continue
 
     out = pd.DataFrame(rows)
     fail = pd.DataFrame(failed)
 
     if not out.empty:
-        grade_order = {
-            "S_TEST": 1,
-            "A_TEST": 2,
-            "A_DIGEST": 3,
-            "A_OBSERVE": 4,
-            "B_PLUS": 5,
-            "B": 6,
-            "C_PLUS": 7,
-            "D": 8,
-            "C": 9,
-            "REVIEW": 10,
-        }
+        tradable_order = {"是": 1, "谨慎观察": 2, "观察": 3, "否": 4}
+        out["_交易排序"] = out["是否可交易"].map(tradable_order).fillna(9)
 
-        out["grade_order"] = out["verify_grade"].map(grade_order).fillna(99)
-        out = out.sort_values(
-            ["grade_order", "composite_quality", "period_count"],
-            ascending=[True, False, False],
-        )
+        def grade_order(x):
+            s = str(x)
+            if "S级" in s:
+                return 1
+            if "A级" in s:
+                return 2
+            if "B级" in s:
+                return 3
+            if "D级" in s:
+                return 8
+            return 5
+
+        out["_突破排序"] = out["突破K等级"].apply(grade_order)
+        out["_RR排序"] = pd.to_numeric(out["第一目标收益风险比"], errors="coerce").fillna(0)
+
+        out = out.sort_values(["_交易排序", "_突破排序", "_RR排序"], ascending=[True, True, False])
+        out = out.drop(columns=["_交易排序", "_突破排序", "_RR排序"])
 
     return out, fail
 
@@ -1618,41 +1509,36 @@ def scan_symbols(
 # ============================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="独立压力带测试模块：验证多周期复合压力带识别是否准确。")
+    p = argparse.ArgumentParser(description="固定核心压力带验证模块：输出中文压力带交易验证表。")
 
     p.add_argument("--symbols", type=str, default=None, help="股票代码，逗号分隔，例如 SZ.000001,SH.600519")
     p.add_argument("--symbols-file", type=str, default=None, help="股票池文件，每行一个代码，可附名称")
     p.add_argument("--all", action="store_true", help="扫描全A股票池，自动过滤ST/退市名称")
     p.add_argument("--limit", type=int, default=None, help="限制扫描数量，用于测试")
 
-    p.add_argument("--cache-dir", type=str, default="data/cache/kline", help="K线缓存目录")
-    p.add_argument("--out", type=str, default="output/pressure_band_candidates.csv", help="候选输出CSV")
+    p.add_argument("--cache-dir", type=str, default="kline_cache", help="K线缓存目录，建议用 kline_cache")
+    p.add_argument("--out", type=str, default="output/pressure_band_candidates.csv", help="中文候选输出CSV")
     p.add_argument("--failed-out", type=str, default="output/pressure_band_failed.csv", help="失败清单CSV")
 
     p.add_argument("--start-date", type=str, default="20160101", help="开始日期，格式YYYYMMDD")
     p.add_argument("--end-date", type=str, default=pd.Timestamp.today().strftime("%Y%m%d"), help="结束日期，格式YYYYMMDD")
     p.add_argument("--refresh", action="store_true", help="强制刷新缓存")
 
-    p.add_argument("--base-bucket-pct", type=float, default=None, help="基础价格桶百分比，例如0.008")
-    p.add_argument("--min-quality", type=float, default=None, help="最小复合压力带质量分")
-    p.add_argument("--include-boring", action="store_true", help="输出普通压力带，不只输出靠近/进入/突破状态")
+    p.add_argument("--only-interesting", action="store_true", help="只输出较接近核心线或可交易的股票")
+    p.add_argument("--min-cluster-score", type=float, default=None, help="最低固定压力带质量分")
 
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-
     cfg = Config()
 
-    if args.base_bucket_pct is not None:
-        cfg.base_bucket_pct = float(args.base_bucket_pct)
+    if args.only_interesting:
+        cfg.only_interesting = True
 
-    if args.min_quality is not None:
-        cfg.min_composite_quality = float(args.min_quality)
-
-    if args.include_boring:
-        cfg.only_interesting = False
+    if args.min_cluster_score is not None:
+        cfg.min_cluster_score = float(args.min_cluster_score)
 
     cache_dir = ensure_dir(args.cache_dir)
     ensure_dir(Path(args.out).parent)
@@ -1660,8 +1546,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     symbol_df = parse_symbols_arg(args.symbols, args.symbols_file, args.all, args.limit)
 
-    print(f"[INFO] symbols={len(symbol_df)} start={args.start_date} end={args.end_date} cache={cache_dir}")
-    print(f"[INFO] config={asdict(cfg)}")
+    print(f"[INFO] symbols={len(symbol_df)} start={args.start_date} end={args.end_date} cache_dir={cache_dir}")
+    print("[INFO] model=固定核心压力带V2；核心上沿来自固定锚点，不使用动态漂移线作为最终确认线")
 
     out, failed = scan_symbols(
         symbol_df=symbol_df,
@@ -1680,32 +1566,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not failed.empty:
         failed.to_csv(args.failed_out, index=False, encoding="utf-8-sig")
     else:
-        pd.DataFrame(columns=["symbol", "name", "reason"]).to_csv(
-            args.failed_out,
-            index=False,
-            encoding="utf-8-sig",
-        )
+        pd.DataFrame(columns=["symbol", "name", "reason"]).to_csv(args.failed_out, index=False, encoding="utf-8-sig")
 
     print(f"[DONE] candidates={len(out)} -> {args.out}")
     print(f"[DONE] failed={len(failed)} -> {args.failed_out}")
 
     if not out.empty:
         show_cols = [
-            "symbol",
-            "name",
-            "current_price",
-            "union_lower",
-            "core_upper",
-            "final_upper",
-            "dist_to_union_lower_pct",
-            "dist_to_final_upper_pct",
-            "current_state",
-            "verify_grade",
-            "composite_quality",
-            "periods",
-            "sources",
+            "股票代码",
+            "股票名称",
+            "当前价",
+            "当前最重要压力带",
+            "当前最重要突破确认线",
+            "当前最重要压力状态",
+            "突破K等级",
+            "是否可交易",
+            "第一目标",
+            "交易防守位",
+            "第一目标收益风险比",
+            "下一步动作",
         ]
-
+        show_cols = [c for c in show_cols if c in out.columns]
         print(out[show_cols].head(20).to_string(index=False))
 
     return 0
