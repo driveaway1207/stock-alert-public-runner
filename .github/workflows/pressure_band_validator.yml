@@ -29,6 +29,47 @@ jobs:
             a-kline-cache-main-
             pressure-band-kline-cache-
 
+      - name: Check restored cache files
+        run: |
+          echo "========== 检查缓存目录 =========="
+          echo "当前目录："
+          pwd
+
+          echo "---------- data 目录 ----------"
+          if [ -d "data" ]; then
+            find data -maxdepth 4 -type f | head -50
+          else
+            echo "没有 data 目录"
+          fi
+
+          echo "---------- data/cache/kline 目录 ----------"
+          if [ -d "data/cache/kline" ]; then
+            echo "data/cache/kline 文件数量："
+            find data/cache/kline -type f | wc -l
+
+            echo "data/cache/kline 前50个文件："
+            find data/cache/kline -type f | head -50
+
+            echo "缓存目录大小："
+            du -sh data/cache/kline || true
+          else
+            echo "没有 data/cache/kline 目录"
+          fi
+
+          echo "---------- cache 目录 ----------"
+          if [ -d "cache" ]; then
+            echo "cache 文件数量："
+            find cache -type f | wc -l
+
+            echo "cache 前50个文件："
+            find cache -type f | head -50
+
+            echo "cache 目录大小："
+            du -sh cache || true
+          else
+            echo "没有 cache 目录"
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -47,6 +88,22 @@ jobs:
             --cache-dir data/cache/kline \
             --out output/pressure_band_candidates.csv \
             --failed-out output/pressure_band_failed.csv
+
+      - name: Check cache after run
+        run: |
+          echo "========== 运行后检查缓存 =========="
+          if [ -d "data/cache/kline" ]; then
+            echo "data/cache/kline 文件数量："
+            find data/cache/kline -type f | wc -l
+
+            echo "data/cache/kline 前50个文件："
+            find data/cache/kline -type f | head -50
+
+            echo "缓存目录大小："
+            du -sh data/cache/kline || true
+          else
+            echo "运行后仍然没有 data/cache/kline 目录"
+          fi
 
       - name: Upload output
         uses: actions/upload-artifact@v4
