@@ -109,6 +109,7 @@ class Config:
     # 输出
     top_n_preview: int = 300
     print_top: int = 30
+    quiet: bool = False
 
 
 PERIOD_NAME = {"D": "日线", "W": "周线", "M": "月线", "Q": "季线", "Y": "年线"}
@@ -1302,7 +1303,7 @@ def scan_symbols(symbol_df: pd.DataFrame, cfg: Config, cache_dir: Path, start_da
     rows = []
     failed = []
     iterator = symbol_df.iterrows()
-    if tqdm is not None:
+    if tqdm is not None and not cfg.quiet:
         iterator = tqdm(symbol_df.iterrows(), total=len(symbol_df), desc="actionable-pressure-breakout-scan")
 
     for _, item in iterator:
@@ -1357,6 +1358,7 @@ def split_outputs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     if df.empty:
         return {
             "actionable": df.copy(),
+            "near_actionable": df.copy(),
             "waiting": df.copy(),
             "failed_breakout": df.copy(),
             "validation": df.copy(),
@@ -1368,6 +1370,15 @@ def split_outputs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         (df["日线收盘站上确认线"].astype(str) == "是") &
         (df["盘中突破但收盘失败"].astype(str) == "否") &
         (pd.to_numeric(df["第一目标收益风险比"], errors="coerce").fillna(0) >= 1.5)
+    ].copy()
+
+    near_actionable = df[
+        (
+            df["是否可实操"].astype(str).isin(["观察"]) |
+            df["突破K等级"].astype(str).str.contains("B级", regex=True, na=False)
+        ) &
+        (df["日线收盘站上确认线"].astype(str) == "是") &
+        (df["盘中突破但收盘失败"].astype(str) == "否")
     ].copy()
 
     waiting = df[
@@ -1385,6 +1396,7 @@ def split_outputs(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
     return {
         "actionable": sort_results(actionable),
+        "near_actionable": sort_results(near_actionable),
         "waiting": sort_results(waiting),
         "failed_breakout": sort_results(failed),
         "validation": sort_results(df),
@@ -1398,6 +1410,7 @@ def save_outputs(df: pd.DataFrame, failed: pd.DataFrame, out_dir: Path) -> None:
     # 完整表
     outputs["validation"].to_csv(out_dir / "pressure_band_all_validation.csv", index=False, encoding="utf-8-sig")
     outputs["actionable"].to_csv(out_dir / "pressure_band_actionable.csv", index=False, encoding="utf-8-sig")
+    outputs["near_actionable"].to_csv(out_dir / "pressure_band_near_actionable.csv", index=False, encoding="utf-8-sig")
     outputs["waiting"].to_csv(out_dir / "pressure_band_waiting_breakout.csv", index=False, encoding="utf-8-sig")
     outputs["failed_breakout"].to_csv(out_dir / "pressure_band_failed_breakout.csv", index=False, encoding="utf-8-sig")
 
@@ -1416,6 +1429,7 @@ def save_outputs(df: pd.DataFrame, failed: pd.DataFrame, out_dir: Path) -> None:
     ]
     simple_cols = [c for c in simple_cols if c in outputs["actionable"].columns]
     outputs["actionable"][simple_cols].to_csv(out_dir / "pressure_band_actionable_精简版.csv", index=False, encoding="utf-8-sig")
+    outputs["near_actionable"][simple_cols].to_csv(out_dir / "pressure_band_near_actionable_精简版.csv", index=False, encoding="utf-8-sig")
 
 
 # ============================================================
@@ -1434,6 +1448,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--end-date", type=str, default=pd.Timestamp.today().strftime("%Y%m%d"), help="结束日期，格式YYYYMMDD")
     p.add_argument("--refresh", action="store_true", help="强制刷新缓存")
     p.add_argument("--min-rr", type=float, default=None, help="可实操最低收益风险比")
+    p.add_argument("--quiet", action="store_true", help="减少日志输出，不显示进度条")
     return p
 
 
@@ -1442,13 +1457,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = Config()
     if args.min_rr is not None:
         cfg.min_rr_actionable = float(args.min_rr)
+    cfg.quiet = bool(getattr(args, "quiet", False))
 
     cache_dir = ensure_dir(args.cache_dir)
     out_dir = ensure_dir(args.out_dir)
 
     symbol_df = parse_symbols_arg(args.symbols, args.symbols_file, args.all, args.limit)
-    print(f"[INFO] symbols={len(symbol_df)} cache_dir={cache_dir}")
-    print("[INFO] 目标：只筛选“核心固定压力带被日线高级K有效突破后”的可实操股票。")
+    if not cfg.quiet:
+        print(f"[INFO] symbols={len(symbol_df)} cache_dir={cache_dir}")
+        print("[INFO] 目标：只筛选“核心固定压力带被日线高级K有效突破后”的可实操股票。")
 
     df, failed = scan_symbols(
         symbol_df=symbol_df,
