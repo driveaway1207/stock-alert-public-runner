@@ -14,7 +14,7 @@ on:
       max_runtime_minutes:
         description: "每日增量更新最多运行分钟数"
         required: true
-        default: "45"
+        default: "110"
 
   schedule:
     # 北京时间 17:00 = UTC 09:00
@@ -31,7 +31,7 @@ concurrency:
 jobs:
   daily-update-and-alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: 拉取仓库代码
@@ -87,7 +87,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '45' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '110' }}
           SOFT_STOP_BUFFER_MINUTES: "5"
           PER_STOCK_TIMEOUT: "20"
           PROGRESS_EVERY: "100"
@@ -119,7 +119,22 @@ jobs:
           SHOULD_RUN=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(str(d.get('should_run_stock_alert', d.get('should_run', True))).lower())")
           TARGET_DATE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('target_trade_date', d.get('目标交易日', '')))")
           COVERAGE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('fresh_coverage_pct', d.get('最新K覆盖率', '')))")
-          REASON=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('gate_reason', d.get('reason', '')))" | head -c 500)
+          REASON=$(python - <<'PY'
+          import json
+          d=json.load(open('$STATE_FILE', encoding='utf-8'))
+          reason=d.get('gate_reason') or d.get('reason') or ''
+          if not reason:
+              stopped=d.get('stopped_by_time')
+              updated=d.get('updated_to_target_count', d.get('updated_成功更新到目标日数', ''))
+              total=d.get('cache_count', d.get('缓存股票数', d.get('total', '')))
+              coverage=d.get('fresh_coverage_pct', d.get('最新K覆盖率', ''))
+              if stopped:
+                  reason=f"stopped_by_time; coverage={coverage}; updated={updated}/{total}"
+              else:
+                  reason=f"coverage_not_enough; coverage={coverage}; updated={updated}/{total}"
+          print(str(reason)[:500])
+          PY
+          )
 
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
           echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
@@ -155,6 +170,72 @@ jobs:
           echo "target_date=${{ steps.data_gate.outputs.target_date }}"
           echo "coverage=${{ steps.data_gate.outputs.coverage }}"
           echo "reason=${{ steps.data_gate.outputs.reason }}"
+
+      - name: 数据未达标时推送Telegram诊断
+        if: ${{ steps.data_gate.outputs.should_run != 'true' && github.event.inputs.run_stock_alert != '0' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
+          COVERAGE: ${{ steps.data_gate.outputs.coverage }}
+          REASON: ${{ steps.data_gate.outputs.reason }}
+        run: |
+          echo "[RUN] 数据未达标Telegram诊断"
+          python - <<'PY'
+          import os, json, html, requests
+          token=os.environ.get('TELEGRAM_TOKEN','').strip()
+          chat_id=os.environ.get('TELEGRAM_CHAT_ID','').strip()
+          if not token or not chat_id:
+              print('telegram diagnostic skipped: missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID')
+              raise SystemExit(0)
+
+          state={}
+          try:
+              with open('outputs/daily_kline_update_state.json', encoding='utf-8') as f:
+                  state=json.load(f)
+          except Exception as e:
+              print('state read failed:', e)
+
+          def pick(*keys, default=''):
+              for k in keys:
+                  if k in state and state[k] not in (None, ''):
+                      return state[k]
+              return default
+
+          target=os.environ.get('TARGET_DATE') or pick('target_trade_date','目标交易日')
+          coverage=os.environ.get('COVERAGE') or pick('fresh_coverage_pct','最新K覆盖率')
+          reason=os.environ.get('REASON') or pick('gate_reason','reason')
+          updated=pick('updated_to_target_count','updated_成功更新到目标日数', default='')
+          processed=pick('processed_count','本轮处理记录数', default='')
+          total=pick('cache_count','缓存股票数','total', default='')
+          stopped=pick('stopped_by_time', default='')
+          failed=pick('failed_count','failed_失败数', default='')
+          elapsed=pick('elapsed','耗时', default='')
+          if not reason:
+              reason=f"coverage_not_enough; stopped_by_time={stopped}; updated={updated}/{total}"
+
+          lines=[
+              '⚠️ <b>一号员工今日未运行正式推荐</b>',
+              '',
+              f'目标交易日：<code>{html.escape(str(target))}</code>',
+              f'数据覆盖率：<code>{html.escape(str(coverage))}</code>',
+              f'已更新到目标日：<code>{html.escape(str(updated))}/{html.escape(str(total))}</code>',
+              f'本轮处理：<code>{html.escape(str(processed))}</code>',
+              f'失败数：<code>{html.escape(str(failed))}</code>',
+              f'时间保护触发：<code>{html.escape(str(stopped))}</code>',
+              f'耗时：<code>{html.escape(str(elapsed))}</code>',
+              '',
+              f'原因：<code>{html.escape(str(reason))}</code>',
+              '',
+              '处理建议：可直接 Re-run all jobs；缓存已保存时，下一轮会继续补剩余股票。'
+          ]
+          text='\n'.join(lines)
+          url=f'https://api.telegram.org/bot{token}/sendMessage'
+          r=requests.post(url, data={'chat_id':chat_id, 'text':text, 'parse_mode':'HTML'}, timeout=20)
+          print('telegram diagnostic status:', r.status_code)
+          if not r.ok:
+              print(r.text[:500])
+          PY
 
       - name: 显示输出文件
         if: always()
