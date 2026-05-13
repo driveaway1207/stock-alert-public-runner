@@ -7,6 +7,10 @@ on:
         description: "是否运行一号员工选股：1=运行，0=只更新缓存"
         required: true
         default: "1"
+      skip_kline_update:
+        description: "是否跳过每日K线更新、直接使用已恢复缓存：1=跳过更新，0=正常更新"
+        required: true
+        default: "0"
       lookback_days:
         description: "落后股票增量回看自然日"
         required: true
@@ -84,6 +88,7 @@ jobs:
           ls -lah kline_cache/_full_history_status.csv || true
 
       - name: 每日增量更新A股K线缓存
+        if: ${{ github.event.inputs.skip_kline_update != '1' }}
         env:
           PYTHONUNBUFFERED: "1"
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
@@ -94,6 +99,61 @@ jobs:
         run: |
           echo "[RUN] 每日增量更新A股K线缓存"
           python -u tools/update_kline_cache_daily.py
+
+      - name: 跳过K线更新时生成昨日缓存闸门状态
+        if: ${{ github.event.inputs.skip_kline_update == '1' }}
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "[SKIP] 本次跳过每日K线更新，直接使用已恢复的 kline_cache 缓存。"
+          mkdir -p outputs
+          python - <<'PY'
+          import os, json, glob
+          import pandas as pd
+          from datetime import datetime
+
+          files=[f for f in glob.glob('kline_cache/*.csv') if not os.path.basename(f).startswith('_')]
+          latest_dates=[]
+          readable=0
+          for f in files[:]:
+              try:
+                  df=pd.read_csv(f)
+                  if df.empty:
+                      continue
+                  # 兼容 date/日期/trade_date 字段
+                  date_col=None
+                  for c in ['date','日期','trade_date','交易日期']:
+                      if c in df.columns:
+                          date_col=c
+                          break
+                  if date_col is None:
+                      continue
+                  s=df[date_col].dropna().astype(str)
+                  if len(s)==0:
+                      continue
+                  latest_dates.append(s.iloc[-1])
+                  readable += 1
+              except Exception:
+                  pass
+
+          target=max(latest_dates) if latest_dates else ''
+          state={
+              'should_run_stock_alert': True,
+              'should_run': True,
+              'target_trade_date': target,
+              'fresh_coverage_pct': 'skip_update_use_restored_cache',
+              'gate_reason': f'skip_kline_update=1; use restored kline_cache; readable_files={readable}; target_trade_date={target}',
+              'skip_kline_update': True,
+              'cache_count': len(files),
+              'readable_cache_files': readable,
+              'generated_at': datetime.now().isoformat(timespec='seconds'),
+          }
+          with open('outputs/daily_kline_update_state.json','w',encoding='utf-8') as f:
+              json.dump(state,f,ensure_ascii=False,indent=2)
+          with open('outputs/daily_kline_update_summary_skip_update.json','w',encoding='utf-8') as f:
+              json.dump(state,f,ensure_ascii=False,indent=2)
+          print(json.dumps(state,ensure_ascii=False,indent=2))
+          PY
 
       - name: 缓存验收并生成模型股票池
         env:
@@ -304,7 +364,10 @@ jobs:
           COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
 
-          if [ "$COUNT" -ge 3000 ]; then
+          if [ "${{ github.event.inputs.skip_kline_update }}" = "1" ]; then
+            echo "save_cache=false" >> "$GITHUB_OUTPUT"
+            echo "本次 skip_kline_update=1，仅用旧缓存跑模型，不保存缓存，避免中午误覆盖。"
+          elif [ "$COUNT" -ge 3000 ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
             echo "缓存文件数 $COUNT >= 3000，允许保存缓存。"
           else
