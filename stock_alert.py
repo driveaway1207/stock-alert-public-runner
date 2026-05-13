@@ -1,4 +1,4 @@
-# V19.3 FULL HOTFIX - base observation subscores + deep score 200 + py_compile passed
+# V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
 import time
@@ -29,6 +29,10 @@ def fmt_seconds(sec):
 import pandas as pd
 import numpy as np
 import requests
+
+# Telegram发送函数兜底引用，防止异常处理阶段 NameError。
+_ORIGINAL_SEND_TELEGRAM = None
+
 
 try:
     import akshare as ak
@@ -8153,6 +8157,23 @@ def _v16_load_font(size=18, bold=False):
     return None
 
 
+
+def _v16_text_short(x, max_chars=16):
+    """V16/V19表格文本截断兜底。"""
+    try:
+        s = "" if x is None else str(x)
+    except Exception:
+        s = ""
+    s = s.replace("\n", " ").replace("\r", " ").strip()
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        max_chars = 16
+    if max_chars <= 0:
+        return s
+    return s if len(s) <= max_chars else s[:max_chars-1] + "…"
+
+
 def _v16_render_table_png(title, columns, rows, output_path, max_col_chars=None):
     """生成Telegram真正表格图片。若matplotlib不可用则写CSV兜底。"""
     try:
@@ -8323,14 +8344,42 @@ def send_telegram_photo(image_path, caption=""):
         return False
 
 
+_ORIGINAL_SEND_TELEGRAM = send_telegram
+
+
 def send_telegram(message):
-    ok = _ORIGINAL_SEND_TELEGRAM(message) if _ORIGINAL_SEND_TELEGRAM else False
+    ok = globals().get('_ORIGINAL_SEND_TELEGRAM')(message) if globals().get('_ORIGINAL_SEND_TELEGRAM') else False
     global TELEGRAM_PENDING_IMAGES
     if TELEGRAM_PENDING_IMAGES:
         for img, cap in TELEGRAM_PENDING_IMAGES:
             send_telegram_photo(img, cap)
         TELEGRAM_PENDING_IMAGES = []
     return ok
+
+
+
+def v14_diagnostics_text(diags, limit=5):
+    """V14/V19诊断文本兜底，避免最终报告阶段因旧函数缺失失败。"""
+    if not diags:
+        return ""
+    lines = []
+    for i, d in enumerate(diags[:limit], 1):
+        if isinstance(d, dict):
+            code = d.get("code") or d.get("symbol") or d.get("股票代码") or ""
+            name = d.get("name") or d.get("股票名称") or ""
+            reason = (
+                d.get("reason")
+                or d.get("diagnosis")
+                or d.get("v14_block_reason")
+                or d.get("v19_note")
+                or d.get("note")
+                or ""
+            )
+            score = d.get("v16_final_score", d.get("v14_final_score", d.get("total_score", "")))
+            lines.append(f"{i}. {code} {name} | 分数={score} | {reason}".strip())
+        else:
+            lines.append(f"{i}. {str(d)}")
+    return "\n".join(lines)
 
 
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
