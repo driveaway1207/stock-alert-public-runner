@@ -8512,6 +8512,22 @@ def build_error_message(e):
     return "\n".join(msg)
 
 
+
+def _v16_grade_rank(grade):
+    """V16/V19候选等级排序兜底，避免旧版本函数名缺失导致主流程失败。"""
+    if grade is None:
+        return 0
+    g = str(grade).strip().upper()
+    order = {
+        "S+": 90, "S": 85, "S-": 80,
+        "A+": 75, "A": 70, "A-": 65,
+        "B+": 55, "B": 50, "B-": 45,
+        "C+": 35, "C": 30, "C-": 25,
+        "D": 10, "": 0,
+    }
+    return order.get(g, 0)
+
+
 def main():
     start_ts = time.time()
 
