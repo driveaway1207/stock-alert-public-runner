@@ -1,4 +1,4 @@
-# V19.4 FULL BUILD - resonance core line fused into pressure band + price plan - py_compile passed
+# V19.4 FINAL BUILD - resonance core line + near/far pressure merge + price plan - py_compile passed
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -284,6 +284,12 @@ V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COU
 V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_4_score_cards.json")
 V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_4_daily_report.txt")
 V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_report.txt")
+
+# V19.4压力/共振线合并规则：
+# 距离<=3%：默认视为同一压力区；3%-5%：若结构/成交密集区相关则合并；>5%：通常拆层。
+# 若两线合并为同一区域，有效突破确认价取更高线/更高上沿；仅突破较低线不给高分。
+V19_PRESSURE_MERGE_NEAR_PCT = safe_float(os.environ.get("V19_PRESSURE_MERGE_NEAR_PCT", "0.03"), 0.03)
+V19_PRESSURE_MERGE_MID_PCT = safe_float(os.environ.get("V19_PRESSURE_MERGE_MID_PCT", "0.05"), 0.05)
 
 # V15：选股模型多周期供需压力带突破模型开关与参数。
 ENABLE_XHU_PRESSURE_BREAKOUT = os.environ.get("ENABLE_XHU_PRESSURE_BREAKOUT", "1")
@@ -5307,7 +5313,25 @@ def _xhu_merge_multi_period_zones(zones, current_close):
     related_ids = set().union(*zone_ids[s:e+1])
     # 相关压力区：与核心区有重叠或边界距离较近的周期带。用其并集计算最终压力上沿。
     for zi, z in enumerate(zones):
-        if z["upper"] >= core_lower * 0.985 and z["lower"] <= core_upper * 1.04:
+        # V19.4 near/far rule:
+        # - 与核心区<=3%默认合并；
+        # - 3%-5%之间，如果同属压力密集/共振结构，也合并为同一区域；
+        # - >5%通常拆层，不把远端压力硬拉入当前确认价。
+        z_low = safe_float(z.get("lower", 0)); z_up = safe_float(z.get("upper", 0))
+        if z_up <= 0 or z_low <= 0:
+            continue
+        gap_up = max(0.0, z_low / max(core_upper, 1e-9) - 1.0)
+        gap_down = max(0.0, core_lower / max(z_up, 1e-9) - 1.0)
+        gap = max(gap_up, gap_down)
+        overlap = z_up >= core_lower * 0.985 and z_low <= core_upper * 1.015
+        near = gap <= V19_PRESSURE_MERGE_NEAR_PCT
+        mid_related = gap <= V19_PRESSURE_MERGE_MID_PCT and (
+            bool(z.get("resonance_core_line", 0))
+            or safe_float(z.get("anchor_score", 0)) >= 8
+            or safe_float(z.get("density_score", 0)) >= 25
+            or safe_float(z.get("quality_score", 0)) >= 45
+        )
+        if overlap or near or mid_related:
             related_ids.add(zi)
     related = [zones[i] for i in sorted(related_ids)] if related_ids else zones
 
@@ -5349,7 +5373,14 @@ def _xhu_merge_multi_period_zones(zones, current_close):
         f"最终上沿{union_upper:.2f}，参与周期{','.join(sorted(set(z['period'] for z in related)))}，等级{grade}"
     )
     if resonance_core_line > 0:
-        desc += f"；共振核心线{resonance_core_line:.2f}（{resonance_desc}）"
+        gap_to_final = abs(safe_float(union_upper) / max(resonance_core_line, 1e-9) - 1.0)
+        if gap_to_final <= V19_PRESSURE_MERGE_NEAR_PCT:
+            merge_note = "同区近线，确认价取高线"
+        elif gap_to_final <= V19_PRESSURE_MERGE_MID_PCT:
+            merge_note = "同区中距，突破高线才给较高分"
+        else:
+            merge_note = "与上方压力拆层"
+        desc += f"；共振核心线{resonance_core_line:.2f}（{resonance_desc}，{merge_note}）"
     return {
         "valid": True,
         "core_lower": float(core_lower), "core_upper": float(core_upper),
@@ -5359,6 +5390,8 @@ def _xhu_merge_multi_period_zones(zones, current_close):
         "pressure_zone_grade": grade, "period_count": int(period_count), "desc": desc,
         "resonance_core_line": float(resonance_core_line),
         "resonance_core_desc": resonance_desc,
+        "effective_confirm_price": float(union_upper),
+        "pressure_merge_gap_pct": float(abs(safe_float(union_upper) / max(resonance_core_line, 1e-9) - 1.0) if resonance_core_line > 0 else 0.0),
         "related_zones": related[:8],
     }
 
@@ -5516,6 +5549,8 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_fake_breakout_high": 0.0,
         "xhu_resonance_core_line": 0.0,
         "xhu_resonance_core_desc": "",
+        "xhu_effective_confirm_price": 0.0,
+        "xhu_pressure_merge_gap_pct": 0.0,
         "xhu_pressure_json": "[]",
     }
     if ENABLE_XHU_PRESSURE_BREAKOUT != "1" or df is None or len(df) < 180:
@@ -5564,6 +5599,8 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_pressure_desc": composite.get("desc", ""),
         "xhu_resonance_core_line": float(composite.get("resonance_core_line", 0.0)),
         "xhu_resonance_core_desc": composite.get("resonance_core_desc", ""),
+        "xhu_effective_confirm_price": float(composite.get("effective_confirm_price", composite.get("final_union_upper", 0.0))),
+        "xhu_pressure_merge_gap_pct": float(composite.get("pressure_merge_gap_pct", 0.0)),
         "xhu_breakout_desc": day.get("desc", ""),
         "xhu_fake_breakout_count": int(day.get("fake_breakout_count", 0)),
         "xhu_fake_breakout_high": float(day.get("fake_breakout_high", 0.0)),
@@ -8777,7 +8814,7 @@ def build_v19_price_plan(s):
     prev_close = _v19_first_float(s, "prev_close", "pre_close", default=close)
     core_low = _v19_first_float(s, "xhu_pressure_core_lower", "core_pressure_lower", "pressure_core_lower")
     core_up = _v19_first_float(s, "xhu_pressure_core_upper", "core_pressure_upper", "pressure_core_upper")
-    final_up = _v19_first_float(s, "xhu_pressure_union_upper", "xhu_final_union_upper", "final_pressure_upper", "pressure_final_upper")
+    final_up = _v19_first_float(s, "xhu_effective_confirm_price", "xhu_pressure_union_upper", "xhu_final_union_upper", "final_pressure_upper", "pressure_final_upper")
     resonance_line = _v19_first_float(s, "xhu_resonance_core_line", "resonance_core_line", "main_resonance_line")
     structure_key = _v19_first_float(s, "structure_key_level", "key_level", "neckline", "platform_upper")
     support = _v19_first_float(s, "support_cluster", "key_support", "platform_support")
@@ -8964,6 +9001,8 @@ def _v19_compact_row(r, pool=""):
         "final_pressure_upper": safe_float(r.get("xhu_pressure_union_upper", r.get("xhu_final_union_upper", 0))),
         "xhu_resonance_core_line": safe_float(r.get("xhu_resonance_core_line", r.get("resonance_core_line", 0))),
         "xhu_resonance_core_desc": r.get("xhu_resonance_core_desc", r.get("resonance_core_desc", "")),
+        "xhu_effective_confirm_price": safe_float(r.get("xhu_effective_confirm_price", r.get("effective_confirm_price", 0))),
+        "xhu_pressure_merge_gap_pct": safe_float(r.get("xhu_pressure_merge_gap_pct", r.get("pressure_merge_gap_pct", 0))),
         "confirm_condition": build_confirm_condition(r),
         "giveup_condition": build_giveup_condition(r),
         "price_plan": build_v19_price_plan(r),
