@@ -1,4 +1,4 @@
-# V19.3 FULL BUILD - price plan Telegram report + 200 deep candidate pool + audited hotfix
+# V19.4 FULL BUILD - resonance core line fused into pressure band + price plan - py_compile passed
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -281,9 +281,9 @@ V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 # 压力带突破、倍量、回踩确认、空头钝化、时间窗口等均为评分项，不作为单独必要条件。
 V19_ENABLE_TOP3_FIXED = os.environ.get("V19_ENABLE_TOP3_FIXED", "1")
 V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3"))))
-V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_3_score_cards.json")
-V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_3_daily_report.txt")
-V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_3_review_report.txt")
+V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_4_score_cards.json")
+V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_4_daily_report.txt")
+V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_report.txt")
 
 # V15：选股模型多周期供需压力带突破模型开关与参数。
 ENABLE_XHU_PRESSURE_BREAKOUT = os.environ.get("ENABLE_XHU_PRESSURE_BREAKOUT", "1")
@@ -4784,7 +4784,268 @@ def _xhu_assign_ohlcv_to_profile(pdf, edges):
     return prof
 
 
-def _xhu_structural_anchors(pdf, period="D"):
+
+# ========================= V19.4 共振核心线/支撑转压力融合模块 =========================
+# 目的：
+# 1）不再只用右侧近端前高作为“最终压力”；
+# 2）先寻找共振点最多、级别最高的核心线，再用该核心线校准核心压力带；
+# 3）次高/次低收盘价共振优先级最高，其次实体顶/实体底，再其次上下影线高低点；
+# 4）该逻辑不是单独打分项，而是直接融入压力带定位与报告价格计划。
+
+def _xhu_local_turning_points(pdf, n=5, tail=260):
+    """提取局部次高点/次低点。返回索引列表，避免只看绝对最高/最低。"""
+    if pdf is None or pdf.empty:
+        return [], []
+    d = pdf.tail(int(tail)).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(d) < n * 2 + 3:
+        return [], []
+    highs, lows = [], []
+    for i in range(n, len(d) - n):
+        hi = safe_float(d.loc[i, "high"])
+        lo = safe_float(d.loc[i, "low"])
+        if hi <= 0 or lo <= 0:
+            continue
+        if hi >= safe_float(d.loc[i-n:i+n, "high"].max()):
+            highs.append(i)
+        if lo <= safe_float(d.loc[i-n:i+n, "low"].min()):
+            lows.append(i)
+    return highs, lows
+
+
+def _xhu_cluster_price_points(points, tolerance_pct=0.008):
+    """对价格点做百分比聚类。收盘/实体点自然获得更高定位权。"""
+    pts = [p for p in points if safe_float(p.get("price", 0)) > 0]
+    if not pts:
+        return []
+    pts = sorted(pts, key=lambda x: safe_float(x.get("price", 0)))
+    clusters = []
+    for p in pts:
+        price = safe_float(p.get("price", 0))
+        placed = False
+        for cl in clusters:
+            center = safe_float(cl.get("center", 0))
+            if center > 0 and abs(price / center - 1) <= tolerance_pct:
+                cl["points"].append(p)
+                total_w = sum(max(0.1, safe_float(x.get("weight", 1))) for x in cl["points"])
+                cl["center"] = sum(safe_float(x["price"]) * max(0.1, safe_float(x.get("weight", 1))) for x in cl["points"]) / max(total_w, 1e-9)
+                cl["lower"] = min(safe_float(x["price"]) for x in cl["points"])
+                cl["upper"] = max(safe_float(x["price"]) for x in cl["points"])
+                placed = True
+                break
+        if not placed:
+            clusters.append({"center": price, "lower": price, "upper": price, "points": [p]})
+
+    for cl in clusters:
+        kinds = {}
+        weighted = 0.0
+        close_points = 0
+        entity_points = 0
+        wick_points = 0
+        for p in cl["points"]:
+            k = p.get("kind", "")
+            kinds[k] = kinds.get(k, 0) + 1
+            w = max(0.1, safe_float(p.get("weight", 1)))
+            weighted += w
+            if "收盘" in k:
+                close_points += 1
+            elif "实体" in k:
+                entity_points += 1
+            elif "影线" in k or "高点" in k or "低点" in k:
+                wick_points += 1
+        priority_bonus = close_points * 2.6 + entity_points * 1.6 + wick_points * 0.8
+        cl["weighted_count"] = float(weighted)
+        cl["priority_score"] = float(weighted + priority_bonus)
+        cl["kinds"] = kinds
+        cl["close_points"] = int(close_points)
+        cl["entity_points"] = int(entity_points)
+        cl["wick_points"] = int(wick_points)
+        cl["desc"] = "、".join([f"{k}{v}次" for k, v in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))])
+    return sorted(clusters, key=lambda x: (safe_float(x.get("priority_score", 0)), len(x.get("points", []))), reverse=True)
+
+
+def _xhu_resonance_core_lines(pdf, period="D", current_close=0.0, lookback=260):
+    """
+    V19.4：寻找“共振点最多、级别最高”的核心压力/支撑线。
+    重点：次高/次低收盘价共振 > 实体顶/实体底共振 > 上下影线共振。
+    输出的是锚点/校准线，不是单独打分项。
+    """
+    if pdf is None or pdf.empty:
+        return []
+    d = pdf.tail(int(lookback)).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(d) < 40:
+        return []
+
+    cur = current_close if current_close > 0 else safe_float(d.iloc[-1].get("close", 0))
+    if cur <= 0:
+        cur = safe_float(d.iloc[-1].get("close", 0))
+    n = 3 if period == "D" else (4 if period == "W" else 2)
+    highs, lows = _xhu_local_turning_points(d, n=n, tail=min(len(d), lookback))
+
+    points = []
+    for idx in highs:
+        r = d.iloc[idx]
+        op = safe_float(r.get("open", 0)); hi = safe_float(r.get("high", 0)); lo = safe_float(r.get("low", 0)); cl = safe_float(r.get("close", 0))
+        if hi <= 0 or lo <= 0:
+            continue
+        body_top = max(op, cl)
+        body_bottom = min(op, cl)
+        rng = max(hi - lo, 1e-9)
+        upper_ratio = max(0.0, hi - body_top) / rng
+        close_pos = (cl - lo) / rng
+        points.append({"price": cl, "weight": 4.2, "kind": "次高收盘共振", "period": period})
+        points.append({"price": body_top, "weight": 2.8, "kind": "次高实体顶共振", "period": period})
+        if upper_ratio >= 0.22 or close_pos <= 0.68:
+            points.append({"price": hi, "weight": 1.5 + min(1.4, upper_ratio * 2.0), "kind": "次高上影线共振", "period": period})
+        points.append({"price": body_bottom, "weight": 1.5, "kind": "次高实体底参考", "period": period})
+
+    for idx in lows:
+        r = d.iloc[idx]
+        op = safe_float(r.get("open", 0)); hi = safe_float(r.get("high", 0)); lo = safe_float(r.get("low", 0)); cl = safe_float(r.get("close", 0))
+        if hi <= 0 or lo <= 0:
+            continue
+        body_top = max(op, cl)
+        body_bottom = min(op, cl)
+        rng = max(hi - lo, 1e-9)
+        lower_ratio = max(0.0, body_bottom - lo) / rng
+        close_pos = (cl - lo) / rng
+        points.append({"price": cl, "weight": 4.5, "kind": "次低收盘共振", "period": period})
+        points.append({"price": body_bottom, "weight": 3.0, "kind": "次低实体底共振", "period": period})
+        points.append({"price": body_top, "weight": 1.6, "kind": "次低实体顶参考", "period": period})
+        if lower_ratio >= 0.22 or close_pos >= 0.38:
+            points.append({"price": lo, "weight": 1.4 + min(1.4, lower_ratio * 2.0), "kind": "次低下影线共振", "period": period})
+
+    try:
+        plat = evaluate_platform_quality(d.tail(min(len(d), 120)))
+        if safe_float(plat.get("score", 0)) >= 3.5:
+            top = safe_float(plat.get("top", 0))
+            bottom = safe_float(plat.get("bottom", 0))
+            if top > 0:
+                points.append({"price": top, "weight": 3.5, "kind": "平台/凹口上沿共振", "period": period})
+            if bottom > 0:
+                points.append({"price": bottom, "weight": 4.0, "kind": "平台下沿/支撑转压力共振", "period": period})
+    except Exception:
+        pass
+
+    tol = 0.006 if period == "D" else (0.008 if period == "W" else 0.012)
+    clusters = _xhu_cluster_price_points(points, tolerance_pct=tol)
+    anchors = []
+    for cl in clusters[:8]:
+        center = safe_float(cl.get("center", 0))
+        if center <= 0:
+            continue
+        dist = center / max(cur, 1e-9) - 1
+        if dist < -0.06 or dist > 0.16:
+            continue
+        pscore = safe_float(cl.get("priority_score", 0))
+        count = len(cl.get("points", []))
+        if count < 3 and pscore < 8:
+            continue
+        line_type = "共振核心压力线" if center >= cur * 0.985 else "共振核心支撑线"
+        anchors.append({
+            "price": float(center),
+            "type": f"{line_type}:{cl.get('desc','')}",
+            "weight": float(min(4.8, 2.2 + pscore / 8.0)),
+            "resonance_core": True,
+            "resonance_desc": cl.get("desc", ""),
+            "resonance_count": int(count),
+            "resonance_priority": float(pscore),
+            "band_low": float(center * (1 - max(0.0045, tol * 0.75))),
+            "band_high": float(center * (1 + max(0.0065, tol * 0.95))),
+            "period": period,
+        })
+    return anchors
+
+
+def _xhu_support_resistance_flip_lines(pdf, period="D", current_close=0.0, lookback=260):
+    """
+    识别左侧平台下沿支撑转压力。该线优先融入主压力带。
+    条件：历史平台/密集区下沿 + 多次支撑/收盘共振 + 后续有效跌破 + 当前从下方接近。
+    """
+    if pdf is None or pdf.empty:
+        return []
+    d = pdf.tail(int(lookback)).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(d) < 80:
+        return []
+    cur = current_close if current_close > 0 else safe_float(d.iloc[-1].get("close", 0))
+    if cur <= 0:
+        return []
+
+    lines = []
+    for w in [60, 90, 120, 180, min(250, len(d))]:
+        if w < 50 or len(d) < w:
+            continue
+        seg = d.iloc[-w:].copy().reset_index(drop=True)
+        hist = seg.iloc[:-10] if len(seg) > 70 else seg
+        if len(hist) < 40:
+            continue
+        body_bottom = pd.concat([hist["open"], hist["close"]], axis=1).min(axis=1)
+        candidate_levels = [
+            safe_float(body_bottom.quantile(0.20)),
+            safe_float(hist["low"].quantile(0.25)),
+            safe_float(hist["close"].quantile(0.25)),
+        ]
+        for level in candidate_levels:
+            if level <= 0:
+                continue
+            dist = level / max(cur, 1e-9) - 1
+            if dist < -0.03 or dist > 0.10:
+                continue
+            tol = 0.010 if period == "D" else 0.014
+            bb = pd.concat([hist["open"], hist["close"]], axis=1).min(axis=1)
+            touch_mask = (hist["low"] <= level * (1 + tol)) & (hist["close"] >= level * (1 - tol))
+            close_res = (abs(hist["close"] / level - 1) <= tol)
+            entity_res = (abs(bb / level - 1) <= tol)
+            touch_count = int(touch_mask.sum())
+            resonance_count = int(close_res.sum() * 2 + entity_res.sum() + touch_count)
+            after = d.tail(60)
+            broken_days = int((after["close"] < level * 0.992).sum()) if len(after) else 0
+            recent_reclaimed = bool(len(d.tail(10)[d.tail(10)["close"] > level * 1.006]) >= 3)
+            if touch_count >= 3 and resonance_count >= 8 and broken_days >= 2 and not recent_reclaimed:
+                priority = resonance_count + touch_count * 1.5 + (3 if 0 <= dist <= 0.05 else 0)
+                lines.append({
+                    "price": float(level),
+                    "type": f"支撑转压力核心线:平台下沿/收盘实体共振{resonance_count}点",
+                    "weight": float(min(5.2, 3.2 + priority / 18.0)),
+                    "resonance_core": True,
+                    "support_resistance_flip": True,
+                    "resonance_desc": f"平台下沿支撑转压力，触碰{touch_count}次，共振{resonance_count}点",
+                    "resonance_count": int(resonance_count),
+                    "resonance_priority": float(priority),
+                    "band_low": float(level * 0.995),
+                    "band_high": float(level * 1.007),
+                    "period": period,
+                })
+    if not lines:
+        return []
+    clusters = _xhu_cluster_price_points(lines, tolerance_pct=0.008 if period == "D" else 0.012)
+    out = []
+    for cl in clusters[:4]:
+        pts = cl.get("points", [])
+        best = sorted(pts, key=lambda x: safe_float(x.get("resonance_priority", x.get("weight", 0))), reverse=True)[0]
+        center = safe_float(cl.get("center", best.get("price", 0)))
+        best = dict(best)
+        best["price"] = float(center)
+        best["band_low"] = float(min(safe_float(p.get("band_low", p.get("price", center))) for p in pts))
+        best["band_high"] = float(max(safe_float(p.get("band_high", p.get("price", center))) for p in pts))
+        out.append(best)
+    return out
+
+# ======================= V19.4 共振核心线/支撑转压力融合模块 END =======================
+
+
+def _xhu_structural_anchors(pdf, period="D", current_close=0.0):
     anchors = []
     if pdf is None or pdf.empty:
         return anchors
@@ -4818,6 +5079,16 @@ def _xhu_structural_anchors(pdf, period="D"):
         fb = d[(d["high"] >= roll_high * 1.003) & (d["close"] < d["high"] * 0.985) & (upper_ratio >= 0.30)]
         for _, r in fb.tail(3).iterrows():
             anchors.append({"price": safe_float(r.get("high")), "type": "假突破/长上影高点", "weight": 1.9})
+    # V19.4：把“共振点最多、级别最高”的核心线直接并入结构锚点。
+    # 收盘共振/实体共振优先于影线共振；支撑转压力主位优先级高于普通近端小高点。
+    try:
+        anchors.extend(_xhu_resonance_core_lines(d, period=period, current_close=current_close, lookback=min(len(d), 260 if period in ("D", "W") else 160)))
+    except Exception:
+        pass
+    try:
+        anchors.extend(_xhu_support_resistance_flip_lines(d, period=period, current_close=current_close, lookback=min(len(d), 260 if period in ("D", "W") else 160)))
+    except Exception:
+        pass
     return [a for a in anchors if safe_float(a.get("price", 0)) > 0]
 
 
@@ -4892,21 +5163,30 @@ def _xhu_extract_period_pressure_zones(period_df, period="D", lookback=250, curr
             density = safe_float(seg["density_score"].mean())
             peak = safe_float(seg["density_score"].max())
             reaction, rdesc = _xhu_score_zone_reaction(seg)
-            anchors = _xhu_structural_anchors(d, period)
+            anchors = _xhu_structural_anchors(d, period, current_close=cur)
             anchor_hits = []
             tol = max(bucket_pct * 2.2, 0.012)
             adj_lower, adj_upper = lower, upper
             anchor_score = 0.0
             for a in anchors:
                 price = safe_float(a.get("price", 0)); wt = safe_float(a.get("weight", 1.0))
-                if lower * (1 - tol) <= price <= upper * (1 + tol):
+                # V19.4：共振核心线/支撑转压力线允许以自己的窄压力带参与校准，而不被普通成交密集桶吞没。
+                a_low = safe_float(a.get("band_low", price))
+                a_high = safe_float(a.get("band_high", price))
+                in_zone = (lower * (1 - tol) <= price <= upper * (1 + tol))
+                band_overlap = (a_high >= lower * (1 - tol) and a_low <= upper * (1 + tol))
+                if in_zone or band_overlap:
                     anchor_hits.append(a.get("type", "锚点"))
-                    anchor_score += wt * 4.0
-                    # 锚点可校准边界，但不能把区间无限拉宽。
-                    if price >= upper * 0.985 and price <= upper * (1 + tol):
-                        adj_upper = max(adj_upper, price)
-                    if price <= lower * 1.015 and price >= lower * (1 - tol):
-                        adj_lower = min(adj_lower, price)
+                    anchor_score += wt * (5.2 if a.get("resonance_core") else 4.0)
+                    # 锚点可校准边界，但不能把区间无限拉宽；共振核心线优先校准核心带。
+                    if a.get("resonance_core"):
+                        adj_lower = min(adj_lower, max(a_low, lower * (1 - tol * 1.8)))
+                        adj_upper = max(adj_upper, min(a_high, upper * (1 + tol * 1.8)))
+                    else:
+                        if price >= upper * 0.985 and price <= upper * (1 + tol):
+                            adj_upper = max(adj_upper, price)
+                        if price <= lower * 1.015 and price >= lower * (1 - tol):
+                            adj_lower = min(adj_lower, price)
             width = adj_upper / max(adj_lower, 1e-9) - 1
             width_score = 8.0 if width <= bucket_pct * 8 else (4.0 if width <= bucket_pct * 14 else -4.0)
             freshness = 4.0 if period in ("M", "Q", "Y") else 2.0
@@ -4922,6 +5202,39 @@ def _xhu_extract_period_pressure_zones(period_df, period="D", lookback=250, curr
                     "reaction_desc": rdesc, "period_weight": float(_xhu_period_weight(period)),
                 })
             start = None
+    # V19.4：若共振核心线/支撑转压力线没有落进成交密集桶，也必须作为候选压力带进入合并。
+    # 这解决“模型只识别右侧近端小压力，漏掉左侧平台下沿主压力”的问题。
+    try:
+        resonance_anchors = [a for a in anchors if a.get("resonance_core")]
+        for a in resonance_anchors:
+            price = safe_float(a.get("price", 0))
+            if price <= 0:
+                continue
+            dist = price / max(cur, 1e-9) - 1
+            if dist < -0.04 or dist > 0.12:
+                continue
+            b_low = safe_float(a.get("band_low", price * 0.995))
+            b_high = safe_float(a.get("band_high", price * 1.007))
+            if b_high <= 0 or b_low <= 0:
+                continue
+            exists = any((z.get("upper", 0) >= b_low * 0.995 and z.get("lower", 0) <= b_high * 1.005) for z in zones)
+            if not exists:
+                q = 38.0 + min(38.0, safe_float(a.get("resonance_priority", 0)) * 1.7) + (8.0 if a.get("support_resistance_flip") else 0.0)
+                zones.append({
+                    "period": period,
+                    "lower": float(b_low), "upper": float(b_high), "mid": float(price),
+                    "density_score": 0.0, "peak_density": 0.0,
+                    "reaction_score": 0.0, "anchor_score": float(safe_float(a.get("weight", 1)) * 6.0),
+                    "quality_score": float(min(100.0, q)), "width_pct": float(b_high / max(b_low, 1e-9) - 1),
+                    "bucket_pct": float(bucket_pct), "anchor_hits": [a.get("type", "共振核心线")],
+                    "reaction_desc": a.get("resonance_desc", ""), "period_weight": float(_xhu_period_weight(period) + 0.25),
+                    "resonance_core_line": float(price),
+                    "resonance_desc": a.get("resonance_desc", ""),
+                    "support_resistance_flip": bool(a.get("support_resistance_flip", False)),
+                })
+    except Exception:
+        pass
+
     # 保留离当前近且质量高的压力区。当前正在内部的也保留。
     zones = sorted(zones, key=lambda z: (safe_float(z["quality_score"]) - max(0.0, z["lower"] / max(cur, 1e-9) - 1) * 20), reverse=True)
     return zones[:max(1, XHU_PRESSURE_MAX_ZONES_PER_PERIOD)]
@@ -4997,12 +5310,34 @@ def _xhu_merge_multi_period_zones(zones, current_close):
         if z["upper"] >= core_lower * 0.985 and z["lower"] <= core_upper * 1.04:
             related_ids.add(zi)
     related = [zones[i] for i in sorted(related_ids)] if related_ids else zones
+
+    # V19.4：共振核心线具有“定位权”。如果相关压力区中存在收盘/实体/影线多点共振线，
+    # 则核心压力带围绕该线校准，而不是只沿用右侧近端小压力。
+    resonance_related = [z for z in related if safe_float(z.get("resonance_core_line", 0)) > 0]
+    resonance_core_line = 0.0
+    resonance_desc = ""
+    if resonance_related:
+        best_res = sorted(
+            resonance_related,
+            key=lambda z: (safe_float(z.get("quality_score", 0)), bool(z.get("support_resistance_flip", False)), safe_float(z.get("resonance_core_line", 0))),
+            reverse=True
+        )[0]
+        resonance_core_line = safe_float(best_res.get("resonance_core_line", best_res.get("mid", 0)))
+        resonance_desc = best_res.get("resonance_desc", "") or "共振核心线"
+        rlow = safe_float(best_res.get("lower", 0)); rhigh = safe_float(best_res.get("upper", 0))
+        if rlow > 0 and rhigh > 0:
+            if rhigh >= current_close * 0.965 and rlow <= current_close * 1.12:
+                core_lower = min(core_lower, rlow)
+                core_upper = max(core_upper, rhigh)
+
     union_lower = min(z["lower"] for z in related)
     union_upper = max(z["upper"] for z in related)
     period_count = len(sorted(set(z["period"] for z in related)))
     raw_quality = (
         max_score * 11.0 + period_count * 8.0 + sum(safe_float(z.get("quality_score", 0)) for z in related) / max(1, len(related)) * 0.35
     )
+    if resonance_core_line > 0:
+        raw_quality += 8.0
     # 年线只做终极压力校验：若年线参与相关区，增加等级但不让过宽区间失真。
     if "Y" in [z.get("period") for z in related]:
         raw_quality += 6.0
@@ -5013,6 +5348,8 @@ def _xhu_merge_multi_period_zones(zones, current_close):
         f"核心重叠压力带{core_lower:.2f}-{core_upper:.2f}，整体压力区{union_lower:.2f}-{union_upper:.2f}，"
         f"最终上沿{union_upper:.2f}，参与周期{','.join(sorted(set(z['period'] for z in related)))}，等级{grade}"
     )
+    if resonance_core_line > 0:
+        desc += f"；共振核心线{resonance_core_line:.2f}（{resonance_desc}）"
     return {
         "valid": True,
         "core_lower": float(core_lower), "core_upper": float(core_upper),
@@ -5020,6 +5357,8 @@ def _xhu_merge_multi_period_zones(zones, current_close):
         "core_periods": core_periods, "dominant_period": dominant,
         "overlap_score": float(max_score), "pressure_quality_score": float(pressure_quality),
         "pressure_zone_grade": grade, "period_count": int(period_count), "desc": desc,
+        "resonance_core_line": float(resonance_core_line),
+        "resonance_core_desc": resonance_desc,
         "related_zones": related[:8],
     }
 
@@ -5175,6 +5514,8 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_breakout_desc": "无有效突破",
         "xhu_fake_breakout_count": 0,
         "xhu_fake_breakout_high": 0.0,
+        "xhu_resonance_core_line": 0.0,
+        "xhu_resonance_core_desc": "",
         "xhu_pressure_json": "[]",
     }
     if ENABLE_XHU_PRESSURE_BREAKOUT != "1" or df is None or len(df) < 180:
@@ -5221,6 +5562,8 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_pressure_overlap_score": float(composite.get("overlap_score", 0.0)),
         "xhu_pressure_periods": ",".join(sorted(set(z.get("period", "") for z in related))),
         "xhu_pressure_desc": composite.get("desc", ""),
+        "xhu_resonance_core_line": float(composite.get("resonance_core_line", 0.0)),
+        "xhu_resonance_core_desc": composite.get("resonance_core_desc", ""),
         "xhu_breakout_desc": day.get("desc", ""),
         "xhu_fake_breakout_count": int(day.get("fake_breakout_count", 0)),
         "xhu_fake_breakout_high": float(day.get("fake_breakout_high", 0.0)),
@@ -8435,14 +8778,22 @@ def build_v19_price_plan(s):
     core_low = _v19_first_float(s, "xhu_pressure_core_lower", "core_pressure_lower", "pressure_core_lower")
     core_up = _v19_first_float(s, "xhu_pressure_core_upper", "core_pressure_upper", "pressure_core_upper")
     final_up = _v19_first_float(s, "xhu_pressure_union_upper", "xhu_final_union_upper", "final_pressure_upper", "pressure_final_upper")
+    resonance_line = _v19_first_float(s, "xhu_resonance_core_line", "resonance_core_line", "main_resonance_line")
     structure_key = _v19_first_float(s, "structure_key_level", "key_level", "neckline", "platform_upper")
     support = _v19_first_float(s, "support_cluster", "key_support", "platform_support")
     defense = _v19_first_float(s, "defense_level", "real_defense_level", "defensive_price", "trade_defense")
 
-    # 主锚点优先级：核心压力下沿/结构位/支撑/收盘。
-    anchor = core_low or structure_key or support or defense or close
+    # 主锚点优先级：V19.4共振核心线 > 核心压力下沿 > 结构位 > 支撑 > 收盘。
+    # 共振核心线用于避免把右侧近端小压力误当最终压力。
+    anchor = resonance_line or core_low or structure_key or support or defense or close
     if anchor <= 0:
         anchor = close or 1.0
+
+    if resonance_line > 0:
+        # 围绕共振核心线生成主压力带；影线/密集区扩展上沿，收盘/实体共振锁定核心线。
+        core_low = min(core_low, resonance_line * 0.996) if core_low > 0 else resonance_line * 0.996
+        core_up = max(core_up, resonance_line * 1.006) if core_up > 0 else resonance_line * 1.006
+        final_up = max(final_up, core_up, resonance_line * 1.006) if final_up > 0 else core_up
 
     if core_up <= 0:
         core_up = final_up if final_up > 0 else anchor * 1.035
@@ -8499,6 +8850,8 @@ def build_v19_price_plan(s):
         "core_pressure_lower": core_low,
         "core_pressure_upper": core_up,
         "final_pressure_upper": final_up,
+        "resonance_core_line": resonance_line,
+        "resonance_core_desc": str(s.get("xhu_resonance_core_desc", s.get("resonance_core_desc", "")) or ""),
     }
     return plan
 
@@ -8508,6 +8861,9 @@ def v19_price_plan_lines(s, html_mode=False):
     esc = html.escape if html_mode else (lambda x: x)
     lines = []
     lines.append("【价格计划】")
+    if safe_float(p.get("resonance_core_line", 0)) > 0:
+        desc = str(p.get("resonance_core_desc", "") or "共振核心线")
+        lines.append(f"共振核心线：{_v19_fmt_price(p['resonance_core_line'])}（{desc[:45]}）")
     lines.append(f"建议标准买入价：{_v19_fmt_range(p['standard_buy_low'], p['standard_buy_high'])}")
     lines.append(f"激进买入价：{_v19_fmt_range(p['aggressive_buy_low'], p['aggressive_buy_high'])}（只适合轻仓试探）")
     lines.append(f"舒服低吸价：{_v19_fmt_range(p['comfortable_buy_low'], p['comfortable_buy_high'])}")
@@ -8527,15 +8883,15 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
-    lines.append("📊 <b>一号员工选股模型 V19.3 固定Top3价格计划报告</b>")
+    lines.append("📊 <b>一号员工选股模型 V19.4 固定Top3价格计划报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
     lines.append(f"正式输出：<b>{len(final_signals)}</b>只，固定目标{V19_FIXED_TOP_N}只。")
-    lines.append("口径：V19.3保留原主模型有效逻辑，并升级基础海选观察值；不使用80分硬门槛，固定Top3。压力带突破、倍量、回踩确认等均为评分项，不是必要条件。")
+    lines.append("口径：V19.4保留原主模型有效逻辑，并融合共振核心线/支撑转压力主位；不使用80分硬门槛，固定Top3。压力带突破、倍量、回踩确认等均为评分项，不是必要条件。")
     lines.append("说明：分数用于排序，不代表无脑买入；硬雷区仍剔除，普通缺点进入风险提示。次日按确认条件/放弃条件执行。")
-    lines.append("报告默认发送文字版价格计划，不再依赖旧PNG表格；同时保存stock_candidates.json与v19_3_score_cards.json，供后续T+1/T+3/T+5复盘归因。")
+    lines.append("报告默认发送文字版价格计划，不再依赖旧PNG表格；同时保存stock_candidates.json与v19_4_score_cards.json，供后续T+1/T+3/T+5复盘归因。")
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
@@ -8545,7 +8901,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
             lines.append(html.escape(diag))
         return "\n".join(lines)
 
-    # V19.3报告层默认不再发送旧V16图片表格：
+    # V19.4报告层默认不再发送旧V16图片表格：
     # 1）GitHub Actions缺中文字体时图片会乱码；2）旧表格字段与V19价格计划不匹配。
     # 如需临时开启旧PNG，可在workflow里设置 SEND_V16_PNG_TABLES=1。
     if os.environ.get("SEND_V16_PNG_TABLES", "0") == "1":
@@ -8606,6 +8962,8 @@ def _v19_compact_row(r, pool=""):
         "defensive_price": safe_float(r.get("defensive_price", r.get("trade_defense", 0))),
         "core_pressure_upper": safe_float(r.get("xhu_pressure_core_upper", 0)),
         "final_pressure_upper": safe_float(r.get("xhu_pressure_union_upper", r.get("xhu_final_union_upper", 0))),
+        "xhu_resonance_core_line": safe_float(r.get("xhu_resonance_core_line", r.get("resonance_core_line", 0))),
+        "xhu_resonance_core_desc": r.get("xhu_resonance_core_desc", r.get("resonance_core_desc", "")),
         "confirm_condition": build_confirm_condition(r),
         "giveup_condition": build_giveup_condition(r),
         "price_plan": build_v19_price_plan(r),
