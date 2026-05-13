@@ -17,7 +17,7 @@ on:
         default: "110"
 
   schedule:
-    # 北京时间 17:00 = UTC 09:00
+    # 北京时间 18:00 = UTC 10:00
     - cron: "0 10 * * 1-5"
 
 permissions:
@@ -154,13 +154,22 @@ jobs:
           ENABLE_TELEGRAM: "1"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FINAL_SCORE_THRESHOLD: "80"
+
+          # V19/V19.1 推送思路：不再用80分作为硬门槛；每日按排序固定推送Top3。
+          # 这些变量如果 stock_alert.py 当前版本尚未全部读取，也不会影响运行。
+          FINAL_SCORE_THRESHOLD: "0"
+          TOP_PUSH_LIMIT: "3"
+          RESULT_LIMIT: "3"
+          FORCE_TOP_N: "3"
+          MIN_PUSH_COUNT: "3"
+
           DATA_GATE_TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
           DATA_GATE_COVERAGE: ${{ steps.data_gate.outputs.coverage }}
           DATA_GATE_REASON: ${{ steps.data_gate.outputs.reason }}
         run: |
           echo "[RUN] 一号员工A股选股并推送"
           echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
+          echo "V19/V19.1: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3"
           python -u stock_alert.py
 
       - name: 数据未达标时不运行正式推荐
@@ -240,19 +249,51 @@ jobs:
       - name: 显示输出文件
         if: always()
         run: |
-          echo "Outputs:"
+          echo "Outputs directory:"
           ls -lah outputs || true
+
+          echo ""
           echo "Daily update state:"
           cat outputs/daily_kline_update_state.json || true
+
+          echo ""
           echo "Latest output files:"
-          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -30 || true
+          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -50 || true
+
+          echo ""
+          echo "Root json/txt/csv files:"
+          ls -lah *.json *.txt *.csv 2>/dev/null || true
+
+          echo ""
+          echo "Important candidate/report files:"
+          for f in stock_candidates.json v19_1_score_cards.json v19_1_daily_report.txt v19_1_review_report.txt telegram_message.txt telegram_report.txt; do
+            if [ -f "$f" ]; then
+              echo "FOUND $f"
+              ls -lah "$f"
+              echo "--- head of $f ---"
+              head -80 "$f" || true
+              echo "--- end head ---"
+            else
+              echo "MISSING $f"
+            fi
+          done
 
       - name: 上传输出结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: employee1-a-stock-daily-outputs
-          path: outputs
+          path: |
+            outputs/
+            stock_candidates.json
+            v19_1_score_cards.json
+            v19_1_daily_report.txt
+            v19_1_review_report.txt
+            telegram_message.txt
+            telegram_report.txt
+            *.json
+            *.txt
+            *.csv
           if-no-files-found: warn
           retention-days: 14
 
