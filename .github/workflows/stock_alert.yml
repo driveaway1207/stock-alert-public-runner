@@ -222,11 +222,12 @@ jobs:
           RESULT_LIMIT: "3"
           FORCE_TOP_N: "3"
           MIN_PUSH_COUNT: "3"
+          SEND_V16_PNG_TABLES: "0"
           DEEP_SCORE_HARD_CAP: "200"
           DEEP_SCORE_LIMIT: "500"
-          V19_SCORE_CARDS_FILE: "v19_3_score_cards.json"
-          V19_DAILY_REPORT_FILE: "v19_3_daily_report.txt"
-          V19_REVIEW_REPORT_FILE: "v19_3_review_report.txt"
+          V19_SCORE_CARDS_FILE: "v19_4_score_cards.json"
+          V19_DAILY_REPORT_FILE: "v19_4_daily_report.txt"
+          V19_REVIEW_REPORT_FILE: "v19_4_review_report.txt"
 
           DATA_GATE_TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
           DATA_GATE_COVERAGE: ${{ steps.data_gate.outputs.coverage }}
@@ -234,7 +235,7 @@ jobs:
         run: |
           echo "[RUN] 一号员工A股选股并推送"
           echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
-          echo "V19.3: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
+          echo "V19.4: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
           python -u stock_alert.py
 
       - name: 数据未达标时不运行正式推荐
@@ -331,7 +332,7 @@ jobs:
 
           echo ""
           echo "Important candidate/report files:"
-          for f in stock_candidates.json v19_3_score_cards.json v19_3_daily_report.txt v19_3_review_report.txt v19_2_score_cards.json v19_2_daily_report.txt v19_2_review_report.txt v19_1_score_cards.json v19_1_daily_report.txt v19_1_review_report.txt telegram_message.txt telegram_report.txt; do
+          for f in stock_candidates.json v19_4_score_cards.json v19_4_daily_report.txt v19_4_review_report.txt v19_2_score_cards.json v19_2_daily_report.txt v19_2_review_report.txt v19_1_score_cards.json v19_1_daily_report.txt v19_1_review_report.txt telegram_message.txt telegram_report.txt; do
             if [ -f "$f" ]; then
               echo "FOUND $f"
               ls -lah "$f"
@@ -351,9 +352,9 @@ jobs:
           path: |
             outputs/
             stock_candidates.json
-            v19_3_score_cards.json
-            v19_3_daily_report.txt
-            v19_3_review_report.txt
+            v19_4_score_cards.json
+            v19_4_daily_report.txt
+            v19_4_review_report.txt
             v19_2_score_cards.json
             v19_2_daily_report.txt
             v19_2_review_report.txt
