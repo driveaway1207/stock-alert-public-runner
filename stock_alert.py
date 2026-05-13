@@ -288,8 +288,14 @@ V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_
 # V19.4压力/共振线合并规则：
 # 距离<=3%：默认视为同一压力区；3%-5%：若结构/成交密集区相关则合并；>5%：通常拆层。
 # 若两线合并为同一区域，有效突破确认价取更高线/更高上沿；仅突破较低线不给高分。
-V19_PRESSURE_MERGE_NEAR_PCT = safe_float(os.environ.get("V19_PRESSURE_MERGE_NEAR_PCT", "0.03"), 0.03)
-V19_PRESSURE_MERGE_MID_PCT = safe_float(os.environ.get("V19_PRESSURE_MERGE_MID_PCT", "0.05"), 0.05)
+try:
+    V19_PRESSURE_MERGE_NEAR_PCT = float(os.environ.get("V19_PRESSURE_MERGE_NEAR_PCT", "0.03") or 0.03)
+except Exception:
+    V19_PRESSURE_MERGE_NEAR_PCT = 0.03
+try:
+    V19_PRESSURE_MERGE_MID_PCT = float(os.environ.get("V19_PRESSURE_MERGE_MID_PCT", "0.05") or 0.05)
+except Exception:
+    V19_PRESSURE_MERGE_MID_PCT = 0.05
 
 # V15：选股模型多周期供需压力带突破模型开关与参数。
 ENABLE_XHU_PRESSURE_BREAKOUT = os.environ.get("ENABLE_XHU_PRESSURE_BREAKOUT", "1")
