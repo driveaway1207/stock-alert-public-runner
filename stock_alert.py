@@ -1,3 +1,4 @@
+# V19.1 VERIFIED BUILD - py_compile passed - replace repository root stock_alert.py with this file
 import os
 import json
 import time
@@ -8548,3 +8549,124 @@ def main():
 
             try:
                 # V16.6：深度评分单票总超时保护。即使某个模块/某只票卡住，也不能拖死全局。
+                with stock_query_timeout(DEEP_SINGLE_STOCK_TIMEOUT_SECONDS, f"deep:{r.get('code', '')}"):
+                    rows = process_stock_deep(r)
+
+                if rows:
+                    deep_success += 1
+                else:
+                    deep_skip += 1
+
+                for rr in rows:
+                    deep_rows.append(rr)
+
+            except Exception as e:
+                deep_fail += 1
+                err_msg = str(e)[:500]
+                deep_failed_records.append({
+                    "code": r.get("code", ""),
+                    "name": r.get("name", ""),
+                    "error": err_msg,
+                })
+                print(f"深度处理失败/超时: {r.get('code', '')} {r.get('name', '')} {err_msg}", flush=True)
+
+        if deep_failed_records:
+            try:
+                os.makedirs("outputs", exist_ok=True)
+                pd.DataFrame(deep_failed_records).to_csv("outputs/deep_failed_symbols.csv", index=False, encoding="utf-8-sig")
+                print(f"深度失败清单已保存: outputs/deep_failed_symbols.csv rows={len(deep_failed_records)}")
+            except Exception as _e:
+                print(f"深度失败清单保存失败: {_e}")
+
+        deep_rows = sorted(
+            deep_rows,
+            key=lambda x: (
+                x["date"],
+                safe_float(x.get("trade_priority_score", 0)),
+                safe_float(x.get("score_trade_quality", 0)),
+                x["total_score"],
+                x["base_score"],
+                x["score"],
+            ),
+            reverse=True
+        )
+
+        if deep_targets and not deep_rows:
+            warning = (
+                "深度评分结果为0，本次不是正常无票，而是深度评分阶段未有效完成。"
+                f"基础评分候选{len(base_rows)}条，深度目标{len(deep_targets)}条。"
+                "为避免误判，本次不推送正式选股结果。"
+            )
+            print(warning)
+            send_telegram(build_error_message(warning))
+            return
+
+        # V14最终三选：原主模型完整跑完后，只做后置审核/分层扣分/相对最优三选；不重写、不删主模型逻辑。
+        final_signals, v14_diagnostics, v14_audited_rows = select_final_signals_v14(deep_rows, history, limit=V14_TARGET_PUSH_COUNT)
+        strong_watch_pool = [r for r in v14_audited_rows if (not r.get("v14_blocked")) and str(r.get("code")) not in {str(x.get("code")) for x in final_signals}][:80]
+
+        for r in final_signals:
+            key = f"{r.get('date','')}_{r.get('code','')}"
+            history[key] = {
+                "date": r.get("date", ""),
+                "code": r.get("code", ""),
+                "name": r.get("name", ""),
+                "score": r.get("score", 0),
+                "base_score": r.get("base_score", 0),
+                "total_score": r.get("total_score", 0),
+                "v14_final_score": r.get("v14_final_score", r.get("total_score", 0)),
+                "v14_level": r.get("v14_level", ""),
+                "candidate_pool": r.get("candidate_pool", ""),
+            }
+
+        print(f"近{CHECK_DAYS}个交易日排查完成：{dates}（默认仅最新有行情日；可用CHECK_DAYS调整）")
+        print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
+        print(f"基础评分数量：{len(base_rows)} 条")
+        print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
+        print(f"V14最终三选数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
+        print(f"V14后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON）")
+
+        save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_pool)
+        save_v19_1_outputs(
+            final_signals,
+            v14_diagnostics,
+            v14_audited_rows,
+            dates=dates,
+            meta={
+                "stock_count": len(stock_list),
+                "kline_success": kline_success,
+                "kline_fail": kline_fail,
+                "base_count": len(base_rows),
+                "deep_count": len(deep_rows),
+                "deep_targets": len(deep_targets),
+                "deep_success": deep_success,
+                "deep_fail": deep_fail,
+                "deep_skip": deep_skip,
+            },
+        )
+        save_signal_history(history)
+
+        msg = build_message(
+            final_signals,
+            dates,
+            stock_count=len(stock_list),
+            kline_success=kline_success,
+            kline_fail=kline_fail,
+            deep_count=len(deep_rows),
+            v14_diagnostics=v14_diagnostics
+        )
+
+        send_telegram(msg)
+
+        print("全部完成!")
+
+    except Exception as e:
+        print(f"主流程失败：{e}")
+        send_telegram(build_error_message(e))
+
+    finally:
+        baostock_logout()
+
+
+if __name__ == "__main__":
+    main()
