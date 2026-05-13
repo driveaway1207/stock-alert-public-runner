@@ -1,3 +1,4 @@
+# V19.3 FULL BUILD - price plan Telegram report + 200 deep candidate pool + audited hotfix
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -8382,19 +8383,159 @@ def v14_diagnostics_text(diags, limit=5):
     return "\n".join(lines)
 
 
+
+def _v19_first_float(row, *keys, default=0.0):
+    """按多个候选字段取第一个有效价格。"""
+    for k in keys:
+        try:
+            if isinstance(row, dict) and k in row:
+                v = safe_float(row.get(k), None)
+                if v is not None and v > 0:
+                    return float(v)
+        except Exception:
+            pass
+    return float(default or 0.0)
+
+
+def _v19_tick(price):
+    """A股报告展示用最小报价步长。"""
+    return 0.01
+
+
+def _v19_fmt_price(price):
+    try:
+        price = float(price)
+        if price <= 0:
+            return "--"
+        return f"{price:.2f}"
+    except Exception:
+        return "--"
+
+
+def _v19_fmt_range(low, high):
+    try:
+        low = float(low); high = float(high)
+        if low <= 0 or high <= 0:
+            return "--"
+        if high < low:
+            low, high = high, low
+        return f"{low:.2f}-{high:.2f}"
+    except Exception:
+        return "--"
+
+
+def build_v19_price_plan(s):
+    """
+    V19.3 报告层价格计划。
+    目标：Telegram不再输出“回踩关键位/跌破支撑”这种模糊话，而是给出可执行价格。
+    说明：这是模型计划价，用于三号员工/人工复核，不代表无条件下单。
+    """
+    close = _v19_first_float(s, "close", "收盘", "last_close")
+    prev_close = _v19_first_float(s, "prev_close", "pre_close", default=close)
+    core_low = _v19_first_float(s, "xhu_pressure_core_lower", "core_pressure_lower", "pressure_core_lower")
+    core_up = _v19_first_float(s, "xhu_pressure_core_upper", "core_pressure_upper", "pressure_core_upper")
+    final_up = _v19_first_float(s, "xhu_pressure_union_upper", "xhu_final_union_upper", "final_pressure_upper", "pressure_final_upper")
+    structure_key = _v19_first_float(s, "structure_key_level", "key_level", "neckline", "platform_upper")
+    support = _v19_first_float(s, "support_cluster", "key_support", "platform_support")
+    defense = _v19_first_float(s, "defense_level", "real_defense_level", "defensive_price", "trade_defense")
+
+    # 主锚点优先级：核心压力下沿/结构位/支撑/收盘。
+    anchor = core_low or structure_key or support or defense or close
+    if anchor <= 0:
+        anchor = close or 1.0
+
+    if core_up <= 0:
+        core_up = final_up if final_up > 0 else anchor * 1.035
+    if final_up <= 0:
+        final_up = core_up if core_up > 0 else anchor * 1.05
+
+    # 如果防守位缺失，使用锚点下方缓冲估算，避免报告空缺。
+    if defense <= 0:
+        defense = support if support > 0 else anchor * 0.982
+    short_defense = defense
+    hard_stop = min(short_defense * 0.988, anchor * 0.972)
+
+    # 买入价体系：以锚点/压力带下沿/结构位为核心。
+    aggressive_low = anchor
+    aggressive_high = min(anchor * 1.008, core_up if core_up > anchor else anchor * 1.012)
+    standard_low = max(hard_stop * 1.012, anchor * 0.990)
+    standard_high = anchor
+    comfort_low = max(hard_stop * 1.003, anchor * 0.970)
+    comfort_high = max(comfort_low, anchor * 0.990)
+
+    # 突破与追高线。
+    breakout_confirm = final_up + _v19_tick(final_up)
+    add_confirm = final_up
+    no_chase = max(core_up + _v19_tick(core_up), final_up * 0.994)
+
+    # 目标价：第一目标优先核心压力上沿，第二目标最终压力上沿。
+    target1 = core_up if core_up > 0 else anchor * 1.03
+    target2 = final_up if final_up > target1 else target1 * 1.04
+    target3 = target2 * 1.05
+
+    # 高开不追阈值。
+    gap_no_chase_pct = 3.0
+    gap_no_chase_price = prev_close * (1 + gap_no_chase_pct / 100.0) if prev_close > 0 else no_chase
+
+    plan = {
+        "anchor": anchor,
+        "aggressive_buy_low": aggressive_low,
+        "aggressive_buy_high": aggressive_high,
+        "standard_buy_low": standard_low,
+        "standard_buy_high": standard_high,
+        "comfortable_buy_low": comfort_low,
+        "comfortable_buy_high": comfort_high,
+        "breakout_confirm_price": breakout_confirm,
+        "add_confirm_price": add_confirm,
+        "no_chase_price": no_chase,
+        "short_defense_price": short_defense,
+        "hard_stop_price": hard_stop,
+        "giveup_price": hard_stop,
+        "target1_price": target1,
+        "target2_price": target2,
+        "target3_price": target3,
+        "gap_no_chase_price": gap_no_chase_price,
+        "gap_no_chase_pct": gap_no_chase_pct,
+        "core_pressure_lower": core_low,
+        "core_pressure_upper": core_up,
+        "final_pressure_upper": final_up,
+    }
+    return plan
+
+
+def v19_price_plan_lines(s, html_mode=False):
+    p = build_v19_price_plan(s)
+    esc = html.escape if html_mode else (lambda x: x)
+    lines = []
+    lines.append("【价格计划】")
+    lines.append(f"建议标准买入价：{_v19_fmt_range(p['standard_buy_low'], p['standard_buy_high'])}")
+    lines.append(f"激进买入价：{_v19_fmt_range(p['aggressive_buy_low'], p['aggressive_buy_high'])}（只适合轻仓试探）")
+    lines.append(f"舒服低吸价：{_v19_fmt_range(p['comfortable_buy_low'], p['comfortable_buy_high'])}")
+    lines.append(f"突破确认价：{_v19_fmt_price(p['breakout_confirm_price'])} 上方放量站稳")
+    lines.append(f"加仓确认价：突破后回踩 {_v19_fmt_price(p['add_confirm_price'])} 不破再转强")
+    lines.append(f"不追价格：{_v19_fmt_price(p['no_chase_price'])} 以上不追")
+    lines.append(f"短线防守价：{_v19_fmt_price(p['short_defense_price'])}")
+    lines.append(f"硬止损价：{_v19_fmt_price(p['hard_stop_price'])}")
+    lines.append(f"放弃价格：有效跌破 {_v19_fmt_price(p['giveup_price'])} 直接放弃")
+    lines.append(f"第一目标价：{_v19_fmt_price(p['target1_price'])}")
+    lines.append(f"第二目标价：{_v19_fmt_price(p['target2_price'])}")
+    lines.append(f"高开处理：若开到 {_v19_fmt_price(p['gap_no_chase_price'])} 附近或高开超过{p['gap_no_chase_pct']:.0f}%，不追，等回踩确认")
+    return [esc(x) for x in lines]
+
+
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
-    lines.append("📊 <b>一号员工选股模型 V19.1 固定Top3机会评分报告</b>")
+    lines.append("📊 <b>一号员工选股模型 V19.3 固定Top3价格计划报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
     lines.append(f"正式输出：<b>{len(final_signals)}</b>只，固定目标{V19_FIXED_TOP_N}只。")
-    lines.append("口径：原V12/V14/V16所有有效战法保留为信号库；V19.1不再使用80分硬门槛，按非硬风险候选综合排序固定Top3。压力带突破、倍量、回踩确认等均为评分项，不是必要条件。")
+    lines.append("口径：V19.3保留原主模型有效逻辑，并升级基础海选观察值；不使用80分硬门槛，固定Top3。压力带突破、倍量、回踩确认等均为评分项，不是必要条件。")
     lines.append("说明：分数用于排序，不代表无脑买入；硬雷区仍剔除，普通缺点进入风险提示。次日按确认条件/放弃条件执行。")
-    lines.append("完整20维评分表仍生成PNG；同时保存stock_candidates.json与v19_1_score_cards.json，供后续T+1/T+3/T+5复盘归因。")
+    lines.append("报告默认发送文字版价格计划，不再依赖旧PNG表格；同时保存stock_candidates.json与v19_3_score_cards.json，供后续T+1/T+3/T+5复盘归因。")
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
@@ -8404,24 +8545,31 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
             lines.append(html.escape(diag))
         return "\n".join(lines)
 
-    try:
-        summary_img = render_v16_summary_table_png(final_signals)
-        if summary_img:
-            TELEGRAM_PENDING_IMAGES.append((summary_img, "一号员工选股模型V19.1：今日固定Top3总览表"))
-        for i, s in enumerate(final_signals, 1):
-            img = render_v16_dimension_table_png(s, f"telegram_tables/v16_{i}_{s.get('code','')}_20d.png")
-            if img:
-                TELEGRAM_PENDING_IMAGES.append((img, f"{i}. {s.get('name','')}({s.get('code','')}) 20维评分表"))
-    except Exception as e:
-        print(f"V16报告表格生成失败：{e}")
+    # V19.3报告层默认不再发送旧V16图片表格：
+    # 1）GitHub Actions缺中文字体时图片会乱码；2）旧表格字段与V19价格计划不匹配。
+    # 如需临时开启旧PNG，可在workflow里设置 SEND_V16_PNG_TABLES=1。
+    if os.environ.get("SEND_V16_PNG_TABLES", "0") == "1":
+        try:
+            summary_img = render_v16_summary_table_png(final_signals)
+            if summary_img:
+                TELEGRAM_PENDING_IMAGES.append((summary_img, "一号员工选股模型V19.3：今日固定Top3总览表"))
+            for i, s in enumerate(final_signals, 1):
+                img = render_v16_dimension_table_png(s, f"telegram_tables/v19_3_{i}_{s.get('code','')}_20d.png")
+                if img:
+                    TELEGRAM_PENDING_IMAGES.append((img, f"{i}. {s.get('name','')}({s.get('code','')}) 20维评分表"))
+        except Exception as e:
+            print(f"V19.3报告表格生成失败：{e}")
 
     for i, s in enumerate(final_signals, 1):
         lines.append(f"<b>{i}. {html.escape(str(s.get('name','')))}({html.escape(str(s.get('code','')))})</b>")
         lines.append(f"等级/总分：<b>{html.escape(str(s.get('v16_final_grade','')))}</b> / {safe_float(s.get('v16_final_score', 0)):.1f}；原深度分{safe_float(s.get('v14_original_total_score', s.get('total_score', 0))):.1f}")
-        lines.append(f"主导信号：{html.escape(str(s.get('v16_main_signal','')))}")
-        lines.append(f"核心压力带：{safe_float(s.get('xhu_pressure_core_lower',0)):.2f}-{safe_float(s.get('xhu_pressure_core_upper',0)):.2f}；最终压力上沿：{safe_float(s.get('xhu_pressure_union_upper',0)):.2f}；压力带等级：{html.escape(str(s.get('xhu_pressure_model_grade','')))}")
-        lines.append(f"确认条件：{html.escape(build_confirm_condition(s))}")
-        lines.append(f"放弃条件：{html.escape(build_giveup_condition(s))}")
+        main_signal = str(s.get('v16_main_signal','') or s.get('v19_main_signal','') or 'V19.3综合机会')
+        lines.append(f"主导逻辑：{html.escape(main_signal)}")
+        lines.append(f"核心压力带：{safe_float(s.get('xhu_pressure_core_lower',0)):.2f}-{safe_float(s.get('xhu_pressure_core_upper',0)):.2f}；最终压力上沿：{safe_float(s.get('xhu_pressure_union_upper', s.get('xhu_final_union_upper',0))):.2f}；压力带等级：{html.escape(str(s.get('xhu_pressure_model_grade','')))}")
+        for pl in v19_price_plan_lines(s, html_mode=True):
+            lines.append(pl)
+        lines.append(f"模型确认：{html.escape(build_confirm_condition(s))}")
+        lines.append(f"模型放弃：{html.escape(build_giveup_condition(s))}")
         lines.append(f"主要封顶/风险：{html.escape(str(s.get('v16_cap_reason','无硬封顶')))}")
         lines.append("—")
 
@@ -8460,6 +8608,7 @@ def _v19_compact_row(r, pool=""):
         "final_pressure_upper": safe_float(r.get("xhu_pressure_union_upper", r.get("xhu_final_union_upper", 0))),
         "confirm_condition": build_confirm_condition(r),
         "giveup_condition": build_giveup_condition(r),
+        "price_plan": build_v19_price_plan(r),
         "generated_at_bj": bj_time_str(),
     }
 
@@ -8481,7 +8630,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
                 watch_rows.append(_v19_compact_row(r, "后台跟踪"))
 
         payload = {
-            "model_version": "V19.1固定Top3+候选池复盘归因底座",
+            "model_version": "V19.3固定Top3+价格计划+候选池复盘归因底座",
             "generated_at_bj": bj_time_str(),
             "dates": dates,
             "meta": meta,
@@ -8502,7 +8651,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         print(f"V19.3评分卡已保存：{V19_SCORE_CARDS_FILE}")
 
         lines = []
-        lines.append("一号员工 V19.1 今日固定Top3报告")
+        lines.append("一号员工 V19.3 今日固定Top3价格计划报告")
         lines.append(f"生成时间：{bj_time_str()} 北京时间")
         lines.append(f"排查日期：{', '.join(dates) if dates else '未知'}")
         lines.append(f"固定推送数量：{V19_FIXED_TOP_N}；实际输出：{len(final_signals)}")
@@ -8513,10 +8662,12 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
             for i, r in enumerate(final_signals, 1):
                 row = _v19_compact_row(r, "正式推荐Top3")
                 lines.append(f"{i}. {row['name']}({row['code']}) | 分数 {row['v16_final_score']:.2f} | 等级 {row['v16_final_grade']} | 主导 {row['v16_main_signal']}")
+                for pl in v19_price_plan_lines(r, html_mode=False):
+                    lines.append(f"   {pl}")
                 if row.get("v19_note"):
                     lines.append(f"   提示：{row['v19_note']}")
-                lines.append(f"   确认：{row['confirm_condition']}")
-                lines.append(f"   放弃：{row['giveup_condition']}")
+                lines.append(f"   模型确认：{row['confirm_condition']}")
+                lines.append(f"   模型放弃：{row['giveup_condition']}")
                 if row.get("v16_cap_reason"):
                     lines.append(f"   风险/封顶：{row['v16_cap_reason']}")
         else:
@@ -8533,7 +8684,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         print(f"V19.3日报已保存：{V19_DAILY_REPORT_FILE}")
 
         review_lines = [
-            "一号员工 V19.1 复盘归因报告占位",
+            "一号员工 V19.3 复盘归因报告占位",
             f"生成时间：{bj_time_str()} 北京时间",
             "当前版本已保存每日Top3与后台跟踪池；下一步接入历史score_cards后，可生成T+1/T+3/T+5/T+8/T+13/T+20复盘。",
         ]
@@ -8541,7 +8692,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
             f.write("\n".join(review_lines))
         print(f"V19.3复盘报告占位已保存：{V19_REVIEW_REPORT_FILE}")
     except Exception as e:
-        print(f"V19.1输出保存失败：{e}")
+        print(f"V19.3输出保存失败：{e}")
 
 
 
