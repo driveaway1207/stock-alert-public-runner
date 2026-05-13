@@ -1,4 +1,4 @@
-# V19.1 VERIFIED BUILD - py_compile passed - replace repository root stock_alert.py with this file
+# V19.3 FULL HOTFIX - base observation subscores + deep score 200 + py_compile passed
 import os
 import json
 import time
@@ -165,9 +165,8 @@ RESULT_LIMIT_RAW = int(os.environ.get("RESULT_LIMIT", "20"))
 TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "3"))
 RESULT_LIMIT = min(RESULT_LIMIT_RAW, TOP_PUSH_LIMIT) if TOP_PUSH_LIMIT > 0 else RESULT_LIMIT_RAW
 DEEP_SCORE_LIMIT_RAW = int(os.environ.get("DEEP_SCORE_LIMIT", "500"))
-# V10：深度评分硬上限。即使 workflow 仍传 500，也默认只取基础分桶后的前150条深评，
-# 避免 GitHub Actions 深度评分跑不完；如确需恢复500，可设置 DEEP_SCORE_HARD_CAP=0 或 500。
-DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "80"))
+# V19.2：深度评分硬上限默认200。V19最终Top3需要更宽候选池，但仍控制运行时间；如需扩大可设置 DEEP_SCORE_HARD_CAP=250/300。
+DEEP_SCORE_HARD_CAP = int(os.environ.get("DEEP_SCORE_HARD_CAP", "200"))
 DEEP_SCORE_LIMIT = min(DEEP_SCORE_LIMIT_RAW, DEEP_SCORE_HARD_CAP) if DEEP_SCORE_HARD_CAP > 0 else DEEP_SCORE_LIMIT_RAW
 
 # V12.4：标准版默认启用“先过滤、后深算”。这不是减少逻辑，而是避免对明显无效股票重复跑昂贵模型。
@@ -277,9 +276,9 @@ V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 # 压力带突破、倍量、回踩确认、空头钝化、时间窗口等均为评分项，不作为单独必要条件。
 V19_ENABLE_TOP3_FIXED = os.environ.get("V19_ENABLE_TOP3_FIXED", "1")
 V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3"))))
-V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_1_score_cards.json")
-V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_1_daily_report.txt")
-V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_1_review_report.txt")
+V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_3_score_cards.json")
+V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_3_daily_report.txt")
+V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_3_review_report.txt")
 
 # V15：选股模型多周期供需压力带突破模型开关与参数。
 ENABLE_XHU_PRESSURE_BREAKOUT = os.environ.get("ENABLE_XHU_PRESSURE_BREAKOUT", "1")
@@ -3058,6 +3057,107 @@ def calc_base_rows(df):
     df.loc[df["limit_volume_mode"].eq("涨停分歧爆量"), "base_risk_penalty"] -= 5
     df["base_risk_penalty"] = df["base_risk_penalty"].clip(-25, 0)
 
+    # ===== V19.3 基础海选观察值子分 =====
+    # 目的：基础海选层要“宽观察、严降权、强兜底”，防止真正有资金记忆/结构弹性的票被挡在深度评分200只之外。
+    # 这些观察值不直接决定买入，只提升进入深度评分的概率；高位乱波动/放量滞涨会被风险活跃扣分抵消。
+
+    base_rng = (df["high"] - df["low"]).replace(0, np.nan)
+    df["base_upper_shadow_ratio"] = ((df["high"] - df[["open", "close"]].max(axis=1)) / base_rng).fillna(0)
+    df["base_lower_shadow_ratio"] = ((df[["open", "close"]].min(axis=1) - df["low"]) / base_rng).fillna(0)
+    df["base_close_pos"] = ((df["close"] - df["low"]) / base_rng).fillna(0)
+    df["base_real_entity_pct"] = ((df["close"] - df["open"]).abs() / df["preclose"].replace(0, np.nan) * 100).fillna(0)
+
+    df["base_big_bull_k"] = (df["pct_chg"] >= 3.0) & (df["base_close_pos"] >= 0.65) & (df["base_upper_shadow_ratio"] <= 0.35)
+    df["base_strong_close_k"] = (df["base_close_pos"] >= 0.80) & (df["close"] >= df["preclose"])
+    df["base_up_gap"] = (df["low"] > df["high"].shift(1) * 1.003) & (df["close"] >= df["preclose"])
+    df["base_gap_not_quick_fill"] = df["base_up_gap"].shift(1).fillna(False) & (df["low"] >= df["low"].shift(1) * 0.995)
+    df["base_bullish_engulfing"] = (
+        df["is_up"]
+        & df["is_down"].shift(1).fillna(False)
+        & (df["close"] >= df["open"].shift(1))
+        & (df["open"] <= df["close"].shift(1) * 1.01)
+        & (df["base_close_pos"] >= 0.60)
+    )
+    df["base_long_lower_repair"] = (df["base_lower_shadow_ratio"] >= 0.30) & (df["base_close_pos"] >= 0.55)
+    df["base_upper_supply_k"] = (df["base_upper_shadow_ratio"] >= 0.35) & ((df["vr1"] >= 1.8) | (df["volr"] >= 2.0))
+    df["base_high_volume_stall"] = ((df["vr1"] >= 2.5) | (df["volr"] >= 3.0)) & (df["pct_chg"] < 2.0) & (df["base_upper_shadow_ratio"] >= 0.25)
+    df["base_break_fail_memory"] = (
+        (df["high"] >= df["high_40_prev"] * 0.995)
+        & (df["close"] < df["high_40_prev"])
+        & (df["base_upper_shadow_ratio"] >= 0.25)
+    )
+    df["base_key_test_memory"] = (
+        (df["high"] >= df["high_40_prev"] * 0.985)
+        & (df["close"] >= df["low_40_prev"] * 1.01)
+    )
+    df["base_mid_reclaim_memory"] = (
+        ((df["low"] <= df["ma20"] * 1.01) & (df["close"] >= df["ma20"]))
+        | ((df["low"] <= df["ma60"] * 1.01) & (df["close"] >= df["ma60"]))
+    )
+    df["base_low_lift_memory"] = df["low"].rolling(5).min() >= df["low"].shift(5).rolling(5).min() * 0.995
+
+    df["base_observe_fund_event_score"] = (
+        (df["beiliang_count_60_base"].clip(0, 5) * 0.9)
+        + (df["flat_volume_count_60_base"].clip(0, 4) * 1.4)
+        + (df["base_limitup_hold_score"].clip(0, 3) * 1.1)
+        + ((df["base_up_down_vol_ratio_60"] >= 1.05).astype(float) * 1.2)
+        + ((df["base_up_down_vol_ratio_40"] >= 1.10).astype(float) * 0.8)
+    ).clip(0, 10)
+
+    df["base_observe_price_attack_score"] = (
+        (df["base_up_gap"].rolling(60).sum().fillna(0).clip(0, 5) * 0.9)
+        + (df["base_gap_not_quick_fill"].rolling(60).sum().fillna(0).clip(0, 4) * 0.8)
+        + (df["base_big_bull_k"].rolling(60).sum().fillna(0).clip(0, 8) * 0.45)
+        + (df["base_strong_close_k"].rolling(60).sum().fillna(0).clip(0, 10) * 0.25)
+        + (df["limit_up_base"].rolling(100).sum().fillna(0).clip(0, 5) * 0.6)
+    ).clip(0, 8)
+
+    df["base_observe_k_repair_score"] = (
+        (df["base_bullish_engulfing"].rolling(60).sum().fillna(0).clip(0, 6) * 0.7)
+        + (df["base_long_lower_repair"].rolling(60).sum().fillna(0).clip(0, 8) * 0.35)
+        + (df["break_bottom_reclaim_base"].rolling(60).sum().fillna(0).clip(0, 4) * 0.8)
+        + (df["base_mid_reclaim_memory"].rolling(60).sum().fillna(0).clip(0, 8) * 0.35)
+    ).clip(0, 7)
+
+    df["base_observe_structure_density_score"] = (
+        (df["base_key_test_memory"].rolling(60).sum().fillna(0).clip(0, 8) * 0.45)
+        + (df["platform20_break_base"].rolling(60).sum().fillna(0).clip(0, 4) * 0.9)
+        + (df["platform40_break_base"].rolling(60).sum().fillna(0).clip(0, 3) * 1.0)
+        + (df["base_mid_reclaim_memory"].rolling(60).sum().fillna(0).clip(0, 8) * 0.30)
+        + (df["base_low_lift_memory"].astype(float) * 1.2)
+    ).clip(0, 8)
+
+    df["base_observe_active_memory_score"] = (
+        (df["limit_up_base"].rolling(100).sum().fillna(0).clip(0, 6) * 0.5)
+        + (df["base_big_bull_k"].rolling(100).sum().fillna(0).clip(0, 10) * 0.25)
+        + (df["beiliang_count_60_base"].clip(0, 5) * 0.35)
+    ).clip(0, 5)
+
+    # 风险活跃扣分：防止高位乱波动、放量长上影、派发型活跃股进入深度候选前排。
+    df["base_observe_risk_active_penalty"] = 0.0
+    df.loc[df["base_upper_supply_k"].rolling(40).sum().fillna(0) >= 3, "base_observe_risk_active_penalty"] -= 2.5
+    df.loc[df["base_high_volume_stall"].rolling(40).sum().fillna(0) >= 2, "base_observe_risk_active_penalty"] -= 3.0
+    df.loc[df["base_break_fail_memory"].rolling(60).sum().fillna(0) >= 3, "base_observe_risk_active_penalty"] -= 2.0
+    df.loc[(df["long_pos_250"] > 0.80) & (df["base_observe_price_attack_score"] >= 5), "base_observe_risk_active_penalty"] -= 2.0
+    df.loc[(df["bias20"] > 0.18) | (df["bias60"] > 0.20), "base_observe_risk_active_penalty"] -= 1.5
+    df["base_observe_risk_active_penalty"] = df["base_observe_risk_active_penalty"].clip(-8, 0)
+
+    df["base_observation_subscore"] = (
+        df["base_observe_fund_event_score"] * 0.28
+        + df["base_observe_price_attack_score"] * 0.20
+        + df["base_observe_k_repair_score"] * 0.18
+        + df["base_observe_structure_density_score"] * 0.24
+        + df["base_observe_active_memory_score"] * 0.10
+        + df["base_observe_risk_active_penalty"]
+    ).clip(0, 12)
+
+    df["base_observation_high_quality"] = (
+        (df["base_observation_subscore"] >= 6.5)
+        & (df["base_risk_penalty"] > -12)
+        & (df["long_pos_250"] <= 0.75)
+        & (df["base_trade_quality_score"] >= -2)
+    )
+
     # V11基础总分：不再让攻击/倍量主导。
     # 大周期位置 + 结构潜力 + 买点质量为主，量能和攻击质量只做确认。
     df["base_total_score"] = (
@@ -3068,6 +3168,7 @@ def calc_base_rows(df):
         + df["base_long_cycle_potential_score"] * 1.00
         + df["base_monthly_height_proxy_score"] * 1.20
         + df["base_trade_quality_score"] * 1.10
+        + df["base_observation_subscore"] * 0.95
         + df["base_risk_penalty"] * 1.20
     ).clip(0, 100)
 
@@ -3079,21 +3180,79 @@ def calc_base_rows(df):
     # 兼容旧字段：base_score 改为V10基础总分；原模型折算另存 score_base_model_legacy。
     df["base_score"] = df["base_total_score"]
 
-    # 分桶：用于进入深度评分的配额选择。
-    df["base_bucket"] = "健康攻击"
-    df.loc[(df["long_pos_250"] <= 0.55) & ((df["just_cross_ma120"] | df["just_cross_ma250"]) | (df["base_long_cycle_potential_score"] >= 5)), "base_bucket"] = "低位修复"
-    df.loc[(df["base_volume_carry_score"] >= 8) & (df["base_attack_quality_score"] < 28), "base_bucket"] = "量价承接"
-    df.loc[((df["base_structure_potential_score"] >= 8) | (df["base_fibo_second_confirm_score"] >= 6)) & (df["base_risk_penalty"] > -12), "base_bucket"] = "结构潜力"
-    df.loc[(df["base_trade_quality_score"] >= 10) & (df["base_monthly_height_proxy_score"] >= 3) & (df["base_structure_potential_score"] >= 4), "base_bucket"] = "交易质量"
-    strong_watch_cond = ((df["pct_chg"] >= 7) | df["limit_up_base"] | (df["entity_pct"] >= 7)) & ((df["base_risk_penalty"] <= -4) | (df["base_trade_quality_score"] < 0))
-    df.loc[strong_watch_cond, "base_bucket"] = "强势观察"
+    # V19.2基础候选分桶：从旧“战法/表现桶”升级为“机会假设桶”。
+    # 注意：交易质量不再作为独立桶，而是全局排序/过滤层；压力带突破、倍量、时间窗口等都只是评分项。
+    # 目标：让深度评分200只覆盖回踩确认、资金承接、低位修复、爆发前夜等V19偏好的机会，而不是只追当天健康攻击。
+    v19_low_trigger_cond = (
+        (df["long_pos_250"] <= 0.60)
+        & ((df["short_ma_volume_entity_start"]) | (df["platform20_break_base"]) | (df["platform40_break_base"]) | (df["just_cross_ma120"]) | (df["just_cross_ma250"]))
+        & (df["base_risk_penalty"] > -12)
+    )
+    v19_pullback_confirm_cond = (
+        (df["base_trade_quality_score"] >= 7)
+        & (df["base_defense_dist"] <= 0.08)
+        & ((df["base_volume_carry_score"] >= 5) | (df["base_structure_potential_score"] >= 5))
+        & (df["base_risk_penalty"] > -12)
+    )
+    v19_multi_cycle_repair_cond = (
+        ((df["base_long_cycle_potential_score"] >= 5) | (df["base_monthly_height_proxy_score"] >= 7) | (df["just_cross_ma120"]) | (df["just_cross_ma250"]))
+        & (df["long_pos_250"] <= 0.65)
+        & (df["base_risk_penalty"] > -14)
+    )
+    v19_capital_carry_cond = (
+        ((df["base_volume_carry_score"] >= 8) | (df["base_limitup_hold_score"] >= 2))
+        & (df["base_attack_quality_score"] < 30)
+        & (df["base_risk_penalty"] > -12)
+    )
+    v19_compression_cond = (
+        ((df["base_structure_potential_score"] >= 5) | (df["base_observe_structure_density_score"] >= 5) | ((df["amp40"] <= 0.22) & (df["close"] >= df["high_40_prev"] * 0.96)))
+        & (df["base_attack_quality_score"] < 26)
+        & (df["base_risk_penalty"] > -12)
+    )
+    v19_structure_break_cond = (
+        ((df["platform40_break_base"]) | (df["platform20_break_base"]) | (df["base_fibo_second_confirm_score"] >= 6) | (df["base_structure_potential_score"] >= 10))
+        & (df["base_risk_penalty"] > -14)
+    )
+    v19_observation_fallback_cond = (
+        df["base_observation_high_quality"]
+        & ((df["base_observe_fund_event_score"] >= 5) | (df["base_observe_structure_density_score"] >= 5) | (df["base_observe_k_repair_score"] >= 4))
+    )
+    v19_active_watch_cond = (
+        ((df["pct_chg"] >= 7) | df["limit_up_base"] | (df["entity_pct"] >= 7))
+        & ((df["base_risk_penalty"] <= -4) | (df["base_trade_quality_score"] < 0) | (df["long_pos_250"] > 0.75))
+    )
 
+    # 默认放入低位强启动/关键位触发，是因为它仍保留原健康攻击入口；随后按更强机会假设覆盖。
+    df["base_bucket"] = "低位强启动/关键位触发"
+    df.loc[v19_multi_cycle_repair_cond, "base_bucket"] = "大周期修复/多周期共振"
+    df.loc[v19_capital_carry_cond, "base_bucket"] = "资金承接/倍量后平量/台阶推进"
+    df.loc[v19_compression_cond, "base_bucket"] = "平台蓄势/爆发前夜/左侧钝化"
+    df.loc[v19_structure_break_cond, "base_bucket"] = "结构突破/压力支撑带突破"
+    df.loc[v19_observation_fallback_cond, "base_bucket"] = "观察值兜底/资金记忆"
+    df.loc[v19_pullback_confirm_cond, "base_bucket"] = "回踩确认/二买候选"
+    df.loc[v19_low_trigger_cond & (df["base_bucket"].eq("低位强启动/关键位触发")), "base_bucket"] = "低位强启动/关键位触发"
+    df.loc[v19_active_watch_cond, "base_bucket"] = "活跃股性/强势观察"
+
+    # 排序分：保留原base_total_score，但把V19偏好的“确认、承接、修复、蓄势”作为排序增强。
     df["base_bucket_rank_score"] = df["base_total_score"].copy()
-    df.loc[df["base_bucket"].eq("低位修复"), "base_bucket_rank_score"] += 3
-    df.loc[df["base_bucket"].eq("量价承接"), "base_bucket_rank_score"] += 2
-    df.loc[df["base_bucket"].eq("结构潜力"), "base_bucket_rank_score"] += 2
-    df.loc[df["base_bucket"].eq("交易质量"), "base_bucket_rank_score"] += 4
-    df.loc[df["base_bucket"].eq("强势观察"), "base_bucket_rank_score"] -= 7
+    df.loc[df["base_bucket"].eq("回踩确认/二买候选"), "base_bucket_rank_score"] += 5
+    df.loc[df["base_bucket"].eq("资金承接/倍量后平量/台阶推进"), "base_bucket_rank_score"] += 4
+    df.loc[df["base_bucket"].eq("大周期修复/多周期共振"), "base_bucket_rank_score"] += 4
+    df.loc[df["base_bucket"].eq("平台蓄势/爆发前夜/左侧钝化"), "base_bucket_rank_score"] += 3
+    df.loc[df["base_bucket"].eq("结构突破/压力支撑带突破"), "base_bucket_rank_score"] += 3
+    df.loc[df["base_bucket"].eq("观察值兜底/资金记忆"), "base_bucket_rank_score"] += 3
+    df.loc[df["base_bucket"].eq("低位强启动/关键位触发"), "base_bucket_rank_score"] += 2
+    df.loc[df["base_bucket"].eq("活跃股性/强势观察"), "base_bucket_rank_score"] -= 5
+    df["base_bucket_rank_score"] += (df["base_observation_subscore"].clip(0, 12) * 0.35)
+    df.loc[df["base_observe_risk_active_penalty"] <= -4, "base_bucket_rank_score"] -= 3
+
+    # 交易质量不是分桶，但对所有桶统一生效。
+    df.loc[df["base_trade_quality_score"] >= 10, "base_bucket_rank_score"] += 3
+    df.loc[(df["base_risk_reward_ratio"] >= 1.5) & (df["base_risk_reward_ratio"] < 2.0), "base_bucket_rank_score"] += 2
+    df.loc[df["base_risk_reward_ratio"] >= 2.0, "base_bucket_rank_score"] += 4
+    df.loc[poor_trade_quality_base, "base_bucket_rank_score"] -= 5
+
+    # 原有重要入口保留，但变成排序增强，不再单独形成旧桶。
     df.loc[df["short_ma_volume_entity_start"] & (df["long_pos_250"] <= 0.60) & (df["bias20"] <= 0.15), "base_bucket_rank_score"] += 4
     df.loc[df["base_fibo_second_confirm_score"] >= 8, "base_bucket_rank_score"] += 5
     df.loc[(df["base_risk_penalty"] <= -12), "base_bucket_rank_score"] -= 8
@@ -7010,7 +7169,8 @@ def process_stock_deep(row):
 
 def select_deep_targets_v10(base_rows, limit):
     """
-    V10基础候选分桶选择。
+    V19.2基础候选分桶选择。
+    仍保留函数名以兼容旧调用，但内部已从V12旧桶升级为V19机会假设桶。
     不再简单按单一base_score取前N，避免强攻/极端放量票霸榜。
     每个股票只保留一条最优候选，减少深度评分重复计算。
     """
@@ -7052,27 +7212,30 @@ def select_deep_targets_v10(base_rows, limit):
             gated_out.append(rr)
     if gated:
         dedup = gated
-    print(f"V12.5基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
+    print(f"V19.2基础闸门：通过{len(dedup)}只，提前排除{len(gated_out)}只")
     append_seed_pool_snapshot(dedup)
 
-    # 配额：健康攻击保留原模型优势，低位修复/量价承接/结构潜力保证入口，强势观察限量。
+    # V19.2配额：深度评分默认200只。
+    # 重点扩大“回踩确认、资金承接、大周期修复、爆发前夜”，压缩单纯强势观察。
     quota_plan = [
-        ("健康攻击", 0.27),
-        ("低位修复", 0.20),
-        ("量价承接", 0.18),
-        ("结构潜力", 0.22),
-        ("交易质量", 0.12),
-        ("强势观察", 0.08),
+        ("低位强启动/关键位触发", 0.15),
+        ("回踩确认/二买候选", 0.20),
+        ("大周期修复/多周期共振", 0.125),
+        ("资金承接/倍量后平量/台阶推进", 0.175),
+        ("平台蓄势/爆发前夜/左侧钝化", 0.125),
+        ("结构突破/压力支撑带突破", 0.075),
+        ("观察值兜底/资金记忆", 0.10),
+        ("活跃股性/强势观察", 0.05),
     ]
     quotas = {name: max(3, int(round(limit * ratio))) for name, ratio in quota_plan}
     # 修正四舍五入误差。
     while sum(quotas.values()) > limit:
-        # 优先从强势观察、健康攻击里减，避免挤压低位/承接/结构。
-        for name in ["强势观察", "健康攻击", "结构潜力", "量价承接", "低位修复"]:
+        # 优先从活跃观察、低位触发、结构突破里减，避免挤压回踩确认/资金承接/修复/蓄势。
+        for name in ["活跃股性/强势观察", "结构突破/压力支撑带突破", "低位强启动/关键位触发", "观察值兜底/资金记忆", "平台蓄势/爆发前夜/左侧钝化", "大周期修复/多周期共振"]:
             if quotas.get(name, 0) > 3 and sum(quotas.values()) > limit:
                 quotas[name] -= 1
     while sum(quotas.values()) < limit:
-        for name in ["健康攻击", "低位修复", "量价承接", "结构潜力", "强势观察"]:
+        for name in ["回踩确认/二买候选", "资金承接/倍量后平量/台阶推进", "观察值兜底/资金记忆", "大周期修复/多周期共振", "平台蓄势/爆发前夜/左侧钝化", "低位强启动/关键位触发"]:
             if sum(quotas.values()) < limit:
                 quotas[name] += 1
 
@@ -7120,7 +7283,7 @@ def select_deep_targets_v10(base_rows, limit):
     )[:limit]
 
     bucket_stats["合计"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
-    bucket_stats["V12.5基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
+    bucket_stats["V19.2基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
 
@@ -7916,7 +8079,7 @@ def select_final_signals_v14(deep_rows, history=None, limit=None):
         history = {}
     limit = int(limit or V19_FIXED_TOP_N or V14_TARGET_PUSH_COUNT or RESULT_LIMIT or 3)
 
-    audited = [v16_candidate_audit(r) for r in deep_rows]
+    audited = [v14_candidate_audit(r) for r in deep_rows]
 
     blocked = [r for r in audited if r.get("v14_blocked")]
     eligible = [r for r in audited if not r.get("v14_blocked")]
@@ -8287,7 +8450,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         }
         with open(V19_SCORE_CARDS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"V19.1评分卡已保存：{V19_SCORE_CARDS_FILE}")
+        print(f"V19.3评分卡已保存：{V19_SCORE_CARDS_FILE}")
 
         lines = []
         lines.append("一号员工 V19.1 今日固定Top3报告")
@@ -8318,7 +8481,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         lines.append("后续每日可按T+1/T+3/T+5/T+8/T+13/T+20读取本文件，对final_top3和watch_pool做路径归因、指标定义反查、阈值/权重/同源重复审计。")
         with open(V19_DAILY_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        print(f"V19.1日报已保存：{V19_DAILY_REPORT_FILE}")
+        print(f"V19.3日报已保存：{V19_DAILY_REPORT_FILE}")
 
         review_lines = [
             "一号员工 V19.1 复盘归因报告占位",
@@ -8327,9 +8490,26 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         ]
         with open(V19_REVIEW_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(review_lines))
-        print(f"V19.1复盘报告占位已保存：{V19_REVIEW_REPORT_FILE}")
+        print(f"V19.3复盘报告占位已保存：{V19_REVIEW_REPORT_FILE}")
     except Exception as e:
         print(f"V19.1输出保存失败：{e}")
+
+
+
+def build_error_message(e):
+    """Telegram错误诊断兜底，避免异常处理阶段再次 NameError。"""
+    import html, traceback
+    tb = traceback.format_exc()
+    msg = [
+        "❌ <b>一号员工运行异常</b>",
+        "",
+        f"错误类型：<code>{html.escape(type(e).__name__)}</code>",
+        f"错误信息：<code>{html.escape(str(e)[:800])}</code>",
+        "",
+        "<b>Traceback 摘要：</b>",
+        f"<pre>{html.escape(tb[-2500:])}</pre>",
+    ]
+    return "\n".join(msg)
 
 
 def main():
@@ -8511,8 +8691,8 @@ def main():
         deep_targets, base_bucket_stats = select_deep_targets_v10(base_rows, DEEP_SCORE_LIMIT)
 
         print(f"基础评分完成：{len(base_rows)}条")
-        print(f"V12.7基础分桶/闸门后进入深度评分：{len(deep_targets)}条")
-        print("V12.7基础候选分桶统计：")
+        print(f"V19.3基础海选机会分桶/闸门后进入深度评分：{len(deep_targets)}条")
+        print("V19.3基础海选机会分桶统计：")
         for _bucket, _st in base_bucket_stats.items():
             print(f"  {_bucket}: 可用{_st.get('available', 0)} | 配额{_st.get('quota', 0)} | 入选{_st.get('selected', 0)}")
 
