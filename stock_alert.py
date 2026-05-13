@@ -1,4 +1,4 @@
-# V19.4 FINAL BUILD - resonance core line + near/far pressure merge + price plan - py_compile passed
+# V19.4.1 BUILD - data quality note for B/Q candidates - py_compile passed
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -8678,6 +8678,7 @@ def build_giveup_condition(s):
 def render_v16_summary_table_png(final_signals, output_path="telegram_tables/v16_summary.png"):
     rows = []
     for i, s in enumerate(final_signals, 1):
+        s = attach_data_quality_to_row(dict(s or {}))
         rows.append([
             i,
             f"{s.get('name','')}({s.get('code','')})",
@@ -8922,11 +8923,131 @@ def v19_price_plan_lines(s, html_mode=False):
     return [esc(x) for x in lines]
 
 
+
+# ========================= V19.4.1 数据质量提示模块 =========================
+# 只做报告层小优化：如果Top3来自B档/Q档数据，在Telegram与score_cards里提示。
+# 不改变选股评分、不改变候选排序、不改变压力带/价格计划逻辑。
+
+_DATA_QUALITY_CACHE = None
+
+def _normalize_stock_code_for_quality(x):
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    s = s.replace("sh.", "").replace("sz.", "").replace("bj.", "").replace("SH.", "").replace("SZ.", "").replace("BJ.", "")
+    return s.zfill(6) if s.isdigit() and len(s) <= 6 else s
+
+def _load_data_quality_map():
+    global _DATA_QUALITY_CACHE
+    if _DATA_QUALITY_CACHE is not None:
+        return _DATA_QUALITY_CACHE
+    mp = {}
+    try:
+        import glob
+        # 优先读模型可用股票池，其次读缓存验收明细。
+        files = []
+        files.extend(sorted(glob.glob("outputs/model_usable_universe_*.csv"), reverse=True))
+        files.extend(sorted(glob.glob("outputs/cache_acceptance_report_*.csv"), reverse=True))
+        for path in files[:4]:
+            try:
+                dfq = pd.read_csv(path)
+            except Exception:
+                continue
+            if dfq is None or dfq.empty:
+                continue
+            cols = {str(c).lower(): c for c in dfq.columns}
+            code_col = None
+            for k in ["code", "symbol", "股票代码", "代码"]:
+                if k.lower() in cols:
+                    code_col = cols[k.lower()]
+                    break
+            if code_col is None:
+                # 兜底：找包含code/symbol的列
+                for c in dfq.columns:
+                    lc = str(c).lower()
+                    if "code" in lc or "symbol" in lc or "代码" in str(c):
+                        code_col = c
+                        break
+            if code_col is None:
+                continue
+
+            # 质量档位列可能命名不同，尽量兼容。
+            tier_col = None
+            for k in ["quality", "quality_tier", "data_quality", "acceptance_tier", "grade", "tier", "验收档位", "质量档位", "档位"]:
+                if k.lower() in cols:
+                    tier_col = cols[k.lower()]
+                    break
+            if tier_col is None:
+                for c in dfq.columns:
+                    name = str(c)
+                    if ("档" in name) or ("tier" in name.lower()) or ("quality" in name.lower()) or ("grade" in name.lower()):
+                        tier_col = c
+                        break
+
+            reason_col = None
+            for k in ["reason", "quality_reason", "acceptance_reason", "note", "备注", "原因", "说明"]:
+                if k.lower() in cols:
+                    reason_col = cols[k.lower()]
+                    break
+
+            for _, rr in dfq.iterrows():
+                cd = _normalize_stock_code_for_quality(rr.get(code_col, ""))
+                if not cd:
+                    continue
+                tier = str(rr.get(tier_col, "")).strip().upper() if tier_col is not None else ""
+                reason = str(rr.get(reason_col, "")).strip() if reason_col is not None else ""
+                # 兼容布尔列/文本列里出现A/B/Q
+                if not tier:
+                    row_text = " ".join(str(rr.get(c, "")) for c in dfq.columns[:12]).upper()
+                    if "Q" in row_text and ("复权" in row_text or "Q" in row_text):
+                        tier = "Q"
+                    elif "B" in row_text:
+                        tier = "B"
+                    elif "A" in row_text:
+                        tier = "A"
+                if tier:
+                    # 不覆盖已经读到的更明确档位
+                    mp.setdefault(cd, {"tier": tier[:8], "reason": reason[:80], "source": path})
+    except Exception:
+        pass
+    _DATA_QUALITY_CACHE = mp
+    return mp
+
+def attach_data_quality_to_row(row):
+    """给候选行附加数据质量字段。只影响报告提示，不影响打分排序。"""
+    try:
+        cd = _normalize_stock_code_for_quality(row.get("code") or row.get("symbol") or row.get("股票代码"))
+        mp = _load_data_quality_map()
+        info = mp.get(cd, {})
+        tier = str(row.get("data_quality_tier") or row.get("quality_tier") or info.get("tier", "") or "").strip().upper()
+        reason = str(row.get("data_quality_reason") or info.get("reason", "") or "").strip()
+        if tier:
+            row["data_quality_tier"] = tier
+            row["data_quality_reason"] = reason
+            if tier.startswith("B"):
+                row["data_quality_note"] = "数据质量：B档，通过但需注意新鲜度/停牌/复权状态。"
+            elif tier.startswith("Q"):
+                row["data_quality_note"] = "数据质量：Q档，前复权/裁剪后通过，需额外留意复权与K线连续性。"
+            elif tier.startswith("A"):
+                row["data_quality_note"] = "数据质量：A档。"
+        return row
+    except Exception:
+        return row
+
+def data_quality_report_line(row):
+    note = str(row.get("data_quality_note", "") or "").strip()
+    if note and not note.endswith("。"):
+        note += "。"
+    return note
+
+# ======================= V19.4.1 数据质量提示模块 END =======================
+
+
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
-    lines.append("📊 <b>一号员工选股模型 V19.4 固定Top3价格计划报告</b>")
+    lines.append("📊 <b>一号员工选股模型 V19.4.1 固定Top3价格计划报告</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
@@ -8965,6 +9086,9 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         main_signal = str(s.get('v16_main_signal','') or s.get('v19_main_signal','') or 'V19.3综合机会')
         lines.append(f"主导逻辑：{html.escape(main_signal)}")
         lines.append(f"核心压力带：{safe_float(s.get('xhu_pressure_core_lower',0)):.2f}-{safe_float(s.get('xhu_pressure_core_upper',0)):.2f}；最终压力上沿：{safe_float(s.get('xhu_pressure_union_upper', s.get('xhu_final_union_upper',0))):.2f}；压力带等级：{html.escape(str(s.get('xhu_pressure_model_grade','')))}")
+        dq_line = data_quality_report_line(s)
+        if dq_line and ("B档" in dq_line or "Q档" in dq_line):
+            lines.append(html.escape(dq_line))
         for pl in v19_price_plan_lines(s, html_mode=True):
             lines.append(pl)
         lines.append(f"模型确认：{html.escape(build_confirm_condition(s))}")
@@ -9171,11 +9295,24 @@ def main():
     print(f"STOCK_LIST_FALLBACK_AKSHARE={STOCK_LIST_FALLBACK_AKSHARE}")
     print(f"北京时间：{bj_time_str()}")
 
-    if not baostock_login():
-        msg = "BaoStock登录失败，无法获取数据。"
-        print(msg)
-        send_telegram(build_error_message(msg))
-        return
+    # V19.4.1 HOTFIX：只读缓存模式下，不让 BaoStock 登录失败阻断主流程。
+    # 说明：USE_FULL_HISTORY_CACHE=1 时，模型优先读取 kline_cache 全历史缓存；
+    # BaoStock 只作为旧联网/兜底通道，不应在启动阶段一票否决。
+    # 如果关闭只读缓存、需要联网取数，则仍然要求 BaoStock 登录成功。
+    need_baostock_login = USE_FULL_HISTORY_CACHE != "1"
+
+    if need_baostock_login:
+        if not baostock_login():
+            msg = "BaoStock登录失败，无法获取数据。"
+            print(msg)
+            send_telegram(build_error_message(msg))
+            return
+    else:
+        try:
+            ok = baostock_login()
+            print(f"只读缓存模式：BaoStock登录尝试结果={ok}，不阻断主流程")
+        except Exception as e:
+            print(f"只读缓存模式：BaoStock登录异常但不阻断主流程：{e}")
 
     try:
         history = load_signal_history()
