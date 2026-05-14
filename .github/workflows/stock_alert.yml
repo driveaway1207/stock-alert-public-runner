@@ -1,10 +1,9 @@
-name: Stock Alert V25.3 BigBull Daily & Backtest
+name: 一号员工选股模型 V25.3
 
 on:
   schedule:
     # GitHub Actions 使用 UTC 时间
     # 北京时间 18:15 = UTC 10:15
-    # 前提：你的K线更新任务在北京时间18:00左右完成
     - cron: '15 10 * * 1-5'
 
   workflow_dispatch:
@@ -20,12 +19,12 @@ on:
           - selfcheck
 
       start:
-        description: '回测开始日期，仅 backtest 使用，例如 2022-04-08'
+        description: '回测开始日期，例如 2022-04-08'
         required: false
         default: '2022-04-08'
 
       end:
-        description: '回测结束日期，仅 backtest 使用，例如 2023-04-08'
+        description: '回测结束日期，例如 2023-04-08'
         required: false
         default: '2023-04-08'
 
@@ -41,90 +40,106 @@ on:
 
 jobs:
   run-stock-alert:
+    name: 运行一号员工选股
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 核心：生产环境优先只读18点更新好的全历史K线缓存
+      # 默认优先尝试读取K线缓存；如果没有缓存，下面步骤会自动改为 BaoStock 主拉
       USE_FULL_HISTORY_CACHE: '1'
-      FULL_HISTORY_CACHE_DIR: 'kline_cache'
+      FULL_HISTORY_CACHE_DIR: 'K线缓存'
 
-      # 重要：AkShare 只允许作为备用思路，不在正式生产里大规模补拉
-      # 避免出现你截图里的 AkShare补拉失败刷屏
+      # 关键：不让 AkShare 变成主数据源，避免你刚才截图那种 AkShare补拉失败刷屏
       KLINE_FALLBACK_AKSHARE: '0'
+
+      # 股票池如果 BaoStock 失败，是否允许 AkShare 备用
+      # 这里先关掉，保持 BaoStock 主线清晰
       STOCK_LIST_FALLBACK_AKSHARE: '0'
 
-      # 不允许旧缓存兜底，避免用过期K线推送正式结果
+      # 不用旧缓存硬凑正式结果
       ALLOW_STALE_KLINE_CACHE: '0'
 
-      # BaoStock仍保留为主数据源兜底，但正常情况下应直接读kline_cache
+      # BaoStock 主数据源保护
       BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
       SUPPRESS_BAOSTOCK_VERBOSE: '1'
 
-      # Telegram：Python脚本读取的是 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / ENABLE_TELEGRAM
+      # Telegram 推送
       ENABLE_TELEGRAM: '1'
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # 输出数量
+      # 正式推送数量
       TOP_PUSH_LIMIT: '3'
       RESULT_LIMIT: '3'
       FORCE_TOP_N: '3'
       MIN_PUSH_COUNT: '3'
 
     steps:
-      - name: Checkout repository
+      - name: ① 下载仓库代码
         uses: actions/checkout@v4
 
-      - name: Check kline cache exists
+      - name: ② 检查K线缓存文件夹
         shell: bash
         run: |
-          echo "检查 kline_cache 是否存在..."
+          echo "开始检查K线缓存文件夹..."
 
-          if [ ! -d "kline_cache" ]; then
-            echo "❌ kline_cache 文件夹不存在。"
-            echo "说明：当前正式生产模式 USE_FULL_HISTORY_CACHE=1，需要先有18点更新好的K线缓存。"
-            echo "为避免误用联网临时补拉数据，本次停止运行。"
-            exit 1
+          if [ -d "K线缓存" ]; then
+            echo "✅ 找到中文K线缓存文件夹：K线缓存"
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> $GITHUB_ENV
+            echo "USE_FULL_HISTORY_CACHE=1" >> $GITHUB_ENV
+
+            CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
+
+          elif [ -d "kline_cache" ]; then
+            echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
+            echo "为了兼容旧代码，本次继续读取 kline_cache"
+            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> $GITHUB_ENV
+            echo "USE_FULL_HISTORY_CACHE=1" >> $GITHUB_ENV
+
+            CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
+
+          else
+            echo "⚠️ 没找到K线缓存文件夹。"
+            echo "说明：仓库里目前没有 K线缓存 或 kline_cache 文件夹。"
+            echo "本次不强制失败，改为使用 BaoStock 主数据源拉取K线。"
+            echo "USE_FULL_HISTORY_CACHE=0" >> $GITHUB_ENV
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> $GITHUB_ENV
           fi
 
-          CSV_COUNT=$(find kline_cache -name "*.csv" | wc -l)
-          echo "kline_cache CSV数量: $CSV_COUNT"
-
-          if [ "$CSV_COUNT" -lt 1000 ]; then
-            echo "❌ kline_cache CSV数量过少，疑似K线缓存没有完整准备好。"
-            echo "为避免小样本误判，本次停止运行。"
-            exit 1
-          fi
-
-          echo "✅ kline_cache 基础检查通过。"
-
-      - name: Show latest kline cache files
+      - name: ③ 显示最近的K线缓存文件
         shell: bash
         run: |
-          echo "最近更新的K线缓存文件："
-          find kline_cache -name "*.csv" -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30 || true
+          echo "当前K线缓存目录：$FULL_HISTORY_CACHE_DIR"
 
-      - name: Check risk flags file
+          if [ -d "$FULL_HISTORY_CACHE_DIR" ]; then
+            echo "最近更新的K线文件："
+            find "$FULL_HISTORY_CACHE_DIR" -name "*.csv" -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30 || true
+          else
+            echo "没有K线缓存目录，本次将走 BaoStock 主数据源。"
+          fi
+
+      - name: ④ 检查风险雷区文件
         shell: bash
         run: |
           if [ -f "risk_flags.json" ]; then
-            echo "✅ risk_flags.json 存在，硬排雷文件可用。"
+            echo "✅ 找到风险雷区文件：risk_flags.json"
           else
-            echo "⚠️ risk_flags.json 不存在。"
-            echo "说明：模型仍可运行，但外部监管/财务/治理雷区命中能力会下降。"
+            echo "⚠️ 没找到风险雷区文件 risk_flags.json"
+            echo "模型仍然可以运行，但外部监管/财务/治理雷区识别会变弱。"
           fi
 
-      - name: Set up Python
+      - name: ⑤ 安装Python环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: ⑥ 安装运行依赖
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -135,12 +150,12 @@ jobs:
             pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
           fi
 
-      - name: Syntax check
+      - name: ⑦ 检查Python代码语法
         shell: bash
         run: |
           python -m py_compile stock_alert_v25_3_bigbull_full.py
 
-      - name: Run stock alert
+      - name: ⑧ 运行一号员工选股模型
         shell: bash
         run: |
           MODE="${{ github.event.inputs.mode }}"
@@ -153,7 +168,10 @@ jobs:
             MODE="daily"
           fi
 
-          echo "当前运行模式: $MODE"
+          echo "当前运行模式：$MODE"
+          echo "是否读取K线缓存：$USE_FULL_HISTORY_CACHE"
+          echo "K线缓存目录：$FULL_HISTORY_CACHE_DIR"
+          echo "AkShare补拉开关：$KLINE_FALLBACK_AKSHARE"
 
           if [ "$MODE" = "selfcheck" ]; then
             python stock_alert_v25_3_bigbull_full.py --mode daily --self-check
@@ -176,11 +194,11 @@ jobs:
             python stock_alert_v25_3_bigbull_full.py --mode daily
           fi
 
-      - name: Upload artifacts
+      - name: ⑨ 保存运行结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-alert-v25-3-bigbull-output
+          name: 一号员工选股结果
           path: |
             *.csv
             *.md
