@@ -109,7 +109,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       # GitHub CLI
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
 
     steps:
       - name: ① 下载仓库代码
