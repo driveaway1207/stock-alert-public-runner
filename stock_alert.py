@@ -157,7 +157,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V20.3.1一号员工选股模型｜基础筛选重构+动态风险库稳定修复版"
+MODEL_VERSION = "V22.0一号员工选股模型｜V20.3.1生产底座+V21.2交易机会融合+信号归属去重版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -10333,6 +10333,822 @@ def v201_simplified_layer_scores(row):
     }
 
 
+
+
+# ======================= V22.0 Signal Registry + V21.2 Unified Opportunity Engine START =======================
+# 设计原则：
+# 1）不删除V20.3.1旧颗粒口径；旧模型继续负责海选、深度评分、风险库、生命周期。
+# 2）V21.2只做统一行为层融合：量、价、时、空、执行、股性。
+# 3）核心压力带只是结构因子，不是唯一主轴；高质量突破只是加分项，不是唯一入口。
+# 4）正式Top更强调“确定性可交易机会”：预判仓/确认仓/失败线/目标概率必须写清楚。
+
+V212_ENABLED = os.environ.get("V212_ENABLED", "1")
+V212_OUTPUT_FILE = os.environ.get("V22_OUTPUT_FILE", os.environ.get("V212_OUTPUT_FILE", "v22_0_fused_score_cards.json"))
+V212_DAILY_REPORT_FILE = os.environ.get("V22_DAILY_REPORT_FILE", os.environ.get("V212_DAILY_REPORT_FILE", "v22_0_fused_daily_report.txt"))
+V212_MIN_FORMAL_SCORE = float(os.environ.get("V22_MIN_FORMAL_SCORE", os.environ.get("V212_MIN_FORMAL_SCORE", "78")))
+V212_MAX_PREDICT_RISK = float(os.environ.get("V22_MAX_PREDICT_RISK", os.environ.get("V212_MAX_PREDICT_RISK", "0.075")))
+V212_MAX_CONFIRM_RISK = float(os.environ.get("V22_MAX_CONFIRM_RISK", os.environ.get("V212_MAX_CONFIRM_RISK", "0.085")))
+V212_MIN_RR_FORMAL = float(os.environ.get("V22_MIN_RR_FORMAL", os.environ.get("V212_MIN_RR_FORMAL", "1.70")))
+V212_TARGET_PUSH_LIMIT = int(os.environ.get("V22_TARGET_PUSH_LIMIT", os.environ.get("V212_TARGET_PUSH_LIMIT", os.environ.get("TOP_PUSH_LIMIT", "3") or "3")))
+
+# V22 信号归属登记：解决“保留好逻辑但不重复打分”的核心机制。
+# owner_layer 只有一个；其他层只能引用 evidence/reference，不允许再拿满分。
+V22_SIGNAL_REGISTRY = {
+    "volume_standard_bull": {"owner_layer": "event", "reference_layers": ["structure", "execution"], "desc": "标准倍量阳K/健康放量启动"},
+    "volume_after_flat_acceptance": {"owner_layer": "confirmation", "reference_layers": ["event", "execution"], "desc": "倍量后平量且后三日承接"},
+    "platform_notch_structure": {"owner_layer": "structure", "reference_layers": ["price", "execution"], "desc": "平台/凹口/颈线结构"},
+    "pressure_zone_breakout": {"owner_layer": "structure", "reference_layers": ["space", "execution"], "desc": "多周期核心压力带突破/消化"},
+    "monthly_reclaim_repair": {"owner_layer": "context", "reference_layers": ["structure"], "desc": "月线BBI/BOLL中轨修复与大周期修复"},
+    "gap_wick_resonance": {"owner_layer": "structure", "reference_layers": ["space"], "desc": "缺口/影线/实体共振形成供需区"},
+    "risk_hard_filter": {"owner_layer": "risk", "reference_layers": ["ranking", "execution"], "desc": "基本面/监管/治理/技术硬风险前置拦截"},
+    "trade_execution_plan": {"owner_layer": "execution", "reference_layers": ["report"], "desc": "确认线、失败线、仓位、目标概率"},
+}
+
+def v22_signal_ownership_audit(row):
+    """给报告/评分卡用的轻量审计字段：每个大类说明谁负责打分，谁只做引用。"""
+    return {
+        "version": "V22.0",
+        "principle": "signal_owner_scores_once_reference_elsewhere",
+        "score_owners": {
+            "event": ["volume_standard_bull"],
+            "structure": ["platform_notch_structure", "pressure_zone_breakout", "gap_wick_resonance"],
+            "context": ["monthly_reclaim_repair"],
+            "confirmation": ["volume_after_flat_acceptance"],
+            "risk": ["risk_hard_filter"],
+            "execution": ["trade_execution_plan"],
+        },
+        "dedupe_note": "V20负责候选质量；V21.2/V22负责交易状态，不重复给同一事件多层满分。"
+    }
+
+def v22_composite_trade_score(row):
+    """最终排序分：只融合V20质量分与V21/V22交易分；不重新拆信号打分。"""
+    v20 = safe_float(row.get("v20_final_score_raw", row.get("v20_final_score", 0)))
+    v212 = safe_float(row.get("v212_final_score", 0))
+    risk_penalty = 0.0
+    if row.get("v14_blocked") or str(row.get("v20_trade_tier", "")).startswith("硬风险"):
+        risk_penalty += 100.0
+    if safe_float(row.get("v212_risk_pct", 0)) > V212_MAX_CONFIRM_RISK:
+        risk_penalty += 6.0
+    if safe_float(row.get("v212_space_score", 0)) < 42:
+        risk_penalty += 4.0
+    # V20=股票/结构质量，V21.2=交易机会状态；二者合成，但风险前置。
+    return round(_v212_clip(v20 * 0.55 + v212 * 0.45 - risk_penalty), 2)
+
+
+def _v212_clip(x, lo=0.0, hi=100.0):
+    try:
+        x = float(x)
+    except Exception:
+        x = lo
+    if x != x:
+        x = lo
+    return max(lo, min(hi, x))
+
+
+def _v212_pct(a, b):
+    a = safe_float(a, 0)
+    b = safe_float(b, 0)
+    if b <= 0:
+        return 0.0
+    return a / b - 1.0
+
+
+def _v212_pct_dist(level, price):
+    price = safe_float(price, 0)
+    level = safe_float(level, 0)
+    if price <= 0 or level <= 0:
+        return 999.0
+    return level / price - 1.0
+
+
+def _v212_norm_df(df):
+    if df is None or getattr(df, 'empty', True):
+        return pd.DataFrame()
+    x = df.copy()
+    aliases = {
+        'date': ['date', '日期', 'trade_date', '交易日期'],
+        'open': ['open', '开盘', '开盘价'],
+        'high': ['high', '最高', '最高价'],
+        'low': ['low', '最低', '最低价'],
+        'close': ['close', '收盘', '收盘价'],
+        'volume': ['volume', 'vol', '成交量', '成交量(手)'],
+        'amount': ['amount', '成交额', '成交额(元)'],
+    }
+    rename = {}
+    for std, names in aliases.items():
+        for n in names:
+            if n in x.columns:
+                rename[n] = std
+                break
+    x = x.rename(columns=rename)
+    for c in ['open', 'high', 'low', 'close']:
+        if c not in x.columns:
+            return pd.DataFrame()
+    if 'volume' not in x.columns:
+        x['volume'] = 0.0
+    if 'amount' not in x.columns:
+        x['amount'] = x['volume'] * x['close']
+    for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+        x[c] = pd.to_numeric(x[c], errors='coerce')
+    if 'date' in x.columns:
+        x['date'] = pd.to_datetime(x['date'], errors='coerce')
+        x = x.dropna(subset=['date']).sort_values('date')
+    else:
+        x['date'] = pd.date_range('2000-01-01', periods=len(x), freq='B')
+    x = x.dropna(subset=['open', 'high', 'low', 'close'])
+    x = x[x['close'] > 0].copy()
+    x['amount'] = x['amount'].fillna(x['volume'] * x['close'])
+    if x.empty:
+        return x
+    rng = (x['high'] - x['low']).replace(0, np.nan)
+    body = (x['close'] - x['open']).abs()
+    top = x[['open', 'close']].max(axis=1)
+    bot = x[['open', 'close']].min(axis=1)
+    x['ret'] = x['close'].pct_change().fillna(0)
+    x['body_ratio'] = (body / rng).fillna(0)
+    x['close_pos'] = ((x['close'] - x['low']) / rng).fillna(0.5)
+    x['upper_wick_ratio'] = ((x['high'] - top) / rng).fillna(0)
+    x['lower_wick_ratio'] = ((bot - x['low']) / rng).fillna(0)
+    x['vol_ma5'] = x['volume'].rolling(5, min_periods=2).mean()
+    x['vol_ma10'] = x['volume'].rolling(10, min_periods=3).mean()
+    x['vol_ma20'] = x['volume'].rolling(20, min_periods=5).mean()
+    x['vol_ma60'] = x['volume'].rolling(60, min_periods=15).mean()
+    x['amount_ma20'] = x['amount'].rolling(20, min_periods=5).mean()
+    x['is_bull_quality'] = (x['close'] >= x['open']) & (x['close'] > x['close'].shift(1)) & (x['close_pos'] >= 0.62)
+    x['is_fake_bear_bull'] = (x['close'] < x['open']) & (x['close'] > x['close'].shift(1)) & (x['close_pos'] >= 0.58)
+    x['is_bad_stall'] = (x['upper_wick_ratio'] >= 0.42) & (x['close_pos'] <= 0.58) & (x['volume'] >= x['vol_ma20'] * 1.2)
+    x['vol_ratio_prev'] = x['volume'] / x['volume'].shift(1).replace(0, np.nan)
+    x['is_double_volume'] = (x['vol_ratio_prev'] >= 1.8) & (x['vol_ratio_prev'] <= 2.5)
+    return x.reset_index(drop=True)
+
+
+def _v212_resample(df, freq):
+    df = _v212_norm_df(df)
+    if df.empty:
+        return pd.DataFrame()
+    y = df.set_index('date').sort_index().resample(freq).agg({
+        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum', 'amount': 'sum'
+    }).dropna(subset=['open', 'high', 'low', 'close']).reset_index()
+    return _v212_norm_df(y)
+
+
+def _v212_get_daily_df(row):
+    """尽量只读缓存，不在最终选择阶段联网，避免输出阶段慢/不稳定。"""
+    code = str(row.get('code', '') or '').zfill(6)
+    if not code or code == '000000':
+        return pd.DataFrame()
+    try:
+        bs_code = _bs_code_from_plain_code(code)
+        if bs_code:
+            df = read_full_history_flat_cache(bs_code, cache_scope='base', min_rows=80)
+            df = _v212_norm_df(df)
+            if len(df) >= 80:
+                return df
+    except Exception:
+        pass
+    # 如果深度行里本身带最近K线字段，无法构成长序列，只返回空，V21.2降级用旧字段。
+    return pd.DataFrame()
+
+
+def _v212_bucket_price(v, pct=0.012):
+    v = safe_float(v, 0)
+    if v <= 0:
+        return 0.0
+    step = max(v * pct, 0.01)
+    return round(round(v / step) * step, 2)
+
+
+def _v212_profile_zones(df, current, window=260, bucket_pct=0.012, tf='日线', weight=1.0):
+    if df is None or df.empty or len(df) < 20:
+        return []
+    x = _v212_norm_df(df).tail(window).copy()
+    if x.empty:
+        return []
+    tp = (x['high'] + x['low'] + x['close']) / 3.0
+    x['_bucket'] = tp.apply(lambda z: _v212_bucket_price(z, bucket_pct))
+    g = x.groupby('_bucket').agg(
+        amount=('amount', 'sum'),
+        volume=('volume', 'sum'),
+        touches=('close', 'count'),
+        wick=('upper_wick_ratio', 'mean'),
+        high=('high', 'max'),
+        low=('low', 'min'),
+    ).reset_index()
+    if g.empty or safe_float(g['amount'].max(), 0) <= 0:
+        return []
+    g['amount_pct'] = g['amount'].rank(pct=True)
+    g['touch_pct'] = g['touches'].rank(pct=True)
+    zones = []
+    for _, r in g.sort_values(['amount_pct', 'touch_pct'], ascending=False).head(10).iterrows():
+        core = safe_float(r['_bucket'], 0)
+        if core <= 0:
+            continue
+        width = max(core * bucket_pct * 1.8, 0.03)
+        strength = _v212_clip((60 * safe_float(r['amount_pct']) + 25 * safe_float(r['touch_pct']) + 15 * safe_float(r['wick'])) * weight, 0, 100)
+        kind = 'supply' if core >= current * 0.98 else 'demand'
+        zones.append({
+            'low': round(core - width, 2),
+            'high': round(core + width, 2),
+            'core': round(core, 2),
+            'strength': round(strength, 2),
+            'kind': kind,
+            'tf': tf,
+            'source': 'volume_profile',
+            'reason': f'{tf}成交密集桶/触碰{int(r["touches"])}'
+        })
+    return zones
+
+
+def _v212_anchor_zones(df, current, window=260, tf='日线', weight=1.0):
+    if df is None or df.empty or len(df) < 10:
+        return []
+    x = _v212_norm_df(df).tail(window).copy()
+    zones = []
+    # 最大量有效阳K高点/实体实底
+    valid_bull = x[((x['is_bull_quality']) | (x['is_fake_bear_bull'])) & (x['body_ratio'] >= 0.28)]
+    if not valid_bull.empty:
+        row = valid_bull.loc[valid_bull['volume'].idxmax()]
+        high = safe_float(row['high'])
+        body_low = min(safe_float(row['open']), safe_float(row['close']))
+        width = max(high * 0.014, 0.03)
+        zones.append({'low': round(high-width,2), 'high': round(high+width,2), 'core': round(high,2), 'strength': _v212_clip(78*weight), 'kind': 'supply' if high >= current*0.98 else 'demand', 'tf': tf, 'source': 'max_bull_volume_high', 'reason': f'{tf}最大量有效阳K高点'})
+        zones.append({'low': round(body_low-width,2), 'high': round(body_low+width,2), 'core': round(body_low,2), 'strength': _v212_clip(62*weight), 'kind': 'demand', 'tf': tf, 'source': 'max_bull_volume_body_low', 'reason': f'{tf}最大量有效阳K实体实底'})
+    # 高点/次高点、长上影失败区、收盘共振
+    highs = x.sort_values('high', ascending=False).head(5)
+    for rank, (_, row) in enumerate(highs.iterrows(), 1):
+        lv = safe_float(row['high'])
+        if lv < current * 0.85:
+            continue
+        width = max(lv * 0.012, 0.03)
+        zones.append({'low': round(lv-width,2), 'high': round(lv+width,2), 'core': round(lv,2), 'strength': _v212_clip((72-rank*4)*weight), 'kind': 'supply' if lv >= current*0.98 else 'demand', 'tf': tf, 'source': f'high_rank_{rank}', 'reason': f'{tf}阶段高点/次高点rank={rank}'})
+    wick = x[(x['upper_wick_ratio'] >= 0.42) & (x['high'] >= current*0.95)]
+    if len(wick) >= 2:
+        lv = safe_float(wick['high'].median())
+        width = max(lv * 0.018, 0.03)
+        zones.append({'low': round(lv-width,2), 'high': round(lv+width,2), 'core': round(lv,2), 'strength': _v212_clip((70+min(18,len(wick)*3))*weight), 'kind': 'supply', 'tf': tf, 'source': 'upper_wick_resonance', 'reason': f'{tf}长上影/失败共振{len(wick)}次'})
+    # 收盘共振，次高收盘比极端影线更稳定
+    if len(x) >= 20:
+        closes = x['close'].tail(min(len(x), window))
+        q = closes.quantile([0.70,0.80,0.90]).tolist()
+        for qv in q[-2:]:
+            lv = safe_float(qv)
+            if lv >= current*0.88:
+                width = max(lv*0.010,0.03)
+                zones.append({'low':round(lv-width,2),'high':round(lv+width,2),'core':round(lv,2),'strength':_v212_clip(64*weight),'kind':'supply' if lv>=current*0.98 else 'demand','tf':tf,'source':'close_resonance','reason':f'{tf}收盘共振区'})
+    return zones
+
+
+def _v212_merge_zones(zones):
+    if not zones:
+        return []
+    zones = sorted(zones, key=lambda z: (z.get('kind',''), safe_float(z.get('low')), safe_float(z.get('high'))))
+    out = []
+    for z in zones:
+        if not out:
+            out.append(dict(z)); continue
+        last = out[-1]
+        if z.get('kind') == last.get('kind') and safe_float(z.get('low')) <= safe_float(last.get('high')) * 1.018:
+            total = max(safe_float(last.get('strength')), safe_float(z.get('strength'))) + 3
+            low = min(safe_float(last.get('low')), safe_float(z.get('low')))
+            high = max(safe_float(last.get('high')), safe_float(z.get('high')))
+            core = (safe_float(last.get('core')) * safe_float(last.get('strength')) + safe_float(z.get('core')) * safe_float(z.get('strength'))) / max(safe_float(last.get('strength')) + safe_float(z.get('strength')), 1)
+            last.update({'low':round(low,2),'high':round(high,2),'core':round(core,2),'strength':round(_v212_clip(total),2),'tf':(str(last.get('tf',''))+'+'+str(z.get('tf','')))[:80],'source':(str(last.get('source',''))+'+'+str(z.get('source','')))[:100],'reason':(str(last.get('reason',''))+'；'+str(z.get('reason','')))[:260]})
+        else:
+            out.append(dict(z))
+    return out
+
+
+def _v212_build_zone_map(daily):
+    daily = _v212_norm_df(daily)
+    if daily.empty:
+        return {'zones': [], 'core_supply_zone': None, 'nearest_supply': None, 'liquidity_void_score': 45}
+    current = safe_float(daily['close'].iloc[-1])
+    weekly = _v212_resample(daily, 'W-FRI')
+    monthly = _v212_resample(daily, 'M')
+    quarterly = _v212_resample(daily, 'Q')
+    yearly = _v212_resample(daily, 'Y')
+    specs = [
+        (daily, '日线', 0.006, 260, 0.70),
+        (weekly, '周线', 0.010, 156, 0.90),
+        (monthly, '月线', 0.018, 84, 1.05),
+        (quarterly, '季线', 0.030, 48, 1.15),
+        (yearly, '年线', 0.050, 20, 1.25),
+    ]
+    zones = []
+    for df, tf, bp, win, w in specs:
+        zones += _v212_profile_zones(df, current, win, bp, tf, w)
+        zones += _v212_anchor_zones(df, current, win, tf, w)
+    zones = _v212_merge_zones(zones)
+    supplies = sorted([z for z in zones if z.get('kind') == 'supply' and safe_float(z.get('high')) >= current*0.995], key=lambda z: (safe_float(z.get('low')), -safe_float(z.get('strength'))))
+    nearest_supply = supplies[0] if supplies else None
+    # 核心压力带不是唯一主轴，只选出最稳定的一条用于Acceptance/空间参考。
+    # 优先：多周期+高强度+靠近当前价上方。
+    core_candidates = []
+    for z in supplies:
+        dist = _v212_pct_dist(z.get('core'), current)
+        if dist < -0.03 or dist > 0.45:
+            continue
+        multi = len(set(str(z.get('tf','')).split('+')))
+        score = safe_float(z.get('strength')) + min(20, multi*4) - max(0, dist)*25
+        if any(s in str(z.get('source','')) for s in ['max_bull','close_resonance','upper_wick']):
+            score += 5
+        core_candidates.append((score, z))
+    core = sorted(core_candidates, key=lambda x: x[0], reverse=True)[0][1] if core_candidates else nearest_supply
+    # 空间真空：当前到30%上方之间强HVN/供应越少，分越高。
+    target = current * 1.30
+    strong_count = 0
+    first_strong = None
+    for z in supplies:
+        low = safe_float(z.get('low'))
+        if current < low <= target and safe_float(z.get('strength')) >= 72:
+            strong_count += 1
+            if first_strong is None or low < safe_float(first_strong.get('low')):
+                first_strong = z
+    if strong_count == 0:
+        void_score = 86
+    elif first_strong and _v212_pct_dist(first_strong.get('low'), current) >= 0.18:
+        void_score = 72
+    elif first_strong and _v212_pct_dist(first_strong.get('low'), current) >= 0.10:
+        void_score = 58
+    else:
+        void_score = 38
+    return {'zones': zones[:40], 'core_supply_zone': core, 'nearest_supply': nearest_supply, 'liquidity_void_score': void_score, 'first_strong_supply_30pct': first_strong, 'current': current}
+
+
+def _v212_volume_behavior(daily, row):
+    daily = _v212_norm_df(daily)
+    reasons = []
+    if daily.empty or len(daily) < 60:
+        # fallback保留旧字段颗粒
+        old = safe_float(row.get('v201_volume_behavior', row.get('score_volume_behavior', 0)))
+        return _v212_clip(old*6 if old <= 15 else old), ['K线不足，沿用旧资金行为分']
+    x = daily.copy()
+    last = x.iloc[-1]
+    vol_ma5 = safe_float(last.get('vol_ma5'))
+    vol_ma10 = safe_float(last.get('vol_ma10'))
+    vol_ma20 = safe_float(last.get('vol_ma20'))
+    vol_ma60 = safe_float(last.get('vol_ma60'))
+    score = 45.0
+    if vol_ma5 > vol_ma10 > vol_ma20 and vol_ma20 > 0:
+        score += 12; reasons.append('短中期量能均线多头，资金热度右移')
+    if len(x) >= 80 and safe_float(x['vol_ma20'].iloc[-1]) > safe_float(x['vol_ma20'].iloc[-20]) * 1.10:
+        score += 10; reasons.append('20日量能中枢上移')
+    if len(x) >= 120:
+        right20 = safe_float(x['volume'].tail(20).mean())
+        left60 = safe_float(x['volume'].iloc[-120:-60].mean())
+        if left60 > 0 and right20 / left60 >= 1.25:
+            score += 10; reasons.append(f'右侧平台均量/左侧约{right20/left60:.2f}')
+    # 倍量/倍量后平量旧口径保留为资金事件，但不重复堆满。
+    if bool(last.get('is_double_volume')) and (bool(last.get('is_bull_quality')) or bool(last.get('is_fake_bear_bull'))):
+        score += 8; reasons.append('标准倍量且K线方向质量合格')
+    # 近20日上涨日量效
+    ret = x['close'].pct_change().fillna(0)
+    up_amt = safe_float(x.loc[ret > 0, 'amount'].tail(60).mean())
+    dn_amt = safe_float(x.loc[ret < 0, 'amount'].tail(60).mean())
+    if up_amt > 0 and dn_amt > 0:
+        ratio = up_amt / dn_amt
+        if ratio >= 1.15:
+            score += 8; reasons.append(f'阳量压阴量，阳/阴成交额比{ratio:.2f}')
+        elif ratio < 0.85:
+            score -= 8; reasons.append(f'阴量偏强，阳/阴成交额比{ratio:.2f}')
+    # 回调量衰减
+    if len(x) >= 30:
+        recent_up_vol = safe_float(x.loc[ret > 0, 'volume'].tail(10).mean())
+        recent_down_vol = safe_float(x.loc[ret < 0, 'volume'].tail(10).mean())
+        if recent_up_vol > 0 and recent_down_vol / recent_up_vol < 0.65:
+            score += 8; reasons.append('回调量明显小于推进量，抛压衰减')
+    bad = int(((x['volume'] > x['vol_ma20']*1.3) & (x['is_bad_stall'])).tail(60).sum())
+    if bad >= 3:
+        score -= min(18, bad*4); reasons.append(f'近60日放量滞涨/长上影{bad}次')
+    return _v212_clip(score), reasons[:6]
+
+
+def _v212_price_structure(daily, zone_map, row):
+    daily = _v212_norm_df(daily)
+    reasons = []
+    if daily.empty or len(daily) < 60:
+        old = safe_float(row.get('v201_structure_position', row.get('score_structure', 0)))
+        return _v212_clip(old*5 if old <= 20 else old), ['K线不足，沿用旧结构分']
+    x = daily
+    current = safe_float(x['close'].iloc[-1])
+    score = 45.0
+    # 低点抬高
+    lows = []
+    win = 10
+    for i in range(win, len(x)-win):
+        lv = safe_float(x['low'].iloc[i])
+        if lv <= safe_float(x['low'].iloc[i-win:i].min()) and lv <= safe_float(x['low'].iloc[i+1:i+win+1].min()):
+            lows.append((i, lv))
+    lows = lows[-4:]
+    if len(lows) >= 3 and lows[-1][1] > lows[-2][1] > lows[-3][1]:
+        score += 14; reasons.append('最近摆动低点连续抬高')
+    elif len(x) >= 120 and safe_float(x['low'].tail(60).min()) > safe_float(x['low'].iloc[-180:-60].min())*1.08:
+        score += 10; reasons.append('近60日低点明显高于左侧低点')
+    # 平台上半区/贴压力横盘
+    if len(x) >= 80:
+        low80 = safe_float(x['low'].tail(80).min()); high80 = safe_float(x['high'].tail(80).max())
+        if high80 > low80:
+            pos = (current-low80)/(high80-low80)
+            if pos >= 0.65:
+                score += 10; reasons.append('收盘处于平台上半区/上沿附近')
+            range20 = safe_float(x['high'].tail(20).max()/max(x['low'].tail(20).min(),1)-1)
+            range80 = safe_float(high80/max(low80,1)-1)
+            if range80 > 0 and range20/range80 < 0.45:
+                score += 8; reasons.append('短期振幅相对长期平台明显收敛')
+    # 压力吸收：靠近核心压力后回撤浅、长上影减少
+    core = zone_map.get('core_supply_zone') or {}
+    if core:
+        core_low = safe_float(core.get('low')); core_high=safe_float(core.get('high')); core_line=safe_float(core.get('core'))
+        dist = _v212_pct_dist(core_low, current)
+        if -0.03 <= dist <= 0.08:
+            score += 10; reasons.append(f'贴近核心压力带{core_low:.2f}-{core_high:.2f}吸收')
+            last30 = x.tail(30)
+            wick_count = int((last30['upper_wick_ratio'] >= 0.45).sum())
+            prev30 = x.iloc[-60:-30] if len(x)>=60 else pd.DataFrame()
+            prev_wick = int((prev30['upper_wick_ratio'] >= 0.45).sum()) if not prev30.empty else wick_count
+            if wick_count <= prev_wick:
+                score += 6; reasons.append('靠近压力后长上影未增加，供应反应减弱')
+    # 黄金柱/强柱承接：最近强放量柱后不破实体中位/上1/3
+    recent = x.tail(40)
+    attack = recent[(recent['volume'] > recent['vol_ma20']*1.35) & ((recent['is_bull_quality']) | (recent['is_fake_bear_bull']))]
+    if not attack.empty:
+        idx = attack.index[-1]
+        r = x.loc[idx]
+        body_low = min(safe_float(r['open']), safe_float(r['close']))
+        body_high = max(safe_float(r['open']), safe_float(r['close']))
+        mid = body_low + (body_high-body_low)*0.5
+        upper13 = body_low + (body_high-body_low)*2/3
+        after = x.loc[idx:].tail(13)
+        if len(after) >= 3:
+            if int((after['close'] >= upper13*0.995).sum()) >= max(2, len(after)-2):
+                score += 12; reasons.append('强柱后多数收盘守实体上1/3，承接很强')
+            elif int((after['close'] >= mid*0.995).sum()) >= max(2, len(after)-2):
+                score += 8; reasons.append('强柱后多数收盘守实体中位，承接合格')
+            elif safe_float(after['close'].iloc[-1]) < body_low*0.995:
+                score -= 10; reasons.append('强柱后跌破实体实底，承接失败')
+    return _v212_clip(score), reasons[:7]
+
+
+def _v212_time_maturity(daily, row):
+    daily = _v212_norm_df(daily)
+    reasons=[]
+    if daily.empty or len(daily)<80:
+        return 50.0, ['K线不足，时间成熟度中性']
+    x=daily
+    score=45.0
+    # 平台持续与波动压缩
+    if len(x)>=160:
+        r20 = safe_float(x['high'].tail(20).max()/max(x['low'].tail(20).min(),1)-1)
+        r120 = safe_float(x['high'].tail(120).max()/max(x['low'].tail(120).min(),1)-1)
+        if r120>0 and r20/r120<0.45:
+            score += 15; reasons.append(f'20日/120日振幅压缩至{r20/r120:.2f}')
+        # ATR压缩
+        tr = pd.concat([(x['high']-x['low']), (x['high']-x['close'].shift(1)).abs(), (x['low']-x['close'].shift(1)).abs()], axis=1).max(axis=1)
+        atr20 = safe_float(tr.rolling(20,min_periods=5).mean().iloc[-1])
+        atr120 = safe_float(tr.rolling(120,min_periods=30).mean().iloc[-1])
+        if atr120>0 and atr20/atr120<0.72:
+            score += 12; reasons.append(f'ATR20/ATR120={atr20/atr120:.2f}，波动压缩成熟')
+    # 长平台：过去120/180日有平台特征且低点不破
+    if len(x)>=180:
+        range120 = safe_float(x['high'].tail(120).max()/max(x['low'].tail(120).min(),1)-1)
+        if range120 < 0.55:
+            score += 8; reasons.append('120日平台蓄势较充分')
+        range180 = safe_float(x['high'].tail(180).max()/max(x['low'].tail(180).min(),1)-1)
+        if range180 < 0.75:
+            score += 5; reasons.append('180日级别筹码消化较久')
+    # 斐波那契/1000天只作为轻辅助，这里用大高点后天数近似
+    if len(x)>=500:
+        high_idx = int(x['high'].iloc[-500:].idxmax())
+        bars_since_high = len(x)-1-high_idx
+        for n in [233,377,610,987]:
+            if n*0.97 <= bars_since_high <= n*1.03:
+                score += 3; reasons.append(f'距近500日高点约{bars_since_high}日，接近{n}时间窗（轻辅助）')
+                break
+    return _v212_clip(score), reasons[:6]
+
+
+def _v212_space_score(daily, zone_map, row):
+    daily = _v212_norm_df(daily)
+    reasons=[]
+    current = safe_float(row.get('close', 0))
+    if not daily.empty:
+        current=safe_float(daily['close'].iloc[-1])
+    score = 45.0
+    void_score = safe_float(zone_map.get('liquidity_void_score'), 45)
+    score += (void_score-45)*0.75
+    if void_score>=72:
+        reasons.append('上方10%-30%内供应较稀，存在价格真空')
+    elif void_score<45:
+        reasons.append('上方空间有厚供应，短线赔率受限')
+    core=zone_map.get('core_supply_zone') or {}
+    if core:
+        core_high=safe_float(core.get('high')); core_low=safe_float(core.get('low'))
+        if core_high>0:
+            d=_v212_pct_dist(core_high,current)
+            if d>0.12:
+                score += 12; reasons.append(f'距核心压力带上沿仍有{d:.1%}空间')
+            elif 0<=d<=0.05:
+                score += 3; reasons.append('贴近核心压力带，等待吸收/突破')
+            elif d<0:
+                score += 10; reasons.append('已站上核心压力带上沿，进入扩张验证')
+    # 旧RR保留
+    rr = safe_float(row.get('v20_rr', row.get('risk_reward_ratio', row.get('rr', 0))))
+    if rr>=2.0:
+        score += 10; reasons.append(f'旧模型RR={rr:.2f}合格')
+    elif 0<rr<1.3:
+        score -= 10; reasons.append(f'旧模型RR={rr:.2f}不足')
+    return _v212_clip(score), reasons[:6]
+
+
+def _v212_stock_character(daily, row):
+    daily=_v212_norm_df(daily)
+    reasons=[]; flags=[]
+    if daily.empty or len(daily)<80:
+        old = safe_float(row.get('score_activity', row.get('active_score', 0)))
+        return _v212_clip(old*5 if old<=20 else 50), '样本不足/沿用旧活跃', ['近一年K线不足，股性画像保守'], []
+    x=daily.tail(250).copy()
+    ret=x['close'].pct_change().fillna(0)
+    amount=x['amount'].fillna(x['volume']*x['close'])
+    amt60=safe_float(amount.tail(60).mean())
+    amt_cv=safe_float(amount.std()/max(amount.mean(),1))
+    if amt60>=200_000_000: liq=86
+    elif amt60>=80_000_000: liq=72
+    elif amt60>=30_000_000: liq=58
+    else: liq=38; flags.append('低流动')
+    if amt_cv>1.6:
+        liq-=10; flags.append('成交额不稳定')
+    big_up5=int((ret>=0.05).sum()); big_down5=int((ret<=-0.05).sum()); limit_like=int((ret>=0.095).sum())
+    activity=_v212_clip(45+min(25,big_up5*2)+min(12,limit_like*3)-min(10,big_down5))
+    # 趋势顺滑：MA20/MA60上方比例+突破延续
+    ma20=x['close'].rolling(20,min_periods=5).mean(); ma60=x['close'].rolling(60,min_periods=15).mean()
+    above20=safe_float((x['close']>ma20).mean()); above60=safe_float((x['close']>ma60).mean())
+    streaks=[]; cur=0
+    for r in ret:
+        if r>0: cur+=1
+        else:
+            if cur: streaks.append(cur)
+            cur=0
+    if cur: streaks.append(cur)
+    avg_streak=sum(streaks)/len(streaks) if streaks else 0
+    bad_stall=int(((x['volume']>x['vol_ma20']*1.25)&x['is_bad_stall']).sum())
+    trend=_v212_clip(38+above20*18+above60*20+min(16,avg_streak*4)-min(18,bad_stall*2))
+    # 追高容错
+    chase_checked=chase_bad=chase_ok=0
+    for i in range(20,len(x)-6):
+        cond = (ret.iloc[i]>=0.04) or (safe_float(x['close'].iloc[i]) > safe_float(x['high'].iloc[i-20:i].max())*1.005)
+        if not cond: continue
+        chase_checked+=1
+        entry=safe_float(x['close'].iloc[i]); fut=x.iloc[i+1:i+6]
+        dd=safe_float(fut['low'].min()/max(entry,1)-1); gain=safe_float(fut['high'].max()/max(entry,1)-1)
+        if dd>-0.035 and gain>=0.03: chase_ok+=1
+        if dd<=-0.05 or gain<0.01: chase_bad+=1
+    ok_ratio=chase_ok/chase_checked if chase_checked else 0.35
+    bad_ratio=chase_bad/chase_checked if chase_checked else 0.35
+    chase=_v212_clip(50+ok_ratio*35-bad_ratio*35 - (10 if trend<55 else 0) - (10 if bad_stall>=5 else 0))
+    # 历史扩张记忆：近3年或全样本最大涨幅
+    y=daily.tail(750) if len(daily)>=250 else daily
+    if not y.empty:
+        min_low=safe_float(y['low'].min()); max_high=safe_float(y['high'].max())
+        expansion=(max_high/min_low-1) if min_low>0 else 0
+    else: expansion=0
+    memory=50
+    if expansion>=3.0: memory=88; reasons.append(f'历史扩张记忆强，近阶段最大振幅约{expansion:.1f}倍')
+    elif expansion>=1.5: memory=72; reasons.append('历史攻击/扩张记忆较强')
+    elif expansion>=0.8: memory=60
+    else: memory=45
+    score=_v212_clip(liq*0.20+activity*0.18+trend*0.22+chase*0.22+memory*0.18)
+    if chase<50: reasons.append('近一年追高容错偏低，需回踩/确认买法'); flags.append('追高容错低')
+    if trend<55: reasons.append('近一年趋势顺滑度一般'); flags.append('趋势顺滑一般')
+    if activity>=68 and trend>=62: style='突破确认型'
+    elif memory>=75 and activity>=62 and chase>=55: style='强股性预扩张型'
+    elif activity>=62 and chase<55: style='弹性低吸/确认型'
+    elif liq<45: style='低流动观察型'
+    else: style='回踩/确认型'
+    if not reasons:
+        reasons.append(f'近一年股性：{style}')
+    return score, style, reasons[:6], flags
+
+
+def _v212_execution_plan(row, daily, zone_map, v_scores):
+    daily=_v212_norm_df(daily)
+    current=safe_float(row.get('close', 0))
+    if not daily.empty:
+        current=safe_float(daily['close'].iloc[-1])
+    core=zone_map.get('core_supply_zone') or {}
+    core_low=safe_float(core.get('low')); core_high=safe_float(core.get('high')); core_line=safe_float(core.get('core'))
+    # 使用核心压力带/近高生成预判区和确认线，但不是模型主轴。
+    if core_line<=0:
+        core_line=safe_float(row.get('v201_precise_trigger_line', row.get('v20_confirm_price', 0)))
+    if core_line<=0 and not daily.empty:
+        core_line=safe_float(daily['high'].tail(60).max())
+    confirm_line=core_high if core_high>0 else core_line
+    if confirm_line<=0:
+        confirm_line=current*1.05
+    # 支撑/失败线：平台中轴、20日低点、旧防守位
+    if not daily.empty and len(daily)>=30:
+        low20=safe_float(daily['low'].tail(20).min()); low60=safe_float(daily['low'].tail(60).min())
+        high60=safe_float(daily['high'].tail(60).max())
+        platform_mid=(low60+high60)/2 if high60>low60 else current*0.95
+        support=max(low20, platform_mid*0.98)
+    else:
+        support=safe_float(row.get('v20_defense', row.get('defensive_price', 0))) or current*0.93
+    old_def=safe_float(row.get('v20_defense', row.get('defensive_price', 0)))
+    if old_def>0:
+        support=max(min(support,current*0.995), old_def)
+    predict_fail=round(support*0.985,2)
+    confirm_fail=round(confirm_line*0.975,2) if confirm_line>0 else round(current*0.94,2)
+    trend_fail=round(max(confirm_fail, current*0.90),2)
+    risk=(current/max(predict_fail,0.01)-1) if predict_fail<current else 0.03
+    # 状态：预触发/确认/扩张/观察
+    distance_to_confirm=_v212_pct_dist(confirm_line,current)
+    volume_score=safe_float(v_scores.get('volume_score'))
+    price_score=safe_float(v_scores.get('price_score'))
+    time_score=safe_float(v_scores.get('time_score'))
+    space_score=safe_float(v_scores.get('space_score'))
+    char_score=safe_float(v_scores.get('character_score'))
+    predict_win=_v212_clip(45 + (volume_score-50)*0.12 + (price_score-50)*0.16 + (time_score-50)*0.10 + (space_score-50)*0.10 + (char_score-50)*0.10, 35, 78)
+    confirm_win=_v212_clip(predict_win + 8 + (8 if distance_to_confirm < 0 else 0), 45, 86)
+    heavy_win=_v212_clip(confirm_win + 5, 50, 90)
+    # 仓位百分比
+    pred_pos='20%-30%' if predict_win>=60 and risk<=V212_MAX_PREDICT_RISK else ('10%-20%' if predict_win>=55 else '观察')
+    conf_pos='50%-60%' if confirm_win>=70 else ('30%-40%' if confirm_win>=62 else '等待')
+    heavy_pos='60%-70%' if heavy_win>=75 and confirm_win>=70 else '不建议重仓'
+    # A/B确认规则
+    a_rule=f'A类回踩确认：突破{confirm_line:.2f}后回踩{max(confirm_line*0.985, confirm_fail):.2f}-{confirm_line:.2f}不破，回踩量≤突破量70%，收盘重新站上确认线。'
+    b_rule=f'B类强势不回踩：突破{confirm_line:.2f}后不回踩，盘中/次日持续站在{confirm_line*1.01:.2f}上方，收盘位置≥80%，上影短，量能健康。'
+    # 操作分类
+    if distance_to_confirm > 0.12:
+        state='观察/等待贴近确认线'
+    elif 0 <= distance_to_confirm <= 0.12:
+        state='预判试仓区'
+    elif -0.08 <= distance_to_confirm < 0:
+        state='确认加仓区'
+    else:
+        state='扩张持仓区/不新开重仓'
+    if risk>0.10:
+        state='风险偏大/等待回踩'
+    return {
+        'v212_state': state,
+        'v212_confirm_line': round(confirm_line,2),
+        'v212_predict_fail_line': predict_fail,
+        'v212_confirm_fail_line': confirm_fail,
+        'v212_trend_fail_line': trend_fail,
+        'v212_risk_pct': round(risk,4),
+        'v212_predict_win_rate': round(predict_win/100,4),
+        'v212_confirm_win_rate': round(confirm_win/100,4),
+        'v212_heavy_win_rate': round(heavy_win/100,4),
+        'v212_predict_position': pred_pos,
+        'v212_confirm_position': conf_pos,
+        'v212_heavy_position': heavy_pos,
+        'v212_a_confirm_rule': a_rule,
+        'v212_b_confirm_rule': b_rule,
+    }
+
+
+def _v212_target_plan(row, daily, zone_map, execution):
+    daily=_v212_norm_df(daily)
+    current=safe_float(row.get('close',0))
+    if not daily.empty:
+        current=safe_float(daily['close'].iloc[-1])
+    confirm=safe_float(execution.get('v212_confirm_line'), current)
+    # 用近期平台低点到确认线做扩展，不够则用10%目标。
+    if not daily.empty and len(daily)>=60:
+        base_low=safe_float(daily['low'].tail(60).min())
+    else:
+        base_low=current*0.88
+    height=max(confirm-base_low, current*0.05)
+    t1=confirm
+    t2=confirm+height*0.5
+    t3=confirm+height*1.0
+    t4=confirm+height*2.0
+    t5=confirm+height*3.0
+    # 如果当前已越过确认线，第一目标至少当前上方附近，不倒退。
+    targets=[]
+    raw=[(t1,0.75,'确认线/前高突破位'),(t2,0.65,'1.5倍扩展/正常扩张'),(t3,0.55,'2倍扩展/主升目标'),(t4,0.40,'3倍扩展/趋势扩张'),(t5,0.25,'4倍扩展/情绪高潮')]
+    for price, prob, reason in raw:
+        # 结合空间真空微调概率
+        if safe_float(zone_map.get('liquidity_void_score'))>=72:
+            prob += 0.03
+        if safe_float(zone_map.get('liquidity_void_score'))<45:
+            prob -= 0.08
+        targets.append({'price':round(max(price,0),2),'probability':round(max(0.05,min(0.9,prob)),2),'reason':reason})
+    return targets
+
+
+def apply_v212_opportunity_to_row(row):
+    if V212_ENABLED != '1':
+        return row
+    r=dict(row)
+    daily=_v212_get_daily_df(r)
+    zone_map=_v212_build_zone_map(daily) if not daily.empty else {'zones': [], 'core_supply_zone': None, 'nearest_supply': None, 'liquidity_void_score': 45, 'current': safe_float(r.get('close',0))}
+    volume_score, volume_reasons=_v212_volume_behavior(daily, r)
+    price_score, price_reasons=_v212_price_structure(daily, zone_map, r)
+    time_score, time_reasons=_v212_time_maturity(daily, r)
+    space_score, space_reasons=_v212_space_score(daily, zone_map, r)
+    character_score, style, character_reasons, character_flags=_v212_stock_character(daily, r)
+    # 旧模型基础分保留，纳入但不主导所有细节。
+    old_score=safe_float(r.get('v20_final_score', r.get('total_score', r.get('score',0))))
+    old_norm=old_score if old_score<=100 else min(100, old_score)
+    # Execution先根据前五层定仓位与胜率。
+    v_scores={'volume_score':volume_score,'price_score':price_score,'time_score':time_score,'space_score':space_score,'character_score':character_score}
+    execution=_v212_execution_plan(r, daily, zone_map, v_scores)
+    targets=_v212_target_plan(r, daily, zone_map, execution)
+    # 权重：旧模型+量价时空+股性+执行。核心压力带只通过price/space/execution体现。
+    exec_score=_v212_clip(50 + (execution['v212_predict_win_rate']-0.60)*100 + (execution['v212_confirm_win_rate']-0.70)*60 - max(0, execution['v212_risk_pct']-0.07)*180)
+    final=_v212_clip(old_norm*0.26 + volume_score*0.17 + price_score*0.17 + time_score*0.11 + space_score*0.14 + character_score*0.10 + exec_score*0.05)
+    # 硬降级：赔率/股性/风险
+    gate=[]
+    if execution['v212_risk_pct']>V212_MAX_CONFIRM_RISK:
+        final-=8; gate.append('防守距离偏远')
+    if character_score<45 or '低流动' in character_flags:
+        final-=8; gate.append('近一年股性/流动性不支持正式Top')
+    if space_score<42:
+        final-=6; gate.append('上方空间/价格真空不足')
+    if str(r.get('v20_trade_tier','')).startswith('C档'):
+        final-=6; gate.append('旧模型交易层为C档')
+    final=_v212_clip(final)
+    # 推荐动作：只保留预判试仓/确认加仓，不输出已加速为新买点。
+    state=execution['v212_state']
+    if final>=V212_MIN_FORMAL_SCORE and state in ['预判试仓区','确认加仓区'] and execution['v212_risk_pct']<=V212_MAX_CONFIRM_RISK:
+        action='V21.2正式候选'
+    elif final>=70 and state in ['预判试仓区','确认加仓区']:
+        action='V21.2试错/确认观察'
+    elif state.startswith('扩张'):
+        action='已扩张，不作为新开重仓推荐'
+    else:
+        action='观察等待'
+    core=zone_map.get('core_supply_zone') or {}
+    r.update({
+        'v212_final_score': round(final,2),
+        'v212_action': action,
+        'v212_gate_notes': '；'.join(gate),
+        'v212_volume_score': round(volume_score,2),
+        'v212_volume_reasons': volume_reasons,
+        'v212_price_score': round(price_score,2),
+        'v212_price_reasons': price_reasons,
+        'v212_time_score': round(time_score,2),
+        'v212_time_reasons': time_reasons,
+        'v212_space_score': round(space_score,2),
+        'v212_space_reasons': space_reasons,
+        'v212_stock_character_score': round(character_score,2),
+        'v212_trade_style_tag': style,
+        'v212_stock_character_reasons': character_reasons,
+        'v212_stock_character_flags': character_flags,
+        'v212_core_supply_low': safe_float(core.get('low',0)),
+        'v212_core_supply_high': safe_float(core.get('high',0)),
+        'v212_core_supply_line': safe_float(core.get('core',0)),
+        'v212_core_supply_confidence': safe_float(core.get('strength',0)),
+        'v212_core_supply_reason': core.get('reason',''),
+        'v212_liquidity_void_score': safe_float(zone_map.get('liquidity_void_score',0)),
+        'v212_targets': targets,
+    })
+    r.update(execution)
+    # 保留旧分，同时给最终排序一个融合分。
+    r['v20_final_score_raw'] = safe_float(r.get('v20_final_score',0))
+    # 保留旧V20分，不再用V21.2覆盖旧分，避免职责混乱；新增V22融合排序分单独承载最终排序。
+    r['v22_signal_audit'] = v22_signal_ownership_audit(r)
+    r['v22_composite_trade_score'] = v22_composite_trade_score(r)
+    r['v22_action'] = action.replace('V21.2', 'V22') if isinstance(action, str) else action
+    return r
+
+
+def v212_compact_fields(r):
+    return {
+        'v212_final_score': safe_float(r.get('v212_final_score',0)),
+        'v212_action': r.get('v212_action',''),
+        'v212_state': r.get('v212_state',''),
+        'v212_volume_score': safe_float(r.get('v212_volume_score',0)),
+        'v212_price_score': safe_float(r.get('v212_price_score',0)),
+        'v212_time_score': safe_float(r.get('v212_time_score',0)),
+        'v212_space_score': safe_float(r.get('v212_space_score',0)),
+        'v212_stock_character_score': safe_float(r.get('v212_stock_character_score',0)),
+        'v212_trade_style_tag': r.get('v212_trade_style_tag',''),
+        'v212_core_supply_low': safe_float(r.get('v212_core_supply_low',0)),
+        'v212_core_supply_high': safe_float(r.get('v212_core_supply_high',0)),
+        'v212_core_supply_line': safe_float(r.get('v212_core_supply_line',0)),
+        'v212_core_supply_confidence': safe_float(r.get('v212_core_supply_confidence',0)),
+        'v212_confirm_line': safe_float(r.get('v212_confirm_line',0)),
+        'v212_predict_fail_line': safe_float(r.get('v212_predict_fail_line',0)),
+        'v212_confirm_fail_line': safe_float(r.get('v212_confirm_fail_line',0)),
+        'v212_trend_fail_line': safe_float(r.get('v212_trend_fail_line',0)),
+        'v212_risk_pct': safe_float(r.get('v212_risk_pct',0)),
+        'v212_predict_win_rate': safe_float(r.get('v212_predict_win_rate',0)),
+        'v212_confirm_win_rate': safe_float(r.get('v212_confirm_win_rate',0)),
+        'v212_heavy_win_rate': safe_float(r.get('v212_heavy_win_rate',0)),
+        'v212_predict_position': r.get('v212_predict_position',''),
+        'v212_confirm_position': r.get('v212_confirm_position',''),
+        'v212_heavy_position': r.get('v212_heavy_position',''),
+        'v212_a_confirm_rule': r.get('v212_a_confirm_rule',''),
+        'v212_b_confirm_rule': r.get('v212_b_confirm_rule',''),
+        'v212_targets': r.get('v212_targets',[]),
+        'v212_gate_notes': r.get('v212_gate_notes',''),
+        'v22_composite_trade_score': safe_float(r.get('v22_composite_trade_score',0)),
+        'v22_action': r.get('v22_action',''),
+        'v22_signal_audit': r.get('v22_signal_audit',{}),
+    }
+
+# ======================= V22.0 Signal Registry + V21.2 Unified Opportunity Engine END =======================
+
 def classify_v20_trade_tier(row):
     """V20.1 A/B/C/B+分层：固定Top3仍可输出，但不能把买点未到票写成A档。"""
     if bool(row.get("v14_blocked", False)) or bool(row.get("regulatory_hard_exclude", False)):
@@ -10466,6 +11282,11 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         r["v20_condition_probability_hint"] = str(layers.get("feedback_text", ""))
         r["v20_condition_score_adj"] = float(layers.get("feedback_adj", 0.0) or 0.0)
         r["v20_final_score"] = float(layers.get("v201_score", 0.0))
+        # V21.2：在不删除旧V20.3.1颗粒口径的前提下，做统一机会引擎融合。
+        try:
+            r = apply_v212_opportunity_to_row(r)
+        except Exception as _e:
+            r["v212_error"] = str(_e)[:200]
 
         if r.get("v14_blocked") or tier.startswith("硬风险"):
             r["v20_pool"] = "硬风险剔除"
@@ -10489,8 +11310,10 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     candidates = sorted(
         candidates,
         key=lambda x: (
+            1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
             tier_rank(x),
-            safe_float(x.get("v20_final_score", 0)),
+            safe_float(x.get("v22_composite_trade_score", x.get("v212_final_score", x.get("v20_final_score", 0)))),
+            safe_float(x.get("v212_final_score", x.get("v20_final_score", 0))),
             safe_float(x.get("v201_trade_quality", 0)),
             safe_float(x.get("v20_rr", 0)),
             safe_float(x.get("v201_structure_position", 0)) + safe_float(x.get("v201_volume_behavior", 0)),
@@ -10563,6 +11386,10 @@ def _v20_compact_row(r, pool=""):
         "data_quality_tier": r.get("data_quality_tier", ""),
         "data_quality_reason": r.get("data_quality_reason", ""),
     })
+    try:
+        base.update(v212_compact_fields(r))
+    except Exception:
+        pass
     return base
 
 
@@ -10894,6 +11721,12 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         with open(V20_SCORE_CARDS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"V20.3评分卡已保存：{V20_SCORE_CARDS_FILE}")
+        try:
+            with open(V212_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"V22融合评分卡已保存：{V212_OUTPUT_FILE}")
+        except Exception as _e:
+            print(f"V22融合评分卡保存失败：{_e}")
         build_v20_condition_probability_placeholder(payload)
 
         # 兼容旧workflow artifact名字。
@@ -10904,23 +11737,42 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
             pass
 
         lines = []
-        lines.append("一号员工 V20.3.1 基础筛选重构+动态风险库稳定修复版日报")
+        lines.append("一号员工 V22.0 融合版日报｜V20生产底座 + V21.2交易机会层 + 信号归属去重")
         lines.append(f"生成时间：{bj_time_str()}")
         lines.append(f"日期：{', '.join(dates) if dates else '未知'}")
         lines.append(f"固定输出目标：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}")
         lines.append(f"分层统计：{tier_counts}")
-        lines.append("口径：保留V19.4.1/V20原主模型完整底座；V20.1合并同源K线/量能指标，收紧A档，新增日线低量精准触发线口径。")
+        lines.append("口径：V20.3.1负责候选质量与风险前置；V21.2/V22负责交易机会、执行计划与融合排序；同一信号只在归属层打分，其他层只引用，避免重复堆分。")
         lines.append("")
         if final_cards:
-            lines.append("【今日V20.3 Top3】")
+            lines.append("【今日V22正式Top3】")
             for i, row in enumerate(final_cards, 1):
-                lines.append(f"{i}. {row['name']}({row['code']}) | V20.3分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
+                lines.append(f"{i}. {row['name']}({row['code']}) | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | V20质量分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
                 if row.get("bottom_pattern_type"):
                     lines.append(f"   底部形态：{row.get('bottom_pattern_type')} 分{row.get('bottom_pattern_score',0):.1f} 颈线{row.get('bottom_pattern_neckline',0):.2f} {'已确认' if row.get('bottom_pattern_confirmed') else '观察中'}")
                 lines.append(f"   七层：结构{row['v201_structure_position']:.1f} 压力{row['v201_pressure_support']:.1f} 资金{row['v201_volume_behavior']:.1f} 触发{row['v201_trigger_confirmation']:.1f} 交易{row['v201_trade_quality']:.1f} 风险{row['v201_risk_filter']:.1f}")
                 if row.get("v201_precise_trigger_line", 0):
                     lines.append(f"   日线精确触发线：{row['v201_precise_trigger_line']:.2f}（{'已计算' if row.get('v201_precise_trigger_valid') else '待日线平台精算'}）")
                 lines.append(f"   RR={row['v20_rr']:.2f}；防守={row['v20_defense']:.2f}；防守距离={row['v20_defense_dist']:.1%}；原因：{row['v20_tier_reason']}")
+                if row.get('v212_final_score') is not None:
+                    lines.append(f"   V22交易机会分={safe_float(row.get('v212_final_score')):.2f}｜{row.get('v212_action','')}｜状态：{row.get('v212_state','')}｜股性：{row.get('v212_trade_style_tag','')}")
+                    lines.append(f"   六层：量{safe_float(row.get('v212_volume_score')):.1f} 价{safe_float(row.get('v212_price_score')):.1f} 时{safe_float(row.get('v212_time_score')):.1f} 空{safe_float(row.get('v212_space_score')):.1f} 股性{safe_float(row.get('v212_stock_character_score')):.1f}")
+                    if safe_float(row.get('v212_core_supply_line',0)) > 0:
+                        lines.append(f"   核心结构因子：压力带{safe_float(row.get('v212_core_supply_low')):.2f}-{safe_float(row.get('v212_core_supply_high')):.2f}，确认线{safe_float(row.get('v212_confirm_line')):.2f}，置信{safe_float(row.get('v212_core_supply_confidence')):.0f}")
+                    lines.append(f"   胜率/仓位：预判{safe_float(row.get('v212_predict_win_rate')):.0%} 仓位{row.get('v212_predict_position','')}；确认{safe_float(row.get('v212_confirm_win_rate')):.0%} 加到{row.get('v212_confirm_position','')}；重仓{safe_float(row.get('v212_heavy_win_rate')):.0%} 上限{row.get('v212_heavy_position','')}")
+                    lines.append(f"   失败线：预判{safe_float(row.get('v212_predict_fail_line')):.2f}；确认{safe_float(row.get('v212_confirm_fail_line')):.2f}；趋势{safe_float(row.get('v212_trend_fail_line')):.2f}")
+                    _tgts = row.get('v212_targets') or []
+                    if _tgts:
+                        lines.append('   目标位概率：' + '；'.join([f"{safe_float(t.get('price')):.2f}({safe_float(t.get('probability')):.0%},{t.get('reason','')})" for t in _tgts[:5]]))
+                    if row.get('v212_a_confirm_rule'):
+                        lines.append(f"   A/B加仓：{row.get('v212_a_confirm_rule')} {row.get('v212_b_confirm_rule')}")
+                    _why = []
+                    for _k in ['v212_volume_reasons','v212_price_reasons','v212_time_reasons','v212_space_reasons','v212_stock_character_reasons']:
+                        _v = row.get(_k) or []
+                        if isinstance(_v, list):
+                            _why.extend(_v[:2])
+                    if _why:
+                        lines.append('   V22交易层原因：' + '；'.join(_why[:5]))
         if lifecycle_tracking:
             lines.append("")
             lines.append("【近期推荐生命周期跟踪】")
@@ -10940,6 +11792,12 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         except Exception:
             pass
         print(f"V20.3日报已保存：{V20_DAILY_REPORT_FILE}")
+        try:
+            with open(V212_DAILY_REPORT_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            print(f"V22融合日报已保存：{V212_DAILY_REPORT_FILE}")
+        except Exception as _e:
+            print(f"V22融合日报保存失败：{_e}")
 
         review_lines = [
             "一号员工 V20.1 复盘归因报告底座",
