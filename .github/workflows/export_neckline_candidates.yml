@@ -1,6 +1,12 @@
 name: A Stock Full Kline Cache Auto Backfill
 
 on:
+  schedule:
+    # GitHub Actions 使用 UTC 时间
+    # 北京时间 18:00 = UTC 10:00
+    # 周一到周五自动运行；周六周日不跑
+    - cron: '0 10 * * 1-5'
+
   workflow_dispatch:
     inputs:
       round:
@@ -38,8 +44,23 @@ concurrency:
 
 jobs:
   cache-backfill:
+    name: cache-backfill
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
+    env:
+      PYTHONUNBUFFERED: "1"
+
+      # 用你自己创建的 PAT，避免 github-actions bot 触发后续 workflow 失败
+      GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+
+      # schedule 触发时没有 inputs，这里给默认值
+      RUN_ROUND_DEFAULT: "1"
+      MAX_AUTO_ROUNDS_DEFAULT: "6"
+      AUTO_CONTINUE_DEFAULT: "1"
+      FULL_REBUILD_DEFAULT: "0"
+      MIN_CACHE_FILES_REQUIRED_DEFAULT: "3000"
+      MAX_RUNTIME_MINUTES_DEFAULT: "270"
 
     steps:
       - name: Checkout repository
@@ -53,6 +74,50 @@ jobs:
           find . -maxdepth 3 -type f -name "*.py" | sort || true
           echo "Workflow files:"
           find .github/workflows -maxdepth 1 -type f | sort || true
+
+      - name: Resolve run config
+        shell: bash
+        env:
+          INPUT_ROUND: ${{ github.event.inputs.round }}
+          INPUT_MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds }}
+          INPUT_AUTO_CONTINUE: ${{ github.event.inputs.auto_continue }}
+          INPUT_FULL_REBUILD: ${{ github.event.inputs.full_rebuild }}
+          INPUT_MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required }}
+          INPUT_MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes }}
+        run: |
+          RUN_ROUND="${INPUT_ROUND:-$RUN_ROUND_DEFAULT}"
+          MAX_AUTO_ROUNDS="${INPUT_MAX_AUTO_ROUNDS:-$MAX_AUTO_ROUNDS_DEFAULT}"
+          AUTO_CONTINUE="${INPUT_AUTO_CONTINUE:-$AUTO_CONTINUE_DEFAULT}"
+          FULL_REBUILD="${INPUT_FULL_REBUILD:-$FULL_REBUILD_DEFAULT}"
+          MIN_CACHE_FILES_REQUIRED="${INPUT_MIN_CACHE_FILES_REQUIRED:-$MIN_CACHE_FILES_REQUIRED_DEFAULT}"
+          MAX_RUNTIME_MINUTES="${INPUT_MAX_RUNTIME_MINUTES:-$MAX_RUNTIME_MINUTES_DEFAULT}"
+
+          echo "RUN_ROUND=$RUN_ROUND" >> "$GITHUB_ENV"
+          echo "MAX_AUTO_ROUNDS=$MAX_AUTO_ROUNDS" >> "$GITHUB_ENV"
+          echo "AUTO_CONTINUE=$AUTO_CONTINUE" >> "$GITHUB_ENV"
+          echo "FULL_REBUILD=$FULL_REBUILD" >> "$GITHUB_ENV"
+          echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED" >> "$GITHUB_ENV"
+          echo "MAX_RUNTIME_MINUTES=$MAX_RUNTIME_MINUTES" >> "$GITHUB_ENV"
+
+          echo "================ K线缓存任务参数 ================"
+          echo "触发方式：${{ github.event_name }}"
+          echo "当前轮次：$RUN_ROUND"
+          echo "最多轮次：$MAX_AUTO_ROUNDS"
+          echo "自动续跑：$AUTO_CONTINUE"
+          echo "允许从0重建：$FULL_REBUILD"
+          echo "最少缓存CSV要求：$MIN_CACHE_FILES_REQUIRED"
+          echo "本轮最大运行分钟数：$MAX_RUNTIME_MINUTES"
+          echo "================================================"
+
+      - name: Check ACTIONS_PAT
+        shell: bash
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️ ACTIONS_PAT 为空。"
+            echo "本轮缓存仍可运行，但如果需要自动续跑下一轮，可能无法触发。"
+          else
+            echo "✅ ACTIONS_PAT 已配置。"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -101,11 +166,6 @@ jobs:
       - name: Run full-history cache auto backfill
         env:
           PYTHONUNBUFFERED: "1"
-          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
-          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
-          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '270' }}
           SOFT_STOP_BUFFER_MINUTES: "20"
           EASTMONEY_TIMEOUT: "20"
           AKSHARE_TIMEOUT: "35"
@@ -116,6 +176,7 @@ jobs:
           echo "[RUN CONFIG]"
           echo "RUN_ROUND=$RUN_ROUND"
           echo "MAX_AUTO_ROUNDS=$MAX_AUTO_ROUNDS"
+          echo "AUTO_CONTINUE=$AUTO_CONTINUE"
           echo "FULL_REBUILD=$FULL_REBUILD"
           echo "MIN_CACHE_FILES_REQUIRED=$MIN_CACHE_FILES_REQUIRED"
           echo "MAX_RUNTIME_MINUTES=$MAX_RUNTIME_MINUTES"
@@ -140,7 +201,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-cache-backfill-outputs-round-${{ github.event.inputs.round || '1' }}
+          name: data-cache-backfill-outputs-round-${{ env.RUN_ROUND }}
           path: outputs
           if-no-files-found: warn
           retention-days: 14
@@ -148,9 +209,6 @@ jobs:
       - name: Decide whether to save cache
         if: always()
         id: cache_save_gate
-        env:
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
-          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
         run: |
           COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
@@ -176,10 +234,6 @@ jobs:
       - name: Decide auto continue
         if: always()
         id: continue_gate
-        env:
-          AUTO_CONTINUE: ${{ github.event.inputs.auto_continue || '1' }}
-          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
-          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
         run: |
           SHOULD_CONTINUE="false"
           NEED_BACKFILL="unknown"
@@ -189,6 +243,11 @@ jobs:
             SHOULD_CONTINUE=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(str(d.get('should_continue', False)).lower())")
             NEED_BACKFILL=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(d.get('need_backfill_count', 'unknown'))")
             REASON=$(python -c "import json; d=json.load(open('outputs/backfill_state.json', encoding='utf-8')); print(d.get('continue_reason', 'unknown'))")
+          fi
+
+          if [ "$RUN_ROUND" -ge "$MAX_AUTO_ROUNDS" ]; then
+            SHOULD_CONTINUE="false"
+            REASON="reached_max_auto_rounds"
           fi
 
           echo "should_continue=$SHOULD_CONTINUE" >> "$GITHUB_OUTPUT"
@@ -203,22 +262,14 @@ jobs:
           echo "REASON=$REASON"
 
       - name: Wait 10 minutes before next round
-        if: always() && github.event.inputs.auto_continue == '1' && steps.continue_gate.outputs.should_continue == 'true'
+        if: always() && env.AUTO_CONTINUE == '1' && steps.continue_gate.outputs.should_continue == 'true'
         run: |
           echo "还有待回补股票：${{ steps.continue_gate.outputs.need_backfill }}"
           echo "10分钟后自动启动下一轮。"
           sleep 600
 
       - name: Trigger next round
-        if: always() && github.event.inputs.auto_continue == '1' && steps.continue_gate.outputs.should_continue == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ROUND: ${{ github.event.inputs.round || '1' }}
-          MAX_AUTO_ROUNDS: ${{ github.event.inputs.max_auto_rounds || '6' }}
-          FULL_REBUILD: ${{ github.event.inputs.full_rebuild || '0' }}
-          MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required || '3000' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '270' }}
-          AUTO_CONTINUE: ${{ github.event.inputs.auto_continue || '1' }}
+        if: always() && env.AUTO_CONTINUE == '1' && steps.continue_gate.outputs.should_continue == 'true'
         run: |
           NEXT_ROUND=$((RUN_ROUND + 1))
           echo "Triggering next round: $NEXT_ROUND / $MAX_AUTO_ROUNDS"
