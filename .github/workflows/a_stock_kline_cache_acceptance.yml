@@ -1,6 +1,12 @@
 name: A Stock Kline Cache Acceptance
 
 on:
+  workflow_run:
+    workflows:
+      - A Stock Full Kline Cache Auto Backfill
+    types:
+      - completed
+
   workflow_dispatch:
 
 permissions:
@@ -13,8 +19,12 @@ concurrency:
 
 jobs:
   cache-acceptance:
+    name: cache-acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
+    # 自动触发时，只有全量缓存任务成功，才验收
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout repository
@@ -78,11 +88,35 @@ jobs:
           echo "Acceptance state:"
           cat outputs/cache_acceptance_state.json || true
 
-      - name: Upload acceptance outputs
+      - name: Check accepted cache before upload
+        run: |
+          CSV_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "准备交给一号员工的K线CSV数量：$CSV_COUNT"
+
+          if [ "$CSV_COUNT" -lt 1000 ]; then
+            echo "❌ K线缓存数量过少，不上传给一号员工。"
+            exit 1
+          fi
+
+          echo "✅ K线缓存数量正常，可以交给一号员工。"
+
+      - name: Upload accepted kline cache and reports
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kline-cache-accepted
+          path: |
+            kline_cache/**
+            outputs/**
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload acceptance reports only
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kline-cache-acceptance-outputs
-          path: outputs
+          name: kline-cache-acceptance-reports
+          path: |
+            outputs/**
           if-no-files-found: warn
           retention-days: 14
