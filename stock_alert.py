@@ -1,4 +1,4 @@
-# V20 BUILD - tiered output + condition probability feedback - py_compile pending
+# V20.3 BUILD - base screening multi-channel recall + dynamic risk library - py_compile passed
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -157,7 +157,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V20一号员工选股模型｜条件概率反馈闭环版"
+MODEL_VERSION = "V20.3.1一号员工选股模型｜基础筛选重构+动态风险库稳定修复版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -286,30 +286,54 @@ V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_4_daily_rep
 V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_report.txt")
 
 
-# ========================= V20：条件概率反馈闭环版配置 =========================
-# 说明：V20 不推翻 V19.4.1，而是在原 Top3/候选池/复盘文件链路上增量升级：
-# 1）最终输出分为 A档正式可交易 / B档观察 / C档今日不交易；
-# 2）每只票必须给出主交易假设、确认条件、放弃条件、真实防守和RR；
-# 3）保存 v20_score_cards.json 作为后续 T+1/T+3/T+5/T+8/T+13/T+20 条件概率反馈底座；
-# 4）条件概率反馈先只做统计与调权建议，避免小样本自动过拟合。
+# ========================= V20.1：精简七层评分 + 条件概率反馈闭环配置 =========================
+# 说明：V20.1 不推翻 V19.4.1 / V20，而是在原底座上做“手术式增量优化”：
+# 1）把零散K线形态合并为“触发质量分”，把零散量能指标合并为“资金行为分”；
+# 2）最终使用七层评分：风险过滤、结构位置、压力支撑、资金行为、触发确认、交易质量、反馈校准；
+# 3）A档门槛收紧：压力带D不能A；压力带C必须有强承接/强大周期修复；买点未触发不A；
+# 4）新增“日线小平台低量精准触发线”字段与报告口径：只作为短线触发线，不替代大周期最终压力上沿；
+# 5）保留固定Top3输出，但允许Top3里出现B/B+/C，并明确“观察/不交易”，避免固定输出被误解为每天必须买。
 V20_ENABLE_TIERED_OUTPUT = os.environ.get("V20_ENABLE_TIERED_OUTPUT", "1")
 V20_ENABLE_CONDITION_FEEDBACK = os.environ.get("V20_ENABLE_CONDITION_FEEDBACK", "1")
 V20_FIXED_TOP_N = int(os.environ.get("V20_FIXED_TOP_N", os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3")))))
-V20_SCORE_CARDS_FILE = os.environ.get("V20_SCORE_CARDS_FILE", "v20_score_cards.json")
-V20_DAILY_REPORT_FILE = os.environ.get("V20_DAILY_REPORT_FILE", "v20_daily_report.txt")
-V20_REVIEW_REPORT_FILE = os.environ.get("V20_REVIEW_REPORT_FILE", "v20_review_report.txt")
-V20_CONDITION_TABLE_FILE = os.environ.get("V20_CONDITION_TABLE_FILE", "v20_condition_probability_table.json")
-V20_SIGNAL_FEEDBACK_CSV = os.environ.get("V20_SIGNAL_FEEDBACK_CSV", "v20_signal_feedback_stats.csv")
-V20_MODEL_AUDIT_LOG_FILE = os.environ.get("V20_MODEL_AUDIT_LOG_FILE", "v20_model_audit_log.json")
+V20_SCORE_CARDS_FILE = os.environ.get("V20_SCORE_CARDS_FILE", "v20_3_1_score_cards.json")
+V20_DAILY_REPORT_FILE = os.environ.get("V20_DAILY_REPORT_FILE", "v20_3_1_daily_report.txt")
+V20_REVIEW_REPORT_FILE = os.environ.get("V20_REVIEW_REPORT_FILE", "v20_3_1_review_report.txt")
+V20_CONDITION_TABLE_FILE = os.environ.get("V20_CONDITION_TABLE_FILE", "v20_3_1_condition_probability_table.json")
+V20_SIGNAL_FEEDBACK_CSV = os.environ.get("V20_SIGNAL_FEEDBACK_CSV", "v20_3_1_signal_feedback_stats.csv")
+V20_MODEL_AUDIT_LOG_FILE = os.environ.get("V20_MODEL_AUDIT_LOG_FILE", "v20_3_1_model_audit_log.json")
+V20_SIGNAL_LIFECYCLE_FILE = os.environ.get("V20_SIGNAL_LIFECYCLE_FILE", "v20_3_1_signal_lifecycle.json")
+V20_ENABLE_SIGNAL_LIFECYCLE = os.environ.get("V20_ENABLE_SIGNAL_LIFECYCLE", "1")
+V20_LIFECYCLE_LOOKBACK_DAYS = int(os.environ.get("V20_LIFECYCLE_LOOKBACK_DAYS", "25"))
+V20_LIFECYCLE_MAX_ITEMS = int(os.environ.get("V20_LIFECYCLE_MAX_ITEMS", "60"))
+
+
+# ========================= V20.3 基础筛选重构 + 动态风险指标库 =========================
+# 基础层重召回、深度层重精度、最终层重交易。
+# V20.3 不删除V20.2任何结构逻辑，只把基础筛选从“单一总分前200”升级为：
+# 多通道召回 + 风险前置过滤 + 种子/近期推荐强制跟踪 + 入围原因可审计。
+V203_ENABLE_BASE_RECALL_REBUILD = os.environ.get("V203_ENABLE_BASE_RECALL_REBUILD", "1")
+V203_ENABLE_DYNAMIC_RISK_LIBRARY = os.environ.get("V203_ENABLE_DYNAMIC_RISK_LIBRARY", "1")
+V203_BASE_AUDIT_FILE = os.environ.get("V203_BASE_AUDIT_FILE", "v20_3_1_base_screen_audit.json")
+V203_BASE_RISK_AUDIT_FILE = os.environ.get("V203_BASE_RISK_AUDIT_FILE", "v20_3_1_base_risk_audit.json")
+V203_FORCE_RECENT_TRACKING_IN_POOL = os.environ.get("V203_FORCE_RECENT_TRACKING_IN_POOL", "1")
+V203_RECENT_TRACKING_LOOKBACK_DAYS = int(os.environ.get("V203_RECENT_TRACKING_LOOKBACK_DAYS", "20"))
+V203_R3_TO_DEEP_LIMIT = int(os.environ.get("V203_R3_TO_DEEP_LIMIT", "0"))  # 默认R3不进正式深评，保留风险审计
+V203_MIN_AMOUNT_FOR_FORMAL = float(os.environ.get("V203_MIN_AMOUNT_FOR_FORMAL", "30000000"))  # 基础层流动性风险参考：3000万成交额
 V20_REVIEW_WINDOWS = [1, 3, 5, 8, 13, 20]
-# 分层阈值：后续可由条件概率反馈校准。
-V20_A_MIN_SCORE = float(os.environ.get("V20_A_MIN_SCORE", "78"))
+
+# V20.1 A档硬门槛：宁可少给A，也不要把“买点未到/压力未破”的票写成正式可交易。
+V20_A_MIN_SCORE = float(os.environ.get("V20_A_MIN_SCORE", "82"))
 V20_A_MIN_RR = float(os.environ.get("V20_A_MIN_RR", "1.5"))
-V20_A_MIN_TRADE_QUALITY = float(os.environ.get("V20_A_MIN_TRADE_QUALITY", "4"))
-V20_MAX_DEFENSE_DIST_A = float(os.environ.get("V20_MAX_DEFENSE_DIST_A", "0.10"))
+V20_A_MIN_TRADE_QUALITY = float(os.environ.get("V20_A_MIN_TRADE_QUALITY", "5"))
+V20_MAX_DEFENSE_DIST_A = float(os.environ.get("V20_MAX_DEFENSE_DIST_A", "0.08"))
+V20_MAX_DEFENSE_DIST_A_STRICT = float(os.environ.get("V20_MAX_DEFENSE_DIST_A_STRICT", "0.05"))
 V20_MAX_NEAR_PRESSURE_A = float(os.environ.get("V20_MAX_NEAR_PRESSURE_A", "0.05"))
 V20_OVERHEAT_RSI = float(os.environ.get("V20_OVERHEAT_RSI", "85"))
 V20_OVERHEAT_CCI = float(os.environ.get("V20_OVERHEAT_CCI", "250"))
+V20_BUY_ZONE_MISS_PCT = float(os.environ.get("V20_BUY_ZONE_MISS_PCT", "0.035"))
+V20_CONFIRM_FAR_PCT = float(os.environ.get("V20_CONFIRM_FAR_PCT", "0.06"))
+V20_PRESSURE_GRADE_BLOCK_A = os.environ.get("V20_PRESSURE_GRADE_BLOCK_A", "D")
 # ===========================================================================
 
 # V19.4压力/共振线合并规则：
@@ -5640,6 +5664,161 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_pressure_json": json.dumps(related, ensure_ascii=False)[:1800],
     }
 
+
+# ========================= V20.2 底部反转强势形态模块 =========================
+def _v202_local_lows(w, order=3):
+    """返回局部低点索引，避免依赖 scipy。"""
+    lows = []
+    try:
+        arr = pd.to_numeric(w["low"], errors="coerce").values
+        n = len(arr)
+        for i in range(order, n - order):
+            if not np.isfinite(arr[i]):
+                continue
+            if arr[i] <= np.nanmin(arr[i-order:i]) and arr[i] <= np.nanmin(arr[i+1:i+order+1]):
+                lows.append(i)
+    except Exception:
+        return []
+    return lows
+
+
+def _v202_local_high_between(w, a, b):
+    try:
+        seg = w.iloc[min(a, b):max(a, b)+1]
+        if seg.empty:
+            return 0.0, ""
+        idx = int(pd.to_numeric(seg["high"], errors="coerce").idxmax())
+        return safe_float(w.loc[idx, "high"]), str(w.loc[idx, "date"] if "date" in w.columns else "")
+    except Exception:
+        return 0.0, ""
+
+
+def detect_v202_bottom_reversal_patterns(hist):
+    """
+    V20.2：底部反转强势形态统一识别。
+    覆盖：头肩底、W底/双底、V底/尖底反转。
+    形态本身给结构分，颈线/确认线突破给触发分，量能配合给确认分；最终仍走结构同源封顶，避免重复堆分。
+    """
+    empty = {
+        "hit": False, "type": "", "score": 0.0, "neckline": 0.0, "confirmed": False,
+        "volume_quality": 0.0, "trigger_quality": 0.0, "retest_quality": 0.0,
+        "desc": "无明确头肩底/W底/V底结构",
+    }
+    if hist is None or len(hist) < 70:
+        return empty
+    w = hist.tail(180).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in w.columns:
+            return empty
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    w = w.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(w) < 70:
+        return empty
+    cur = w.iloc[-1]
+    cur_close = safe_float(cur["close"]); cur_high = safe_float(cur["high"]); cur_low = safe_float(cur["low"])
+    cur_vol = safe_float(cur["volume"]); vol_ma20 = safe_float(w["volume"].tail(20).mean())
+    pos = (cur_close - cur_low) / max(cur_high - cur_low, 1e-9)
+    long_pos = safe_float(cur.get("long_pos_250", 0.0)) if "long_pos_250" in w.columns else 0.0
+    candidates = []
+    lows = [i for i in _v202_local_lows(w, order=3) if 8 <= i <= len(w) - 4]
+
+    # W底 / 双底：第二底不有效破第一底，颈线突破或接近颈线；第二底缩量/突破放量加分。
+    for a_i, i1 in enumerate(lows[:-1]):
+        for i2 in lows[a_i+1:]:
+            gap = i2 - i1
+            if gap < 10 or gap > 90:
+                continue
+            low1 = safe_float(w.loc[i1, "low"]); low2 = safe_float(w.loc[i2, "low"])
+            if low1 <= 0 or low2 <= 0 or abs(low2 / low1 - 1) > 0.10 or low2 < low1 * 0.94:
+                continue
+            neckline, _ = _v202_local_high_between(w, i1, i2)
+            if neckline <= max(low1, low2) * 1.05:
+                continue
+            confirmed = cur_close >= neckline * 1.005
+            near_neck = cur_close >= neckline * 0.97
+            if not (confirmed or near_neck):
+                continue
+            vol1 = safe_float(w.loc[i1, "volume"]); vol2 = safe_float(w.loc[i2, "volume"])
+            second_bottom_shrink = vol2 <= vol1 * 1.10 if vol1 > 0 else False
+            breakout_vol = cur_vol >= vol_ma20 * 1.25 if vol_ma20 > 0 else False
+            score = 2.5
+            desc_bits = [f"W底/双底：第一底{low1:.2f}，第二底{low2:.2f}，颈线{neckline:.2f}"]
+            if second_bottom_shrink: score += 1.5; desc_bits.append("第二底缩量承接")
+            if near_neck: score += 1.0; desc_bits.append("已接近颈线")
+            if confirmed: score += 3.0; desc_bits.append("实体/收盘突破颈线")
+            if breakout_vol and confirmed: score += 1.5; desc_bits.append("突破量能健康放大")
+            if pos >= 0.70 and confirmed: score += 0.8; desc_bits.append("收盘位置较强")
+            if long_pos > 0.75: score -= 2.0; desc_bits.append("位置偏高降权")
+            score = max(0.0, min(10.0, score))
+            if score >= 4.0:
+                candidates.append({"hit": True, "type": "W底/双底", "score": score, "neckline": neckline, "confirmed": bool(confirmed), "volume_quality": 1.5 if second_bottom_shrink else 0.0, "trigger_quality": 3.0 if confirmed else 1.0, "retest_quality": 0.0, "desc": "；".join(desc_bits)})
+
+    # 头肩底：三低点，中间头部最低，右肩不破头；颈线突破或接近。
+    for a in range(len(lows) - 2):
+        i1, i2, i3 = lows[a], lows[a+1], lows[a+2]
+        if i2 - i1 < 8 or i3 - i2 < 8 or i3 - i1 > 120:
+            continue
+        l1, l2, l3 = safe_float(w.loc[i1, "low"]), safe_float(w.loc[i2, "low"]), safe_float(w.loc[i3, "low"])
+        if min(l1, l2, l3) <= 0 or not (l2 < l1 * 0.97 and l2 < l3 * 0.97):
+            continue
+        shoulder_sym = abs(l3 / l1 - 1)
+        if shoulder_sym > 0.18 or l3 < l2 * 1.03:
+            continue
+        neck1, _ = _v202_local_high_between(w, i1, i2); neck2, _ = _v202_local_high_between(w, i2, i3)
+        neckline = max(neck1, neck2)
+        if neckline <= max(l1, l3) * 1.05:
+            continue
+        confirmed = cur_close >= neckline * 1.005
+        near_neck = cur_close >= neckline * 0.97
+        if not (confirmed or near_neck):
+            continue
+        right_vol = safe_float(w.loc[i3, "volume"]); head_vol = safe_float(w.loc[i2, "volume"])
+        right_shrink = right_vol <= head_vol * 0.95 if head_vol > 0 else False
+        breakout_vol = cur_vol >= vol_ma20 * 1.25 if vol_ma20 > 0 else False
+        score = 3.0
+        desc_bits = [f"头肩底：左肩{l1:.2f}，头部{l2:.2f}，右肩{l3:.2f}，颈线{neckline:.2f}"]
+        if right_shrink: score += 1.2; desc_bits.append("右肩缩量")
+        if shoulder_sym <= 0.10: score += 0.8; desc_bits.append("左右肩较对称")
+        if near_neck: score += 1.0; desc_bits.append("已接近颈线")
+        if confirmed: score += 3.0; desc_bits.append("突破颈线确认")
+        if confirmed and breakout_vol: score += 1.5; desc_bits.append("突破量能配合")
+        if pos >= 0.70 and confirmed: score += 0.8; desc_bits.append("收盘较强")
+        if long_pos > 0.75: score -= 2.0; desc_bits.append("位置偏高降权")
+        score = max(0.0, min(11.0, score))
+        if score >= 4.0:
+            candidates.append({"hit": True, "type": "头肩底", "score": score, "neckline": neckline, "confirmed": bool(confirmed), "volume_quality": 1.2 if right_shrink else 0.0, "trigger_quality": 3.0 if confirmed else 1.0, "retest_quality": 0.0, "desc": "；".join(desc_bits)})
+
+    # V底 / 尖底：只给中等结构分；必须快速收回修复线，未回踩确认不重奖。
+    recent = w.tail(100).copy().reset_index(drop=True)
+    if len(recent) >= 55:
+        low_idx = int(pd.to_numeric(recent["low"], errors="coerce").idxmin())
+        if 12 <= low_idx <= len(recent) - 8:
+            low_price = safe_float(recent.loc[low_idx, "low"])
+            left_seg = recent.iloc[max(0, low_idx-25):low_idx]
+            left_high = safe_float(left_seg["high"].max()) if not left_seg.empty else 0.0
+            repair_line = safe_float(left_seg["high"].quantile(0.65)) if not left_seg.empty else 0.0
+            if low_price > 0 and left_high > 0 and repair_line > 0:
+                drop = 1 - low_price / left_high; rebound = cur_close / low_price - 1
+                reclaimed = cur_close >= repair_line * 1.003
+                vol_expand = cur_vol >= vol_ma20 * 1.20 if vol_ma20 > 0 else False
+                if drop >= 0.15 and rebound >= 0.10 and reclaimed:
+                    score = 2.5
+                    desc_bits = [f"V底/尖底修复：低点{low_price:.2f}，修复线{repair_line:.2f}，跌幅{drop:.1%}后反弹{rebound:.1%}"]
+                    if vol_expand: score += 1.5; desc_bits.append("右侧量能接力")
+                    if pos >= 0.70: score += 0.8; desc_bits.append("收盘较强")
+                    if cur_close >= left_high * 0.98: score += 1.5; desc_bits.append("接近/收复急跌前平台")
+                    if long_pos > 0.70: score -= 1.5; desc_bits.append("中高位V修复降权")
+                    score = max(0.0, min(8.0, score))
+                    if score >= 4.0:
+                        candidates.append({"hit": True, "type": "V底/尖底反转", "score": score, "neckline": repair_line, "confirmed": bool(reclaimed), "volume_quality": 1.5 if vol_expand else 0.0, "trigger_quality": 2.0 if reclaimed else 0.0, "retest_quality": 0.0, "desc": "；".join(desc_bits) + "；V底未回踩确认前只做中等结构分"})
+
+    if not candidates:
+        return empty
+    best = sorted(candidates, key=lambda x: safe_float(x.get("score", 0)), reverse=True)[0]
+    best["score"] = float(max(0.0, min(12.0, safe_float(best.get("score", 0)))))
+    return best
+# ======================= V20.2 底部反转强势形态模块 END ======================
+
 def calc_deep_rows(df, code):
     if df is None or len(df) < 260:
         return pd.DataFrame()
@@ -6129,6 +6308,15 @@ def calc_deep_rows(df, code):
     extra["fibo_level_100"] = 0.0
     extra["fibo_level_150"] = 0.0
     extra["fibo_level_200"] = 0.0
+    # V20.2：底部反转强势形态补全（头肩底/W底/V底）。保留细项识别，最终同源封顶。
+    extra["score_bottom_reversal_pattern"] = 0.0
+    extra["bottom_pattern_type"] = ""
+    extra["bottom_pattern_neckline"] = 0.0
+    extra["bottom_pattern_confirmed"] = False
+    extra["bottom_pattern_volume_quality"] = 0.0
+    extra["bottom_pattern_trigger_quality"] = 0.0
+    extra["bottom_pattern_retest_quality"] = 0.0
+    extra["bottom_pattern_desc"] = ""
 
     for idx in range(len(df)):
         if idx not in _active_deep_indices:
@@ -7227,7 +7415,7 @@ def v122_base_candidate_gate(row):
     near_pressure = safe_float(row.get("near_pressure_dist", 0))
     rsi = safe_float(row.get("base_rsi", 50))
     cci = safe_float(row.get("base_cci", 0))
-    bucket = str(row.get("base_bucket", ""))
+    bucket = normalize_base_bucket_name(row.get("base_bucket", ""))
 
     seed_score = structure + long_cycle + monthly_proxy + fibo + limit_hold
     trigger_score = attack * 0.40 + volume_carry + trade_quality + fibo
@@ -7242,8 +7430,8 @@ def v122_base_candidate_gate(row):
         return False, "贴近压力且触发质量不足"
     if rsi >= 86 and cci >= 300 and seed_score < 14:
         return False, "指标重度过热且缺少大结构支撑"
-    if bucket == "强势观察" and trade_quality < 0 and seed_score < 16:
-        return False, "强势观察但交易质量不足"
+    if ("强势观察" in bucket or "活跃股性" in bucket) and trade_quality < 0 and seed_score < 16:
+        return False, "活跃股性/强势观察但交易质量不足"
 
     return True, "通过V12.5基础闸门"
 
@@ -7380,6 +7568,16 @@ def process_stock_deep(row):
             "amount": float(r["amount"]) if pd.notna(r["amount"]) else 0,
             "score": float(r["score"]) if pd.notna(r["score"]) else 0,
             "base_score": float(row["base_score"]),
+            "base_entry_channels": row.get("base_entry_channels", []),
+            "base_entry_reason": str(row.get("base_entry_reason", "")),
+            "base_recall_score": float(row.get("base_recall_score", 0)) if row.get("base_recall_score", None) is not None else 0,
+            "base_risk_score": float(row.get("base_risk_score", 0)) if row.get("base_risk_score", None) is not None else 0,
+            "base_risk_level": str(row.get("base_risk_level", "R0")),
+            "base_risk_flags": str(row.get("base_risk_flags", "")),
+            "base_risk_action": str(row.get("base_risk_action", "")),
+            "base_risk_reason": str(row.get("base_risk_reason", "")),
+            "base_risk_pool": str(row.get("base_risk_pool", "")),
+            "base_seed_pool_flag": bool(row.get("base_seed_pool_flag", False)),
             "score_base_model": float(r["score_base_model"]) if pd.notna(r["score_base_model"]) else 0,
             "score_volume_structure": float(r["score_volume_structure"]) if pd.notna(r["score_volume_structure"]) else 0,
             "score_behavior": float(r["score_behavior"]) if pd.notna(r["score_behavior"]) else 0,
@@ -7585,9 +7783,9 @@ def process_stock_deep(row):
     return rows
 
 
-def select_deep_targets_v10(base_rows, limit):
+def select_deep_targets_v10_legacy_v192(base_rows, limit):
     """
-    V19.2基础候选分桶选择。
+    V19.2基础候选分桶选择（遗留备份，V20.3.1主流程不调用）。
     仍保留函数名以兼容旧调用，但内部已从V12旧桶升级为V19机会假设桶。
     不再简单按单一base_score取前N，避免强攻/极端放量票霸榜。
     每个股票只保留一条最优候选，减少深度评分重复计算。
@@ -7704,6 +7902,494 @@ def select_deep_targets_v10(base_rows, limit):
     bucket_stats["V19.2基础闸门"] = {"available": len(dedup), "quota": limit, "selected": len(selected)}
     return selected, bucket_stats
 
+
+
+# ========================= V20.3 基础筛选重构 / 动态风险指标库 =========================
+def _v203_add_flag(flags, name, weight=0.0, severity="R1"):
+    if name:
+        flags.append({"name": str(name), "weight": float(weight), "severity": str(severity)})
+
+def normalize_base_bucket_name(bucket):
+    """统一基础分桶命名，避免“强势观察/活跃股性观察/活跃股性/强势观察”混用。"""
+    b = str(bucket or "")
+    if "强势观察" in b or "活跃股性" in b:
+        return "活跃股性/强势观察"
+    return b
+
+
+def _v203_parse_date(text):
+    try:
+        return pd.to_datetime(str(text)).date()
+    except Exception:
+        return None
+
+
+def v203_recent_tracking_codes():
+    """读取近期推荐/生命周期文件，把未失效股票强制纳入基础深评候选。"""
+    codes = set()
+    today = datetime.now().date()
+
+    def _maybe_add(code, date_text="", status=""):
+        code = str(code or "").zfill(6)
+        if not code or len(code) != 6 or not code.isdigit():
+            return
+        d = _v203_parse_date(date_text)
+        if d is not None and (today - d).days > V203_RECENT_TRACKING_LOOKBACK_DAYS:
+            return
+        if any(x in str(status) for x in ["放弃", "硬风险", "剔除"]):
+            return
+        codes.add(code)
+
+    # 1）signals_history.json：通常以 date_code 为键，也可能存dict。
+    try:
+        hist = load_signal_history()
+        if isinstance(hist, dict):
+            for k, v in hist.items():
+                if isinstance(v, dict):
+                    _maybe_add(v.get("code") or str(k).split("_")[-1], v.get("date") or v.get("signal_date") or str(k).split("_")[0], v.get("status", ""))
+                else:
+                    parts = str(k).split("_")
+                    if len(parts) >= 2:
+                        _maybe_add(parts[-1], parts[0], "")
+    except Exception:
+        pass
+
+    # 2）V20生命周期文件：兼容 list/dict 两种格式。
+    try:
+        if os.path.exists(V20_SIGNAL_LIFECYCLE_FILE):
+            with open(V20_SIGNAL_LIFECYCLE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("items", data.get("lifecycle", data)) if isinstance(data, dict) else data
+            if isinstance(items, list):
+                for it in items:
+                    if isinstance(it, dict):
+                        _maybe_add(it.get("code"), it.get("signal_date") or it.get("date"), it.get("status") or it.get("lifecycle_status", ""))
+    except Exception:
+        pass
+    return codes
+
+
+def evaluate_v203_dynamic_base_risk(row):
+    """V20.3 动态风险指标库：基础层前置风控，不等深度评分/三号员工再处理。"""
+    if V203_ENABLE_DYNAMIC_RISK_LIBRARY != "1":
+        return {
+            "base_risk_score": 0.0, "base_risk_level": "R0", "base_risk_flags": "",
+            "base_risk_action": "动态风险库关闭", "base_risk_reason": "", "base_risk_blocked": False,
+            "base_risk_pool": "正常候选池",
+        }
+
+    flags = []
+    score = 0.0
+    code = str(row.get("code", "") or row.get("代码", "")).zfill(6)
+    name = str(row.get("name", "") or row.get("名称", ""))
+
+    # 外部硬雷区/监管财务风险优先。
+    try:
+        reg = evaluate_regulatory_risk(code, name)
+        if reg.get("hard_exclude"):
+            _v203_add_flag(flags, "基本面/监管/审计硬雷区:" + "；".join(reg.get("flags", []))[:80], 100, "R4")
+            score += 100
+        elif safe_float(reg.get("penalty", 0)) <= -20:
+            _v203_add_flag(flags, "基本面/治理中高风险:" + "；".join(reg.get("flags", []))[:80], 35, "R3")
+            score += 35
+    except Exception:
+        pass
+
+    pct = safe_float(row.get("pct_chg", 0))
+    amount = safe_float(row.get("amount", 0))
+    close = safe_float(row.get("close", 0))
+    vr1 = safe_float(row.get("vr1", 0))
+    volr = safe_float(row.get("volr", 0))
+    pos = safe_float(row.get("pos", 0.5))
+    entity_pct = safe_float(row.get("entity_pct", 0))
+    break_rate = safe_float(row.get("break_rate", 0))
+    bias20 = safe_float(row.get("bias20", 0))
+    bias60 = safe_float(row.get("bias60", 0))
+    long_pos = safe_float(row.get("long_pos_250", 0))
+    near_p = safe_float(row.get("near_pressure_dist", 0))
+    mid_p = safe_float(row.get("mid_pressure_dist", 0))
+    overhead_p = safe_float(row.get("overhead_pressure_dist", 0))
+    rr = safe_float(row.get("base_risk_reward_ratio", row.get("risk_reward_ratio", 0)))
+    defense_dist = safe_float(row.get("base_defense_dist", row.get("defense_dist", 0)))
+    target_dist = safe_float(row.get("base_target_dist", 0))
+    base_rsi = safe_float(row.get("base_rsi", row.get("rsi", 50)))
+    base_cci = safe_float(row.get("base_cci", row.get("cci", 0)))
+    bucket = normalize_base_bucket_name(row.get("base_bucket", ""))
+    limit_mode = str(row.get("limit_volume_mode", ""))
+
+    # 1）技术/追高风险。
+    if long_pos >= 0.90 and bias20 >= 0.15:
+        _v203_add_flag(flags, "年内高位+20日高乖离", 18, "R2"); score += 18
+    if bias20 >= 0.22 or (bias20 >= 0.18 and bias60 >= 0.18):
+        _v203_add_flag(flags, "20/60日乖离过高", 20, "R2"); score += 20
+    if base_rsi >= 86 and base_cci >= 300:
+        _v203_add_flag(flags, "RSI/CCI重度过热", 24, "R3"); score += 24
+    elif base_rsi >= 80 or base_cci >= 250:
+        _v203_add_flag(flags, "RSI/CCI偏热", 10, "R1"); score += 10
+    if break_rate > 0.08 and defense_dist > 0.08:
+        _v203_add_flag(flags, "突破过远且离防守位远", 14, "R2"); score += 14
+
+    # 2）量价派发/分歧风险。
+    if (vr1 >= 5.0 or volr >= 5.0) and pct < 4:
+        _v203_add_flag(flags, "极端放量但价格推进不足", 28, "R3"); score += 28
+    elif vr1 >= 3.5 or volr >= 4.5:
+        _v203_add_flag(flags, "量能极端放大", 15, "R2"); score += 15
+    if pos < 0.35 and (vr1 >= 2.0 or volr >= 2.5):
+        _v203_add_flag(flags, "放量收盘弱/长上影风险", 22, "R3"); score += 22
+    if "分歧爆量" in limit_mode:
+        _v203_add_flag(flags, "涨停分歧爆量", 15, "R2"); score += 15
+
+    # 3）压力/空间/RR风险。
+    if near_p > 0 and near_p < 0.035 and pct >= 2:
+        _v203_add_flag(flags, "近端压力贴脸", 22, "R3"); score += 22
+    elif near_p > 0 and near_p < 0.06:
+        _v203_add_flag(flags, "近端压力偏近", 12, "R2"); score += 12
+    if mid_p > 0 and mid_p < 0.035 and pct >= 3:
+        _v203_add_flag(flags, "中层压力贴近且强攻", 12, "R2"); score += 12
+    if rr > 0 and rr < 1.2:
+        _v203_add_flag(flags, "风险收益比不足", 18, "R2"); score += 18
+    if defense_dist > 0.12:
+        _v203_add_flag(flags, "离真实防守位过远", 18, "R2"); score += 18
+    elif defense_dist > 0.08:
+        _v203_add_flag(flags, "防守距离偏远", 10, "R1"); score += 10
+    if target_dist > 0 and target_dist < 0.05:
+        _v203_add_flag(flags, "上方空间不足", 14, "R2"); score += 14
+
+    # 4）流动性/可执行风险。
+    # V20.3.1修复：部分缓存源没有amount字段或amount被填0，不能直接R3误伤。
+    # 若close和volume可用，则用close*volume做保守估算，只给数据提示，不当作成交额缺失硬风险。
+    volume = safe_float(row.get("volume", row.get("成交量", 0)))
+    amount_effective = amount
+    amount_missing_but_estimable = False
+    if amount_effective <= 0 and close > 0 and volume > 0:
+        amount_effective = close * volume
+        amount_missing_but_estimable = True
+        _v203_add_flag(flags, "成交额字段缺失，已用收盘价*成交量估算流动性", 3, "R1"); score += 3
+    if amount_effective > 0 and amount_effective < V203_MIN_AMOUNT_FOR_FORMAL:
+        _v203_add_flag(flags, f"成交额偏低<{V203_MIN_AMOUNT_FOR_FORMAL/100000000:.2f}亿", 12, "R2"); score += 12
+    if close > 0 and close < 2.0:
+        _v203_add_flag(flags, "低价股流动性/质量风险", 16, "R2"); score += 16
+    if amount_effective <= 0:
+        _v203_add_flag(flags, "成交额与成交量均缺失/为0", 25, "R3"); score += 25
+
+    # 5）数据质量风险。
+    try:
+        date_text = str(row.get("date", ""))
+        if DATA_GATE_TARGET_DATE and date_text and date_text < DATA_GATE_TARGET_DATE:
+            _v203_add_flag(flags, "K线日期落后目标交易日", 25, "R3"); score += 25
+    except Exception:
+        pass
+    if str(DATA_GATE_COVERAGE).lower().startswith("skip") or "restored" in str(DATA_GATE_COVERAGE).lower() or "restored" in str(DATA_GATE_REASON).lower():
+        _v203_add_flag(flags, "使用恢复缓存/数据更新跳过", 6, "R1"); score += 6
+
+    # 6）活跃强攻但结构弱，只做观察。
+    seed_score = safe_float(row.get("base_structure_potential_score", 0)) + safe_float(row.get("base_long_cycle_potential_score", 0)) + safe_float(row.get("base_monthly_height_proxy_score", 0))
+    if (pct >= 7 or entity_pct >= 7) and seed_score < 8 and long_pos > 0.60:
+        _v203_add_flag(flags, "强攻但结构种子不足", 18, "R2"); score += 18
+
+    # 风险等级和动作。
+    max_sev = "R0"
+    sev_rank = {"R0": 0, "R1": 1, "R2": 2, "R3": 3, "R4": 4}
+    for f in flags:
+        if sev_rank.get(f.get("severity", "R0"), 0) > sev_rank.get(max_sev, 0):
+            max_sev = f.get("severity", "R0")
+    if score >= 80 or max_sev == "R4":
+        level = "R4"
+    elif score >= 45 or max_sev == "R3":
+        level = "R3"
+    elif score >= 22 or max_sev == "R2":
+        level = "R2"
+    elif score > 0 or max_sev == "R1":
+        level = "R1"
+    else:
+        level = "R0"
+
+    if level == "R4":
+        action, pool, blocked = "基础层硬剔除", "硬剔除池", True
+    elif level == "R3":
+        action, pool, blocked = "不进正式深评，仅风险观察", "风险观察池", True
+    elif level == "R2":
+        action, pool, blocked = "允许入池但明显降权/谨慎观察", "谨慎观察池", False
+    elif level == "R1":
+        action, pool, blocked = "允许入池但轻度降权", "正常候选池", False
+    else:
+        action, pool, blocked = "正常进入基础通道", "正常候选池", False
+
+    # 某些结构优质但R3的候选，默认仍不进正式深评；如用户想诊断可设置V203_R3_TO_DEEP_LIMIT。
+    names = [f["name"] for f in flags]
+    return {
+        "base_risk_score": float(score),
+        "base_risk_level": level,
+        "base_risk_flags": "；".join(names),
+        "base_risk_action": action,
+        "base_risk_reason": "；".join(names[:6]),
+        "base_risk_blocked": bool(blocked),
+        "base_risk_pool": pool,
+    }
+
+
+def infer_v203_base_entry_channels(row):
+    """基础多通道召回：每只票可以命中多个机会入口，便于审计和配额选择。"""
+    channels = []
+    reasons = []
+    def add(ch, why):
+        if ch not in channels:
+            channels.append(ch)
+        if why:
+            reasons.append(why)
+
+    bucket = normalize_base_bucket_name(row.get("base_bucket", ""))
+    if "回踩" in bucket or safe_float(row.get("base_trade_quality_score", 0)) >= 7 or safe_float(row.get("base_limitup_hold_score", 0)) >= 2:
+        add("回踩确认/二买", "回踩/承接/交易质量入口")
+    if "资金承接" in bucket or safe_float(row.get("base_volume_carry_score", 0)) >= 7 or safe_float(row.get("flat_volume_count_60_base", 0)) >= 1:
+        add("资金承接/倍量后平量", "倍量后平量/阳量承接入口")
+    if "大周期" in bucket or safe_float(row.get("base_long_cycle_potential_score", 0)) >= 5 or safe_float(row.get("base_monthly_height_proxy_score", 0)) >= 7:
+        add("大周期修复", "长周期位置/年线修复入口")
+    if "平台蓄势" in bucket or safe_float(row.get("base_observe_structure_density_score", 0)) >= 5 or safe_float(row.get("base_observation_subscore", 0)) >= 6.5:
+        add("平台蓄势/爆发前夜", "平台收敛/观察值入口")
+    if "压力" in bucket or (0 < safe_float(row.get("near_pressure_dist", 0)) <= 0.12 and safe_float(row.get("base_structure_potential_score", 0)) >= 5):
+        add("压力带临界/精确触发", "靠近压力带/结构线入口")
+    if safe_float(row.get("score_bottom_reversal_pattern", 0)) > 0 or safe_float(row.get("base_structure_potential_score", 0)) >= 8 or "观察值" in bucket:
+        add("底部反转/结构种子", "底部反转/结构潜力入口")
+    if "低位" in bucket or bool(row.get("short_ma_volume_entity_start", False)):
+        add("低位强启动", "低位短均线/倍量启动入口")
+    if "活跃" in bucket or safe_float(row.get("base_observe_active_memory_score", 0)) >= 3:
+        add("活跃股性观察", "近期股性活跃入口")
+
+    if not channels:
+        add(bucket or "综合基础质量", "基础综合分入口")
+
+    return channels, "；".join(reasons[:6])
+
+
+def v203_enrich_base_row(row, recent_tracking_codes=None):
+    rr = dict(row)
+    recent_tracking_codes = recent_tracking_codes or set()
+    risk = evaluate_v203_dynamic_base_risk(rr)
+    rr.update(risk)
+    channels, reason = infer_v203_base_entry_channels(rr)
+    code = str(rr.get("code", "")).zfill(6)
+    is_tracking = V203_FORCE_RECENT_TRACKING_IN_POOL == "1" and code in recent_tracking_codes
+    if is_tracking:
+        if "近期推荐跟踪" not in channels:
+            channels.insert(0, "近期推荐跟踪")
+        reason = ("近期推荐仍在生命周期内，强制进入基础跟踪；" + reason).strip("；")
+        rr["base_seed_pool_flag"] = True
+        # 近期推荐健康票不能被轻中度风险直接挤出，但R4硬雷区仍剔除。
+        if rr.get("base_risk_level") in ["R1", "R2", "R3"] and rr.get("base_risk_level") != "R4":
+            rr["base_risk_action"] = "近期推荐跟踪：保留跟踪，但按风险降权"
+            rr["base_risk_blocked"] = False if rr.get("base_risk_level") != "R4" else True
+    else:
+        rr["base_seed_pool_flag"] = False
+    rr["base_entry_channels"] = channels
+    rr["base_entry_reason"] = reason or "基础综合质量入围"
+
+    # V20.3召回分：风险前置降权，但不过度压制优质种子。
+    recall = safe_float(rr.get("base_bucket_rank_score", rr.get("base_total_score", rr.get("base_score", 0))))
+    recall += min(8.0, safe_float(rr.get("base_observation_subscore", 0)) * 0.6)
+    recall += min(6.0, safe_float(rr.get("base_structure_potential_score", 0)) * 0.25)
+    recall += min(5.0, safe_float(rr.get("base_volume_carry_score", 0)) * 0.25)
+    if is_tracking:
+        recall += 8.0
+    level = str(rr.get("base_risk_level", "R0"))
+    if level == "R1": recall -= 3
+    elif level == "R2": recall -= 10
+    elif level == "R3": recall -= 25
+    elif level == "R4": recall -= 999
+    rr["base_recall_score"] = float(recall)
+    return rr
+
+
+def v203_pick_channel_quota(limit):
+    # V20.3配额：基础层重召回，偏向回踩、资金承接、周期修复、蓄势和压力临界，压缩单纯活跃强攻。
+    plan = [
+        ("回踩确认/二买", 0.20),
+        ("资金承接/倍量后平量", 0.175),
+        ("大周期修复", 0.15),
+        ("平台蓄势/爆发前夜", 0.15),
+        ("压力带临界/精确触发", 0.125),
+        ("底部反转/结构种子", 0.10),
+        ("低位强启动", 0.075),
+        ("活跃股性观察", 0.025),
+    ]
+    quotas = {name: max(2, int(round(limit * ratio))) for name, ratio in plan}
+    while sum(quotas.values()) > limit:
+        for name in ["活跃股性观察", "低位强启动", "底部反转/结构种子", "压力带临界/精确触发", "平台蓄势/爆发前夜"]:
+            if quotas.get(name, 0) > 2 and sum(quotas.values()) > limit:
+                quotas[name] -= 1
+    while sum(quotas.values()) < limit:
+        for name in ["回踩确认/二买", "资金承接/倍量后平量", "大周期修复", "平台蓄势/爆发前夜", "压力带临界/精确触发"]:
+            if sum(quotas.values()) < limit:
+                quotas[name] += 1
+    return plan, quotas
+
+
+def save_v203_base_audit(enriched, selected, gated_out, bucket_stats):
+    try:
+        payload = {
+            "generated_at_bj": bj_time_str(),
+            "model_version": MODEL_VERSION,
+            "summary": {
+                "enriched": len(enriched),
+                "selected": len(selected),
+                "gated_out": len(gated_out),
+                "bucket_stats": bucket_stats,
+            },
+            "selected": [
+                {
+                    "code": r.get("code", ""), "name": r.get("name", ""), "date": r.get("date", ""),
+                    "base_recall_score": safe_float(r.get("base_recall_score", 0)),
+                    "base_entry_channels": r.get("base_entry_channels", []),
+                    "base_entry_reason": r.get("base_entry_reason", ""),
+                    "base_risk_level": r.get("base_risk_level", ""),
+                    "base_risk_action": r.get("base_risk_action", ""),
+                    "base_risk_flags": r.get("base_risk_flags", ""),
+                }
+                for r in selected[:500]
+            ],
+            "gated_out": [
+                {
+                    "code": r.get("code", ""), "name": r.get("name", ""), "date": r.get("date", ""),
+                    "base_recall_score": safe_float(r.get("base_recall_score", 0)),
+                    "base_entry_channels": r.get("base_entry_channels", []),
+                    "base_risk_level": r.get("base_risk_level", ""),
+                    "base_risk_action": r.get("base_risk_action", ""),
+                    "base_risk_flags": r.get("base_risk_flags", ""),
+                    "v122_gate_reason": r.get("v122_gate_reason", ""),
+                }
+                for r in gated_out[:300]
+            ],
+        }
+        with open(V203_BASE_AUDIT_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        # 风险审计单独保存所有R2以上。
+        risk_rows = [r for r in enriched if str(r.get("base_risk_level", "R0")) in ["R2", "R3", "R4"]]
+        with open(V203_BASE_RISK_AUDIT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"generated_at_bj": bj_time_str(), "risk_rows": risk_rows[:1000]}, f, ensure_ascii=False, indent=2)
+        print(f"V20.3基础筛选审计已保存：{V203_BASE_AUDIT_FILE}；风险审计：{V203_BASE_RISK_AUDIT_FILE}")
+    except Exception as e:
+        print(f"V20.3基础筛选审计保存失败：{e}")
+
+
+def select_deep_targets_v10(base_rows, limit):
+    """
+    V20.3基础筛选重构版：
+    多通道召回 + 动态风险前置过滤 + 近期推荐跟踪强制入池 + 入围原因可审计。
+    保留函数名以兼容主流程。
+    """
+    if not base_rows:
+        return [], {}
+    if V203_ENABLE_BASE_RECALL_REBUILD != "1":
+        # 若关闭V20.3，则退回一个简单排序逻辑，避免递归调用旧函数不可用。
+        rows = sorted(base_rows, key=lambda x: safe_float(x.get("base_bucket_rank_score", x.get("base_score", 0))), reverse=True)
+        return rows[:int(max(1, limit))], {"V20.3关闭": {"available": len(rows), "quota": limit, "selected": min(len(rows), limit)}}
+
+    limit = int(max(1, limit))
+    recent_codes = v203_recent_tracking_codes()
+
+    # 每只股票只保留最优基础候选。
+    sorted_rows = sorted(
+        base_rows,
+        key=lambda x: (
+            str(x.get("date", "")),
+            safe_float(x.get("base_bucket_rank_score", x.get("base_score", 0))),
+            safe_float(x.get("base_total_score", x.get("base_score", 0))),
+            safe_float(x.get("score", 0)),
+        ),
+        reverse=True,
+    )
+    dedup, seen = [], set()
+    for r in sorted_rows:
+        code = str(r.get("code", ""))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        dedup.append(r)
+
+    enriched = [v203_enrich_base_row(r, recent_codes) for r in dedup]
+
+    # 风险前置过滤：R4硬剔除；R3默认风险观察，不进正式深评，除非近期推荐跟踪或用户设置允许少量诊断。
+    gated, gated_out, r3_watch = [], [], []
+    for r in enriched:
+        level = str(r.get("base_risk_level", "R0"))
+        if level == "R4":
+            rr = dict(r); rr["v122_gate_reason"] = "V20.3动态风险R4硬剔除"; gated_out.append(rr); continue
+        if level == "R3" and not bool(r.get("base_seed_pool_flag", False)):
+            r3_watch.append(r); continue
+        ok, reason = v122_base_candidate_gate(r)
+        if ok or bool(r.get("base_seed_pool_flag", False)):
+            gated.append(r)
+        else:
+            rr = dict(r); rr["v122_gate_reason"] = reason; gated_out.append(rr)
+
+    # 如用户允许，少量R3进入诊断深评，但排在最后。
+    if V203_R3_TO_DEEP_LIMIT > 0 and r3_watch:
+        r3_sorted = sorted(r3_watch, key=lambda x: safe_float(x.get("base_recall_score", 0)), reverse=True)[:V203_R3_TO_DEEP_LIMIT]
+        for r in r3_sorted:
+            rr = dict(r); rr["base_risk_action"] = "R3诊断深评，禁止正式A档"; gated.append(rr)
+
+    print(f"V20.3基础风险/闸门：原始{len(dedup)}只，通过{len(gated)}只，R4/闸门排除{len(gated_out)}只，R3风险观察{len(r3_watch)}只，近期跟踪{len(recent_codes)}只")
+    append_seed_pool_snapshot(gated)
+
+    plan, quotas = v203_pick_channel_quota(limit)
+    selected, selected_codes, bucket_stats = [], set(), {}
+
+    # 近期推荐跟踪先入池，防止健康回调/小涨后消失。
+    tracking_rows = [r for r in gated if bool(r.get("base_seed_pool_flag", False))]
+    tracking_rows = sorted(tracking_rows, key=lambda x: safe_float(x.get("base_recall_score", 0)), reverse=True)
+    tracking_quota = min(max(3, int(limit * 0.08)), len(tracking_rows), max(3, limit // 8))
+    for r in tracking_rows[:tracking_quota]:
+        code = str(r.get("code", ""))
+        if code not in selected_codes:
+            selected.append(r); selected_codes.add(code)
+    bucket_stats["近期推荐跟踪"] = {"available": len(tracking_rows), "quota": tracking_quota, "selected": min(len(tracking_rows), tracking_quota)}
+
+    for channel, _ratio in plan:
+        rows = [r for r in gated if channel in list(r.get("base_entry_channels", [])) and str(r.get("code", "")) not in selected_codes]
+        # R2风险允许入池但排序降权，R3诊断靠后。
+        rows = sorted(rows, key=lambda x: (safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
+        take = rows[:quotas.get(channel, 0)]
+        for r in take:
+            code = str(r.get("code", ""))
+            if code not in selected_codes:
+                selected.append(r); selected_codes.add(code)
+        bucket_stats[channel] = {"available": len(rows), "quota": quotas.get(channel, 0), "selected": len(take)}
+
+    # 不足则全局补齐：按召回分，避免某通道不足导致池子缩水。
+    if len(selected) < limit:
+        leftovers = [r for r in gated if str(r.get("code", "")) not in selected_codes]
+        leftovers = sorted(leftovers, key=lambda x: (safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
+        for r in leftovers:
+            code = str(r.get("code", ""))
+            if code in selected_codes:
+                continue
+            selected.append(r); selected_codes.add(code)
+            if len(selected) >= limit:
+                break
+
+    selected = sorted(
+        selected,
+        key=lambda x: (
+            bool(x.get("base_seed_pool_flag", False)),
+            safe_float(x.get("base_recall_score", 0)),
+            safe_float(x.get("base_total_score", x.get("base_score", 0))),
+            safe_float(x.get("score", 0)),
+        ),
+        reverse=True,
+    )[:limit]
+
+    bucket_stats["合计"] = {"available": len(gated), "quota": limit, "selected": len(selected)}
+    bucket_stats["V20.3动态风险"] = {
+        "R0": sum(1 for r in enriched if r.get("base_risk_level") == "R0"),
+        "R1": sum(1 for r in enriched if r.get("base_risk_level") == "R1"),
+        "R2": sum(1 for r in enriched if r.get("base_risk_level") == "R2"),
+        "R3": sum(1 for r in enriched if r.get("base_risk_level") == "R3"),
+        "R4": sum(1 for r in enriched if r.get("base_risk_level") == "R4"),
+    }
+    save_v203_base_audit(enriched, selected, gated_out + r3_watch, bucket_stats)
+    return selected, bucket_stats
+
+# ======================= V20.3 基础筛选重构 / 动态风险指标库 END ======================
 
 def calc_no_chase_line(close, strategy_type):
     """V11.3：根据策略类型给出次日禁止追高线。"""
@@ -9070,25 +9756,25 @@ def data_quality_report_line(row):
 # ======================= V19.4.1 数据质量提示模块 END =======================
 
 
-def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None):
+def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None, lifecycle_tracking=None):
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
-    lines.append("📊 <b>一号员工选股模型 V20 条件概率反馈闭环版</b>")
+    lines.append("📊 <b>一号员工选股模型 V20.3 基础筛选重构+动态风险指标库版</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
-    lines.append(f"正式输出：<b>{len(final_signals)}</b>只，固定目标{V20_FIXED_TOP_N}只。")
+    lines.append(f"正式输出：<b>{len(final_signals)}</b>只，固定目标{V20_FIXED_TOP_N}只；注意Top3可能包含A/B+/B/C分层。")
     if final_signals:
         _tier_stat = {}
         for _s in final_signals:
             _t = str(_s.get("v20_trade_tier", "未分层"))
             _tier_stat[_t] = _tier_stat.get(_t, 0) + 1
         lines.append(f"V20分层：{html.escape(str(_tier_stat))}")
-    lines.append("口径：V20保留V19.4.1原主模型完整底座；新增A/B/C交易分层、主交易假设、RR/防守位校准、条件概率反馈底座。压力带突破、倍量、回踩确认等均为评分项，不是必要条件。")
+    lines.append("口径：V20.3保留V20.2全部结构；新增多通道基础召回、动态风险指标库前置风控、近期推荐强制跟踪入池和基础入围原因审计。基础层重召回、深度层重精度、最终层重交易。")
     lines.append("说明：分数用于排序，不代表无脑买入；硬雷区仍剔除，普通缺点进入风险提示。次日按确认条件/放弃条件执行。")
-    lines.append("报告默认发送文字版价格计划；同时保存stock_candidates.json、v20_score_cards.json、v20_condition_probability_table.json，供后续T+1/T+3/T+5/T+8/T+13/T+20复盘归因。")
+    lines.append("报告默认发送文字版价格计划；同时保存stock_candidates.json、v20_3_1_score_cards.json、v20_3_1_condition_probability_table.json、v20_3_1_signal_lifecycle.json。今日新推荐与近期推荐跟踪分开，避免健康回调票从报告里“消失”。")
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
@@ -9115,9 +9801,21 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
 
     for i, s in enumerate(final_signals, 1):
         lines.append(f"<b>{i}. {html.escape(str(s.get('name','')))}({html.escape(str(s.get('code','')))})</b>")
-        lines.append(f"等级/总分：<b>{html.escape(str(s.get('v16_final_grade','')))}</b> / {safe_float(s.get('v16_final_score', 0)):.1f}；V20分{safe_float(s.get('v20_final_score', 0)):.1f}；原深度分{safe_float(s.get('v14_original_total_score', s.get('total_score', 0))):.1f}")
+        lines.append(f"原模型分：{safe_float(s.get('v16_final_score', s.get('v14_original_total_score', s.get('total_score', 0)))):.1f}；V20.3分：<b>{safe_float(s.get('v20_final_score', 0)):.1f}</b>；分层：{html.escape(str(s.get('v20_trade_tier','未分层')))}")
         lines.append(f"V20层级：<b>{html.escape(str(s.get('v20_trade_tier','未分层')))}</b>｜原因：{html.escape(str(s.get('v20_tier_reason','')))}")
+        lines.append(f"七层评分：结构{safe_float(s.get('v201_structure_position',0)):.1f}｜压力{safe_float(s.get('v201_pressure_support',0)):.1f}｜资金{safe_float(s.get('v201_volume_behavior',0)):.1f}｜触发{safe_float(s.get('v201_trigger_confirmation',0)):.1f}｜交易{safe_float(s.get('v201_trade_quality',0)):.1f}｜风险{safe_float(s.get('v201_risk_filter',0)):.1f}")
+        if safe_float(s.get('v201_precise_trigger_line',0)) > 0:
+            _precise_status = "已计算" if bool(s.get('v201_precise_trigger_valid', False)) else "待日线平台精算"
+            lines.append(f"日线精确触发线：{safe_float(s.get('v201_precise_trigger_line',0)):.2f}（{_precise_status}）")
         lines.append(f"主交易假设：{html.escape(str(s.get('v20_main_hypothesis','综合结构机会')))}")
+        if safe_float(s.get('score_bottom_reversal_pattern', s.get('bottom_pattern_score', 0))) > 0 or str(s.get('bottom_pattern_type','')).strip():
+            _bp_type = str(s.get('bottom_pattern_type','底部反转结构'))
+            _bp_score = safe_float(s.get('score_bottom_reversal_pattern', s.get('bottom_pattern_score', 0)))
+            _bp_neck = safe_float(s.get('bottom_pattern_neckline',0))
+            _bp_confirm = '已确认' if bool(s.get('bottom_pattern_confirmed', False)) else '观察中'
+            lines.append(f"底部反转形态：{html.escape(_bp_type)}｜分{_bp_score:.1f}｜颈线{_bp_neck:.2f}｜{_bp_confirm}")
+            if str(s.get('bottom_pattern_desc','')).strip():
+                lines.append(f"形态说明：{html.escape(str(s.get('bottom_pattern_desc',''))[:120])}")
         if str(s.get('v20_condition_probability_hint','')).strip():
             lines.append(f"条件概率参考：{html.escape(str(s.get('v20_condition_probability_hint','')))}")
         lines.append(f"RR/防守：RR={safe_float(s.get('v20_rr', s.get('risk_reward_ratio', s.get('rr', 0)))):.2f}；防守={safe_float(s.get('v20_defense', s.get('defensive_price', s.get('trade_defense', 0)))):.2f}；防守距离={safe_float(s.get('v20_defense_dist',0)):.1%}")
@@ -9132,6 +9830,21 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         lines.append(f"模型确认：{html.escape(build_confirm_condition(s))}")
         lines.append(f"模型放弃：{html.escape(build_giveup_condition(s))}")
         lines.append(f"主要封顶/风险：{html.escape(str(s.get('v16_cap_reason','无硬封顶')))}")
+        lines.append("—")
+
+    if lifecycle_tracking:
+        lines.append("【近期推荐跟踪】")
+        for j, tr in enumerate((lifecycle_tracking or [])[:8], 1):
+            lines.append(
+                f"{j}. {html.escape(str(tr.get('name','')))}({html.escape(str(tr.get('code','')))}) "
+                f"| {html.escape(str(tr.get('lifecycle_status','')))} | T+{tr.get('t_window','?')} | "
+                f"收益{safe_float(tr.get('return_since_signal',0)):.1%} | "
+                f"说明：{html.escape(str(tr.get('lifecycle_reason',''))[:80])}"
+            )
+            lines.append(
+                f"   处理：{html.escape(str(tr.get('lifecycle_action',''))[:90])}；"
+                f"放弃：{html.escape(str(tr.get('giveup_condition',''))[:80])}"
+            )
         lines.append("—")
 
     diag = v14_diagnostics_text(v14_diagnostics or [], 5)
@@ -9261,7 +9974,13 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
 
 
 
-# ========================= V20 条件概率反馈闭环模块 =========================
+# ========================= V20.1 条件概率反馈闭环模块 =========================
+
+# V20.1设计原则：
+# - 不删除原模型任何有效逻辑，只在最终层做同源合并与分层收紧；
+# - K线形态、量能形态不再零散堆分，而是归入“触发质量/资金行为”；
+# - 压力带D、买点未触发、防守位过远、近端压力贴脸，不允许A档；
+# - 条件概率反馈只做轻量校准，小样本不自动大幅调权。
 
 def _v20_first_value(row, keys, default=0.0):
     for k in keys:
@@ -9284,6 +10003,26 @@ def _v20_float(row, *keys, default=0.0):
     return safe_float(_v20_first_value(row, keys, default), default)
 
 
+def _v20_text(row, *keys, default=""):
+    v = _v20_first_value(row, keys, default)
+    return str(v or default)
+
+
+def _v20_pressure_grade_rank(grade):
+    g = str(grade or "").strip().upper()
+    if g.startswith("S"):
+        return 5
+    if g.startswith("A"):
+        return 4
+    if g.startswith("B"):
+        return 3
+    if g.startswith("C"):
+        return 2
+    if g.startswith("D"):
+        return 1
+    return 0
+
+
 def v20_trade_metrics(row):
     """统一提取交易质量指标，兼容 V12/V14/V16/V19 不同字段名。"""
     close = _v20_float(row, "close", "收盘", "last_close")
@@ -9299,28 +10038,65 @@ def v20_trade_metrics(row):
     long_pos = _v20_float(row, "long_pos_250")
     final_pressure = _v20_float(row, "xhu_pressure_union_upper", "xhu_final_union_upper", "final_pressure_upper")
     core_pressure = _v20_float(row, "xhu_pressure_core_upper", "core_pressure_upper")
+    core_lower = _v20_float(row, "xhu_pressure_core_lower", "core_pressure_lower")
     confirm_price = _v20_float(row, "xhu_effective_confirm_price", "effective_confirm_price")
-    if defense <= 0:
+    pressure_grade = _v20_text(row, "xhu_pressure_model_grade", "v151_strongest_model_grade")
+
+    plan = {}
+    try:
+        plan = build_v19_price_plan(row)
+    except Exception:
         plan = {}
-        try:
-            plan = build_v19_price_plan(row)
-        except Exception:
-            plan = {}
+
+    if close <= 0:
+        close = safe_float(plan.get("close", 0)) or close
+    if defense <= 0:
         defense = safe_float(plan.get("short_defense_price", 0)) or safe_float(plan.get("hard_stop_price", 0))
-        if rr <= 0:
-            target = safe_float(plan.get("target1_price", 0))
-            risk = close - defense if close > defense > 0 else 0
-            reward = target - close if target > close > 0 else 0
-            rr = reward / risk if risk > 0 else rr
+    if final_pressure <= 0:
+        final_pressure = safe_float(plan.get("target2_price", 0)) or safe_float(plan.get("break_confirm_price", 0))
+    if core_pressure <= 0:
+        core_pressure = safe_float(plan.get("target1_price", 0))
+    if confirm_price <= 0:
+        confirm_price = safe_float(plan.get("break_confirm_price", 0))
+    if rr <= 0:
+        target = safe_float(plan.get("target1_price", 0)) or core_pressure or final_pressure
+        risk = close - defense if close > defense > 0 else 0
+        reward = target - close if target > close > 0 else 0
+        rr = reward / risk if risk > 0 else rr
+
+    standard_low = safe_float(plan.get("standard_buy_low", 0))
+    standard_high = safe_float(plan.get("standard_buy_high", 0))
+    comfort_low = safe_float(plan.get("comfort_buy_low", 0))
+    comfort_high = safe_float(plan.get("comfort_buy_high", 0))
+    hard_stop = safe_float(plan.get("hard_stop_price", 0))
+    target1 = safe_float(plan.get("target1_price", 0))
+    target2 = safe_float(plan.get("target2_price", 0))
+
     defense_dist = close / defense - 1 if close > 0 and defense > 0 else 0.0
     target_dist = 0.0
     if final_pressure > close > 0:
         target_dist = final_pressure / close - 1
     elif core_pressure > close > 0:
         target_dist = core_pressure / close - 1
+    elif target1 > close > 0:
+        target_dist = target1 / close - 1
+
+    buy_zone_miss = False
+    buy_zone_gap = 0.0
+    if standard_high > 0 and close > standard_high:
+        buy_zone_gap = close / standard_high - 1
+        buy_zone_miss = buy_zone_gap > V20_BUY_ZONE_MISS_PCT
+
+    confirm_far = False
+    confirm_gap = 0.0
+    if confirm_price > close > 0:
+        confirm_gap = confirm_price / close - 1
+        confirm_far = confirm_gap > V20_CONFIRM_FAR_PCT
+
     return {
         "close": float(close),
         "defense": float(defense),
+        "hard_stop": float(hard_stop),
         "defense_dist": float(max(0.0, defense_dist)),
         "rr": float(rr),
         "trade_q": float(trade_q),
@@ -9332,8 +10108,51 @@ def v20_trade_metrics(row):
         "rsi": float(rsi),
         "cci": float(cci),
         "long_pos": float(long_pos),
+        "core_lower": float(core_lower),
+        "core_pressure": float(core_pressure),
         "final_pressure": float(final_pressure),
         "confirm_price": float(confirm_price),
+        "confirm_gap": float(confirm_gap),
+        "confirm_far": bool(confirm_far),
+        "pressure_grade": pressure_grade,
+        "pressure_grade_rank": _v20_pressure_grade_rank(pressure_grade),
+        "standard_low": float(standard_low),
+        "standard_high": float(standard_high),
+        "comfort_low": float(comfort_low),
+        "comfort_high": float(comfort_high),
+        "buy_zone_gap": float(buy_zone_gap),
+        "buy_zone_miss": bool(buy_zone_miss),
+        "target1": float(target1),
+        "target2": float(target2),
+    }
+
+
+def detect_v201_low_volume_precise_trigger_line_from_row(row):
+    """V20.1日线小平台低量精准触发线。
+    说明：真正精算需要日线平台OHLCV；本函数先承接已有字段/价格计划，若未来深度层计算出
+    v201_precise_trigger_line，将直接使用。没有该字段时，只做报告占位，不替代最终压力上沿。
+    """
+    explicit = _v20_float(row, "v201_precise_trigger_line", "low_volume_precise_trigger_line", "daily_precise_trigger_line")
+    if explicit > 0:
+        return {
+            "line": float(explicit),
+            "valid": True,
+            "source": "已计算低量平台精准线",
+            "note": str(row.get("v201_precise_trigger_note", "平台内低量K高点/实体顶/收盘共振线")),
+        }
+    m = v20_trade_metrics(row)
+    # 若大周期压力带明确，但尚未有精算线，则用核心压力带下沿/价格计划标准买区上沿做弱占位。
+    # 该占位只用于提示“需要日线精算”，不参与A档强确认。
+    approx = 0.0
+    if m["core_lower"] > 0 and m["core_pressure"] > 0:
+        approx = m["core_lower"]
+    elif m["standard_high"] > 0:
+        approx = m["standard_high"]
+    return {
+        "line": float(approx),
+        "valid": False,
+        "source": "待深度层计算",
+        "note": "需在大周期压力带明确时，切回日线小平台，寻找平台内低量分位K最高价与平台上沿/实体顶/收盘共振线。",
     }
 
 
@@ -9349,6 +10168,13 @@ def detect_v20_main_hypothesis(row):
     pressure_score = _v20_float(row, "xhu_pressure_breakout_score", "score_xhu_pressure_breakout", "v15_pressure_bonus")
     low_pos = _v20_float(row, "long_pos_250") <= 0.60
 
+    bottom_score = _v20_float(row, "score_bottom_reversal_pattern", "bottom_pattern_score")
+    bottom_type = str(row.get("bottom_pattern_type", "") or "")
+    bottom_confirmed = bool(row.get("bottom_pattern_confirmed", False))
+    if bottom_score >= 4:
+        if bottom_confirmed:
+            return f"底部反转确认/{bottom_type or '头肩底/W底/V底'}"
+        return f"底部反转观察/{bottom_type or '头肩底/W底/V底'}"
     if "回踩" in bucket or "二买" in bucket or pullback > 0:
         return "回踩确认/二买候选"
     if "大周期" in bucket or "多周期" in bucket or monthly_score >= 6:
@@ -9357,7 +10183,7 @@ def detect_v20_main_hypothesis(row):
         return "资金承接/倍量后平量"
     if "平台蓄势" in bucket or "爆发前夜" in bucket or timing > 0:
         return "平台蓄势/爆发前夜"
-    if "压力" in bucket or pressure_score > 0 or pressure_grade in ["S", "A", "B"]:
+    if "压力" in bucket or pressure_score > 0 or pressure_grade.upper()[:1] in ["S", "A", "B"]:
         return "压力带突破/供应吸收"
     if "低位" in bucket or (low_pos and ("突破" in main_signal or "启动" in main_signal)):
         return "低位强启动/关键位触发"
@@ -9366,22 +10192,168 @@ def detect_v20_main_hypothesis(row):
     return "综合结构机会"
 
 
+def v201_simplified_layer_scores(row):
+    """V20.1七层评分：在后置层合并同源指标，避免战法重复堆分。"""
+    m = v20_trade_metrics(row)
+    base_score = _v20_float(row, "v16_final_score", "v14_final_score", "total_score")
+    monthly = _v20_float(row, "score_monthly_cycle", "score_monthly_midline", "monthly_score")
+    structure = _v20_float(row, "score_structure_core", "base_structure_potential_score", "score_advanced_ao_kou", "score_fibo_reclaim")
+    bottom_pattern = _v20_float(row, "score_bottom_reversal_pattern", "bottom_pattern_score")
+    bottom_vol_quality = _v20_float(row, "bottom_pattern_volume_quality")
+    bottom_trigger_quality = _v20_float(row, "bottom_pattern_trigger_quality")
+    pressure = _v20_float(row, "xhu_pressure_breakout_score", "score_xhu_pressure_breakout", "v15_pressure_bonus")
+    pressure_quality = _v20_float(row, "xhu_pressure_quality", "xhu_pressure_zone_quality", "v15_pressure_quality")
+    flat = _v20_float(row, "score_beiliang_flat", "flat_volume_count_60", "flat_volume_count_60_base")
+    carry = _v20_float(row, "score_carry_structure", "base_volume_carry_score")
+    timing = _v20_float(row, "score_v126_timing_sufficiency", "score_timing_sufficiency")
+    pullback = _v20_float(row, "score_v12_pullback_entry", "score_pullback_entry")
+    kline_attack = _v20_float(row, "base_attack_quality_score", "score_kline_quality", "v16_kline_trigger_score")
+    risk_penalty_old = _v20_float(row, "score_chase_penalty", "base_risk_penalty", default=0.0)
+
+    # 1）风险过滤层：硬雷区一票否决，软风险只做扣分。
+    risk_filter = 0.0
+    hard_block = bool(row.get("v14_blocked", False)) or bool(row.get("regulatory_hard_exclude", False))
+    if hard_block:
+        risk_filter = -100.0
+    else:
+        if m["bias20"] > 0.18:
+            risk_filter -= 4.0
+        if m["rsi"] >= V20_OVERHEAT_RSI and m["cci"] >= V20_OVERHEAT_CCI:
+            risk_filter -= 6.0
+        if 0 < m["near_pressure"] < 0.05:
+            risk_filter -= 5.0
+        if m["defense_dist"] > 0.10:
+            risk_filter -= 5.0
+        if str(row.get("data_quality_tier", "")).upper().startswith("Q"):
+            risk_filter -= 3.0
+        risk_filter += max(-8.0, min(0.0, risk_penalty_old))
+
+    # 2）结构位置层：大周期修复、低位/中低位、核心结构质量。
+    structure_position = 0.0
+    if m["long_pos"] <= 0.35:
+        structure_position += 5.0
+    elif m["long_pos"] <= 0.60:
+        structure_position += 3.0
+    elif m["long_pos"] > 0.80:
+        structure_position -= 3.0
+    structure_position += min(8.0, monthly * 0.55)
+    structure_position += min(7.0, structure * 0.35)
+    # V20.2：头肩底/W底/V底等底部反转形态归入结构位置层；只做同源合并，不重复撑爆。
+    structure_position += min(4.0, bottom_pattern * 0.35)
+    structure_position = max(0.0, min(20.0, structure_position))
+
+    # 3）压力支撑层：压力带质量 + 是否有精准触发线。C/D不直接归零，但不能单独推A。
+    precise = detect_v201_low_volume_precise_trigger_line_from_row(row)
+    pressure_support = 0.0
+    if m["pressure_grade_rank"] >= 4:
+        pressure_support += 7.0
+    elif m["pressure_grade_rank"] == 3:
+        pressure_support += 5.0
+    elif m["pressure_grade_rank"] == 2:
+        pressure_support += 2.0
+    elif m["pressure_grade_rank"] == 1:
+        pressure_support -= 2.0
+    pressure_support += min(6.0, pressure * 0.45)
+    pressure_support += min(4.0, pressure_quality * 0.10)
+    if precise["line"] > 0:
+        pressure_support += 2.0 if precise["valid"] else 0.5
+    if m["confirm_far"] and m["pressure_grade_rank"] <= 2:
+        pressure_support -= 3.0
+    pressure_support = max(0.0, min(20.0, pressure_support))
+
+    # 4）资金行为层：资金进入、承接、平台量能结构统一处理。
+    volume_behavior = 0.0
+    volume_behavior += min(7.0, carry * 0.45)
+    volume_behavior += min(5.0, flat * 1.25)
+    volume_behavior += min(5.0, timing * 0.40)
+    volume_behavior += min(2.0, bottom_vol_quality)
+    if _v20_float(row, "vr1") > 3.5 and m["bias20"] > 0.12:
+        volume_behavior -= 3.0
+    volume_behavior = max(0.0, min(20.0, volume_behavior))
+
+    # 5）触发确认层：K线质量 + 回踩/承接确认，不再单独奖励每个形态。
+    trigger_confirmation = 0.0
+    trigger_confirmation += min(6.0, kline_attack * 0.16)
+    trigger_confirmation += min(6.0, pullback * 0.70)
+    trigger_confirmation += min(3.0, bottom_trigger_quality)
+    if m["buy_zone_miss"]:
+        trigger_confirmation -= 3.0
+    if m["confirm_far"]:
+        trigger_confirmation -= 2.0
+    trigger_confirmation = max(0.0, min(15.0, trigger_confirmation))
+
+    # 6）交易质量层：RR、防守距离、买点是否舒服，是A/B/C分层核心。
+    trade_quality = 0.0
+    if m["rr"] >= 2.0:
+        trade_quality += 8.0
+    elif m["rr"] >= 1.5:
+        trade_quality += 5.0
+    elif 0 < m["rr"] < 1.2:
+        trade_quality -= 5.0
+    if 0 < m["defense_dist"] <= 0.05:
+        trade_quality += 7.0
+    elif m["defense_dist"] <= 0.08:
+        trade_quality += 4.0
+    elif m["defense_dist"] > 0.10:
+        trade_quality -= 6.0
+    if m["target_dist"] >= 0.12:
+        trade_quality += 4.0
+    elif 0 < m["target_dist"] < 0.06:
+        trade_quality -= 3.0
+    if m["buy_zone_miss"]:
+        trade_quality -= 5.0
+    trade_quality = max(0.0, min(25.0, trade_quality))
+
+    # 7）反馈校准层：由条件概率表提供，样本不足默认为0。
+    feedback = v20_condition_probability_hint(row) if V20_ENABLE_CONDITION_FEEDBACK == "1" else {"score_adj": 0.0, "text": "条件概率反馈关闭", "sample_count": 0}
+    feedback_adj = max(-10.0, min(10.0, float(feedback.get("score_adj", 0.0) or 0.0)))
+
+    # 最终分：旧模型占55%，七层后置占45%左右，避免后置规则把所有票打满100。
+    layer_raw = structure_position + pressure_support + volume_behavior + trigger_confirmation + trade_quality + feedback_adj + risk_filter
+    v201_score = max(0.0, min(100.0, base_score * 0.55 + layer_raw * 0.75))
+
+    return {
+        "base_score": float(base_score),
+        "risk_filter": float(risk_filter),
+        "structure_position": float(structure_position),
+        "pressure_support": float(pressure_support),
+        "volume_behavior": float(volume_behavior),
+        "trigger_confirmation": float(trigger_confirmation),
+        "trade_quality": float(trade_quality),
+        "feedback_adj": float(feedback_adj),
+        "v201_score": float(v201_score),
+        "feedback_text": str(feedback.get("text", "")),
+        "feedback_sample_count": int(feedback.get("sample_count", 0) or 0),
+        "precise_trigger_line": float(precise["line"]),
+        "precise_trigger_valid": bool(precise["valid"]),
+        "precise_trigger_note": precise["note"],
+        "bottom_pattern_score": float(bottom_pattern),
+        "bottom_pattern_volume_quality": float(bottom_vol_quality),
+        "bottom_pattern_trigger_quality": float(bottom_trigger_quality),
+    }
+
+
 def classify_v20_trade_tier(row):
-    """A/B/C 分层：固定Top3仍可输出，但不把所有Top3都表达成可交易买点。"""
+    """V20.1 A/B/C/B+分层：固定Top3仍可输出，但不能把买点未到票写成A档。"""
     if bool(row.get("v14_blocked", False)) or bool(row.get("regulatory_hard_exclude", False)):
         reason = row.get("v14_block_reason") or row.get("regulatory_risk_flags") or "命中硬风险/硬约束"
         return "硬风险剔除", str(reason)
 
     m = v20_trade_metrics(row)
-    score = _v20_float(row, "v16_final_score", "v14_final_score", "total_score")
+    layers = v201_simplified_layer_scores(row)
+    score = layers["v201_score"]
     tier_reasons = []
 
     severe_overheat = (m["rsi"] >= V20_OVERHEAT_RSI and m["cci"] >= V20_OVERHEAT_CCI) or m["bias20"] >= 0.22 or (m["bias20"] >= 0.18 and m["bias60"] >= 0.18)
     pressure_too_near = 0 < m["near_pressure"] < V20_MAX_NEAR_PRESSURE_A
     no_rr = 0 < m["rr"] < 1.20
-    too_far_defense = m["defense_dist"] > V20_MAX_DEFENSE_DIST_A if m["defense_dist"] > 0 else False
-    data_tier = str(row.get("data_quality_tier", "") or "").upper()
-    q_data = data_tier.startswith("Q")
+    too_far_defense = m["defense_dist"] > 0.10 if m["defense_dist"] > 0 else False
+    defense_not_comfy = m["defense_dist"] > V20_MAX_DEFENSE_DIST_A if m["defense_dist"] > 0 else False
+    q_data = str(row.get("data_quality_tier", "")).upper().startswith("Q")
+    pressure_d = m["pressure_grade_rank"] == 1
+    pressure_c = m["pressure_grade_rank"] == 2
+    buy_zone_miss = bool(m["buy_zone_miss"])
+    confirm_far = bool(m["confirm_far"])
 
     if severe_overheat:
         tier_reasons.append("过热/乖离偏高")
@@ -9390,23 +10362,53 @@ def classify_v20_trade_tier(row):
     if no_rr:
         tier_reasons.append("风险收益比不足")
     if too_far_defense:
-        tier_reasons.append("离真实防守位偏远")
+        tier_reasons.append("离真实防守位超过10%")
     if q_data:
-        tier_reasons.append("数据质量Q档，需人工复核")
+        tier_reasons.append("数据质量Q档需人工复核")
+    if pressure_d:
+        tier_reasons.append("压力带等级D，不能给A档")
+    if buy_zone_miss:
+        tier_reasons.append("当前价明显高于标准买区，买点未到/不舒服")
+    if confirm_far and pressure_c:
+        tier_reasons.append("仍未接近最终确认价，压力带C仅观察")
 
-    # C档优先保护：排序靠前也不能表达为舒服买点。
+    # C档：硬性交易风险，不表达为正式买点。
     if severe_overheat or pressure_too_near or no_rr or too_far_defense:
         return "C档今日不交易", "；".join(tier_reasons) or "交易条件不足"
 
-    # A档：要求分数、交易质量、RR、买点舒服度共同合格。
-    if score >= V20_A_MIN_SCORE and (m["rr"] >= V20_A_MIN_RR or m["target_dist"] >= 0.12) and m["trade_q"] >= V20_A_MIN_TRADE_QUALITY:
-        if q_data:
-            return "B档观察候选", "结构较好但数据质量Q档，先观察复核"
-        return "A档正式可交易候选", "结构、买点、防守位和风险收益比基本合格"
+    # A档硬门槛。
+    strong_context_for_c = (
+        layers["structure_position"] >= 13.0 and layers["volume_behavior"] >= 8.0 and layers["trigger_confirmation"] >= 6.0
+    ) or (m["pullback"] > 0 and m["rr"] >= 2.0 and m["defense_dist"] <= V20_MAX_DEFENSE_DIST_A_STRICT)
 
-    # B档：有结构或买点，但确认不足。
-    if score >= 70 or m["pullback"] > 0 or m["trade_q"] >= 3 or m["rr"] >= 1.5:
-        return "B档观察候选", "结构有看点，但确认/买点/RR未全部达到A档"
+    can_a = True
+    if score < V20_A_MIN_SCORE:
+        can_a = False
+    if not (m["rr"] >= V20_A_MIN_RR or m["target_dist"] >= 0.12):
+        can_a = False
+    if layers["trade_quality"] < 10.0 and m["trade_q"] < V20_A_MIN_TRADE_QUALITY:
+        can_a = False
+    if defense_not_comfy:
+        can_a = False
+    if q_data or pressure_d or buy_zone_miss:
+        can_a = False
+    if pressure_c and not strong_context_for_c:
+        can_a = False
+    if confirm_far and m["pressure_grade_rank"] <= 2 and not strong_context_for_c:
+        can_a = False
+
+    if can_a:
+        return "A档正式可交易候选", "结构、承接、买点、防守位和风险收益比共同合格"
+
+    # B+：质量较好，但因为压力未破/买点未触发/压力C等原因不能给A。
+    if score >= 78 or layers["trade_quality"] >= 12 or strong_context_for_c:
+        reason = "；".join(tier_reasons) if tier_reasons else "结构质量较好，但A档确认条件未全部满足"
+        return "B+重点观察候选", reason
+
+    # B：有结构或买点，但确认不足。
+    if score >= 68 or m["pullback"] > 0 or m["trade_q"] >= 3 or m["rr"] >= 1.5:
+        reason = "；".join(tier_reasons) if tier_reasons else "结构有看点，但确认/买点/RR未全部达到A档"
+        return "B档观察候选", reason
 
     return "C档今日不交易", "综合质量不足，仅保留复盘观察"
 
@@ -9430,7 +10432,7 @@ def v20_condition_probability_hint(row):
         adj = 0.0
         if win_rate >= 0.62 and med_ret > 0.025 and med_dd > -0.055:
             adj = 3.0 if n >= 50 else 1.5
-        elif win_rate <= 0.45 and med_ret < 0:
+        elif win_rate <= 0.45 and med_ret < 0 and med_dd < -0.06:
             adj = -3.0 if n >= 50 else -1.5
         text = f"{hypo}历史样本{n}，T+5胜率{win_rate:.1%}，中位收益{med_ret:.1%}，中位回撤{med_dd:.1%}"
         return {"sample_count": n, "score_adj": float(adj), "text": text}
@@ -9439,7 +10441,7 @@ def v20_condition_probability_hint(row):
 
 
 def select_final_signals_v20(deep_rows, history=None, limit=None):
-    """V20最终选择：原V14/V16综合分为底座，叠加A/B/C分层、主假设、RR与条件概率轻量校准。"""
+    """V20.1最终选择：七层精简评分 + 严格A档 + 固定Top3分层输出。"""
     if history is None:
         history = {}
     limit = int(limit or V20_FIXED_TOP_N or V19_FIXED_TOP_N or V14_TARGET_PUSH_COUNT or RESULT_LIMIT or 3)
@@ -9449,58 +10451,21 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
 
     for r in audited:
         r = attach_data_quality_to_row(r)
-        tier, tier_reason = classify_v20_trade_tier(r)
         hypothesis = detect_v20_main_hypothesis(r)
-        r["v20_trade_tier"] = tier
-        r["v20_tier_reason"] = tier_reason
         r["v20_main_hypothesis"] = hypothesis
         metrics = v20_trade_metrics(r)
         for k, v in metrics.items():
             r[f"v20_{k}"] = v
-        feedback = v20_condition_probability_hint(r) if V20_ENABLE_CONDITION_FEEDBACK == "1" else {"score_adj": 0.0, "text": "条件概率反馈关闭", "sample_count": 0}
-        r["v20_condition_sample_count"] = int(feedback.get("sample_count", 0) or 0)
-        r["v20_condition_probability_hint"] = str(feedback.get("text", ""))
-        r["v20_condition_score_adj"] = float(feedback.get("score_adj", 0.0) or 0.0)
-
-        base_score = _v20_float(r, "v16_final_score", "v14_final_score", "total_score")
-        tier_bonus = 0.0
-        if tier.startswith("A档"):
-            tier_bonus = 8.0
-        elif tier.startswith("B档"):
-            tier_bonus = 2.0
-        elif tier.startswith("C档"):
-            tier_bonus = -8.0
-        elif tier.startswith("硬风险"):
-            tier_bonus = -999.0
-
-        rr_bonus = 0.0
-        rr = metrics.get("rr", 0.0)
-        if rr >= 2.0:
-            rr_bonus = 5.0
-        elif rr >= 1.5:
-            rr_bonus = 3.0
-        elif 0 < rr < 1.2:
-            rr_bonus = -6.0
-
-        comfort_bonus = 0.0
-        if 0 < metrics.get("defense_dist", 0) <= 0.05:
-            comfort_bonus += 3.0
-        elif 0.05 < metrics.get("defense_dist", 0) <= 0.08:
-            comfort_bonus += 1.5
-        elif metrics.get("defense_dist", 0) > 0.10:
-            comfort_bonus -= 4.0
-        if metrics.get("pullback", 0) > 0:
-            comfort_bonus += min(4.0, metrics.get("pullback", 0) * 0.5)
-
-        risk_penalty = 0.0
-        if metrics.get("bias20", 0) > 0.18:
-            risk_penalty -= 3.0
-        if 0 < metrics.get("near_pressure", 0) < 0.08:
-            risk_penalty -= 2.0
-        if str(r.get("data_quality_tier", "")).upper().startswith("Q"):
-            risk_penalty -= 2.0
-
-        r["v20_final_score"] = float(max(0.0, min(100.0, base_score + tier_bonus + rr_bonus + comfort_bonus + risk_penalty + r["v20_condition_score_adj"])))
+        layers = v201_simplified_layer_scores(r)
+        for k, v in layers.items():
+            r[f"v201_{k}"] = v
+        tier, tier_reason = classify_v20_trade_tier(r)
+        r["v20_trade_tier"] = tier
+        r["v20_tier_reason"] = tier_reason
+        r["v20_condition_sample_count"] = int(layers.get("feedback_sample_count", 0) or 0)
+        r["v20_condition_probability_hint"] = str(layers.get("feedback_text", ""))
+        r["v20_condition_score_adj"] = float(layers.get("feedback_adj", 0.0) or 0.0)
+        r["v20_final_score"] = float(layers.get("v201_score", 0.0))
 
         if r.get("v14_blocked") or tier.startswith("硬风险"):
             r["v20_pool"] = "硬风险剔除"
@@ -9512,6 +10477,8 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     def tier_rank(x):
         t = str(x.get("v20_trade_tier", ""))
         if t.startswith("A档"):
+            return 4
+        if t.startswith("B+档") or t.startswith("B+重点"):
             return 3
         if t.startswith("B档"):
             return 2
@@ -9524,9 +10491,9 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         key=lambda x: (
             tier_rank(x),
             safe_float(x.get("v20_final_score", 0)),
-            safe_float(x.get("v16_final_score", x.get("v14_final_score", x.get("total_score", 0)))),
+            safe_float(x.get("v201_trade_quality", 0)),
             safe_float(x.get("v20_rr", 0)),
-            safe_float(x.get("v20_trade_q", 0)),
+            safe_float(x.get("v201_structure_position", 0)) + safe_float(x.get("v201_volume_behavior", 0)),
         ),
         reverse=True,
     )
@@ -9540,7 +10507,7 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = "signals_history已推送过"
             diagnostics.append(rr)
             continue
-        r["v20_pool"] = "V20最终Top3"
+        r["v20_pool"] = "V20.2最终Top3"
         r["v20_rank"] = len(final) + 1
         final.append(r)
         if len(final) >= limit:
@@ -9551,14 +10518,14 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         if str(r.get("code")) not in selected_codes:
             rr = dict(r)
             rr["v20_pool"] = "后台跟踪"
-            rr["v20_skip_reason"] = "未进入V20最终Top3，进入跟踪池用于条件概率复盘"
+            rr["v20_skip_reason"] = "未进入V20.2最终Top3，进入跟踪池用于条件概率复盘"
             diagnostics.append(rr)
 
     return final, diagnostics[:80], audited
 
 
 def _v20_compact_row(r, pool=""):
-    """V20 score card：既能复盘路径，也能做条件概率分组。"""
+    """V20.1 score card：既能复盘路径，也能做条件概率分组。"""
     base = _v19_compact_row(r, pool or r.get("v20_pool", ""))
     base.update({
         "model_version": MODEL_VERSION,
@@ -9575,6 +10542,24 @@ def _v20_compact_row(r, pool=""):
         "v20_defense_dist": safe_float(r.get("v20_defense_dist", 0)),
         "v20_near_pressure": safe_float(r.get("v20_near_pressure", r.get("near_pressure_dist", 0))),
         "v20_target_dist": safe_float(r.get("v20_target_dist", 0)),
+        "v201_risk_filter": safe_float(r.get("v201_risk_filter", 0)),
+        "v201_structure_position": safe_float(r.get("v201_structure_position", 0)),
+        "v201_pressure_support": safe_float(r.get("v201_pressure_support", 0)),
+        "v201_volume_behavior": safe_float(r.get("v201_volume_behavior", 0)),
+        "v201_trigger_confirmation": safe_float(r.get("v201_trigger_confirmation", 0)),
+        "v201_trade_quality": safe_float(r.get("v201_trade_quality", 0)),
+        "v201_feedback_adj": safe_float(r.get("v201_feedback_adj", 0)),
+        "v201_precise_trigger_line": safe_float(r.get("v201_precise_trigger_line", 0)),
+        "v201_precise_trigger_valid": bool(r.get("v201_precise_trigger_valid", False)),
+        "v201_precise_trigger_note": r.get("v201_precise_trigger_note", ""),
+        "bottom_pattern_type": r.get("bottom_pattern_type", ""),
+        "bottom_pattern_score": safe_float(r.get("score_bottom_reversal_pattern", r.get("bottom_pattern_score", 0))),
+        "bottom_pattern_neckline": safe_float(r.get("bottom_pattern_neckline", 0)),
+        "bottom_pattern_confirmed": bool(r.get("bottom_pattern_confirmed", False)),
+        "bottom_pattern_volume_quality": safe_float(r.get("bottom_pattern_volume_quality", 0)),
+        "bottom_pattern_trigger_quality": safe_float(r.get("bottom_pattern_trigger_quality", 0)),
+        "bottom_pattern_retest_quality": safe_float(r.get("bottom_pattern_retest_quality", 0)),
+        "bottom_pattern_desc": r.get("bottom_pattern_desc", ""),
         "data_quality_tier": r.get("data_quality_tier", ""),
         "data_quality_reason": r.get("data_quality_reason", ""),
     })
@@ -9597,11 +10582,20 @@ def build_v20_condition_probability_placeholder(payload):
             d = by_hypothesis.setdefault(hypo, {"sample_count": 0, "pending_count": 0, "windows": V20_REVIEW_WINDOWS})
             d["sample_count"] += 1
             d["pending_count"] += 1
-            rows.append({"hypothesis": hypo, "tier": r.get("v20_trade_tier", ""), "pool": r.get("pool", ""), "code": r.get("code", ""), "date": r.get("date", ""), "status": "pending_forward_kline"})
+            rows.append({
+                "hypothesis": hypo,
+                "tier": r.get("v20_trade_tier", ""),
+                "pool": r.get("pool", ""),
+                "code": r.get("code", ""),
+                "date": r.get("date", ""),
+                "v20_final_score": r.get("v20_final_score", 0),
+                "v201_precise_trigger_line": r.get("v201_precise_trigger_line", 0),
+                "status": "pending_forward_kline",
+            })
     table = {
         "model_version": MODEL_VERSION,
         "generated_at_bj": bj_time_str(),
-        "note": "V20已保存条件概率分组底座；真实T+1/T+3/T+5/T+8/T+13/T+20收益需在后续交易日读取历史score_cards与K线后更新。",
+        "note": "V20.1已保存条件概率分组底座；真实T+1/T+3/T+5/T+8/T+13/T+20收益需在后续交易日读取历史score_cards与K线后更新。",
         "review_windows": V20_REVIEW_WINDOWS,
         "by_hypothesis": by_hypothesis,
     }
@@ -9611,12 +10605,246 @@ def build_v20_condition_probability_placeholder(payload):
         if rows:
             pd.DataFrame(rows).to_csv(V20_SIGNAL_FEEDBACK_CSV, index=False, encoding="utf-8-sig")
     except Exception as e:
-        print(f"V20条件概率占位表保存失败：{e}")
+        print(f"V20.1条件概率占位表保存失败：{e}")
     return table
 
 
-def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=None):
-    """保存 V20 score cards / 日报 / 复盘归因底座。"""
+
+def _v20_parse_date_safe(x):
+    try:
+        if not x:
+            return None
+        return pd.to_datetime(str(x)).date()
+    except Exception:
+        return None
+
+
+def _v20_history_code(entry):
+    code = str(entry.get("code", "") or "").strip()
+    digits = "".join(ch for ch in code if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:].zfill(6)
+    return code.zfill(6) if code.isdigit() else code
+
+
+def _v20_find_current_row_for_code(code, current_rows):
+    code = str(code).zfill(6)
+    for r in current_rows or []:
+        if str(r.get("code", "")).zfill(6) == code:
+            return r
+    return None
+
+
+def _v20_read_latest_cache_for_tracking(code):
+    """只读全历史缓存做跟踪，不在报告阶段联网补拉，避免输出阶段变慢/不稳定。"""
+    try:
+        bs_code = _bs_code_from_plain_code(str(code).zfill(6))
+        if not bs_code:
+            return None, None
+        df = read_full_history_flat_cache(bs_code, cache_scope="base", min_rows=20)
+        if df is None or df.empty:
+            return None, None
+        return df, df.iloc[-1].to_dict()
+    except Exception:
+        return None, None
+
+
+def _v20_trading_days_since_from_df(df, signal_date, current_date=None):
+    try:
+        if df is None or df.empty or not signal_date:
+            return None
+        d = df.copy()
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d = d.dropna(subset=["date"])
+        sig = pd.to_datetime(signal_date, errors="coerce")
+        if pd.isna(sig):
+            return None
+        if current_date:
+            cur = pd.to_datetime(current_date, errors="coerce")
+            if pd.isna(cur):
+                cur = d["date"].max()
+        else:
+            cur = d["date"].max()
+        return int(((d["date"] > sig) & (d["date"] <= cur)).sum())
+    except Exception:
+        return None
+
+
+def _v20_kline_row_metrics(row_or_k):
+    if not row_or_k:
+        return {}
+    close = _v20_float(row_or_k, "close", "收盘")
+    open_ = _v20_float(row_or_k, "open", "开盘")
+    high = _v20_float(row_or_k, "high", "最高")
+    low = _v20_float(row_or_k, "low", "最低")
+    pct = _v20_float(row_or_k, "pct_chg", "pct", "涨跌幅")
+    vr1 = _v20_float(row_or_k, "vr1")
+    volr = _v20_float(row_or_k, "volr")
+    if pct == 0 and close > 0 and _v20_float(row_or_k, "preclose") > 0:
+        pct = close / _v20_float(row_or_k, "preclose") - 1
+    elif abs(pct) > 1.0:
+        pct = pct / 100.0
+    return {"close": close, "open": open_, "high": high, "low": low, "pct": pct, "vr1": vr1, "volr": volr}
+
+
+def build_v20_signal_lifecycle(history, current_rows, final_signals=None, current_dates=None):
+    """V20.2推荐生命周期跟踪：
+    今日新Top3之外，继续跟踪T+1/T+3/T+5/T+8/T+13/T+20窗口内仍健康的旧推荐。
+    目的：昨天推荐后今天健康回调/小涨，不应该从报告体系里消失。
+    """
+    if V20_ENABLE_SIGNAL_LIFECYCLE != "1":
+        return []
+    history = history or {}
+    current_rows = current_rows or []
+    final_codes = {str(x.get("code", "")).zfill(6) for x in (final_signals or [])}
+    # V20.3.1修复：dates在主流程中通常是倒序（最新日期在前）。
+    # 生命周期跟踪必须取最大/最新日期，而不是current_dates[-1]，否则CHECK_DAYS>1时会误取较旧日期。
+    parsed_dates = [_v20_parse_date_safe(x) for x in (current_dates or [])]
+    parsed_dates = [x for x in parsed_dates if x is not None]
+    today = max(parsed_dates) if parsed_dates else datetime.now().date()
+    current_date = str(today)
+
+    # 每只代码只取最近一次历史推荐，避免重复刷屏。
+    hist_items = []
+    for key, entry in history.items():
+        if not isinstance(entry, dict):
+            continue
+        code = _v20_history_code(entry)
+        if not code or code in final_codes:
+            continue
+        sig_date = str(entry.get("date", "") or "")
+        sd = _v20_parse_date_safe(sig_date)
+        if sd is None or sd >= today:
+            continue
+        if (today - sd).days > max(3, V20_LIFECYCLE_LOOKBACK_DAYS):
+            continue
+        hist_items.append((sd, code, entry))
+    hist_items = sorted(hist_items, key=lambda x: x[0], reverse=True)
+    seen = set()
+    out = []
+
+    for sd, code, entry in hist_items:
+        if code in seen:
+            continue
+        seen.add(code)
+        if len(out) >= V20_LIFECYCLE_MAX_ITEMS:
+            break
+
+        cur_row = _v20_find_current_row_for_code(code, current_rows)
+        df = None
+        kline_row = None
+        if cur_row is None:
+            df, kline_row = _v20_read_latest_cache_for_tracking(code)
+            source = "cache"
+        else:
+            source = "current_deep_row"
+        k = _v20_kline_row_metrics(cur_row or kline_row or {})
+        if not k or safe_float(k.get("close", 0)) <= 0:
+            out.append({
+                "code": code,
+                "name": entry.get("name", ""),
+                "signal_date": entry.get("date", ""),
+                "t_window": "?",
+                "lifecycle_status": "待复盘",
+                "lifecycle_reason": "今日未进入深度评分且缓存缺少最新K线，暂无法判断是否健康。",
+                "lifecycle_action": "保留历史记录，等待下一次有有效K线后复盘。",
+                "giveup_condition": entry.get("giveup_condition", "跌破原防守位/硬止损则放弃"),
+            })
+            continue
+
+        if df is None:
+            df, _ = _v20_read_latest_cache_for_tracking(code)
+        tdays = _v20_trading_days_since_from_df(df, entry.get("date", ""), current_date) if df is not None else None
+        if tdays is None:
+            # 回退为近似自然日窗口，不用于精确统计，只用于报告提示。
+            tdays = max(1, (today - sd).days)
+
+        entry_close = safe_float(entry.get("entry_close", entry.get("close", entry.get("v20_close", 0))))
+        if entry_close <= 0:
+            entry_close = safe_float(entry.get("price_plan", {}).get("close", 0)) if isinstance(entry.get("price_plan", {}), dict) else 0
+        cur_close = safe_float(k.get("close", 0))
+        cur_low = safe_float(k.get("low", 0))
+        cur_high = safe_float(k.get("high", 0))
+        pct = safe_float(k.get("pct", 0))
+        vr1 = safe_float(k.get("vr1", 0))
+        volr = safe_float(k.get("volr", 0))
+        defense = safe_float(entry.get("v20_defense", entry.get("defensive_price", entry.get("trade_defense", 0))))
+        hard_stop = safe_float(entry.get("hard_stop", entry.get("hard_stop_price", 0)))
+        confirm_price = safe_float(entry.get("confirm_price", entry.get("xhu_effective_confirm_price", 0)))
+        target1 = safe_float(entry.get("target1", entry.get("target1_price", 0)))
+        ret = cur_close / entry_close - 1 if cur_close > 0 and entry_close > 0 else 0.0
+
+        status = "等待二次确认"
+        reason = "结构仍在跟踪窗口内，但今日缺少新的强确认。"
+        action = "继续观察，不追；等待重新站上触发线/确认线，或回踩关键位不破后再评估。"
+        if hard_stop > 0 and cur_close < hard_stop * 0.998:
+            status = "放弃"
+            reason = f"收盘{cur_close:.2f}跌破硬止损{hard_stop:.2f}附近。"
+            action = "按放弃条件处理，不再作为跟踪候选。"
+        elif defense > 0 and cur_close < defense * 0.995:
+            status = "风险升高"
+            reason = f"收盘{cur_close:.2f}跌破真实防守位{defense:.2f}附近。"
+            action = "不加仓，不低吸；除非快速收回防守位，否则降级/放弃。"
+        elif pct <= -0.035 and (vr1 >= 1.5 or volr >= 2.0):
+            status = "风险升高"
+            reason = f"当日放量下跌或分歧明显，pct={pct:.1%}，vr1={vr1:.2f}。"
+            action = "只观察修复，不再作为新买点；次日不能收回关键位则放弃。"
+        elif confirm_price > 0 and cur_close >= confirm_price * 1.002:
+            status = "强确认"
+            reason = f"收盘站上确认价{confirm_price:.2f}，推荐后进入强确认路径。"
+            action = "可交给三号员工盘中/次日评估是否突破后回踩不破再加仓。"
+        elif defense > 0 and cur_low <= defense * 1.035 and cur_close >= defense * 0.995:
+            status = "健康回踩"
+            reason = f"回踩防守区附近但收盘未有效跌破，低点{cur_low:.2f}，防守{defense:.2f}。"
+            action = "继续跟踪；若缩量企稳后重新站上短线触发线，可视为二次买点观察。"
+        elif ret >= 0 and pct >= -0.02:
+            status = "继续健康"
+            reason = f"推荐后收益{ret:.1%}，今日未出现破位或明显放量长阴。"
+            action = "继续跟踪，不因未进今日Top3而删除；等待T+3/T+5路径验证。"
+        elif ret > -0.035 and pct > -0.025:
+            status = "健康震荡"
+            reason = f"推荐后小幅回撤{ret:.1%}，仍属于正常震荡范围。"
+            action = "继续观察关键位承接；不追高，等转强确认。"
+
+        out.append({
+            "code": code,
+            "name": entry.get("name", ""),
+            "signal_date": entry.get("date", ""),
+            "current_date": current_date,
+            "t_window": int(tdays) if str(tdays).isdigit() or isinstance(tdays, int) else tdays,
+            "source": source,
+            "entry_close": float(entry_close),
+            "current_close": float(cur_close),
+            "current_low": float(cur_low),
+            "current_high": float(cur_high),
+            "current_pct": float(pct),
+            "return_since_signal": float(ret),
+            "defense": float(defense),
+            "hard_stop": float(hard_stop),
+            "confirm_price": float(confirm_price),
+            "target1": float(target1),
+            "v20_trade_tier": entry.get("v20_trade_tier", ""),
+            "v20_main_hypothesis": entry.get("v20_main_hypothesis", ""),
+            "lifecycle_status": status,
+            "lifecycle_reason": reason,
+            "lifecycle_action": action,
+            "confirm_condition": entry.get("confirm_condition", "站上原确认线/触发线并获得量能确认"),
+            "giveup_condition": entry.get("giveup_condition", "有效跌破原防守位/硬止损则放弃"),
+        })
+
+    # 展示优先级：强确认/健康回踩/继续健康优先，其次风险升高/待复盘。
+    order = {"强确认": 5, "健康回踩": 4, "继续健康": 3, "健康震荡": 3, "等待二次确认": 2, "风险升高": 1, "待复盘": 0, "放弃": -1}
+    out = sorted(out, key=lambda x: (order.get(str(x.get("lifecycle_status")), 0), -int(x.get("t_window") if str(x.get("t_window")).isdigit() else 99)), reverse=True)
+    try:
+        with open(V20_SIGNAL_LIFECYCLE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"generated_at_bj": bj_time_str(), "model_version": MODEL_VERSION, "items": out}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"V20.2生命周期跟踪保存失败：{e}")
+    return out
+
+
+def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=None, history=None, lifecycle_tracking=None):
+    """保存 V20.1 score cards / 日报 / 复盘归因底座。"""
     try:
         meta = meta or {}
         dates = dates or []
@@ -9631,7 +10859,9 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
             else:
                 watch_rows.append(_v20_compact_row(r, "后台跟踪"))
 
-        final_cards = [_v20_compact_row(r, "V20最终Top3") for r in final_signals]
+        final_cards = [_v20_compact_row(r, "V20.2最终Top3") for r in final_signals]
+        if lifecycle_tracking is None:
+            lifecycle_tracking = build_v20_signal_lifecycle(history or {}, audited_rows or [], final_signals or [], current_dates=dates or [])
         tier_counts = {}
         for r in final_cards:
             tier_counts[r.get("v20_trade_tier", "未知")] = tier_counts.get(r.get("v20_trade_tier", "未知"), 0) + 1
@@ -9643,61 +10873,65 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
             "meta": meta,
             "rule": {
                 "fixed_top_n": V20_FIXED_TOP_N,
-                "tiered_output": True,
-                "score_threshold_hard_gate": False,
-                "pressure_breakout_required": False,
-                "hard_risk_still_blocked": True,
+                "tier_counts": tier_counts,
+                "a_tier_is_strict": True,
+                "strict_a_rules": [
+                    "压力带D不能A",
+                    "压力带C必须有强承接/大周期修复/舒服防守位",
+                    "防守距离超过8%不能A",
+                    "明显高于标准买区不能A",
+                    "最终确认价太远且压力等级C/D不能A",
+                    "今日新推荐与近期推荐跟踪分开，健康回踩/小涨不因未进Top3而消失",
+                ],
                 "condition_feedback_enabled": V20_ENABLE_CONDITION_FEEDBACK == "1",
                 "review_windows": V20_REVIEW_WINDOWS,
             },
-            "tier_counts": tier_counts,
             "final_top3": final_cards,
             "watch_pool": watch_rows[:120],
             "blocked_pool": blocked_rows[:80],
-            "audit_count": len(audited_rows or []),
+            "lifecycle_tracking": lifecycle_tracking[:120] if lifecycle_tracking else [],
         }
         with open(V20_SCORE_CARDS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"V20评分卡已保存：{V20_SCORE_CARDS_FILE}")
+        print(f"V20.3评分卡已保存：{V20_SCORE_CARDS_FILE}")
+        build_v20_condition_probability_placeholder(payload)
 
-        # 同步保留V19文件名，兼容现有workflow artifact上传。
+        # 兼容旧workflow artifact名字。
         try:
             with open(V19_SCORE_CARDS_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
-        build_v20_condition_probability_placeholder(payload)
-
         lines = []
-        lines.append("一号员工 V20 条件概率反馈闭环版日报")
-        lines.append(f"生成时间：{bj_time_str()} 北京时间")
-        lines.append(f"排查日期：{', '.join(dates) if dates else '未知'}")
+        lines.append("一号员工 V20.3.1 基础筛选重构+动态风险库稳定修复版日报")
+        lines.append(f"生成时间：{bj_time_str()}")
+        lines.append(f"日期：{', '.join(dates) if dates else '未知'}")
         lines.append(f"固定输出目标：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}")
         lines.append(f"分层统计：{tier_counts}")
-        lines.append("口径：保留V19.4.1原主模型完整底座；V20只增加A/B/C交易分层、主交易假设、RR/防守位校准与条件概率反馈底座。")
+        lines.append("口径：保留V19.4.1/V20原主模型完整底座；V20.1合并同源K线/量能指标，收紧A档，新增日线低量精准触发线口径。")
         lines.append("")
-        if final_signals:
-            lines.append("【今日V20 Top3】")
-            for i, r in enumerate(final_signals, 1):
-                row = _v20_compact_row(r, "V20最终Top3")
-                lines.append(f"{i}. {row['name']}({row['code']}) | V20分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
-                lines.append(f"   分层原因：{row['v20_tier_reason']}")
-                lines.append(f"   条件概率：{row['v20_condition_probability_hint']}")
-                lines.append(f"   RR：{row['v20_rr']:.2f} | 防守：{row['v20_defense']:.2f} | 防守距离：{row['v20_defense_dist']:.1%} | 近端压力距离：{row['v20_near_pressure']:.1%}")
-                for pl in v19_price_plan_lines(r, html_mode=False):
-                    lines.append(f"   {pl}")
-                lines.append(f"   明日确认：{row['confirm_condition']}")
-                lines.append(f"   放弃条件：{row['giveup_condition']}")
-        else:
-            lines.append("今日没有可用Top3：深度评分为空或全部命中硬雷区/硬约束。")
-        lines.append("")
-        lines.append("【后台跟踪前10】")
-        for i, row in enumerate(watch_rows[:10], 1):
-            lines.append(f"{i}. {row['name']}({row['code']}) | V20分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | {row['v20_main_hypothesis']} | 原因 {row.get('skip_reason','')}")
-        lines.append("")
-        lines.append("【复盘归因说明】")
-        lines.append("V20已保存final_top3与watch_pool的主交易假设、层级、RR、防守位、确认/放弃条件；后续按T+1/T+3/T+5/T+8/T+13/T+20补充收益、最大回撤、是否破防守位，用于权重校准。")
+        if final_cards:
+            lines.append("【今日V20.3 Top3】")
+            for i, row in enumerate(final_cards, 1):
+                lines.append(f"{i}. {row['name']}({row['code']}) | V20.3分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
+                if row.get("bottom_pattern_type"):
+                    lines.append(f"   底部形态：{row.get('bottom_pattern_type')} 分{row.get('bottom_pattern_score',0):.1f} 颈线{row.get('bottom_pattern_neckline',0):.2f} {'已确认' if row.get('bottom_pattern_confirmed') else '观察中'}")
+                lines.append(f"   七层：结构{row['v201_structure_position']:.1f} 压力{row['v201_pressure_support']:.1f} 资金{row['v201_volume_behavior']:.1f} 触发{row['v201_trigger_confirmation']:.1f} 交易{row['v201_trade_quality']:.1f} 风险{row['v201_risk_filter']:.1f}")
+                if row.get("v201_precise_trigger_line", 0):
+                    lines.append(f"   日线精确触发线：{row['v201_precise_trigger_line']:.2f}（{'已计算' if row.get('v201_precise_trigger_valid') else '待日线平台精算'}）")
+                lines.append(f"   RR={row['v20_rr']:.2f}；防守={row['v20_defense']:.2f}；防守距离={row['v20_defense_dist']:.1%}；原因：{row['v20_tier_reason']}")
+        if lifecycle_tracking:
+            lines.append("")
+            lines.append("【近期推荐生命周期跟踪】")
+            for i, tr in enumerate((lifecycle_tracking or [])[:20], 1):
+                lines.append(f"{i}. {tr.get('name','')}({tr.get('code','')}) | {tr.get('lifecycle_status','')} | T+{tr.get('t_window','?')} | 收益{safe_float(tr.get('return_since_signal',0)):.1%}")
+                lines.append(f"   说明：{tr.get('lifecycle_reason','')}；处理：{tr.get('lifecycle_action','')}")
+        if watch_rows:
+            lines.append("")
+            lines.append("【后台跟踪前20】")
+            for i, row in enumerate(watch_rows[:20], 1):
+                lines.append(f"{i}. {row['name']}({row['code']}) | V20.3分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | {row['v20_main_hypothesis']}")
         with open(V20_DAILY_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         try:
@@ -9705,15 +10939,17 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
                 f.write("\n".join(lines))
         except Exception:
             pass
-        print(f"V20日报已保存：{V20_DAILY_REPORT_FILE}")
+        print(f"V20.3日报已保存：{V20_DAILY_REPORT_FILE}")
 
         review_lines = [
-            "一号员工 V20 复盘归因报告底座",
-            f"生成时间：{bj_time_str()} 北京时间",
+            "一号员工 V20.1 复盘归因报告底座",
+            f"生成时间：{bj_time_str()}",
             "复盘窗口：T+1/T+3/T+5/T+8/T+13/T+20",
-            "当前运行已保存条件概率分组底座；真实收益统计需要后续交易日读取历史score_cards与K线后更新。",
+            f"评分卡：{V20_SCORE_CARDS_FILE}",
             f"条件概率表：{V20_CONDITION_TABLE_FILE}",
             f"信号反馈CSV：{V20_SIGNAL_FEEDBACK_CSV}",
+            f"推荐生命周期：{V20_SIGNAL_LIFECYCLE_FILE}",
+            "说明：当前已加入推荐后生命周期跟踪；后续继续补充forward return、max drawdown、是否破防守位、是否触及目标位。",
         ]
         with open(V20_REVIEW_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(review_lines))
@@ -9722,21 +10958,26 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
                 f.write("\n".join(review_lines))
         except Exception:
             pass
-        print(f"V20复盘报告底座已保存：{V20_REVIEW_REPORT_FILE}")
+        print(f"V20.3复盘报告底座已保存：{V20_REVIEW_REPORT_FILE}")
 
-        audit_log = {
+        audit = {
             "generated_at_bj": bj_time_str(),
             "model_version": MODEL_VERSION,
-            "audit_note": "V20初期不自动大幅调权；样本<20只只观察，20-50只轻微建议，>50只才允许中等调权。",
+            "audit_note": "V20.2初期不自动大幅调权；样本<20只只观察，20-50只轻微建议，>50只才允许中等调权。A档门槛已收紧，固定Top3不等于每天必须买；近期推荐进入生命周期跟踪，健康回踩/小涨不因未进Top3而消失。",
             "tier_counts": tier_counts,
-            "suggested_next_step": "后续用真实T+路径更新v20_condition_probability_table.json，再根据胜率/中位收益/最大回撤校准权重。",
+            "simplification": {
+                "kline_shapes": "阳包阴/双阳夹阴/跳空/强阳/假阴真阳统一归入触发质量，不再零散堆分。",
+                "volume_shapes": "倍量/平量/阳梯量/平台均量/低量精准线归入资金行为与平台量能结构。",
+                "trend_indicators": "RSI/CCI主要做过热扣分，普通均线多头只做背景。",
+                "pressure_output": "报告只强调日线精确触发线、核心压力带、最终压力上沿、真实防守位。",
+            },
         }
         with open(V20_MODEL_AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(audit_log, f, ensure_ascii=False, indent=2)
+            json.dump(audit, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"V20输出保存失败：{e}")
+        print(f"V20.1输出保存失败：{e}")
 
-# ======================= V20 条件概率反馈闭环模块 END =======================
+# ======================= V20.1 条件概率反馈闭环模块 END =======================
 
 
 def build_error_message(e):
@@ -10056,6 +11297,7 @@ def main():
         # V14最终三选：原主模型完整跑完后，只做后置审核/分层扣分/相对最优三选；不重写、不删主模型逻辑。
         final_signals, v14_diagnostics, v14_audited_rows = select_final_signals_v20(deep_rows, history, limit=V20_FIXED_TOP_N)
         strong_watch_pool = [r for r in v14_audited_rows if (not r.get("v14_blocked")) and str(r.get("code")) not in {str(x.get("code")) for x in final_signals}][:80]
+        lifecycle_tracking = build_v20_signal_lifecycle(history, v14_audited_rows, final_signals, current_dates=dates)
 
         for r in final_signals:
             key = f"{r.get('date','')}_{r.get('code','')}"
@@ -10070,6 +11312,13 @@ def main():
                 "v20_final_score": r.get("v20_final_score", r.get("v14_final_score", r.get("total_score", 0))),
                 "v20_trade_tier": r.get("v20_trade_tier", ""),
                 "v20_main_hypothesis": r.get("v20_main_hypothesis", ""),
+                "entry_close": safe_float(r.get("close", 0)),
+                "v20_defense": safe_float(r.get("v20_defense", r.get("defensive_price", r.get("trade_defense", 0)))),
+                "hard_stop": safe_float(build_v19_price_plan(r).get("hard_stop_price", 0)),
+                "confirm_price": safe_float(r.get("v20_confirm_price", r.get("xhu_effective_confirm_price", build_v19_price_plan(r).get("break_confirm_price", 0)))),
+                "target1": safe_float(build_v19_price_plan(r).get("target1_price", 0)),
+                "confirm_condition": build_confirm_condition(r),
+                "giveup_condition": build_giveup_condition(r),
                 "v14_level": r.get("v14_level", ""),
                 "candidate_pool": r.get("candidate_pool", ""),
             }
@@ -10078,8 +11327,8 @@ def main():
         print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
         print(f"基础评分数量：{len(base_rows)} 条")
         print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
-        print(f"V20最终Top3数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
-        print(f"V20后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON/条件概率跟踪底座）")
+        print(f"V20.3最终Top3数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
+        print(f"V20.1后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON/条件概率跟踪底座）")
 
         save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_pool)
         save_v20_outputs(
@@ -10098,6 +11347,8 @@ def main():
                 "deep_fail": deep_fail,
                 "deep_skip": deep_skip,
             },
+            history=history,
+            lifecycle_tracking=lifecycle_tracking,
         )
         save_signal_history(history)
 
@@ -10108,7 +11359,8 @@ def main():
             kline_success=kline_success,
             kline_fail=kline_fail,
             deep_count=len(deep_rows),
-            v14_diagnostics=v14_diagnostics
+            v14_diagnostics=v14_diagnostics,
+            lifecycle_tracking=lifecycle_tracking
         )
 
         send_telegram(msg)
