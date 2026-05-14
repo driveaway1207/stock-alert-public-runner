@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检"
+        description: "daily=每日选股；backtest=历史回测；selfcheck=自检"
         required: true
         default: "daily"
         type: choice
@@ -13,19 +13,19 @@ on:
           - backtest
           - selfcheck
       start:
-        description: "回测开始日期，仅 backtest 使用"
+        description: "回测开始日期"
         required: false
         default: "2022-04-08"
       end:
-        description: "回测结束日期，仅 backtest 使用"
+        description: "回测结束日期"
         required: false
         default: "2023-04-08"
       max_dates:
-        description: "最多回测交易日数量，留空表示不限制"
+        description: "最多回测交易日数量"
         required: false
         default: ""
       base_limit:
-        description: "基础层进入深度层数量，例如 200/300/500"
+        description: "基础层进入深度层数量"
         required: false
         default: ""
 
@@ -41,6 +41,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: List files
+        run: |
+          pwd
+          ls -la
+          echo "All Python files:"
+          find . -maxdepth 3 -name "*.py" -print
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -53,19 +60,16 @@ jobs:
 
       - name: Detect Python script
         run: |
-          if [ -f "stock_alert_v25_3_bigbull_full.py" ]; then
-            echo "SCRIPT=stock_alert_v25_3_bigbull_full.py" >> $GITHUB_ENV
-          elif [ -f "stock_alert_v25_3_full.py" ]; then
-            echo "SCRIPT=stock_alert_v25_3_full.py" >> $GITHUB_ENV
-          elif [ -f "stock_alert_v25_3.py" ]; then
-            echo "SCRIPT=stock_alert_v25_3.py" >> $GITHUB_ENV
-          elif [ -f "stock_alert_v24_1_full.py" ]; then
-            echo "SCRIPT=stock_alert_v24_1_full.py" >> $GITHUB_ENV
-          else
-            echo "找不到可运行的 Python 文件"
+          SCRIPT=$(find . -maxdepth 3 -name "stock_alert*.py" | head -n 1)
+
+          if [ -z "$SCRIPT" ]; then
+            echo "没有找到 stock_alert*.py 文件"
+            echo "当前目录文件："
             ls -la
             exit 1
           fi
+
+          echo "SCRIPT=$SCRIPT" >> $GITHUB_ENV
           echo "Using script: $SCRIPT"
 
       - name: Syntax check
@@ -95,14 +99,18 @@ jobs:
             python "$SCRIPT" --mode daily
           fi
 
+      - name: Prepare artifacts
+        if: always()
+        run: |
+          mkdir -p artifact_upload
+          find . -maxdepth 3 \( -name "*.csv" -o -name "*.html" -o -name "*.md" -o -path "./output*" \) -print -exec cp -r {} artifact_upload/ \; || true
+          echo "Artifact files:"
+          ls -la artifact_upload || true
+
       - name: Upload output artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stock-alert-output
-          path: |
-            output*
-            *.csv
-            *.html
-            *.md
+          path: artifact_upload
           retention-days: 7
