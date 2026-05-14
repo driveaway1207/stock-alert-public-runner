@@ -1,447 +1,113 @@
-name: 一号员工A股每日增量更新并推送
+name: Stock Alert V25.3 BigBull Daily & Backtest
 
 on:
+  schedule:
+    # GitHub Actions 使用 UTC。这里是北京时间 09:05，若你原来有固定时间，可自行改回原 cron。
+    - cron: '5 1 * * 1-5'
   workflow_dispatch:
     inputs:
-      run_stock_alert:
-        description: "是否运行一号员工选股：1=运行，0=只更新缓存"
+      mode:
+        description: '运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检'
         required: true
-        default: "1"
-      skip_kline_update:
-        description: "是否跳过每日K线更新、直接使用已恢复缓存：1=跳过更新，0=正常更新"
-        required: true
-        default: "0"
-      lookback_days:
-        description: "落后股票增量回看自然日"
-        required: true
-        default: "7"
-      max_runtime_minutes:
-        description: "每日增量更新最多运行分钟数"
-        required: true
-        default: "110"
-
-  schedule:
-    # 北京时间 18:00 = UTC 10:00
-    - cron: "0 10 * * 1-5"
-
-permissions:
-  contents: read
-  actions: write
-
-concurrency:
-  group: employee1-a-stock-daily-update-and-alert
-  cancel-in-progress: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - backtest
+          - selfcheck
+      start:
+        description: '回测开始日期，例如 2022-04-08，仅 backtest 使用'
+        required: false
+        default: '2022-04-08'
+      end:
+        description: '回测结束日期，例如 2023-04-08，仅 backtest 使用'
+        required: false
+        default: '2023-04-08'
+      max_dates:
+        description: '最多回测交易日数量，留空表示不限制'
+        required: false
+        default: ''
+      base_limit:
+        description: '回测基础层进入深度层数量，例如 300/500，留空使用脚本默认'
+        required: false
+        default: ''
 
 jobs:
-  daily-update-and-alert:
+  run-stock-alert:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
+    env:
+      PYTHONUNBUFFERED: '1'
+      USE_FULL_HISTORY_CACHE: '1'
+      # 如脚本使用 Telegram 推送，保持与你仓库 Secrets 名称一致。
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
-      - name: 拉取仓库代码
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 显示工作目录
-        run: |
-          pwd
-          ls -la
-          echo "Python files:"
-          find . -maxdepth 3 -type f -name "*.py" | sort || true
-          echo "Workflow files:"
-          find .github/workflows -maxdepth 1 -type f | sort || true
-
-      - name: 安装 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: 安装依赖
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm numpy pillow matplotlib
-
-      - name: 准备目录
-        run: |
-          mkdir -p outputs
-          mkdir -p kline_cache
-          mkdir -p telegram_tables
-
-      - name: 恢复A股K线缓存
-        id: restore_kline_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-daily-${{ github.run_id }}
-          restore-keys: |
-            a-kline-cache-${{ github.ref_name }}-
-            a-kline-cache-
-
-      - name: 显示缓存恢复状态
-        run: |
-          echo "Cache hit: ${{ steps.restore_kline_cache.outputs.cache-hit }}"
-          echo "Cache matched key: ${{ steps.restore_kline_cache.outputs.cache-matched-key }}"
-          echo "Restored kline_cache stock csv count:"
-          find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l
-          echo "Cache dir size:"
-          du -sh kline_cache || true
-          echo "Meta file:"
-          ls -lah kline_cache/_full_history_status.csv || true
-
-      - name: 每日增量更新A股K线缓存
-        if: ${{ github.event.inputs.skip_kline_update != '1' }}
-        env:
-          PYTHONUNBUFFERED: "1"
-          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
-          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '110' }}
-          SOFT_STOP_BUFFER_MINUTES: "5"
-          PER_STOCK_TIMEOUT: "20"
-          PROGRESS_EVERY: "100"
-        run: |
-          echo "[RUN] 每日增量更新A股K线缓存"
-          python -u tools/update_kline_cache_daily.py
-
-      - name: 跳过K线更新时生成昨日缓存闸门状态
-        if: ${{ github.event.inputs.skip_kline_update == '1' }}
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          echo "[SKIP] 本次跳过每日K线更新，直接使用已恢复的 kline_cache 缓存。"
-          mkdir -p outputs
-          python - <<'PY'
-          import os, json, glob
-          import pandas as pd
-          from datetime import datetime
-
-          files=[f for f in glob.glob('kline_cache/*.csv') if not os.path.basename(f).startswith('_')]
-          latest_dates=[]
-          readable=0
-          for f in files[:]:
-              try:
-                  df=pd.read_csv(f)
-                  if df.empty:
-                      continue
-                  # 兼容 date/日期/trade_date 字段
-                  date_col=None
-                  for c in ['date','日期','trade_date','交易日期']:
-                      if c in df.columns:
-                          date_col=c
-                          break
-                  if date_col is None:
-                      continue
-                  s=df[date_col].dropna().astype(str)
-                  if len(s)==0:
-                      continue
-                  latest_dates.append(s.iloc[-1])
-                  readable += 1
-              except Exception:
-                  pass
-
-          target=max(latest_dates) if latest_dates else ''
-          state={
-              'should_run_stock_alert': True,
-              'should_run': True,
-              'target_trade_date': target,
-              'fresh_coverage_pct': 'skip_update_use_restored_cache',
-              'gate_reason': f'skip_kline_update=1; use restored kline_cache; readable_files={readable}; target_trade_date={target}',
-              'skip_kline_update': True,
-              'cache_count': len(files),
-              'readable_cache_files': readable,
-              'generated_at': datetime.now().isoformat(timespec='seconds'),
-          }
-          with open('outputs/daily_kline_update_state.json','w',encoding='utf-8') as f:
-              json.dump(state,f,ensure_ascii=False,indent=2)
-          with open('outputs/daily_kline_update_summary_skip_update.json','w',encoding='utf-8') as f:
-              json.dump(state,f,ensure_ascii=False,indent=2)
-          print(json.dumps(state,ensure_ascii=False,indent=2))
-          PY
-
-      - name: 缓存验收并生成模型股票池
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: |
-          echo "[RUN] 缓存验收并生成 model_usable_universe"
-          python -u tools/validate_kline_cache.py
-
-      - name: 数据新鲜度闸门
-        id: data_gate
-        run: |
-          echo "[RUN] 数据新鲜度闸门"
-
-          STATE_FILE="outputs/daily_kline_update_state.json"
-
-          if [ ! -f "$STATE_FILE" ]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=missing_daily_update_state" >> "$GITHUB_OUTPUT"
-            echo "❌ 缺少 daily_kline_update_state.json，不运行一号员工。"
-            exit 0
-          fi
-
-          SHOULD_RUN=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(str(d.get('should_run_stock_alert', d.get('should_run', True))).lower())")
-          TARGET_DATE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('target_trade_date', d.get('目标交易日', '')))")
-          COVERAGE=$(python -c "import json; d=json.load(open('$STATE_FILE', encoding='utf-8')); print(d.get('fresh_coverage_pct', d.get('最新K覆盖率', '')))")
-          REASON=$(python - <<'PY'
-          import json
-          d=json.load(open('outputs/daily_kline_update_state.json', encoding='utf-8'))
-          reason=d.get('gate_reason') or d.get('reason') or ''
-          if not reason:
-              stopped=d.get('stopped_by_time')
-              updated=d.get('updated_to_target_count', d.get('updated_成功更新到目标日数', ''))
-              total=d.get('cache_count', d.get('缓存股票数', d.get('total', '')))
-              coverage=d.get('fresh_coverage_pct', d.get('最新K覆盖率', ''))
-              if stopped:
-                  reason=f"stopped_by_time; coverage={coverage}; updated={updated}/{total}"
-              else:
-                  reason=f"coverage_not_enough; coverage={coverage}; updated={updated}/{total}"
-          print(str(reason)[:500])
-          PY
-          )
-
-          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
-          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
-          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
-          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
-
-          echo "数据新鲜度闸门:"
-          echo "should_run=$SHOULD_RUN"
-          echo "target_date=$TARGET_DATE"
-          echo "coverage=$COVERAGE"
-          echo "reason=$REASON"
-
-      - name: 运行一号员工A股选股并推送Telegram
-        if: ${{ steps.data_gate.outputs.should_run == 'true' && github.event.inputs.run_stock_alert != '0' }}
-        env:
-          PYTHONUNBUFFERED: "1"
-          ENABLE_TELEGRAM: "1"
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # V22.0：V20.3.1生产底座 + V21.2交易机会层 + 信号归属去重 + 固定Top3。
-          FINAL_SCORE_THRESHOLD: "0"
-          TOP_PUSH_LIMIT: "3"
-          RESULT_LIMIT: "3"
-          FORCE_TOP_N: "3"
-          MIN_PUSH_COUNT: "3"
-          CHECK_DAYS: "1"
-          SEND_V16_PNG_TABLES: "0"
-          DEEP_SCORE_HARD_CAP: "200"
-          DEEP_SCORE_LIMIT: "500"
-
-          # V22.0 主输出文件；保留V20.3.1旧输出兼容。
-          V212_ENABLED: "1"
-          V22_OUTPUT_FILE: "v22_0_fused_score_cards.json"
-          V22_DAILY_REPORT_FILE: "v22_0_fused_daily_report.txt"
-          V22_MIN_FORMAL_SCORE: "78"
-          V22_MAX_PREDICT_RISK: "0.075"
-          V22_MAX_CONFIRM_RISK: "0.085"
-          V22_MIN_RR_FORMAL: "1.70"
-          V22_TARGET_PUSH_LIMIT: "3"
-          V20_3_1_SCORE_CARDS_FILE: "v20_3_1_score_cards.json"
-          V20_3_1_DAILY_REPORT_FILE: "v20_3_1_daily_report.txt"
-          V20_3_1_REVIEW_REPORT_FILE: "v20_3_1_review_report.txt"
-          V20_3_1_CONDITION_TABLE_FILE: "v20_3_1_condition_probability_table.json"
-          V20_3_1_SIGNAL_LIFECYCLE_FILE: "v20_3_1_signal_lifecycle.json"
-          V20_3_1_BASE_SCREEN_AUDIT_FILE: "v20_3_1_base_screen_audit.json"
-          V20_3_1_BASE_RISK_AUDIT_FILE: "v20_3_1_base_risk_audit.json"
-          V20_3_1_MODEL_AUDIT_LOG_FILE: "v20_3_1_model_audit_log.json"
-
-          # 保留旧变量兼容，避免 stock_alert.py 内部仍有旧字段读取时报错。
-          V19_SCORE_CARDS_FILE: "v19_4_score_cards.json"
-          V19_DAILY_REPORT_FILE: "v19_4_daily_report.txt"
-          V19_REVIEW_REPORT_FILE: "v19_4_review_report.txt"
-
-          DATA_GATE_TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
-          DATA_GATE_COVERAGE: ${{ steps.data_gate.outputs.coverage }}
-          DATA_GATE_REASON: ${{ steps.data_gate.outputs.reason }}
-        run: |
-          echo "[RUN] 一号员工A股选股并推送"
-          echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
-          echo "V22.0: V20底座+V21.2交易层；FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
-
-          if [ -f "stock_alert.py" ]; then
-            python -u stock_alert.py
-          elif [ -f "stock_alert_v22_0_fused.py" ]; then
-            echo "⚠️ 未找到 stock_alert.py，改用 stock_alert_v22_0_fused.py。正式上线建议将融合版统一命名为 stock_alert.py。"
-            python -u stock_alert_v22_0_fused.py
-          elif [ -f "stock_alert_v20_3_1.py" ]; then
-            echo "⚠️ 未找到 V22 融合版，回退使用 stock_alert_v20_3_1.py。"
-            python -u stock_alert_v20_3_1.py
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           else
-            echo "❌ 未找到 stock_alert.py、stock_alert_v22_0_fused.py 或 stock_alert_v20_3_1.py"
-            exit 1
+            pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4
           fi
 
-      - name: 数据未达标时不运行正式推荐
-        if: ${{ steps.data_gate.outputs.should_run != 'true' }}
+      - name: Syntax check
         run: |
-          echo "⚠️ 数据新鲜度闸门未通过，本次不运行正式选股。"
-          echo "target_date=${{ steps.data_gate.outputs.target_date }}"
-          echo "coverage=${{ steps.data_gate.outputs.coverage }}"
-          echo "reason=${{ steps.data_gate.outputs.reason }}"
+          python -m py_compile stock_alert_v25_3_bigbull_full.py
 
-      - name: 数据未达标时推送Telegram诊断
-        if: ${{ steps.data_gate.outputs.should_run != 'true' && github.event.inputs.run_stock_alert != '0' }}
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TARGET_DATE: ${{ steps.data_gate.outputs.target_date }}
-          COVERAGE: ${{ steps.data_gate.outputs.coverage }}
-          REASON: ${{ steps.data_gate.outputs.reason }}
+      - name: Run stock alert
+        shell: bash
         run: |
-          echo "[RUN] 数据未达标Telegram诊断"
-          python - <<'PY'
-          import os, json, html, requests
-          token=os.environ.get('TELEGRAM_TOKEN','').strip()
-          chat_id=os.environ.get('TELEGRAM_CHAT_ID','').strip()
-          if not token or not chat_id:
-              print('telegram diagnostic skipped: missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID')
-              raise SystemExit(0)
+          MODE="${{ github.event.inputs.mode }}"
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
+          MAX_DATES="${{ github.event.inputs.max_dates }}"
+          BASE_LIMIT="${{ github.event.inputs.base_limit }}"
 
-          state={}
-          try:
-              with open('outputs/daily_kline_update_state.json', encoding='utf-8') as f:
-                  state=json.load(f)
-          except Exception as e:
-              print('state read failed:', e)
+          # schedule 触发时 inputs 为空，默认 daily。
+          if [ -z "$MODE" ]; then
+            MODE="daily"
+          fi
 
-          def pick(*keys, default=''):
-              for k in keys:
-                  if k in state and state[k] not in (None, ''):
-                      return state[k]
-              return default
-
-          target=os.environ.get('TARGET_DATE') or pick('target_trade_date','目标交易日')
-          coverage=os.environ.get('COVERAGE') or pick('fresh_coverage_pct','最新K覆盖率')
-          reason=os.environ.get('REASON') or pick('gate_reason','reason')
-          updated=pick('updated_to_target_count','updated_成功更新到目标日数', default='')
-          processed=pick('processed_count','本轮处理记录数', default='')
-          total=pick('cache_count','缓存股票数','total', default='')
-          stopped=pick('stopped_by_time', default='')
-          failed=pick('failed_count','failed_失败数', default='')
-          elapsed=pick('elapsed','耗时', default='')
-          if not reason:
-              reason=f"coverage_not_enough; stopped_by_time={stopped}; updated={updated}/{total}"
-
-          lines=[
-              '⚠️ <b>一号员工今日未运行正式推荐</b>',
-              '',
-              f'目标交易日：<code>{html.escape(str(target))}</code>',
-              f'数据覆盖率：<code>{html.escape(str(coverage))}</code>',
-              f'已更新到目标日：<code>{html.escape(str(updated))}/{html.escape(str(total))}</code>',
-              f'本轮处理：<code>{html.escape(str(processed))}</code>',
-              f'失败数：<code>{html.escape(str(failed))}</code>',
-              f'时间保护触发：<code>{html.escape(str(stopped))}</code>',
-              f'耗时：<code>{html.escape(str(elapsed))}</code>',
-              '',
-              f'原因：<code>{html.escape(str(reason))}</code>',
-              '',
-              '处理建议：可直接 Re-run all jobs；缓存已保存时，下一轮会继续补剩余股票。'
-          ]
-          text='\n'.join(lines)
-          url=f'https://api.telegram.org/bot{token}/sendMessage'
-          r=requests.post(url, data={'chat_id':chat_id, 'text':text, 'parse_mode':'HTML'}, timeout=20)
-          print('telegram diagnostic status:', r.status_code)
-          if not r.ok:
-              print(r.text[:500])
-          PY
-
-      - name: 显示输出文件
-        if: always()
-        run: |
-          echo "Outputs directory:"
-          ls -lah outputs || true
-
-          echo ""
-          echo "Daily update state:"
-          cat outputs/daily_kline_update_state.json || true
-
-          echo ""
-          echo "Latest output files:"
-          find outputs -maxdepth 1 -type f -printf "%s %p\n" 2>/dev/null | sort -nr | head -50 || true
-
-          echo ""
-          echo "Root json/txt/csv files:"
-          ls -lah *.json *.txt *.csv 2>/dev/null || true
-
-          echo ""
-          echo "Important candidate/report files:"
-          for f in \
-            stock_candidates.json \
-            v22_0_fused_score_cards.json \
-            v22_0_fused_daily_report.txt \
-            v20_3_1_score_cards.json \
-            v20_3_1_daily_report.txt \
-            v20_3_1_review_report.txt \
-            v20_3_1_condition_probability_table.json \
-            v20_3_1_signal_lifecycle.json \
-            v20_3_1_base_screen_audit.json \
-            v20_3_1_base_risk_audit.json \
-            v20_3_1_model_audit_log.json \
-            v19_4_score_cards.json \
-            v19_4_daily_report.txt \
-            v19_4_review_report.txt \
-            telegram_message.txt \
-            telegram_report.txt; do
-            if [ -f "$f" ]; then
-              echo "FOUND $f"
-              ls -lah "$f"
-              echo "--- head of $f ---"
-              head -80 "$f" || true
-              echo "--- end head ---"
-            else
-              echo "MISSING $f"
+          if [ "$MODE" = "selfcheck" ]; then
+            python stock_alert_v25_3_bigbull_full.py --mode daily --self-check
+          elif [ "$MODE" = "backtest" ]; then
+            CMD="python stock_alert_v25_3_bigbull_full.py --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
+            if [ -n "$MAX_DATES" ]; then
+              CMD="$CMD --max-dates $MAX_DATES"
             fi
-          done
+            if [ -n "$BASE_LIMIT" ]; then
+              CMD="$CMD --base-limit $BASE_LIMIT"
+            fi
+            echo "$CMD"
+            eval "$CMD"
+          else
+            python stock_alert_v25_3_bigbull_full.py --mode daily
+          fi
 
-      - name: 上传输出结果
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: employee1-a-stock-daily-outputs
+          name: stock-alert-v25-3-bigbull-output
           path: |
-            outputs/
-            stock_candidates.json
-            v22_0_fused_score_cards.json
-            v22_0_fused_daily_report.txt
-            v20_3_1_score_cards.json
-            v20_3_1_daily_report.txt
-            v20_3_1_review_report.txt
-            v20_3_1_condition_probability_table.json
-            v20_3_1_signal_lifecycle.json
-            v20_3_1_base_screen_audit.json
-            v20_3_1_base_risk_audit.json
-            v20_3_1_model_audit_log.json
-            v19_4_score_cards.json
-            v19_4_daily_report.txt
-            v19_4_review_report.txt
-            telegram_message.txt
-            telegram_report.txt
-            *.json
-            *.txt
             *.csv
-          if-no-files-found: warn
+            *.md
+            *.html
+            output*/**
+            reports/**
+            logs/**
+          if-no-files-found: ignore
           retention-days: 14
-
-      - name: 判断是否保存缓存
-        if: always()
-        id: cache_save_gate
-        run: |
-          COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
-          echo "cache_count=$COUNT" >> "$GITHUB_OUTPUT"
-
-          if [ "${{ github.event.inputs.skip_kline_update }}" = "1" ]; then
-            echo "save_cache=false" >> "$GITHUB_OUTPUT"
-            echo "本次 skip_kline_update=1，仅用旧缓存跑模型，不保存缓存，避免中午误覆盖。"
-          elif [ "$COUNT" -ge 3000 ]; then
-            echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "缓存文件数 $COUNT >= 3000，允许保存缓存。"
-          else
-            echo "save_cache=false" >> "$GITHUB_OUTPUT"
-            echo "缓存文件数 $COUNT < 3000，不保存，避免覆盖好缓存。"
-          fi
-
-      - name: 保存更新后的A股K线缓存
-        if: always() && steps.cache_save_gate.outputs.save_cache == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-daily-${{ github.run_id }}
