@@ -13,19 +13,19 @@ on:
           - backtest
           - selfcheck
       start:
-        description: "回测开始日期"
+        description: "回测开始日期，仅 backtest 使用"
         required: false
         default: "2022-04-08"
       end:
-        description: "回测结束日期"
+        description: "回测结束日期，仅 backtest 使用"
         required: false
         default: "2023-04-08"
       max_dates:
-        description: "最多回测交易日数量"
+        description: "最多回测交易日数量，留空表示不限制"
         required: false
         default: ""
       base_limit:
-        description: "基础层进入深度层数量"
+        description: "基础层进入深度层数量，例如 200/300/500"
         required: false
         default: ""
 
@@ -37,6 +37,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    env:
+      PYTHONUTF8: "1"
+      TQDM_DISABLE: "1"
+      BAOSTOCK_SOURCE: "1"
+      USE_FULL_HISTORY_CACHE: "1"
+      FULL_HISTORY_CACHE_DIR: "./full_history_cache"
+      V25_3_MIN_AMOUNT: "50000000"
+      V25_3_DEFAULT_MODE: "daily"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -47,25 +56,47 @@ jobs:
           ls -la
           echo "All Python files:"
           find . -maxdepth 3 -name "*.py" -print
+          echo "Workflow files:"
+          find .github/workflows -maxdepth 2 -name "*.yml" -print || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests tqdm akshare beautifulsoup4 lxml openpyxl
+          pip install pandas numpy requests tqdm akshare baostock beautifulsoup4 lxml openpyxl pyarrow
+
+      - name: Verify dependencies
+        run: |
+          python - <<'PY'
+          import pandas, numpy, requests
+          import akshare
+          import baostock
+          print("dependencies ok")
+          print("baostock:", getattr(baostock, "__version__", "unknown"))
+          PY
 
       - name: Detect Python script
         run: |
-          SCRIPT=$(find . -maxdepth 3 -name "stock_alert*.py" | head -n 1)
+          echo "Searching stock alert script..."
+          SCRIPT=$(find . -maxdepth 3 -name "stock_alert_v25_3_bigbull_full.py" | head -n 1)
+          if [ -z "$SCRIPT" ]; then
+            SCRIPT=$(find . -maxdepth 3 -name "stock_alert_v25_3_full.py" | head -n 1)
+          fi
+          if [ -z "$SCRIPT" ]; then
+            SCRIPT=$(find . -maxdepth 3 -name "stock_alert.py" | head -n 1)
+          fi
+          if [ -z "$SCRIPT" ]; then
+            SCRIPT=$(find . -maxdepth 3 -name "stock_alert*.py" | head -n 1)
+          fi
 
           if [ -z "$SCRIPT" ]; then
             echo "没有找到 stock_alert*.py 文件"
-            echo "当前目录文件："
-            ls -la
+            find . -maxdepth 3 -type f -print
             exit 1
           fi
 
@@ -77,21 +108,25 @@ jobs:
           python -m py_compile "$SCRIPT"
 
       - name: Run stock alert
-        env:
-          PYTHONUTF8: "1"
-          TQDM_DISABLE: "1"
         run: |
           MODE="${{ github.event.inputs.mode || 'daily' }}"
+          START_DATE="${{ github.event.inputs.start || '2022-04-08' }}"
+          END_DATE="${{ github.event.inputs.end || '2023-04-08' }}"
+          MAX_DATES="${{ github.event.inputs.max_dates }}"
+          BASE_LIMIT="${{ github.event.inputs.base_limit }}"
+
+          echo "MODE=$MODE"
+          echo "SCRIPT=$SCRIPT"
 
           if [ "$MODE" = "selfcheck" ]; then
             python "$SCRIPT" --mode backtest --self-check
           elif [ "$MODE" = "backtest" ]; then
-            CMD="python $SCRIPT --mode backtest --start ${{ github.event.inputs.start }} --end ${{ github.event.inputs.end }}"
-            if [ -n "${{ github.event.inputs.max_dates }}" ]; then
-              CMD="$CMD --max-dates ${{ github.event.inputs.max_dates }}"
+            CMD="python $SCRIPT --mode backtest --start $START_DATE --end $END_DATE"
+            if [ -n "$MAX_DATES" ]; then
+              CMD="$CMD --max-dates $MAX_DATES"
             fi
-            if [ -n "${{ github.event.inputs.base_limit }}" ]; then
-              CMD="$CMD --base-limit ${{ github.event.inputs.base_limit }}"
+            if [ -n "$BASE_LIMIT" ]; then
+              CMD="$CMD --base-limit $BASE_LIMIT"
             fi
             echo "$CMD"
             eval "$CMD"
