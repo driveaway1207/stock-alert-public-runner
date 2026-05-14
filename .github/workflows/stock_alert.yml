@@ -215,7 +215,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # V20.3.1：固定Top3 + 近期推荐生命周期跟踪 + 基础筛选重构 + 动态风险库。
+          # V22.0：V20.3.1生产底座 + V21.2交易机会层 + 信号归属去重 + 固定Top3。
           FINAL_SCORE_THRESHOLD: "0"
           TOP_PUSH_LIMIT: "3"
           RESULT_LIMIT: "3"
@@ -226,7 +226,15 @@ jobs:
           DEEP_SCORE_HARD_CAP: "200"
           DEEP_SCORE_LIMIT: "500"
 
-          # V20.3.1 主输出文件。
+          # V22.0 主输出文件；保留V20.3.1旧输出兼容。
+          V212_ENABLED: "1"
+          V22_OUTPUT_FILE: "v22_0_fused_score_cards.json"
+          V22_DAILY_REPORT_FILE: "v22_0_fused_daily_report.txt"
+          V22_MIN_FORMAL_SCORE: "78"
+          V22_MAX_PREDICT_RISK: "0.075"
+          V22_MAX_CONFIRM_RISK: "0.085"
+          V22_MIN_RR_FORMAL: "1.70"
+          V22_TARGET_PUSH_LIMIT: "3"
           V20_3_1_SCORE_CARDS_FILE: "v20_3_1_score_cards.json"
           V20_3_1_DAILY_REPORT_FILE: "v20_3_1_daily_report.txt"
           V20_3_1_REVIEW_REPORT_FILE: "v20_3_1_review_report.txt"
@@ -247,15 +255,18 @@ jobs:
         run: |
           echo "[RUN] 一号员工A股选股并推送"
           echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
-          echo "V20.3.1: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
+          echo "V22.0: V20底座+V21.2交易层；FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
 
           if [ -f "stock_alert.py" ]; then
             python -u stock_alert.py
+          elif [ -f "stock_alert_v22_0_fused.py" ]; then
+            echo "⚠️ 未找到 stock_alert.py，改用 stock_alert_v22_0_fused.py。正式上线建议将融合版统一命名为 stock_alert.py。"
+            python -u stock_alert_v22_0_fused.py
           elif [ -f "stock_alert_v20_3_1.py" ]; then
-            echo "⚠️ 未找到 stock_alert.py，改用 stock_alert_v20_3_1.py。建议仓库里统一命名为 stock_alert.py。"
+            echo "⚠️ 未找到 V22 融合版，回退使用 stock_alert_v20_3_1.py。"
             python -u stock_alert_v20_3_1.py
           else
-            echo "❌ 未找到 stock_alert.py 或 stock_alert_v20_3_1.py"
+            echo "❌ 未找到 stock_alert.py、stock_alert_v22_0_fused.py 或 stock_alert_v20_3_1.py"
             exit 1
           fi
 
@@ -355,6 +366,8 @@ jobs:
           echo "Important candidate/report files:"
           for f in \
             stock_candidates.json \
+            v22_0_fused_score_cards.json \
+            v22_0_fused_daily_report.txt \
             v20_3_1_score_cards.json \
             v20_3_1_daily_report.txt \
             v20_3_1_review_report.txt \
@@ -387,6 +400,8 @@ jobs:
           path: |
             outputs/
             stock_candidates.json
+            v22_0_fused_score_cards.json
+            v22_0_fused_daily_report.txt
             v20_3_1_score_cards.json
             v20_3_1_daily_report.txt
             v20_3_1_review_report.txt
