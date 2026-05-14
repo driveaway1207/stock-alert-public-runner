@@ -2,8 +2,7 @@ name: 一号员工选股模型 V25.3
 
 on:
   schedule:
-    # GitHub Actions 使用 UTC 时间
-    # 北京时间 18:15 = UTC 10:15
+    # GitHub Actions 使用 UTC 时间；北京时间 18:15 = UTC 10:15
     - cron: '15 10 * * 1-5'
 
   workflow_dispatch:
@@ -17,26 +16,26 @@ on:
           - daily
           - backtest
           - selfcheck
-
       start:
-        description: '回测开始日期，例如 2022-04-08'
+        description: '回测开始日期，例如 2022-04-08，仅 backtest 使用'
         required: false
         default: '2022-04-08'
-
       end:
-        description: '回测结束日期，例如 2023-04-08'
+        description: '回测结束日期，例如 2023-04-08，仅 backtest 使用'
         required: false
         default: '2023-04-08'
-
       max_dates:
         description: '最多回测交易日数量，留空表示不限制'
         required: false
         default: ''
-
       base_limit:
         description: '回测基础层进入深度层数量，例如 300/500，留空使用脚本默认'
         required: false
         default: ''
+
+concurrency:
+  group: 一号员工选股模型-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run-stock-alert:
@@ -47,31 +46,29 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 一号员工主程序固定使用仓库里的 stock_alert.py
+      # 仓库根目录里的主程序文件名。你截图里已经有 stock_alert.py。
       MODEL_FILE: 'stock_alert.py'
 
-      # 优先读取K线缓存；如果没有缓存，就走 BaoStock 主数据源
-      USE_FULL_HISTORY_CACHE: '1'
-      FULL_HISTORY_CACHE_DIR: 'K线缓存'
-
-      # BaoStock 是主数据源，AkShare 不做大规模补拉
+      # 数据源原则：BaoStock 是主数据源；AkShare 只作为手动开启的备用，不默认大规模补拉。
       KLINE_FALLBACK_AKSHARE: '0'
       STOCK_LIST_FALLBACK_AKSHARE: '0'
 
-      # 不用旧缓存硬凑正式结果
+      # K线缓存：如果仓库里有 K线缓存 或 kline_cache，就优先读；没有就自动改为 BaoStock 主拉。
+      USE_FULL_HISTORY_CACHE: '1'
+      FULL_HISTORY_CACHE_DIR: 'K线缓存'
       ALLOW_STALE_KLINE_CACHE: '0'
 
-      # BaoStock 连接保护
+      # BaoStock 连接保护。
       BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
       SUPPRESS_BAOSTOCK_VERBOSE: '1'
 
-      # Telegram 推送
+      # Telegram 推送。Python 脚本读取 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / ENABLE_TELEGRAM。
       ENABLE_TELEGRAM: '1'
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # 正式推送数量
+      # 正式推送数量。
       TOP_PUSH_LIMIT: '3'
       RESULT_LIMIT: '3'
       FORCE_TOP_N: '3'
@@ -102,27 +99,23 @@ jobs:
 
           if [ -d "K线缓存" ]; then
             echo "✅ 找到中文K线缓存文件夹：K线缓存"
-            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> $GITHUB_ENV
-            echo "USE_FULL_HISTORY_CACHE=1" >> $GITHUB_ENV
-
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            echo "USE_FULL_HISTORY_CACHE=1" >> "$GITHUB_ENV"
             CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           elif [ -d "kline_cache" ]; then
             echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
-            echo "为了兼容旧代码，本次继续读取 kline_cache"
-            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> $GITHUB_ENV
-            echo "USE_FULL_HISTORY_CACHE=1" >> $GITHUB_ENV
-
+            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            echo "USE_FULL_HISTORY_CACHE=1" >> "$GITHUB_ENV"
             CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           else
             echo "⚠️ 没找到K线缓存文件夹。"
-            echo "说明：仓库里目前没有 K线缓存 或 kline_cache 文件夹。"
-            echo "本次不强制失败，改为使用 BaoStock 主数据源拉取K线。"
-            echo "USE_FULL_HISTORY_CACHE=0" >> $GITHUB_ENV
-            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> $GITHUB_ENV
+            echo "本次不会失败，改为使用 BaoStock 主数据源拉取K线。"
+            echo "USE_FULL_HISTORY_CACHE=0" >> "$GITHUB_ENV"
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
           fi
 
       - name: ④ 显示最近的K线缓存文件
@@ -144,7 +137,7 @@ jobs:
             echo "✅ 找到风险雷区文件：risk_flags.json"
           else
             echo "⚠️ 没找到风险雷区文件 risk_flags.json"
-            echo "模型仍然可以运行，但外部监管/财务/治理雷区识别会变弱。"
+            echo "模型仍可运行，但外部监管/财务/治理雷区识别会变弱。"
           fi
 
       - name: ⑥ 安装Python环境
@@ -153,22 +146,34 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: ⑦ 安装运行依赖
+      - name: ⑦ 安装运行依赖并自检BaoStock
         shell: bash
         run: |
           python -m pip install --upgrade pip
 
           if [ -f requirements.txt ]; then
+            echo "发现 requirements.txt，先安装里面的依赖..."
             pip install -r requirements.txt
-          else
-            pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
           fi
+
+          echo "强制补装一号员工必需依赖，避免 requirements.txt 缺包..."
+          pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
+
+          echo "检查核心依赖是否可导入..."
+          python - <<'PY'
+          import pandas
+          import numpy
+          import requests
+          import baostock as bs
+          print("✅ pandas / numpy / requests / BaoStock 导入成功")
+          PY
 
       - name: ⑧ 检查Python代码语法
         shell: bash
         run: |
           echo "检查Python代码语法：$MODEL_FILE"
           python -m py_compile "$MODEL_FILE"
+          echo "✅ Python语法检查通过"
 
       - name: ⑨ 运行一号员工选股模型
         shell: bash
@@ -188,6 +193,7 @@ jobs:
           echo "是否读取K线缓存：$USE_FULL_HISTORY_CACHE"
           echo "K线缓存目录：$FULL_HISTORY_CACHE_DIR"
           echo "AkShare补拉开关：$KLINE_FALLBACK_AKSHARE"
+          echo "股票池AkShare备用开关：$STOCK_LIST_FALLBACK_AKSHARE"
 
           if [ "$MODE" = "selfcheck" ]; then
             python "$MODEL_FILE" --mode daily --self-check
