@@ -1,151 +1,194 @@
-name: Stock Alert V25.3
+name: Stock Alert V25.3 BigBull Daily & Backtest
 
 on:
+  schedule:
+    # GitHub Actions 使用 UTC 时间
+    # 北京时间 18:15 = UTC 10:15
+    # 前提：你的K线更新任务在北京时间18:00左右完成
+    - cron: '15 10 * * 1-5'
+
   workflow_dispatch:
     inputs:
       mode:
-        description: "daily=每日选股；backtest=历史回测；selfcheck=自检"
+        description: '运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检'
         required: true
-        default: "daily"
+        default: 'daily'
         type: choice
         options:
           - daily
           - backtest
           - selfcheck
-      start:
-        description: "回测开始日期，仅 backtest 使用"
-        required: false
-        default: "2022-04-08"
-      end:
-        description: "回测结束日期，仅 backtest 使用"
-        required: false
-        default: "2023-04-08"
-      max_dates:
-        description: "最多回测交易日数量，留空表示不限制"
-        required: false
-        default: ""
-      base_limit:
-        description: "基础层进入深度层数量，例如 200/300/500"
-        required: false
-        default: ""
 
-  schedule:
-    - cron: "30 7 * * 1-5"
+      start:
+        description: '回测开始日期，仅 backtest 使用，例如 2022-04-08'
+        required: false
+        default: '2022-04-08'
+
+      end:
+        description: '回测结束日期，仅 backtest 使用，例如 2023-04-08'
+        required: false
+        default: '2023-04-08'
+
+      max_dates:
+        description: '最多回测交易日数量，留空表示不限制'
+        required: false
+        default: ''
+
+      base_limit:
+        description: '回测基础层进入深度层数量，例如 300/500，留空使用脚本默认'
+        required: false
+        default: ''
 
 jobs:
   run-stock-alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     env:
-      PYTHONUTF8: "1"
-      TQDM_DISABLE: "1"
-      BAOSTOCK_SOURCE: "1"
-      USE_FULL_HISTORY_CACHE: "1"
-      FULL_HISTORY_CACHE_DIR: "./full_history_cache"
-      V25_3_MIN_AMOUNT: "50000000"
-      V25_3_DEFAULT_MODE: "daily"
+      PYTHONUNBUFFERED: '1'
+
+      # 核心：生产环境优先只读18点更新好的全历史K线缓存
+      USE_FULL_HISTORY_CACHE: '1'
+      FULL_HISTORY_CACHE_DIR: 'kline_cache'
+
+      # 重要：AkShare 只允许作为备用思路，不在正式生产里大规模补拉
+      # 避免出现你截图里的 AkShare补拉失败刷屏
+      KLINE_FALLBACK_AKSHARE: '0'
+      STOCK_LIST_FALLBACK_AKSHARE: '0'
+
+      # 不允许旧缓存兜底，避免用过期K线推送正式结果
+      ALLOW_STALE_KLINE_CACHE: '0'
+
+      # BaoStock仍保留为主数据源兜底，但正常情况下应直接读kline_cache
+      BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
+      SUPPRESS_BAOSTOCK_VERBOSE: '1'
+
+      # Telegram：Python脚本读取的是 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / ENABLE_TELEGRAM
+      ENABLE_TELEGRAM: '1'
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 输出数量
+      TOP_PUSH_LIMIT: '3'
+      RESULT_LIMIT: '3'
+      FORCE_TOP_N: '3'
+      MIN_PUSH_COUNT: '3'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: List files
+      - name: Check kline cache exists
+        shell: bash
         run: |
-          pwd
-          ls -la
-          echo "All Python files:"
-          find . -maxdepth 3 -name "*.py" -print
-          echo "Workflow files:"
-          find .github/workflows -maxdepth 2 -name "*.yml" -print || true
+          echo "检查 kline_cache 是否存在..."
+
+          if [ ! -d "kline_cache" ]; then
+            echo "❌ kline_cache 文件夹不存在。"
+            echo "说明：当前正式生产模式 USE_FULL_HISTORY_CACHE=1，需要先有18点更新好的K线缓存。"
+            echo "为避免误用联网临时补拉数据，本次停止运行。"
+            exit 1
+          fi
+
+          CSV_COUNT=$(find kline_cache -name "*.csv" | wc -l)
+          echo "kline_cache CSV数量: $CSV_COUNT"
+
+          if [ "$CSV_COUNT" -lt 1000 ]; then
+            echo "❌ kline_cache CSV数量过少，疑似K线缓存没有完整准备好。"
+            echo "为避免小样本误判，本次停止运行。"
+            exit 1
+          fi
+
+          echo "✅ kline_cache 基础检查通过。"
+
+      - name: Show latest kline cache files
+        shell: bash
+        run: |
+          echo "最近更新的K线缓存文件："
+          find kline_cache -name "*.csv" -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30 || true
+
+      - name: Check risk flags file
+        shell: bash
+        run: |
+          if [ -f "risk_flags.json" ]; then
+            echo "✅ risk_flags.json 存在，硬排雷文件可用。"
+          else
+            echo "⚠️ risk_flags.json 不存在。"
+            echo "说明：模型仍可运行，但外部监管/财务/治理雷区命中能力会下降。"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests tqdm akshare baostock beautifulsoup4 lxml openpyxl pyarrow
 
-      - name: Verify dependencies
-        run: |
-          python - <<'PY'
-          import pandas, numpy, requests
-          import akshare
-          import baostock
-          print("dependencies ok")
-          print("baostock:", getattr(baostock, "__version__", "unknown"))
-          PY
-
-      - name: Detect Python script
-        run: |
-          echo "Searching stock alert script..."
-          SCRIPT=$(find . -maxdepth 3 -name "stock_alert_v25_3_bigbull_full.py" | head -n 1)
-          if [ -z "$SCRIPT" ]; then
-            SCRIPT=$(find . -maxdepth 3 -name "stock_alert_v25_3_full.py" | head -n 1)
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
           fi
-          if [ -z "$SCRIPT" ]; then
-            SCRIPT=$(find . -maxdepth 3 -name "stock_alert.py" | head -n 1)
-          fi
-          if [ -z "$SCRIPT" ]; then
-            SCRIPT=$(find . -maxdepth 3 -name "stock_alert*.py" | head -n 1)
-          fi
-
-          if [ -z "$SCRIPT" ]; then
-            echo "没有找到 stock_alert*.py 文件"
-            find . -maxdepth 3 -type f -print
-            exit 1
-          fi
-
-          echo "SCRIPT=$SCRIPT" >> $GITHUB_ENV
-          echo "Using script: $SCRIPT"
 
       - name: Syntax check
+        shell: bash
         run: |
-          python -m py_compile "$SCRIPT"
+          python -m py_compile stock_alert_v25_3_bigbull_full.py
 
       - name: Run stock alert
+        shell: bash
         run: |
-          MODE="${{ github.event.inputs.mode || 'daily' }}"
-          START_DATE="${{ github.event.inputs.start || '2022-04-08' }}"
-          END_DATE="${{ github.event.inputs.end || '2023-04-08' }}"
+          MODE="${{ github.event.inputs.mode }}"
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
           MAX_DATES="${{ github.event.inputs.max_dates }}"
           BASE_LIMIT="${{ github.event.inputs.base_limit }}"
 
-          echo "MODE=$MODE"
-          echo "SCRIPT=$SCRIPT"
+          if [ -z "$MODE" ]; then
+            MODE="daily"
+          fi
+
+          echo "当前运行模式: $MODE"
 
           if [ "$MODE" = "selfcheck" ]; then
-            python "$SCRIPT" --mode backtest --self-check
+            python stock_alert_v25_3_bigbull_full.py --mode daily --self-check
+
           elif [ "$MODE" = "backtest" ]; then
-            CMD="python $SCRIPT --mode backtest --start $START_DATE --end $END_DATE"
+            CMD="python stock_alert_v25_3_bigbull_full.py --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
+
             if [ -n "$MAX_DATES" ]; then
               CMD="$CMD --max-dates $MAX_DATES"
             fi
+
             if [ -n "$BASE_LIMIT" ]; then
               CMD="$CMD --base-limit $BASE_LIMIT"
             fi
+
             echo "$CMD"
             eval "$CMD"
+
           else
-            python "$SCRIPT" --mode daily
+            python stock_alert_v25_3_bigbull_full.py --mode daily
           fi
 
-      - name: Prepare artifacts
-        if: always()
-        run: |
-          mkdir -p artifact_upload
-          find . -maxdepth 3 \( -name "*.csv" -o -name "*.html" -o -name "*.md" -o -path "./output*" \) -print -exec cp -r {} artifact_upload/ \; || true
-          echo "Artifact files:"
-          ls -la artifact_upload || true
-
-      - name: Upload output artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-alert-output
-          path: artifact_upload
-          retention-days: 7
+          name: stock-alert-v25-3-bigbull-output
+          path: |
+            *.csv
+            *.md
+            *.html
+            *.json
+            output*/**
+            outputs/**
+            reports/**
+            logs/**
+          if-no-files-found: ignore
+          retention-days: 14
