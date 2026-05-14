@@ -154,13 +154,13 @@ warnings.filterwarnings("ignore")
 #    涨停/大阳阶段标签修正、近端压力硬约束、极端放量/高乖离/过热组合封顶。
 # ===========================================================================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))  # 兼容 GitHub Secret 名称 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
-CACHE_DIR = "kline_cache"
+CACHE_DIR = os.environ.get("CACHE_DIR", "kline_cache")  # 默认旧英文缓存目录；可通过环境变量切换为中文目录
 MODEL_VERSION = "V25.3一号员工选股模型｜V24.1生产核心完整融合+daily/backtest同逻辑+严格No-Lookahead真实回测版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
@@ -235,7 +235,7 @@ MIN_FORMAL_COVERAGE_RATE = float(os.environ.get("MIN_FORMAL_COVERAGE_RATE", "0.8
 # V12.7：稳定提速补丁。评分逻辑不变，只增强数据获取层。
 # 1）BaoStock失败时可切换AkShare补拉；2）远程失败时允许使用旧缓存；
 # 3）连续失败时更快熔断，避免成功数卡死后继续空跑几千只。
-KLINE_FALLBACK_AKSHARE = os.environ.get("KLINE_FALLBACK_AKSHARE", "1")
+KLINE_FALLBACK_AKSHARE = os.environ.get("KLINE_FALLBACK_AKSHARE", "0")  # 生产默认不启用AkShare大规模补拉；需要时在yml里显式设为1
 ALLOW_STALE_KLINE_CACHE = os.environ.get("ALLOW_STALE_KLINE_CACHE", "1")
 STALE_CACHE_MAX_DAYS = int(os.environ.get("STALE_CACHE_MAX_DAYS", "10"))
 AKSHARE_FALLBACK_MAX_RETRIES = int(os.environ.get("AKSHARE_FALLBACK_MAX_RETRIES", "2"))
@@ -248,6 +248,9 @@ DEEP_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("DEEP_EMPTY_CACHE_MIN_ROWS", "500
 # 说明：不改V16评分模型，只把数据入口改为优先读取全量缓存 kline_cache/000001.csv。
 USE_FULL_HISTORY_CACHE = os.environ.get("USE_FULL_HISTORY_CACHE", "1")
 FULL_HISTORY_CACHE_DIR = os.environ.get("FULL_HISTORY_CACHE_DIR", CACHE_DIR)
+# 兼容中文缓存文件夹：如果没有显式指定目录，但仓库里存在“ K线缓存 ”，自动优先读取它。
+if not os.environ.get("FULL_HISTORY_CACHE_DIR") and os.path.exists("K线缓存"):
+    FULL_HISTORY_CACHE_DIR = "K线缓存"
 MODEL_UNIVERSE_FILE = os.environ.get("MODEL_UNIVERSE_FILE", "")
 FULL_CACHE_MAX_STALE_DAYS = int(os.environ.get("FULL_CACHE_MAX_STALE_DAYS", "7"))
 FULL_CACHE_BASE_TAIL_ROWS = int(os.environ.get("FULL_CACHE_BASE_TAIL_ROWS", "760"))
@@ -270,7 +273,7 @@ DATA_GATE_FAILED_COUNT = os.environ.get("DATA_GATE_FAILED_COUNT", "").strip()
 # V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
 STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
 STOCK_LIST_MAX_RETRIES = int(os.environ.get("STOCK_LIST_MAX_RETRIES", "2"))
-STOCK_LIST_FALLBACK_AKSHARE = os.environ.get("STOCK_LIST_FALLBACK_AKSHARE", "1")
+STOCK_LIST_FALLBACK_AKSHARE = os.environ.get("STOCK_LIST_FALLBACK_AKSHARE", "0")  # 股票池仍以BaoStock/缓存为主；AkShare仅手动开启备用
 STOCK_LIST_RELOGIN_ON_FAIL = os.environ.get("STOCK_LIST_RELOGIN_ON_FAIL", "1")
 
 SCORE_LIMIT = 75
