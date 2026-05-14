@@ -2,7 +2,7 @@
   "mode": "daily",
   "start": "2022-04-08",
   "end": "2023-04-08",
-  "max_dates": "60",
-  "base_limit": "200",
+  "max_dates": "",
+  "base_limit": "",
   "created_by": "stock_alert_workflow"
 }
