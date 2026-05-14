@@ -47,21 +47,21 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 默认优先尝试读取K线缓存；如果没有缓存，下面步骤会自动改为 BaoStock 主拉
+      # 一号员工主程序固定使用仓库里的 stock_alert.py
+      MODEL_FILE: 'stock_alert.py'
+
+      # 优先读取K线缓存；如果没有缓存，就走 BaoStock 主数据源
       USE_FULL_HISTORY_CACHE: '1'
       FULL_HISTORY_CACHE_DIR: 'K线缓存'
 
-      # 关键：不让 AkShare 变成主数据源，避免你刚才截图那种 AkShare补拉失败刷屏
+      # BaoStock 是主数据源，AkShare 不做大规模补拉
       KLINE_FALLBACK_AKSHARE: '0'
-
-      # 股票池如果 BaoStock 失败，是否允许 AkShare 备用
-      # 这里先关掉，保持 BaoStock 主线清晰
       STOCK_LIST_FALLBACK_AKSHARE: '0'
 
       # 不用旧缓存硬凑正式结果
       ALLOW_STALE_KLINE_CACHE: '0'
 
-      # BaoStock 主数据源保护
+      # BaoStock 连接保护
       BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
       SUPPRESS_BAOSTOCK_VERBOSE: '1'
 
@@ -81,7 +81,21 @@ jobs:
       - name: ① 下载仓库代码
         uses: actions/checkout@v4
 
-      - name: ② 检查K线缓存文件夹
+      - name: ② 检查一号员工主程序
+        shell: bash
+        run: |
+          echo "检查一号员工主程序：$MODEL_FILE"
+
+          if [ ! -f "$MODEL_FILE" ]; then
+            echo "❌ 没找到一号员工主程序：$MODEL_FILE"
+            echo "当前仓库根目录文件如下："
+            ls -la
+            exit 1
+          fi
+
+          echo "✅ 找到一号员工主程序：$MODEL_FILE"
+
+      - name: ③ 检查K线缓存文件夹
         shell: bash
         run: |
           echo "开始检查K线缓存文件夹..."
@@ -111,7 +125,7 @@ jobs:
             echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> $GITHUB_ENV
           fi
 
-      - name: ③ 显示最近的K线缓存文件
+      - name: ④ 显示最近的K线缓存文件
         shell: bash
         run: |
           echo "当前K线缓存目录：$FULL_HISTORY_CACHE_DIR"
@@ -123,7 +137,7 @@ jobs:
             echo "没有K线缓存目录，本次将走 BaoStock 主数据源。"
           fi
 
-      - name: ④ 检查风险雷区文件
+      - name: ⑤ 检查风险雷区文件
         shell: bash
         run: |
           if [ -f "risk_flags.json" ]; then
@@ -133,13 +147,13 @@ jobs:
             echo "模型仍然可以运行，但外部监管/财务/治理雷区识别会变弱。"
           fi
 
-      - name: ⑤ 安装Python环境
+      - name: ⑥ 安装Python环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: ⑥ 安装运行依赖
+      - name: ⑦ 安装运行依赖
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -150,12 +164,13 @@ jobs:
             pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
           fi
 
-      - name: ⑦ 检查Python代码语法
+      - name: ⑧ 检查Python代码语法
         shell: bash
         run: |
-          python -m py_compile stock_alert_v25_3_bigbull_full.py
+          echo "检查Python代码语法：$MODEL_FILE"
+          python -m py_compile "$MODEL_FILE"
 
-      - name: ⑧ 运行一号员工选股模型
+      - name: ⑨ 运行一号员工选股模型
         shell: bash
         run: |
           MODE="${{ github.event.inputs.mode }}"
@@ -169,15 +184,16 @@ jobs:
           fi
 
           echo "当前运行模式：$MODE"
+          echo "一号员工主程序：$MODEL_FILE"
           echo "是否读取K线缓存：$USE_FULL_HISTORY_CACHE"
           echo "K线缓存目录：$FULL_HISTORY_CACHE_DIR"
           echo "AkShare补拉开关：$KLINE_FALLBACK_AKSHARE"
 
           if [ "$MODE" = "selfcheck" ]; then
-            python stock_alert_v25_3_bigbull_full.py --mode daily --self-check
+            python "$MODEL_FILE" --mode daily --self-check
 
           elif [ "$MODE" = "backtest" ]; then
-            CMD="python stock_alert_v25_3_bigbull_full.py --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
+            CMD="python \"$MODEL_FILE\" --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
 
             if [ -n "$MAX_DATES" ]; then
               CMD="$CMD --max-dates $MAX_DATES"
@@ -191,10 +207,10 @@ jobs:
             eval "$CMD"
 
           else
-            python stock_alert_v25_3_bigbull_full.py --mode daily
+            python "$MODEL_FILE" --mode daily
           fi
 
-      - name: ⑨ 保存运行结果
+      - name: ⑩ 保存运行结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
