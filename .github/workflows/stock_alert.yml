@@ -215,16 +215,28 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # V19/V19.1 推送思路：不再用80分作为硬门槛；每日按排序固定推送Top3。
-          # 这些变量如果 stock_alert.py 当前版本尚未全部读取，也不会影响运行。
+          # V20.3.1：固定Top3 + 近期推荐生命周期跟踪 + 基础筛选重构 + 动态风险库。
           FINAL_SCORE_THRESHOLD: "0"
           TOP_PUSH_LIMIT: "3"
           RESULT_LIMIT: "3"
           FORCE_TOP_N: "3"
           MIN_PUSH_COUNT: "3"
+          CHECK_DAYS: "1"
           SEND_V16_PNG_TABLES: "0"
           DEEP_SCORE_HARD_CAP: "200"
           DEEP_SCORE_LIMIT: "500"
+
+          # V20.3.1 主输出文件。
+          V20_3_1_SCORE_CARDS_FILE: "v20_3_1_score_cards.json"
+          V20_3_1_DAILY_REPORT_FILE: "v20_3_1_daily_report.txt"
+          V20_3_1_REVIEW_REPORT_FILE: "v20_3_1_review_report.txt"
+          V20_3_1_CONDITION_TABLE_FILE: "v20_3_1_condition_probability_table.json"
+          V20_3_1_SIGNAL_LIFECYCLE_FILE: "v20_3_1_signal_lifecycle.json"
+          V20_3_1_BASE_SCREEN_AUDIT_FILE: "v20_3_1_base_screen_audit.json"
+          V20_3_1_BASE_RISK_AUDIT_FILE: "v20_3_1_base_risk_audit.json"
+          V20_3_1_MODEL_AUDIT_LOG_FILE: "v20_3_1_model_audit_log.json"
+
+          # 保留旧变量兼容，避免 stock_alert.py 内部仍有旧字段读取时报错。
           V19_SCORE_CARDS_FILE: "v19_4_score_cards.json"
           V19_DAILY_REPORT_FILE: "v19_4_daily_report.txt"
           V19_REVIEW_REPORT_FILE: "v19_4_review_report.txt"
@@ -235,8 +247,17 @@ jobs:
         run: |
           echo "[RUN] 一号员工A股选股并推送"
           echo "使用 TELEGRAM_BOT_TOKEN → TELEGRAM_TOKEN"
-          echo "V19.4: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
-          python -u stock_alert.py
+          echo "V20.3.1: FINAL_SCORE_THRESHOLD=0, TOP_PUSH_LIMIT=3, RESULT_LIMIT=3, DEEP_SCORE_HARD_CAP=200"
+
+          if [ -f "stock_alert.py" ]; then
+            python -u stock_alert.py
+          elif [ -f "stock_alert_v20_3_1.py" ]; then
+            echo "⚠️ 未找到 stock_alert.py，改用 stock_alert_v20_3_1.py。建议仓库里统一命名为 stock_alert.py。"
+            python -u stock_alert_v20_3_1.py
+          else
+            echo "❌ 未找到 stock_alert.py 或 stock_alert_v20_3_1.py"
+            exit 1
+          fi
 
       - name: 数据未达标时不运行正式推荐
         if: ${{ steps.data_gate.outputs.should_run != 'true' }}
@@ -332,7 +353,21 @@ jobs:
 
           echo ""
           echo "Important candidate/report files:"
-          for f in stock_candidates.json v19_4_score_cards.json v19_4_daily_report.txt v19_4_review_report.txt v19_2_score_cards.json v19_2_daily_report.txt v19_2_review_report.txt v19_1_score_cards.json v19_1_daily_report.txt v19_1_review_report.txt telegram_message.txt telegram_report.txt; do
+          for f in \
+            stock_candidates.json \
+            v20_3_1_score_cards.json \
+            v20_3_1_daily_report.txt \
+            v20_3_1_review_report.txt \
+            v20_3_1_condition_probability_table.json \
+            v20_3_1_signal_lifecycle.json \
+            v20_3_1_base_screen_audit.json \
+            v20_3_1_base_risk_audit.json \
+            v20_3_1_model_audit_log.json \
+            v19_4_score_cards.json \
+            v19_4_daily_report.txt \
+            v19_4_review_report.txt \
+            telegram_message.txt \
+            telegram_report.txt; do
             if [ -f "$f" ]; then
               echo "FOUND $f"
               ls -lah "$f"
@@ -352,15 +387,17 @@ jobs:
           path: |
             outputs/
             stock_candidates.json
+            v20_3_1_score_cards.json
+            v20_3_1_daily_report.txt
+            v20_3_1_review_report.txt
+            v20_3_1_condition_probability_table.json
+            v20_3_1_signal_lifecycle.json
+            v20_3_1_base_screen_audit.json
+            v20_3_1_base_risk_audit.json
+            v20_3_1_model_audit_log.json
             v19_4_score_cards.json
             v19_4_daily_report.txt
             v19_4_review_report.txt
-            v19_2_score_cards.json
-            v19_2_daily_report.txt
-            v19_2_review_report.txt
-            v19_1_score_cards.json
-            v19_1_daily_report.txt
-            v19_1_review_report.txt
             telegram_message.txt
             telegram_report.txt
             *.json
