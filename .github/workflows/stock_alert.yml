@@ -1,14 +1,14 @@
 name: 一号员工选股模型 V25.3
 
 on:
-  # 正式生产：等“K线缓存验收”成功后，再自动启动一号员工
+  # K线验收成功后，自动启动一号员工
   workflow_run:
     workflows:
       - A Stock Kline Cache Acceptance
     types:
       - completed
 
-  # 手动运行：需要时可以手动跑 daily / backtest / selfcheck
+  # 手动运行 daily / backtest / selfcheck
   workflow_dispatch:
     inputs:
       mode:
@@ -46,8 +46,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  actions: read
+  contents: write
+  actions: write
 
 jobs:
   run-stock-alert:
@@ -55,28 +55,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
-    # workflow_run 触发时，只有“K线缓存验收成功”才运行；
-    # 手动运行时不拦截。
+    # 自动触发时，只有 K线验收成功才运行；手动运行不拦截
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 一号员工主程序，仓库根目录里的 stock_alert.py
+      # 一号员工主程序
       MODEL_FILE: 'stock_alert.py'
 
-      # 生产模式：一号员工只读已经更新/验收过的K线缓存
+      # pending 请求文件：用于“没缓存时先缓存，缓存完成后继续跑原来的 daily/backtest”
+      PENDING_REQUEST_FILE: '.github/pending_stock_alert_request.json'
+
+      # 生产模式：一号员工优先只读已经更新/验收过的K线缓存
       USE_FULL_HISTORY_CACHE: '1'
       FULL_HISTORY_CACHE_DIR: 'K线缓存'
-
-      # 不允许用旧缓存硬凑正式结果
       ALLOW_STALE_KLINE_CACHE: '0'
 
-      # BaoStock 是主数据源，但正式 daily 不应该现场全市场重拉
+      # BaoStock 是主数据源；AkShare 默认不做大规模补拉
       KLINE_FALLBACK_AKSHARE: '0'
       STOCK_LIST_FALLBACK_AKSHARE: '0'
 
-      # BaoStock 连接保护
+      # BaoStock 稳定性参数
       BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
       SUPPRESS_BAOSTOCK_VERBOSE: '1'
       REQUEST_SLEEP: '0.02'
@@ -85,15 +85,15 @@ jobs:
       SINGLE_STOCK_TIMEOUT_SECONDS: '8'
       STOCK_LIST_QUERY_TIMEOUT_SECONDS: '60'
 
-      # 每日正式选股提速参数
-      BASE_KLINE_LOOKBACK_DAYS: '420'
+      # 每日正式选股口径
+      BASE_KLINE_LOOKBACK_DAYS: '520'
       DEEP_KLINE_LOOKBACK_DAYS: '2200'
       KLINE_LOOKBACK_DAYS: '2200'
-      DEEP_SCORE_LIMIT: '120'
-      DEEP_SCORE_LIMIT_RAW: '120'
-      DEEP_SCORE_HARD_CAP: '120'
+      DEEP_SCORE_LIMIT: '200'
+      DEEP_SCORE_LIMIT_RAW: '200'
+      DEEP_SCORE_HARD_CAP: '200'
 
-      # 最低样本要求：缓存验收后正常应远高于这个数
+      # 最低样本要求
       MIN_VALID_KLINE: '1000'
 
       # 正式推送数量
@@ -108,9 +108,14 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
+      # GitHub CLI
+      GH_TOKEN: ${{ github.token }}
+
     steps:
       - name: ① 下载仓库代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: ② 显示当前生产口径
         shell: bash
@@ -118,10 +123,14 @@ jobs:
           echo "================ 一号员工生产口径 ================"
           echo "模型版本：V25.3"
           echo "主程序文件：$MODEL_FILE"
-          echo "正式触发：A Stock Kline Cache Acceptance 成功后自动运行"
-          echo "每日选股：只读已验收K线缓存"
+          echo "手动 daily：先查缓存，有缓存就选股，没缓存就自动缓存"
+          echo "手动 backtest：先查缓存，有缓存就回测，没缓存就自动缓存"
+          echo "selfcheck：只自检，不缓存"
+          echo "K线验收成功后：自动启动一号员工"
           echo "主数据源：BaoStock"
           echo "AkShare补拉：默认关闭"
+          echo "基础层窗口：520天"
+          echo "深度评分数量：200只"
           echo "正式推送数量：Top3"
           echo "=================================================="
 
@@ -139,72 +148,223 @@ jobs:
 
           echo "✅ 找到一号员工主程序：$MODEL_FILE"
 
-      - name: ④ 尝试下载K线验收任务产物
+      - name: ④ 解析本次运行请求
+        shell: bash
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_START: ${{ github.event.inputs.start }}
+          INPUT_END: ${{ github.event.inputs.end }}
+          INPUT_MAX_DATES: ${{ github.event.inputs.max_dates }}
+          INPUT_BASE_LIMIT: ${{ github.event.inputs.base_limit }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "开始解析本次运行请求..."
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            MODE="${INPUT_MODE:-daily}"
+            START="${INPUT_START:-2022-04-08}"
+            END="${INPUT_END:-2023-04-08}"
+            MAX_DATES="${INPUT_MAX_DATES:-}"
+            BASE_LIMIT="${INPUT_BASE_LIMIT:-}"
+            PENDING_USED="0"
+
+            echo "本次为手动运行。"
+
+          else
+            echo "本次为 K线验收成功后自动触发。"
+
+            if [ -f "$PENDING_REQUEST_FILE" ]; then
+              echo "发现 pending 请求文件：$PENDING_REQUEST_FILE"
+              MODE=$(python - <<'PY'
+          import json
+          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
+              d=json.load(f)
+          print(d.get("mode","daily"))
+          PY
+          )
+              START=$(python - <<'PY'
+          import json
+          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
+              d=json.load(f)
+          print(d.get("start","2022-04-08"))
+          PY
+          )
+              END=$(python - <<'PY'
+          import json
+          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
+              d=json.load(f)
+          print(d.get("end","2023-04-08"))
+          PY
+          )
+              MAX_DATES=$(python - <<'PY'
+          import json
+          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
+              d=json.load(f)
+          print(d.get("max_dates",""))
+          PY
+          )
+              BASE_LIMIT=$(python - <<'PY'
+          import json
+          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
+              d=json.load(f)
+          print(d.get("base_limit",""))
+          PY
+          )
+              PENDING_USED="1"
+            else
+              echo "没有 pending 请求文件，默认执行 daily。"
+              MODE="daily"
+              START="2022-04-08"
+              END="2023-04-08"
+              MAX_DATES=""
+              BASE_LIMIT=""
+              PENDING_USED="0"
+            fi
+          fi
+
+          echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
+          echo "BT_START=$START" >> "$GITHUB_ENV"
+          echo "BT_END=$END" >> "$GITHUB_ENV"
+          echo "BT_MAX_DATES=$MAX_DATES" >> "$GITHUB_ENV"
+          echo "BT_BASE_LIMIT=$BASE_LIMIT" >> "$GITHUB_ENV"
+          echo "PENDING_FILE_USED=$PENDING_USED" >> "$GITHUB_ENV"
+
+          echo "本次模式：$MODE"
+          echo "回测开始：$START"
+          echo "回测结束：$END"
+          echo "最多交易日：$MAX_DATES"
+          echo "基础入深度数量：$BASE_LIMIT"
+
+      - name: ⑤ 尝试下载K线验收产物
         if: ${{ github.event_name == 'workflow_run' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
+          name: kline-cache-accepted
           path: .
-          merge-multiple: true
 
-      - name: ⑤ 尝试恢复GitHub缓存里的K线
+      - name: ⑥ 尝试恢复GitHub缓存里的K线
+        if: ${{ env.RUN_MODE != 'selfcheck' }}
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: |
             K线缓存
             kline_cache
-          key: astock-kline-cache-${{ github.ref_name }}
+          key: a-kline-cache-${{ github.ref_name }}
           restore-keys: |
-            astock-kline-cache-
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
 
-      - name: ⑥ 检查K线缓存文件夹
+      - name: ⑦ 检查K线缓存状态
         shell: bash
         run: |
-          echo "开始检查K线缓存文件夹..."
+          echo "开始检查K线缓存状态..."
+
+          if [ "$RUN_MODE" = "selfcheck" ]; then
+            echo "当前是 selfcheck，自检模式不需要K线缓存。"
+            echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
+            echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           if [ -d "K线缓存" ]; then
             echo "✅ 找到中文K线缓存文件夹：K线缓存"
             echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
-            echo "USE_FULL_HISTORY_CACHE=1" >> "$GITHUB_ENV"
-
             CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           elif [ -d "kline_cache" ]; then
             echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
             echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            echo "USE_FULL_HISTORY_CACHE=1" >> "$GITHUB_ENV"
-
             CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           else
-            echo "❌ 没找到K线缓存文件夹。"
-            echo "说明：一号员工现在是生产只读缓存模式。"
-            echo "请先确认 A Stock Full Kline Cache Auto Backfill 和 A Stock Kline Cache Acceptance 已经成功，并且它们保存了 K线缓存 / kline_cache。"
-            echo "为避免重新现场拉全市场历史K线，本次停止运行。"
-            exit 1
+            echo "⚠️ 没找到 K线缓存 或 kline_cache。"
+            CSV_COUNT=0
           fi
 
-          if [ "$CSV_COUNT" -lt 1000 ]; then
-            echo "❌ K线缓存CSV数量过少：$CSV_COUNT"
-            echo "为避免小样本误判，本次停止运行。"
-            exit 1
+          if [ "$CSV_COUNT" -ge 1000 ]; then
+            echo "✅ K线缓存可用。"
+            echo "HAS_KLINE_CACHE=1" >> "$GITHUB_ENV"
+            echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
+            echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "本次是手动 daily/backtest，缓存不足，准备保存 pending 请求并自动启动缓存任务。"
+              echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
+            else
+              echo "本次是验收后自动触发，但仍然没有拿到缓存，停止。"
+              exit 1
+            fi
           fi
 
-          echo "✅ K线缓存基础检查通过。"
+      - name: ⑧ 没缓存时保存 pending 请求
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+        shell: bash
+        run: |
+          echo "保存 pending 请求：$PENDING_REQUEST_FILE"
+          mkdir -p .github
 
-      - name: ⑦ 显示最近的K线缓存文件
+          python - <<PY
+          import json, os
+          data = {
+              "mode": os.environ.get("RUN_MODE", "daily"),
+              "start": os.environ.get("BT_START", "2022-04-08"),
+              "end": os.environ.get("BT_END", "2023-04-08"),
+              "max_dates": os.environ.get("BT_MAX_DATES", ""),
+              "base_limit": os.environ.get("BT_BASE_LIMIT", ""),
+              "created_by": "stock_alert_workflow",
+          }
+          with open(os.environ["PENDING_REQUEST_FILE"], "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(json.dumps(data, ensure_ascii=False, indent=2))
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$PENDING_REQUEST_FILE"
+
+          if git diff --cached --quiet; then
+            echo "pending 请求没有变化，不需要提交。"
+          else
+            git commit -m "保存一号员工待执行请求"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
+
+      - name: ⑨ 没缓存时自动启动K线缓存任务
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+        shell: bash
+        run: |
+          echo "准备自动启动：A Stock Full Kline Cache Auto Backfill"
+          gh workflow run "A Stock Full Kline Cache Auto Backfill" --ref "$GITHUB_REF_NAME"
+          echo "✅ 已启动K线缓存任务。"
+          echo "本次一号员工先结束；缓存完成、验收成功后，会自动继续执行刚才的 $RUN_MODE。"
+
+      - name: ⑩ 没缓存时结束当前运行
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+        shell: bash
+        run: |
+          echo "当前没有可用K线缓存，已自动启动缓存任务。"
+          echo "等待缓存完成后，一号员工会被验收任务自动触发。"
+          exit 0
+
+      - name: ⑪ 显示最近的K线缓存文件
+        if: ${{ env.SHOULD_RUN_MODEL == '1' && env.RUN_MODE != 'selfcheck' }}
         shell: bash
         run: |
           echo "当前K线缓存目录：$FULL_HISTORY_CACHE_DIR"
-
           echo "最近更新的K线文件："
           find "$FULL_HISTORY_CACHE_DIR" -name "*.csv" -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30 || true
 
-      - name: ⑧ 检查风险雷区文件
+      - name: ⑫ 检查风险雷区文件
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         shell: bash
         run: |
           if [ -f "risk_flags.json" ]; then
@@ -214,13 +374,15 @@ jobs:
             echo "模型仍可运行，但外部监管/财务/治理雷区识别会变弱。"
           fi
 
-      - name: ⑨ 安装Python环境
+      - name: ⑬ 安装Python环境
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: ⑩ 安装运行依赖并自检核心包
+      - name: ⑭ 安装运行依赖并自检核心包
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -242,23 +404,27 @@ jobs:
           print("✅ pandas / numpy / requests / BaoStock 导入成功")
           PY
 
-      - name: ⑪ 检查Python代码语法
+      - name: ⑮ 检查Python代码语法
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         shell: bash
         run: |
           echo "检查Python代码语法：$MODEL_FILE"
           python -m py_compile "$MODEL_FILE"
           echo "✅ Python语法检查通过"
 
-      - name: ⑫ 运行前轻量自检
+      - name: ⑯ 运行前轻量自检
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         shell: bash
         run: |
           echo "运行前环境确认："
+          echo "本次模式：$RUN_MODE"
           echo "主程序：$MODEL_FILE"
           echo "是否读取K线缓存：$USE_FULL_HISTORY_CACHE"
           echo "K线缓存目录：$FULL_HISTORY_CACHE_DIR"
           echo "AkShare补拉开关：$KLINE_FALLBACK_AKSHARE"
           echo "股票池AkShare备用开关：$STOCK_LIST_FALLBACK_AKSHARE"
           echo "Telegram开关：$ENABLE_TELEGRAM"
+          echo "pending文件是否使用：$PENDING_FILE_USED"
 
           if [ "$ENABLE_TELEGRAM" = "1" ] && [ -z "$TELEGRAM_TOKEN" ]; then
             echo "⚠️ Telegram Token 为空，模型可运行，但可能无法推送。"
@@ -268,33 +434,24 @@ jobs:
             echo "⚠️ Telegram Chat ID 为空，模型可运行，但可能无法推送。"
           fi
 
-      - name: ⑬ 运行一号员工选股模型
+      - name: ⑰ 运行一号员工选股模型
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
         shell: bash
         run: |
-          MODE="${{ github.event.inputs.mode }}"
-          START="${{ github.event.inputs.start }}"
-          END="${{ github.event.inputs.end }}"
-          MAX_DATES="${{ github.event.inputs.max_dates }}"
-          BASE_LIMIT="${{ github.event.inputs.base_limit }}"
+          echo "当前运行模式：$RUN_MODE"
 
-          if [ -z "$MODE" ]; then
-            MODE="daily"
-          fi
-
-          echo "当前运行模式：$MODE"
-
-          if [ "$MODE" = "selfcheck" ]; then
+          if [ "$RUN_MODE" = "selfcheck" ]; then
             python "$MODEL_FILE" --mode daily --self-check
 
-          elif [ "$MODE" = "backtest" ]; then
-            CMD="python \"$MODEL_FILE\" --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
+          elif [ "$RUN_MODE" = "backtest" ]; then
+            CMD="python \"$MODEL_FILE\" --mode backtest --start ${BT_START:-2022-04-08} --end ${BT_END:-2023-04-08}"
 
-            if [ -n "$MAX_DATES" ]; then
-              CMD="$CMD --max-dates $MAX_DATES"
+            if [ -n "$BT_MAX_DATES" ]; then
+              CMD="$CMD --max-dates $BT_MAX_DATES"
             fi
 
-            if [ -n "$BASE_LIMIT" ]; then
-              CMD="$CMD --base-limit $BASE_LIMIT"
+            if [ -n "$BT_BASE_LIMIT" ]; then
+              CMD="$CMD --base-limit $BT_BASE_LIMIT"
             fi
 
             echo "$CMD"
@@ -304,7 +461,24 @@ jobs:
             python "$MODEL_FILE" --mode daily
           fi
 
-      - name: ⑭ 保存运行结果
+      - name: ⑱ 清理已完成的 pending 请求
+        if: ${{ success() && env.PENDING_FILE_USED == '1' }}
+        shell: bash
+        run: |
+          echo "本次 pending 请求已经执行完成，准备清理：$PENDING_REQUEST_FILE"
+
+          if [ -f "$PENDING_REQUEST_FILE" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm "$PENDING_REQUEST_FILE"
+            git commit -m "清理一号员工待执行请求" || true
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push || true
+          else
+            echo "没有 pending 文件需要清理。"
+          fi
+
+      - name: ⑲ 保存运行结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
