@@ -37,6 +37,10 @@ import requests
 
 # Telegram发送函数兜底引用，防止异常处理阶段 NameError。
 _ORIGINAL_SEND_TELEGRAM = None
+# V25.3 HOTFIX：图片待发送队列必须全局初始化，否则异常消息阶段会触发 NameError。
+TELEGRAM_PENDING_IMAGES = []
+# V25.3 数据审计：记录每只股票本次读到/拉到的K线最新日期。
+KLINE_DATE_AUDIT = []
 
 
 try:
@@ -154,13 +158,13 @@ warnings.filterwarnings("ignore")
 #    涨停/大阳阶段标签修正、近端压力硬约束、极端放量/高乖离/过热组合封顶。
 # ===========================================================================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))  # 兼容 GitHub Secret 名称 TELEGRAM_BOT_TOKEN
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
-CACHE_DIR = os.environ.get("CACHE_DIR", "kline_cache")  # 默认旧英文缓存目录；可通过环境变量切换为中文目录
+CACHE_DIR = "kline_cache"
 MODEL_VERSION = "V25.3一号员工选股模型｜V24.1生产核心完整融合+daily/backtest同逻辑+严格No-Lookahead真实回测版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
@@ -235,7 +239,7 @@ MIN_FORMAL_COVERAGE_RATE = float(os.environ.get("MIN_FORMAL_COVERAGE_RATE", "0.8
 # V12.7：稳定提速补丁。评分逻辑不变，只增强数据获取层。
 # 1）BaoStock失败时可切换AkShare补拉；2）远程失败时允许使用旧缓存；
 # 3）连续失败时更快熔断，避免成功数卡死后继续空跑几千只。
-KLINE_FALLBACK_AKSHARE = os.environ.get("KLINE_FALLBACK_AKSHARE", "0")  # 生产默认不启用AkShare大规模补拉；需要时在yml里显式设为1
+KLINE_FALLBACK_AKSHARE = os.environ.get("KLINE_FALLBACK_AKSHARE", "0")
 ALLOW_STALE_KLINE_CACHE = os.environ.get("ALLOW_STALE_KLINE_CACHE", "1")
 STALE_CACHE_MAX_DAYS = int(os.environ.get("STALE_CACHE_MAX_DAYS", "10"))
 AKSHARE_FALLBACK_MAX_RETRIES = int(os.environ.get("AKSHARE_FALLBACK_MAX_RETRIES", "2"))
@@ -248,9 +252,6 @@ DEEP_EMPTY_CACHE_MIN_ROWS = int(os.environ.get("DEEP_EMPTY_CACHE_MIN_ROWS", "500
 # 说明：不改V16评分模型，只把数据入口改为优先读取全量缓存 kline_cache/000001.csv。
 USE_FULL_HISTORY_CACHE = os.environ.get("USE_FULL_HISTORY_CACHE", "1")
 FULL_HISTORY_CACHE_DIR = os.environ.get("FULL_HISTORY_CACHE_DIR", CACHE_DIR)
-# 兼容中文缓存文件夹：如果没有显式指定目录，但仓库里存在“ K线缓存 ”，自动优先读取它。
-if not os.environ.get("FULL_HISTORY_CACHE_DIR") and os.path.exists("K线缓存"):
-    FULL_HISTORY_CACHE_DIR = "K线缓存"
 MODEL_UNIVERSE_FILE = os.environ.get("MODEL_UNIVERSE_FILE", "")
 FULL_CACHE_MAX_STALE_DAYS = int(os.environ.get("FULL_CACHE_MAX_STALE_DAYS", "7"))
 FULL_CACHE_BASE_TAIL_ROWS = int(os.environ.get("FULL_CACHE_BASE_TAIL_ROWS", "760"))
@@ -273,7 +274,7 @@ DATA_GATE_FAILED_COUNT = os.environ.get("DATA_GATE_FAILED_COUNT", "").strip()
 # V11.5：股票池获取保护。BaoStock 股票列表阶段也可能卡住，必须有超时、重试、备用 AkShare 通道。
 STOCK_LIST_QUERY_TIMEOUT_SECONDS = int(os.environ.get("STOCK_LIST_QUERY_TIMEOUT_SECONDS", "120"))
 STOCK_LIST_MAX_RETRIES = int(os.environ.get("STOCK_LIST_MAX_RETRIES", "2"))
-STOCK_LIST_FALLBACK_AKSHARE = os.environ.get("STOCK_LIST_FALLBACK_AKSHARE", "0")  # 股票池仍以BaoStock/缓存为主；AkShare仅手动开启备用
+STOCK_LIST_FALLBACK_AKSHARE = os.environ.get("STOCK_LIST_FALLBACK_AKSHARE", "0")
 STOCK_LIST_RELOGIN_ON_FAIL = os.environ.get("STOCK_LIST_RELOGIN_ON_FAIL", "1")
 
 SCORE_LIMIT = 75
@@ -7909,6 +7910,73 @@ def v122_base_candidate_gate(row):
     return True, "通过V12.5基础闸门"
 
 
+
+def record_kline_date_audit(code, name, bs_code, df, stage="base"):
+    """记录本次每只股票读到/拉到的K线最新日期，用于确认是否已到当天。"""
+    try:
+        last_date = ""
+        rows = 0
+        if df is not None and not getattr(df, "empty", True) and "date" in df.columns:
+            last_date = str(df["date"].max())
+            rows = int(len(df))
+        KLINE_DATE_AUDIT.append({
+            "code": str(code),
+            "name": str(name),
+            "bs_code": str(bs_code),
+            "stage": str(stage),
+            "last_date": last_date,
+            "rows": rows,
+        })
+    except Exception:
+        pass
+
+
+def print_kline_date_audit(target_date=""):
+    """打印K线日期覆盖率，避免只看到股票池日期却不知道K线是否更新到当天。"""
+    try:
+        items = list(globals().get("KLINE_DATE_AUDIT", []) or [])
+        if not items:
+            print("K线日期检查：没有可统计的K线数据。")
+            return {"target_date": target_date, "total": 0, "latest": 0, "coverage": 0.0}
+        dates = [x.get("last_date", "") for x in items if x.get("last_date")]
+        if not target_date:
+            target_date = LAST_TRADE_DAY or (max(dates) if dates else "")
+        total = len(items)
+        latest = [x for x in items if x.get("last_date") == target_date]
+        stale = [x for x in items if x.get("last_date") and x.get("last_date") != target_date]
+        failed = [x for x in items if not x.get("last_date")]
+        coverage = len(latest) / max(1, total)
+        print("========== K线日期检查 ==========")
+        print(f"目标日期：{target_date or '未知'}")
+        print(f"最新K线股票：{len(latest)}/{total}，覆盖率：{coverage:.2%}")
+        print(f"旧K线股票：{len(stale)}")
+        print(f"失败/无K线股票：{len(failed)}")
+        if stale:
+            print("旧K线示例：")
+            for x in stale[:20]:
+                print(f"{x.get('code')} {x.get('name')} 最新K线={x.get('last_date')} rows={x.get('rows')}")
+        if failed:
+            print("失败/无K线示例：")
+            for x in failed[:20]:
+                print(f"{x.get('code')} {x.get('name')} 无有效K线")
+        save_json_file("kline_date_audit.json", {
+            "generated_at_bj": bj_time_str(),
+            "target_date": target_date,
+            "total": total,
+            "latest_count": len(latest),
+            "stale_count": len(stale),
+            "failed_count": len(failed),
+            "coverage": coverage,
+            "items": items,
+        })
+        print("K线日期检查文件已保存：kline_date_audit.json")
+        print("================================")
+        return {"target_date": target_date, "total": total, "latest": len(latest), "coverage": coverage}
+    except Exception as e:
+        print(f"K线日期检查失败：{e}")
+        return {"target_date": target_date, "total": 0, "latest": 0, "coverage": 0.0}
+
+
 def append_seed_pool_snapshot(rows, path=SEED_POOL_FILE):
     """保存后台种子/跟踪池快照，减少后续人工从Telegram反推。"""
     try:
@@ -7945,6 +8013,7 @@ def process_stock_base(row):
             return []
 
     df = get_daily_kline(bs_code, lookback_days=BASE_KLINE_LOOKBACK_DAYS, cache_scope="base")
+    record_kline_date_audit(code, name, bs_code, df, stage="base")
     recent = calc_base_rows(df)
 
     rows = []
@@ -9964,8 +10033,9 @@ _ORIGINAL_SEND_TELEGRAM = send_telegram
 def send_telegram(message):
     ok = globals().get('_ORIGINAL_SEND_TELEGRAM')(message) if globals().get('_ORIGINAL_SEND_TELEGRAM') else False
     global TELEGRAM_PENDING_IMAGES
-    if TELEGRAM_PENDING_IMAGES:
-        for img, cap in TELEGRAM_PENDING_IMAGES:
+    pending_images = globals().get('TELEGRAM_PENDING_IMAGES', []) or []
+    if pending_images:
+        for img, cap in pending_images:
             send_telegram_photo(img, cap)
         TELEGRAM_PENDING_IMAGES = []
     return ok
@@ -13907,7 +13977,7 @@ def main():
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
-        print("V14原主模型完整底座+增量体系版：不删V12.6主模型任何有效逻辑；新增阳包阴精细分层、V14后置审核、相对最优三选、分项打分表；财务硬雷区一票否决，普通缺点扣分不杀光。")
+        print("V25.3一号员工选股模型启动：当前为生产融合版，保留历史有效底座并由V25.3统一调度。")
 
         base_rows = []
         all_dates = set()
@@ -13993,6 +14063,7 @@ def main():
         dates = sorted(list(all_dates), reverse=True)[:CHECK_DAYS]
 
         progress_line("基础评分完成", processed_count, len(stock_list), start_ts, kline_success, kline_fail)
+        kline_date_audit = print_kline_date_audit(target_date=LAST_TRADE_DAY)
         coverage_rate = kline_success / max(1, kline_success + kline_fail)
         print(f"{summarize_kline_source_stats()}，覆盖率={coverage_rate:.1%}")
         if failed_symbols:
