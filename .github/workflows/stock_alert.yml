@@ -1,48 +1,41 @@
-name: Stock Alert V25.3 BigBull Daily & Backtest
+name: Stock Alert V25.3
 
 on:
-  schedule:
-    # GitHub Actions 使用 UTC。这里是北京时间 09:05，若你原来有固定时间，可自行改回原 cron。
-    - cron: '5 1 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
-        description: '运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检'
+        description: "运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检"
         required: true
-        default: 'daily'
+        default: "daily"
         type: choice
         options:
           - daily
           - backtest
           - selfcheck
       start:
-        description: '回测开始日期，例如 2022-04-08，仅 backtest 使用'
+        description: "回测开始日期，仅 backtest 使用"
         required: false
-        default: '2022-04-08'
+        default: "2022-04-08"
       end:
-        description: '回测结束日期，例如 2023-04-08，仅 backtest 使用'
+        description: "回测结束日期，仅 backtest 使用"
         required: false
-        default: '2023-04-08'
+        default: "2023-04-08"
       max_dates:
-        description: '最多回测交易日数量，留空表示不限制'
+        description: "最多回测交易日数量，留空表示不限制"
         required: false
-        default: ''
+        default: ""
       base_limit:
-        description: '回测基础层进入深度层数量，例如 300/500，留空使用脚本默认'
+        description: "基础层进入深度层数量，例如 200/300/500"
         required: false
-        default: ''
+        default: ""
+
+  schedule:
+    - cron: "30 7 * * 1-5"
 
 jobs:
   run-stock-alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
-    env:
-      PYTHONUNBUFFERED: '1'
-      USE_FULL_HISTORY_CACHE: '1'
-      # 如脚本使用 Telegram 推送，保持与你仓库 Secrets 名称一致。
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -51,63 +44,65 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          pip install pandas numpy requests tqdm akshare beautifulsoup4 lxml openpyxl
+
+      - name: Detect Python script
+        run: |
+          if [ -f "stock_alert_v25_3_bigbull_full.py" ]; then
+            echo "SCRIPT=stock_alert_v25_3_bigbull_full.py" >> $GITHUB_ENV
+          elif [ -f "stock_alert_v25_3_full.py" ]; then
+            echo "SCRIPT=stock_alert_v25_3_full.py" >> $GITHUB_ENV
+          elif [ -f "stock_alert_v25_3.py" ]; then
+            echo "SCRIPT=stock_alert_v25_3.py" >> $GITHUB_ENV
+          elif [ -f "stock_alert_v24_1_full.py" ]; then
+            echo "SCRIPT=stock_alert_v24_1_full.py" >> $GITHUB_ENV
           else
-            pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4
+            echo "找不到可运行的 Python 文件"
+            ls -la
+            exit 1
           fi
+          echo "Using script: $SCRIPT"
 
       - name: Syntax check
         run: |
-          python -m py_compile stock_alert_v25_3_bigbull_full.py
+          python -m py_compile "$SCRIPT"
 
       - name: Run stock alert
-        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          TQDM_DISABLE: "1"
         run: |
-          MODE="${{ github.event.inputs.mode }}"
-          START="${{ github.event.inputs.start }}"
-          END="${{ github.event.inputs.end }}"
-          MAX_DATES="${{ github.event.inputs.max_dates }}"
-          BASE_LIMIT="${{ github.event.inputs.base_limit }}"
-
-          # schedule 触发时 inputs 为空，默认 daily。
-          if [ -z "$MODE" ]; then
-            MODE="daily"
-          fi
+          MODE="${{ github.event.inputs.mode || 'daily' }}"
 
           if [ "$MODE" = "selfcheck" ]; then
-            python stock_alert_v25_3_bigbull_full.py --mode daily --self-check
+            python "$SCRIPT" --mode backtest --self-check
           elif [ "$MODE" = "backtest" ]; then
-            CMD="python stock_alert_v25_3_bigbull_full.py --mode backtest --start ${START:-2022-04-08} --end ${END:-2023-04-08}"
-            if [ -n "$MAX_DATES" ]; then
-              CMD="$CMD --max-dates $MAX_DATES"
+            CMD="python $SCRIPT --mode backtest --start ${{ github.event.inputs.start }} --end ${{ github.event.inputs.end }}"
+            if [ -n "${{ github.event.inputs.max_dates }}" ]; then
+              CMD="$CMD --max-dates ${{ github.event.inputs.max_dates }}"
             fi
-            if [ -n "$BASE_LIMIT" ]; then
-              CMD="$CMD --base-limit $BASE_LIMIT"
+            if [ -n "${{ github.event.inputs.base_limit }}" ]; then
+              CMD="$CMD --base-limit ${{ github.event.inputs.base_limit }}"
             fi
             echo "$CMD"
             eval "$CMD"
           else
-            python stock_alert_v25_3_bigbull_full.py --mode daily
+            python "$SCRIPT" --mode daily
           fi
 
-      - name: Upload artifacts
+      - name: Upload output artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stock-alert-v25-3-bigbull-output
+          name: stock-alert-output
           path: |
+            output*
             *.csv
-            *.md
             *.html
-            output*/**
-            reports/**
-            logs/**
-          if-no-files-found: ignore
-          retention-days: 14
+            *.md
+          retention-days: 7
