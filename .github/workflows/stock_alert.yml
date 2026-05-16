@@ -1,4 +1,4 @@
-name: 一号员工选股模型 V25.6
+name: 一号员工选股模型 V25.6.3
 
 on:
   # 每个交易日下午6点执行：GitHub cron 使用 UTC；北京时间18:00 = UTC 10:00
@@ -57,7 +57,7 @@ on:
         default: '3'
 
 concurrency:
-  group: 一号员工选股模型-v25-6-${{ github.ref }}
+  group: 一号员工选股模型-v25-6-3-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -66,7 +66,7 @@ permissions:
 
 jobs:
   run-stock-alert:
-    name: 运行一号员工选股 V25.6
+    name: 运行一号员工选股 V25.6.3
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -79,15 +79,15 @@ jobs:
       # 当前仓库真实主程序文件名。日志显示仓库里存在 stock_alert.py，不存在 stock_alert_v25_6.py。
       # 所以这里必须指向 stock_alert.py；不要改成不存在的文件名。
       MODEL_FILE: 'stock_alert.py'
-      MODEL_VERSION: 'V25.6'
+      MODEL_VERSION: 'V25.6.3'
 
-      # V25.6 核心线/神经线精修参数：只影响压力/支撑线模块，不改变主流程
+      # V25.6.3 核心线/神经线精修参数：只影响压力/支撑线模块，不改变主流程
       ENABLE_XHU_PRESSURE_BREAKOUT: '1'
       XHU_PRESSURE_DEFAULT_BUCKET_PCT: '0.005'
       XHU_PRESSURE_MAX_ZONES_PER_PERIOD: '5'
       XHU_PRESSURE_ENABLE_YEARLY: '1'
 
-      # V25.6 分层口径：正式A档不降级，新增A-观察层
+      # V25.6.3 分层口径：正式A档不降级，新增A-观察层
       V20_A_MIN_SCORE: '82'
       V20_A_MINUS_MIN_SCORE: '79'
       V20_BPLUS_MIN_SCORE: '75'
@@ -96,7 +96,7 @@ jobs:
       V20_TRADE_QUALITY_FLOOR_A_MINUS: '5'
       V20_TRADE_QUALITY_FLOOR_BPLUS: '3'
 
-      # V25.6 市场环境：默认中性，只影响突破确认强度，不影响股票池与主流程
+      # V25.6.3 市场环境：默认中性，只影响突破确认强度，不影响股票池与主流程
       V24_1_MARKET_REGIME: 'neutral'
 
       # 关键保护：生产任务默认禁止自动回测
@@ -358,7 +358,7 @@ jobs:
           import json, os
           data = {
               "mode": "daily",
-              "created_by": "stock_alert_workflow_v25_6",
+              "created_by": "stock_alert_workflow_v25_6_3",
               "note": "workflow_run 会强制 daily，不会继承 backtest。",
           }
           with open(os.environ["PENDING_REQUEST_FILE"], "w", encoding="utf-8") as f:
