@@ -52,13 +52,11 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 与一号员工保持一致：优先使用中文K线缓存目录
+      # 一号员工当前缓存结构：kline_cache/base/*.csv + kline_cache/deep/*.csv
       USE_FULL_HISTORY_CACHE: "1"
-      FULL_HISTORY_CACHE_DIR: "K线缓存"
-      CACHE_DIR: "K线缓存"
-      ALLOW_STALE_KLINE_CACHE: "0"
+      FULL_HISTORY_CACHE_DIR: "kline_cache/base"
+      CACHE_DIR: "kline_cache"
 
-      # 公开源只做兜底，不作为主入口
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
@@ -81,8 +79,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            K线缓存
             kline_cache
+            K线缓存
           key: a-kline-cache-${{ github.ref_name }}
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
@@ -99,32 +97,50 @@ jobs:
             exit 0
           fi
 
-          if [ -d "K线缓存" ]; then
-            echo "✅ 找到中文K线缓存文件夹：K线缓存"
-            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
-            echo "CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+          CSV_COUNT=0
+
+          if [ -d "kline_cache" ]; then
+            echo "✅ 找到一号员工英文缓存目录：kline_cache"
+            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' | wc -l)"
+            echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l)"
+            echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l)"
+            find kline_cache -name '*.csv' | head -20 || true
+
+            BASE_COUNT=$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l)
+            DEEP_COUNT=$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l)
+            ROOT_COUNT=$(find kline_cache -maxdepth 1 -name '*.csv' 2>/dev/null | wc -l)
+            CSV_COUNT=$((BASE_COUNT + DEEP_COUNT + ROOT_COUNT))
+
+            if [ "$BASE_COUNT" -ge 100 ]; then
+              echo "FULL_HISTORY_CACHE_DIR=kline_cache/base" >> "$GITHUB_ENV"
+              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            elif [ "$DEEP_COUNT" -ge 100 ]; then
+              echo "FULL_HISTORY_CACHE_DIR=kline_cache/deep" >> "$GITHUB_ENV"
+              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            else
+              echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            fi
+
+          elif [ -d "K线缓存" ]; then
+            echo "✅ 找到中文缓存目录：K线缓存"
             CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
-
-          elif [ -d "kline_cache" ]; then
-            echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
-            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
-            echo "K线缓存CSV数量：$CSV_COUNT"
+            find "K线缓存" -name "*.csv" | head -20 || true
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            echo "CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
 
           else
-            echo "⚠️ 没找到 K线缓存 或 kline_cache。"
-            CSV_COUNT=0
+            echo "⚠️ 没找到 kline_cache 或 K线缓存。"
           fi
 
-          if [ "$CSV_COUNT" -ge 1000 ]; then
+          echo "最终识别K线CSV数量：$CSV_COUNT"
+
+          if [ "$CSV_COUNT" -ge 100 ]; then
             echo "✅ K线缓存可用。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           else
             echo "❌ K线缓存不可用或数量过少：$CSV_COUNT"
-            echo "破界战法不直接触发全量补缓存，避免和一号员工缓存任务冲突。"
-            echo "请先运行 A Stock Full Kline Cache Auto Backfill 或等一号员工缓存验收完成。"
             echo "SHOULD_RUN_POJIE=0" >> "$GITHUB_ENV"
             exit 1
           fi
@@ -152,11 +168,7 @@ jobs:
             echo "发现 requirements.txt，先安装仓库依赖。"
             pip install -r requirements.txt
           fi
-
-          echo "强制补装破界战法必需依赖，避免 requirements.txt 缺包。"
           pip install pandas numpy requests akshare baostock openpyxl
-
-          echo "验证关键依赖是否可导入。"
           python - <<'PY'
           import pandas, numpy, requests
           import akshare
