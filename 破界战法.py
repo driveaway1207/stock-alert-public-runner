@@ -669,7 +669,10 @@ def main():
             else:
                 bs_code = "sz." + code
         try:
-            df = base.get_daily_kline(bs_code, cache_scope="deep")
+            try:
+                df = base.get_daily_kline(bs_code, cache_scope="deep")
+            except TypeError:
+                df = base.get_daily_kline(bs_code)
             res = scan_one(code, name, df)
             scanned += 1
             if res and res["score"] >= args.最低分:
