@@ -55,10 +55,10 @@ jobs:
       STOCK_LIST_FALLBACK_AKSHARE: "0"
       KLINE_FALLBACK_AKSHARE: "0"
       POJIE_ALLOW_AKSHARE_KLINE: "0"
-      POJIE_REMOTE_ON_CACHE_MISS: "1"
+      POJIE_REMOTE_ON_CACHE_MISS: "0"
 
-      # 性能优化：全量默认4进程并行读缓存；缓存缺失仍会顺序BaoStock补拉，避免并发打数据源。
-      POJIE_WORKERS: "4"
+      # 性能优化：全量默认10进程并行读本地缓存；底层战法不做BaoStock补拉。
+      POJIE_WORKERS: "10"
       POJIE_PARALLEL_MIN_STOCKS: "300"
       POJIE_FAST_PREFILTER: "1"
 
@@ -268,8 +268,9 @@ jobs:
           echo "是否已恢复K线缓存：$HAS_KLINE_CACHE"
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
           echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
-          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
+          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
           echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
+          echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
