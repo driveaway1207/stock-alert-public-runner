@@ -11,14 +11,17 @@ on:
         options:
           - selfcheck
           - daily
+
       max_stocks:
         description: "最多扫描股票数量；0=不限制。第一次建议100"
         required: true
         default: "100"
+
       result_limit:
         description: "输出候选数量"
         required: true
         default: "10"
+
       send_telegram:
         description: "是否发送Telegram"
         required: true
@@ -52,8 +55,9 @@ jobs:
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
 
-      STOCK_LIST_FALLBACK_AKSHARE: "1"
-      KLINE_FALLBACK_AKSHARE: "1"
+      STOCK_LIST_FALLBACK_AKSHARE: "0"
+      KLINE_FALLBACK_AKSHARE: "0"
+      POJIE_ALLOW_AKSHARE_KLINE: "0"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '100' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
@@ -62,106 +66,36 @@ jobs:
       - name: 下载仓库代码
         uses: actions/checkout@v4
 
-      - name: 显示当前生产路径
+      - name: 显示当前运行环境
         shell: bash
         run: |
+          echo "当前路径："
           pwd
-          echo "当前仓库根目录文件："
+
+          echo "仓库根目录文件："
           ls -la
-          echo "当前 workflow 文件："
+
+          echo "workflow 文件："
           ls -la .github/workflows || true
+
+          echo "Python版本："
+          python3 --version || true
 
       - name: 检查破界主程序
         shell: bash
         run: |
           echo "检查破界主程序：$MODEL_FILE"
+
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             echo "当前目录文件如下："
             ls -la
             exit 1
           fi
+
           echo "✅ 找到破界主程序：$MODEL_FILE"
 
-      - name: 尝试下载最新K线验收产物
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
-        continue-on-error: true
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: A Stock Kline Cache Acceptance
-          name: kline-cache-accepted
-          path: kline_artifact
-          search_artifacts: true
-          if_no_artifact_found: warn
-
-      - name: 从K线验收产物恢复K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
-        shell: bash
-        run: |
-          echo "开始从 K线验收产物 恢复K线..."
-
-          rm -rf kline_cache K线缓存
-          mkdir -p kline_cache
-
-          if [ -d "kline_artifact" ]; then
-            echo "kline_artifact 文件列表："
-            find kline_artifact -maxdepth 5 -type f | head -120 || true
-
-            if [ -d "kline_artifact/kline_cache" ]; then
-              echo "发现 kline_artifact/kline_cache"
-              cp -r kline_artifact/kline_cache/* kline_cache/ || true
-            fi
-
-            if [ -d "kline_artifact/K线缓存" ]; then
-              echo "发现 kline_artifact/K线缓存"
-              cp -r kline_artifact/K线缓存/* kline_cache/ || true
-            fi
-
-            ZIP_FILE=$(find kline_artifact -name "*.zip" | head -n 1 || true)
-            if [ -n "$ZIP_FILE" ]; then
-              echo "发现zip：$ZIP_FILE，开始解压"
-              rm -rf kline_unzip
-              mkdir -p kline_unzip
-              unzip -o "$ZIP_FILE" -d kline_unzip || true
-
-              echo "解压后文件列表："
-              find kline_unzip -maxdepth 5 -type f | head -120 || true
-
-              if [ -d "kline_unzip/kline_cache" ]; then
-                cp -r kline_unzip/kline_cache/* kline_cache/ || true
-              fi
-
-              if [ -d "kline_unzip/K线缓存" ]; then
-                cp -r kline_unzip/K线缓存/* kline_cache/ || true
-              fi
-            fi
-
-            if [ -d "kline_artifact/base" ]; then
-              mkdir -p kline_cache/base
-              cp -r kline_artifact/base/* kline_cache/base/ || true
-            fi
-
-            if [ -d "kline_artifact/deep" ]; then
-              mkdir -p kline_cache/deep
-              cp -r kline_artifact/deep/* kline_cache/deep/ || true
-            fi
-
-            ROOT_CSV_COUNT=$(find kline_artifact -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
-            if [ "$ROOT_CSV_COUNT" -gt 0 ]; then
-              mkdir -p kline_cache/base
-              cp kline_artifact/*.csv kline_cache/base/ || true
-            fi
-          else
-            echo "没有下载到 kline_artifact。"
-          fi
-
-          echo "产物恢复后："
-          echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-          echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-          echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-          find kline_cache -name "*.csv" | head -20 || true
-
-      - name: 尝试恢复GitHub缓存里的K线
+      - name: 恢复一号员工K线缓存
         if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
@@ -169,6 +103,7 @@ jobs:
           path: |
             kline_cache
             K线缓存
+            outputs
           key: a-kline-cache-${{ github.ref_name }}
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
@@ -185,37 +120,43 @@ jobs:
             exit 0
           fi
 
-          CSV_COUNT=0
+          mkdir -p kline_cache
 
-          if [ -d "kline_cache" ]; then
-            echo "✅ 找到缓存目录：kline_cache"
-            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-            echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-            echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)"
-            find kline_cache -name '*.csv' | head -20 || true
+          echo "kline_cache 目录："
+          ls -la kline_cache || true
 
-            BASE_COUNT=$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)
-            DEEP_COUNT=$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)
-            ROOT_COUNT=$(find kline_cache -maxdepth 1 -name '*.csv' 2>/dev/null | wc -l || echo 0)
-            CSV_COUNT=$((BASE_COUNT + DEEP_COUNT + ROOT_COUNT))
+          echo "K线缓存 目录："
+          ls -la "K线缓存" || true
+
+          ROOT_COUNT=$(find kline_cache -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          BASE_COUNT=$(find kline_cache/base -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          DEEP_COUNT=$(find kline_cache/deep -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          CN_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l || echo 0)
+
+          TOTAL_COUNT=$((ROOT_COUNT + BASE_COUNT + DEEP_COUNT + CN_COUNT))
+
+          echo "kline_cache 根目录CSV数量：$ROOT_COUNT"
+          echo "kline_cache/base CSV数量：$BASE_COUNT"
+          echo "kline_cache/deep CSV数量：$DEEP_COUNT"
+          echo "K线缓存 CSV数量：$CN_COUNT"
+          echo "最终识别K线CSV数量：$TOTAL_COUNT"
+
+          echo "展示前20个缓存文件："
+          find kline_cache "K线缓存" -name "*.csv" 2>/dev/null | head -20 || true
+
+          if [ "$TOTAL_COUNT" -ge 1 ]; then
+            echo "✅ 已发现K线缓存，破界会优先读取缓存。"
           else
-            echo "⚠️ 没找到 kline_cache。"
-            mkdir -p kline_cache
-          fi
-
-          echo "最终识别K线CSV数量：$CSV_COUNT"
-
-          if [ "$CSV_COUNT" -ge 100 ]; then
-            echo "✅ K线缓存可用，允许运行破界。"
-          else
-            echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
-            echo "⚠️ 重要：这里不再 exit 1。"
-            echo "⚠️ 允许破界战法继续运行，由 AkShare / 基础模型兜底拉取K线。"
+            echo "⚠️ 当前没有发现K线缓存。"
+            echo "⚠️ 破界会先尝试一号员工数据入口，补拉主通道为 BaoStock，AkShare 已默认关闭。"
           fi
 
           echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
           echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+          echo "KLINE_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
+          echo "STOCK_LIST_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
+          echo "POJIE_ALLOW_AKSHARE_KLINE=0" >> "$GITHUB_ENV"
 
       - name: 安装Python环境
         uses: actions/setup-python@v5
@@ -223,6 +164,7 @@ jobs:
           python-version: "3.11"
 
       - name: 安装依赖
+        shell: bash
         run: |
           python -m pip install --upgrade pip
 
@@ -231,30 +173,36 @@ jobs:
             pip install -r requirements.txt
           fi
 
-          echo "强制补装破界战法必需依赖。"
-          pip install pandas numpy requests akshare baostock openpyxl
+          echo "补装破界战法必需依赖。"
+          pip install pandas numpy requests baostock akshare openpyxl
 
           python - <<'PY'
-          import pandas, numpy, requests
-          import akshare
+          import pandas
+          import numpy
+          import requests
           import baostock
-          print("依赖验证通过")
+          print("依赖验证通过：pandas / numpy / requests / baostock")
           PY
 
       - name: 语法检查
+        shell: bash
         run: |
           python -m py_compile "$MODEL_FILE"
+          echo "✅ Python语法检查通过"
 
       - name: 运行破界战法
         if: ${{ env.SHOULD_RUN_POJIE == '1' }}
         env:
           RAW_MODE: ${{ github.event.inputs.run_mode }}
           RAW_SEND_TG: ${{ github.event.inputs.send_telegram }}
+        shell: bash
         run: |
           echo "运行模式：$RAW_MODE"
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
+          echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
+          echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
@@ -288,4 +236,5 @@ jobs:
           path: |
             kline_cache
             K线缓存
+            outputs
           key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
