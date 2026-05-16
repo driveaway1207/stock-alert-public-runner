@@ -1,166 +1,285 @@
-name: 破界战法2.0专业核心压力线版
+name: 一号员工选股模型 V25.6.3
 
 on:
+  # 每个交易日下午6点执行：GitHub cron 使用 UTC；北京时间18:00 = UTC 10:00
+  schedule:
+    - cron: '0 10 * * 1-5'
+
+  # K线验收成功后，自动启动一号员工
+  # 重要：这里永远强制 daily，不再继承 pending 里的 backtest，避免再次跑满3小时。
+  workflow_run:
+    workflows:
+      - A Stock Kline Cache Acceptance
+    types:
+      - completed
+
+  # 手动运行 daily / backtest / selfcheck
   workflow_dispatch:
     inputs:
-      run_mode:
-        description: "运行模式：selfcheck=自检；daily=正式扫描"
+      mode:
+        description: '运行模式：daily=每日选股；backtest=压缩回测；selfcheck=自检'
         required: true
-        default: "daily"
+        default: 'daily'
         type: choice
         options:
-          - selfcheck
           - daily
-      max_stocks:
-        description: "最多扫描股票数量；0=全量扫描"
-        required: true
-        default: "0"
-      result_limit:
-        description: "输出候选数量"
-        required: true
-        default: "20"
-      send_telegram:
-        description: "是否发送Telegram"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+          - backtest
+          - selfcheck
+
+      start:
+        description: '回测开始日期，仅 backtest 使用，例如 2022-04-08'
+        required: false
+        default: '2022-04-08'
+
+      end:
+        description: '回测结束日期，仅 backtest 使用，例如 2023-04-08'
+        required: false
+        default: '2023-04-08'
+
+      max_dates:
+        description: '最多回测交易日数量，仅 backtest 使用；默认15，防止超时'
+        required: false
+        default: '15'
+
+      topn:
+        description: '每日回测最终推荐数量，仅 backtest 使用；默认3'
+        required: false
+        default: '3'
+
+      deep_limit:
+        description: '回测深度评分数量，仅 backtest 使用；默认3，压缩计算量'
+        required: false
+        default: '3'
+
+      base_limit:
+        description: '回测基础入深度数量，仅 backtest 使用；默认3，压缩计算量'
+        required: false
+        default: '3'
+
+concurrency:
+  group: 一号员工选股模型-v25-6-3-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: read
-  actions: read
+  contents: write
+  actions: write
 
 jobs:
-  run-pojie:
-    name: 运行破界战法
+  run-stock-alert:
+    name: 运行一号员工选股 V25.6.3
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
+
+    # 自动触发时，只有 K线验收成功才运行；定时和手动运行不拦截
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success' }}
 
     env:
-      PYTHONUNBUFFERED: "1"
-      MODEL_FILE: "破界战法.py"
-      BRANCH_NAME: ${{ github.ref_name }}
+      PYTHONUNBUFFERED: '1'
 
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      # 当前仓库真实主程序文件名。日志显示仓库里存在 stock_alert.py，不存在 stock_alert_v25_6.py。
+      # 所以这里必须指向 stock_alert.py；不要改成不存在的文件名。
+      MODEL_FILE: 'stock_alert.py'
+      MODEL_VERSION: 'V25.6.3'
+
+      # V25.6.3 核心线/神经线精修参数：只影响压力/支撑线模块，不改变主流程
+      ENABLE_XHU_PRESSURE_BREAKOUT: '1'
+      XHU_PRESSURE_DEFAULT_BUCKET_PCT: '0.005'
+      XHU_PRESSURE_MAX_ZONES_PER_PERIOD: '5'
+      XHU_PRESSURE_ENABLE_YEARLY: '1'
+
+      # V25.6.3 分层口径：正式A档不降级，新增A-观察层
+      V20_A_MIN_SCORE: '82'
+      V20_A_MINUS_MIN_SCORE: '79'
+      V20_BPLUS_MIN_SCORE: '75'
+      V20_A_MIN_RR: '1.5'
+      V20_A_MIN_TRADE_QUALITY: '5'
+      V20_TRADE_QUALITY_FLOOR_A_MINUS: '5'
+      V20_TRADE_QUALITY_FLOOR_BPLUS: '3'
+
+      # V25.6.3 市场环境：默认中性，只影响突破确认强度，不影响股票池与主流程
+      V24_1_MARKET_REGIME: 'neutral'
+
+      # 关键保护：生产任务默认禁止自动回测
+      RUN_V25_BACKTEST: '0'
+      V25_1_MODE: 'daily'
+
+      # pending 请求文件：只用于“没缓存时先缓存，缓存完成后继续跑 daily”。
+      # workflow_run 自动触发时不会继承 pending 的 backtest。
+      PENDING_REQUEST_FILE: '.github/pending_stock_alert_request.json'
+
+      # 生产模式：一号员工优先只读已经更新/验收过的K线缓存
+      USE_FULL_HISTORY_CACHE: '1'
+      FULL_HISTORY_CACHE_DIR: 'K线缓存'
+      ALLOW_STALE_KLINE_CACHE: '0'
+
+      # BaoStock 是主数据源；AkShare 默认不做大规模补拉
+      KLINE_FALLBACK_AKSHARE: '0'
+      STOCK_LIST_FALLBACK_AKSHARE: '0'
+
+      # BaoStock 稳定性参数
+      BAOSTOCK_RELOGIN_ON_BROKEN_PIPE: '1'
+      SUPPRESS_BAOSTOCK_VERBOSE: '1'
+      REQUEST_SLEEP: '0.02'
+      KLINE_MAX_RETRIES: '1'
+      RETRY_FAILED_KLINE_AFTER_SCAN: '0'
+      SINGLE_STOCK_TIMEOUT_SECONDS: '8'
+      STOCK_LIST_QUERY_TIMEOUT_SECONDS: '60'
+
+      # 每日正式选股口径
+      BASE_KLINE_LOOKBACK_DAYS: '520'
+      DEEP_KLINE_LOOKBACK_DAYS: '2200'
+      KLINE_LOOKBACK_DAYS: '2200'
+      DEEP_SCORE_LIMIT: '200'
+      DEEP_SCORE_LIMIT_RAW: '200'
+      DEEP_SCORE_HARD_CAP: '200'
+
+      # 最低样本要求
+      MIN_VALID_KLINE: '1000'
+
+      # 正式推送数量：每日只推 Top3
+      TOP_PUSH_LIMIT: '3'
+      RESULT_LIMIT: '3'
+      FORCE_TOP_N: '3'
+      MIN_PUSH_COUNT: '3'
+
+      # 压缩回测默认口径：只回测每天最终推荐Top3，只取15个交易日
+      V25_BACKTEST_TOP_N: '3'
+      V25_BACKTEST_DEEP_LIMIT: '3'
+      V25_1_BACKTEST_BASE_LIMIT: '3'
+      V25_BACKTEST_MAX_DATES: '15'
+      V25_BACKTEST_DATE_STEP: '1'
+      V25_BACKTEST_DISABLE_TELEGRAM: '1'
+
+      # Telegram 推送
+      ENABLE_TELEGRAM: '1'
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      USE_FULL_HISTORY_CACHE: "1"
-      FULL_HISTORY_CACHE_DIR: "kline_cache"
-      CACHE_DIR: "kline_cache"
-      STOCK_LIST_FALLBACK_AKSHARE: "0"
-      KLINE_FALLBACK_AKSHARE: "0"
-      POJIE_ALLOW_AKSHARE_KLINE: "0"
-      POJIE_REMOTE_ON_CACHE_MISS: "0"
-
-      # 性能优化：默认6进程。实测小CSV I/O下4-6通常比10更稳；如需可改成10。
-      POJIE_WORKERS: "6"
-      POJIE_PARALLEL_MIN_STOCKS: "300"
-      POJIE_FAST_PREFILTER: "1"
-      POJIE_STRATEGY_PROFILE: "balanced"
-      POJIE_MIN_CORELINE_SCORE: "58"
-      POJIE_OUTPUT_OBSERVATION: "1"
-      破界_最低分: "58"
-
-      # 日志/进度优化：默认不逐只打印K线成功，避免Actions刷屏。
-      POJIE_VERBOSE_KLINE: "0"
-      POJIE_LOG_FIRST_N: "5"
-      POJIE_PROGRESS_EVERY: "300"
-      POJIE_PROGRESS_SECONDS: "30"
-
-      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
-      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '20' }}
+      # GitHub CLI：用于没缓存时自动启动K线缓存任务
+      GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
 
     steps:
-      - name: 下载仓库代码
+      - name: ① 下载仓库代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 显示当前运行环境
+      - name: ② 显示当前生产口径
         shell: bash
         run: |
-          echo "当前路径：$(pwd)"
-          echo "当前分支：$BRANCH_NAME"
-          echo "仓库根目录文件："
-          ls -la
-          echo "workflow 文件："
-          ls -la .github/workflows || true
+          echo "================ 一号员工生产口径 ================"
+          echo "模型版本：$MODEL_VERSION"
+          echo "主程序文件：$MODEL_FILE"
+          echo "定时任务：北京时间18:00，固定 daily 选股"
+          echo "K线验收成功后：固定 daily，不继承 pending backtest"
+          echo "手动 daily：先查缓存，有缓存就选股，没缓存就自动缓存"
+          echo "手动 backtest：压缩回测，默认15个交易日、Top3、Deep=3、Base=3"
+          echo "selfcheck：只自检，不缓存"
+          echo "主数据源：BaoStock"
+          echo "AkShare补拉：默认关闭"
+          echo "基础层窗口：520天"
+          echo "正式推送数量：Top3"
+          echo "=================================================="
 
-      - name: 检查破界战法2.0专业核心压力线版主程序
+      - name: ③ 检查一号员工主程序
         shell: bash
         run: |
-          echo "检查破界战法2.0专业核心压力线版主程序：$MODEL_FILE"
+          echo "检查一号员工主程序：$MODEL_FILE"
+
           if [ ! -f "$MODEL_FILE" ]; then
-            echo "❌ 没找到破界主程序：$MODEL_FILE"
+            echo "❌ 没找到一号员工主程序：$MODEL_FILE"
+            echo "当前仓库根目录文件如下："
             ls -la
             exit 1
           fi
-          echo "✅ 找到破界战法2.0主程序：$MODEL_FILE"
 
-      - name: 尝试下载最近K线验收产物
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
+          echo "✅ 找到一号员工主程序：$MODEL_FILE"
+
+      - name: ④ 解析本次运行请求
         shell: bash
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_START: ${{ github.event.inputs.start }}
+          INPUT_END: ${{ github.event.inputs.end }}
+          INPUT_MAX_DATES: ${{ github.event.inputs.max_dates }}
+          INPUT_TOPN: ${{ github.event.inputs.topn }}
+          INPUT_DEEP_LIMIT: ${{ github.event.inputs.deep_limit }}
+          INPUT_BASE_LIMIT: ${{ github.event.inputs.base_limit }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          set +e
-          echo "开始查找最近成功的 K线验收产物：artifact=kline-cache-accepted"
-          rm -rf artifact_download
-          mkdir -p artifact_download
+          echo "开始解析本次运行请求..."
 
-          RUN_ID=$(gh run list --limit 80 --json databaseId,name,conclusion,status,createdAt \
-            --jq '.[] | select((.name=="A Stock Kline Cache Acceptance" or (.name|contains("Kline Cache Acceptance")) or (.name|contains("K线"))) and .conclusion=="success") | .databaseId' \
-            | head -n 1)
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            MODE="${INPUT_MODE:-daily}"
+            START="${INPUT_START:-2022-04-08}"
+            END="${INPUT_END:-2023-04-08}"
+            MAX_DATES="${INPUT_MAX_DATES:-15}"
+            TOPN="${INPUT_TOPN:-3}"
+            DEEP_LIMIT="${INPUT_DEEP_LIMIT:-3}"
+            BASE_LIMIT="${INPUT_BASE_LIMIT:-3}"
+            PENDING_USED="0"
+            echo "本次为手动运行。"
 
-          if [ -z "$RUN_ID" ]; then
-            echo "⚠️ 没找到最近成功的K线验收运行。稍后尝试GitHub cache恢复。"
-            echo "ARTIFACT_KLINE_COUNT=0" >> "$GITHUB_ENV"
-            exit 0
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+            echo "本次为 K线验收成功后自动触发。"
+            echo "安全规则：workflow_run 永远强制 daily，绝不继承 pending 的 backtest。"
+            MODE="daily"
+            START="2022-04-08"
+            END="2023-04-08"
+            MAX_DATES="15"
+            TOPN="3"
+            DEEP_LIMIT="3"
+            BASE_LIMIT="3"
+            PENDING_USED="0"
+
+          else
+            echo "本次为定时运行。"
+            echo "安全规则：定时任务固定 daily，绝不跑 backtest。"
+            MODE="daily"
+            START="2022-04-08"
+            END="2023-04-08"
+            MAX_DATES="15"
+            TOPN="3"
+            DEEP_LIMIT="3"
+            BASE_LIMIT="3"
+            PENDING_USED="0"
           fi
 
-          echo "找到最近K线验收运行 RUN_ID=$RUN_ID，开始下载 artifact..."
-          gh run download "$RUN_ID" --name kline-cache-accepted --dir artifact_download
-          DL_STATUS=$?
-          if [ "$DL_STATUS" -ne 0 ]; then
-            echo "⚠️ artifact下载失败，稍后尝试GitHub cache恢复。"
-            echo "ARTIFACT_KLINE_COUNT=0" >> "$GITHUB_ENV"
-            exit 0
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$MODE" = "backtest" ]; then
+            echo "⚠️ 非手动触发不允许 backtest，已强制改为 daily。"
+            MODE="daily"
           fi
 
-          echo "artifact_download 文件预览："
-          find artifact_download -maxdepth 4 -type f | head -80 || true
+          echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
+          echo "BT_START=$START" >> "$GITHUB_ENV"
+          echo "BT_END=$END" >> "$GITHUB_ENV"
+          echo "BT_MAX_DATES=$MAX_DATES" >> "$GITHUB_ENV"
+          echo "BT_TOPN=$TOPN" >> "$GITHUB_ENV"
+          echo "BT_DEEP_LIMIT=$DEEP_LIMIT" >> "$GITHUB_ENV"
+          echo "BT_BASE_LIMIT=$BASE_LIMIT" >> "$GITHUB_ENV"
+          echo "PENDING_FILE_USED=$PENDING_USED" >> "$GITHUB_ENV"
 
-          mkdir -p kline_cache
-          if [ -d artifact_download/kline_cache ]; then
-            cp -r artifact_download/kline_cache/* kline_cache/ || true
-          fi
-          if [ -d artifact_download/K线缓存 ]; then
-            mkdir -p "K线缓存"
-            cp -r artifact_download/K线缓存/* "K线缓存"/ || true
-          fi
-          if [ -d artifact_download/base ]; then
-            mkdir -p kline_cache/base
-            cp -r artifact_download/base/* kline_cache/base/ || true
-          fi
-          if [ -d artifact_download/deep ]; then
-            mkdir -p kline_cache/deep
-            cp -r artifact_download/deep/* kline_cache/deep/ || true
-          fi
-          ROOT_CSV=$(find artifact_download -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${ROOT_CSV:-0}" -gt 0 ]; then
-            mkdir -p kline_cache/base
-            cp artifact_download/*.csv kline_cache/base/ || true
-          fi
+          echo "本次模式：$MODE"
+          echo "回测开始：$START"
+          echo "回测结束：$END"
+          echo "最多交易日：$MAX_DATES"
+          echo "每日TopN：$TOPN"
+          echo "深度评分数量：$DEEP_LIMIT"
+          echo "基础入深度数量：$BASE_LIMIT"
 
-          COUNT=$(find kline_cache "K线缓存" -name "*.csv" 2>/dev/null | wc -l | tr -d ' ')
-          echo "从artifact恢复后的K线CSV数量：${COUNT:-0}"
-          echo "ARTIFACT_KLINE_COUNT=${COUNT:-0}" >> "$GITHUB_ENV"
+      - name: ⑤ 尝试下载K线验收产物
+        if: ${{ github.event_name == 'workflow_run' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          name: kline-cache-accepted
+          path: .
 
-      - name: 如果artifact不足则恢复GitHub缓存里的K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' && env.ARTIFACT_KLINE_COUNT < 1000 }}
+      - name: ⑥ 尝试恢复GitHub缓存里的K线
+        if: ${{ env.RUN_MODE != 'selfcheck' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -171,181 +290,246 @@ jobs:
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
-            pojie-kline-cache-${{ github.ref_name }}-
-            pojie-kline-cache-
 
-      - name: 检查K线缓存状态
+      - name: ⑦ 检查K线缓存状态
         shell: bash
         run: |
           echo "开始检查K线缓存状态..."
-          if [ "${{ github.event.inputs.run_mode }}" = "selfcheck" ]; then
+
+          if [ "$RUN_MODE" = "selfcheck" ]; then
             echo "当前是 selfcheck，自检模式不需要K线缓存。"
-            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
             echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
+            echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          mkdir -p kline_cache kline_cache/base kline_cache/deep outputs
+          if [ -d "K线缓存" ]; then
+            echo "✅ 找到中文K线缓存文件夹：K线缓存"
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
 
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          items = {
-              'kline_cache_root': len(list(Path('kline_cache').glob('*.csv'))) if Path('kline_cache').exists() else 0,
-              'kline_cache_base': len(list(Path('kline_cache/base').rglob('*.csv'))) if Path('kline_cache/base').exists() else 0,
-              'kline_cache_deep': len(list(Path('kline_cache/deep').rglob('*.csv'))) if Path('kline_cache/deep').exists() else 0,
-              'cn_cache': len(list(Path('K线缓存').rglob('*.csv'))) if Path('K线缓存').exists() else 0,
-              'outputs': len(list(Path('outputs').rglob('*.csv'))) if Path('outputs').exists() else 0,
-          }
-          total = items['kline_cache_root'] + items['kline_cache_base'] + items['kline_cache_deep'] + items['cn_cache']
-          print(f"kline_cache 根目录CSV数量：{items['kline_cache_root']}")
-          print(f"kline_cache/base CSV数量：{items['kline_cache_base']}")
-          print(f"kline_cache/deep CSV数量：{items['kline_cache_deep']}")
-          print(f"K线缓存 CSV数量：{items['cn_cache']}")
-          print(f"outputs CSV数量：{items['outputs']}")
-          print(f"最终识别K线缓存CSV数量：{total}")
-          print('展示前10个K线缓存文件：')
-          n=0
-          for root in [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]:
-              if not root.exists():
-                  continue
-              for f in root.rglob('*.csv'):
-                  print(str(f))
-                  n += 1
-                  if n >= 10:
-                      break
-              if n >= 10:
-                  break
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
-              f.write('SHOULD_RUN_POJIE=1\n')
-              f.write('FULL_HISTORY_CACHE_DIR=kline_cache\n')
-              f.write('CACHE_DIR=kline_cache\n')
-              f.write('KLINE_FALLBACK_AKSHARE=0\n')
-              f.write('STOCK_LIST_FALLBACK_AKSHARE=0\n')
-              f.write('POJIE_ALLOW_AKSHARE_KLINE=0\n')
-              f.write(f"HAS_KLINE_CACHE={1 if total >= 1000 else 0}\n")
-          if total >= 1000:
-              print('✅ 已发现一号员工K线缓存；破界.py将按股票代码懒加载读取，缓存命中不联网。')
-          elif total > 0:
-              print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失才BaoStock补拉。')
-          else:
-              print('⚠️ 当前没有发现K线缓存；破界.py会使用BaoStock主通道补拉，AkShare已关闭。')
-          PY
+          elif [ -d "kline_cache" ]; then
+            echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
+            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
 
-      - name: 安装Python环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: 安装依赖
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            echo "发现 requirements.txt，先安装仓库依赖。"
-            pip install -r requirements.txt
-          fi
-          echo "补装破界战法必需依赖。"
-          pip install pandas numpy requests baostock openpyxl
-          python - <<'PY'
-          import pandas, numpy, requests, baostock
-          print('依赖验证通过：pandas / numpy / requests / baostock')
-          PY
-
-      - name: 语法检查
-        shell: bash
-        run: |
-          python -m py_compile "$MODEL_FILE"
-          echo "✅ Python语法检查通过"
-
-      - name: 运行破界战法
-        if: ${{ env.SHOULD_RUN_POJIE == '1' }}
-        env:
-          RAW_MODE: ${{ github.event.inputs.run_mode }}
-          RAW_SEND_TG: ${{ github.event.inputs.send_telegram }}
-        shell: bash
-        run: |
-          echo "运行模式：$RAW_MODE"
-          echo "策略档位：$POJIE_STRATEGY_PROFILE"
-          echo "最低分：$破界_最低分"
-          echo "最多股票数量：$MAX_STOCKS"
-          echo "输出数量：$RESULT_LIMIT"
-          echo "K线目录：$FULL_HISTORY_CACHE_DIR"
-          echo "是否已恢复K线缓存：$HAS_KLINE_CACHE"
-          echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
-          echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
-          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
-          echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
-          echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
-          echo "推送策略：默认发送Telegram；即使候选为0，也推送总结报告。"
-
-          if [ "$RAW_MODE" = "selfcheck" ]; then
-            echo "执行破界自检，不发送Telegram。"
-            python "$MODEL_FILE" --模式 selfcheck
           else
-            if [ "$RAW_SEND_TG" = "true" ]; then
-              echo "执行破界正式扫描，并发送Telegram。"
-              python "$MODEL_FILE" --模式 daily --最多股票数量 "$MAX_STOCKS" --输出数量 "$RESULT_LIMIT" --发送Telegram
+            echo "⚠️ 没找到 K线缓存 或 kline_cache。"
+            CSV_COUNT=0
+          fi
+
+          if [ "$CSV_COUNT" -ge 1000 ]; then
+            echo "✅ K线缓存可用。"
+            echo "HAS_KLINE_CACHE=1" >> "$GITHUB_ENV"
+            echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
+            echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$RUN_MODE" = "daily" ]; then
+              echo "本次是手动 daily，缓存不足，准备保存 pending 请求并自动启动缓存任务。"
+              echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
+            elif [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "本次是定时 daily，但缓存不足，停止；请先跑K线缓存任务。"
+              exit 1
+            elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+              echo "本次是验收后自动触发，但仍然没有拿到缓存，停止。"
+              exit 1
+            elif [ "$RUN_MODE" = "backtest" ]; then
+              echo "手动 backtest 缓存不足：为避免误触发超时回测，不自动保存 pending backtest。"
+              echo "请先手动运行K线缓存任务，缓存完成后再手动运行 backtest。"
+              exit 1
             else
-              echo "执行破界正式扫描，不发送Telegram。"
-              python "$MODEL_FILE" --模式 daily --最多股票数量 "$MAX_STOCKS" --输出数量 "$RESULT_LIMIT"
+              echo "缓存不足，停止。"
+              exit 1
             fi
           fi
 
-      - name: 保存破界运行结果
+      - name: ⑧ 没缓存时保存 pending daily 请求
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
+        shell: bash
+        run: |
+          echo "保存 pending daily 请求：$PENDING_REQUEST_FILE"
+          mkdir -p .github
+
+          python - <<PY
+          import json, os
+          data = {
+              "mode": "daily",
+              "created_by": "stock_alert_workflow_v25_6_3",
+              "note": "workflow_run 会强制 daily，不会继承 backtest。",
+          }
+          with open(os.environ["PENDING_REQUEST_FILE"], "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(json.dumps(data, ensure_ascii=False, indent=2))
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$PENDING_REQUEST_FILE"
+
+          if git diff --cached --quiet; then
+            echo "pending daily 请求没有变化，不需要提交。"
+          else
+            git commit -m "保存一号员工daily待执行请求"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
+
+      - name: ⑨ 没缓存时自动启动K线缓存任务
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
+        shell: bash
+        run: |
+          echo "准备自动启动：A Stock Full Kline Cache Auto Backfill"
+          gh workflow run "A Stock Full Kline Cache Auto Backfill" --ref "$GITHUB_REF_NAME"
+          echo "✅ 已启动K线缓存任务。"
+          echo "本次一号员工先结束；缓存完成、验收成功后，会自动以 daily 模式继续执行。"
+
+      - name: ⑩ 没缓存时结束当前运行
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
+        shell: bash
+        run: |
+          echo "当前没有可用K线缓存，已自动启动缓存任务。"
+          echo "等待缓存完成后，一号员工会被验收任务自动触发，并强制 daily。"
+          exit 0
+
+      - name: ⑪ 显示最近的K线缓存文件
+        if: ${{ env.SHOULD_RUN_MODEL == '1' && env.RUN_MODE != 'selfcheck' }}
+        shell: bash
+        run: |
+          echo "当前K线缓存目录：$FULL_HISTORY_CACHE_DIR"
+          echo "最近更新的K线文件："
+          find "$FULL_HISTORY_CACHE_DIR" -name "*.csv" -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30 || true
+
+      - name: ⑫ 检查风险雷区文件
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        shell: bash
+        run: |
+          if [ -f "risk_flags.json" ]; then
+            echo "✅ 找到风险雷区文件：risk_flags.json"
+          else
+            echo "⚠️ 没找到风险雷区文件 risk_flags.json"
+            echo "模型仍可运行，但外部监管/财务/治理雷区识别会变弱。"
+          fi
+
+      - name: ⑬ 安装Python环境
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: ⑭ 安装运行依赖并自检核心包
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+
+          if [ -f requirements.txt ]; then
+            echo "发现 requirements.txt，先安装里面的依赖..."
+            pip install -r requirements.txt
+          fi
+
+          echo "强制补装一号员工必需依赖，避免 requirements.txt 缺包..."
+          pip install pandas numpy requests tqdm akshare baostock openpyxl lxml beautifulsoup4 matplotlib
+
+          echo "检查核心依赖是否可导入..."
+          python - <<'PY'
+          import pandas
+          import numpy
+          import requests
+          import baostock as bs
+          print("✅ pandas / numpy / requests / BaoStock 导入成功")
+          PY
+
+      - name: ⑮ 检查Python代码语法
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        shell: bash
+        run: |
+          echo "检查Python代码语法：$MODEL_FILE"
+          python -m py_compile "$MODEL_FILE"
+          echo "✅ Python语法检查通过"
+
+      - name: ⑯ 运行前轻量自检
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        shell: bash
+        run: |
+          echo "运行前环境确认："
+          echo "本次模式：$RUN_MODE"
+          echo "主程序：$MODEL_FILE"
+          echo "是否读取K线缓存：$USE_FULL_HISTORY_CACHE"
+          echo "K线缓存目录：$FULL_HISTORY_CACHE_DIR"
+          echo "AkShare补拉开关：$KLINE_FALLBACK_AKSHARE"
+          echo "股票池AkShare备用开关：$STOCK_LIST_FALLBACK_AKSHARE"
+          echo "Telegram开关：$ENABLE_TELEGRAM"
+          echo "pending文件是否使用：$PENDING_FILE_USED"
+          echo "压缩回测参数：max_dates=$BT_MAX_DATES topn=$BT_TOPN deep_limit=$BT_DEEP_LIMIT base_limit=$BT_BASE_LIMIT"
+
+          if [ "$ENABLE_TELEGRAM" = "1" ] && [ -z "$TELEGRAM_TOKEN" ]; then
+            echo "⚠️ Telegram Token 为空，模型可运行，但可能无法推送。"
+          fi
+
+          if [ "$ENABLE_TELEGRAM" = "1" ] && [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "⚠️ Telegram Chat ID 为空，模型可运行，但可能无法推送。"
+          fi
+
+      - name: ⑰ 运行一号员工选股模型
+        if: ${{ env.SHOULD_RUN_MODEL == '1' }}
+        shell: bash
+        run: |
+          echo "当前运行模式：$RUN_MODE"
+
+          if [ "$RUN_MODE" = "selfcheck" ]; then
+            python "$MODEL_FILE" --mode daily --self-check
+
+          elif [ "$RUN_MODE" = "backtest" ]; then
+            echo "启动压缩回测：只回测最多${BT_MAX_DATES:-15}个交易日，每日最终Top${BT_TOPN:-3}。"
+            export ENABLE_TELEGRAM=0
+            export RUN_V25_BACKTEST=1
+            export V25_1_MODE=backtest
+            CMD="python \"$MODEL_FILE\" --mode backtest --start ${BT_START:-2022-04-08} --end ${BT_END:-2023-04-08} --max-dates ${BT_MAX_DATES:-15} --topn ${BT_TOPN:-3} --deep-limit ${BT_DEEP_LIMIT:-3} --base-limit ${BT_BASE_LIMIT:-3}"
+            echo "$CMD"
+            eval "$CMD"
+
+          else
+            echo "启动每日选股：固定 daily，允许 Telegram 推送。"
+            export RUN_V25_BACKTEST=0
+            export V25_1_MODE=daily
+            python "$MODEL_FILE" --mode daily
+          fi
+
+      - name: ⑱ 清理历史 pending 请求
+        if: ${{ success() && github.event_name == 'workflow_run' }}
+        shell: bash
+        run: |
+          echo "workflow_run 已强制 daily，本次运行完成后清理可能遗留的 pending 请求：$PENDING_REQUEST_FILE"
+
+          if [ -f "$PENDING_REQUEST_FILE" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm "$PENDING_REQUEST_FILE"
+            git commit -m "清理一号员工历史待执行请求" || true
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push || true
+          else
+            echo "没有 pending 文件需要清理。"
+          fi
+
+      - name: ⑲ 保存运行结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 破界战法运行结果
+          name: 一号员工选股结果
           path: |
+            *.csv
+            *.md
+            *.html
+            *.json
+            output*/**
             outputs/**
-            *_pojie*
-            破界*
+            reports/**
+            logs/**
           if-no-files-found: ignore
-
-      - name: 检查是否需要保存破界补拉缓存
-        if: always()
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, json
-          from pathlib import Path
-
-          total = 0
-          for root in [Path('kline_cache'), Path('K线缓存')]:
-              if root.exists():
-                  total += len(list(root.rglob('*.csv')))
-
-          remote_success = 0
-          signals = Path('outputs/pojie/pojie_signals.json')
-          if signals.exists():
-              try:
-                  data = json.loads(signals.read_text(encoding='utf-8'))
-                  remote_success = int(data.get('kline_stats', {}).get('remote_success', 0) or 0)
-              except Exception as e:
-                  print(f'读取破界K线统计失败：{e}')
-
-          print(f'运行结束后K线CSV数量：{total}')
-          print(f'本次BaoStock补拉成功数量：{remote_success}')
-
-          # 优化原则：如果只是读取已有缓存、没有新增补拉，就不重复保存巨大cache，节省时间和GitHub存储。
-          should_save = (total >= 1000 and remote_success > 0)
-
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
-              f.write(f"SAVE_POJIE_CACHE={1 if should_save else 0}\n")
-
-          if should_save:
-              print('✅ 本次有BaoStock补拉并且K线数量足够，保存破界专用缓存。')
-          else:
-              print('✅ 本次未新增补拉或K线数量不足，不重复保存缓存，避免浪费时间/存储。')
-          PY
-
-      - name: 保存破界专用K线缓存
-        if: ${{ always() && env.SAVE_POJIE_CACHE == '1' }}
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            K线缓存
-            kline_cache
-          key: pojie-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
+          retention-days: 14
