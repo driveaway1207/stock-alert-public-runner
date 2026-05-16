@@ -6,15 +6,15 @@ on:
       run_mode:
         description: "运行模式：selfcheck=自检；daily=正式扫描"
         required: true
-        default: "selfcheck"
+        default: "daily"
         type: choice
         options:
           - selfcheck
           - daily
       max_stocks:
-        description: "最多扫描股票数量；0=不限制。第一次建议300"
+        description: "最多扫描股票数量；0=不限制。第一次建议100"
         required: true
-        default: "300"
+        default: "100"
       result_limit:
         description: "输出候选数量"
         required: true
@@ -28,12 +28,6 @@ on:
           - "false"
           - "true"
 
-  workflow_run:
-    workflows:
-      - 一号员工选股模型 V25.6
-    types:
-      - completed
-
 permissions:
   contents: read
   actions: read
@@ -43,8 +37,6 @@ jobs:
     name: 运行破界战法
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     env:
       PYTHONUNBUFFERED: "1"
@@ -57,13 +49,13 @@ jobs:
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
       USE_FULL_HISTORY_CACHE: "1"
-      FULL_HISTORY_CACHE_DIR: "kline_cache/base"
+      FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
 
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
-      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
+      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '100' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
 
     steps:
@@ -76,6 +68,8 @@ jobs:
           pwd
           echo "当前仓库根目录文件："
           ls -la
+          echo "当前 workflow 文件："
+          ls -la .github/workflows || true
 
       - name: 检查破界主程序
         shell: bash
@@ -90,7 +84,7 @@ jobs:
           echo "✅ 找到破界主程序：$MODEL_FILE"
 
       - name: 尝试下载最新K线验收产物
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -101,7 +95,7 @@ jobs:
           if_no_artifact_found: warn
 
       - name: 从K线验收产物恢复K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
         shell: bash
         run: |
           echo "开始从 K线验收产物 恢复K线..."
@@ -136,6 +130,7 @@ jobs:
               if [ -d "kline_unzip/kline_cache" ]; then
                 cp -r kline_unzip/kline_cache/* kline_cache/ || true
               fi
+
               if [ -d "kline_unzip/K线缓存" ]; then
                 cp -r kline_unzip/K线缓存/* kline_cache/ || true
               fi
@@ -145,6 +140,7 @@ jobs:
               mkdir -p kline_cache/base
               cp -r kline_artifact/base/* kline_cache/base/ || true
             fi
+
             if [ -d "kline_artifact/deep" ]; then
               mkdir -p kline_cache/deep
               cp -r kline_artifact/deep/* kline_cache/deep/ || true
@@ -166,7 +162,7 @@ jobs:
           find kline_cache -name "*.csv" | head -20 || true
 
       - name: 尝试恢复GitHub缓存里的K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -183,7 +179,7 @@ jobs:
         run: |
           echo "开始检查K线缓存状态..."
 
-          if [ "${{ github.event.inputs.run_mode || 'daily' }}" = "selfcheck" ] && [ "${{ github.event_name }}" != "workflow_run" ]; then
+          if [ "${{ github.event.inputs.run_mode }}" = "selfcheck" ]; then
             echo "当前是 selfcheck，自检模式不需要K线缓存。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
             exit 0
@@ -193,52 +189,33 @@ jobs:
 
           if [ -d "kline_cache" ]; then
             echo "✅ 找到缓存目录：kline_cache"
-            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l)"
-            echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l)"
-            echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l)"
+            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+            echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+            echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)"
             find kline_cache -name '*.csv' | head -20 || true
 
-            BASE_COUNT=$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l)
-            DEEP_COUNT=$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l)
-            ROOT_COUNT=$(find kline_cache -maxdepth 1 -name '*.csv' 2>/dev/null | wc -l)
+            BASE_COUNT=$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)
+            DEEP_COUNT=$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)
+            ROOT_COUNT=$(find kline_cache -maxdepth 1 -name '*.csv' 2>/dev/null | wc -l || echo 0)
             CSV_COUNT=$((BASE_COUNT + DEEP_COUNT + ROOT_COUNT))
-
-            if [ "$BASE_COUNT" -ge 100 ]; then
-              echo "FULL_HISTORY_CACHE_DIR=kline_cache/base" >> "$GITHUB_ENV"
-              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            elif [ "$DEEP_COUNT" -ge 100 ]; then
-              echo "FULL_HISTORY_CACHE_DIR=kline_cache/deep" >> "$GITHUB_ENV"
-              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            else
-              echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-              echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            fi
-
-          elif [ -d "K线缓存" ]; then
-            echo "✅ 找到中文缓存目录：K线缓存"
-            CSV_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l)
-            echo "K线缓存CSV数量：$CSV_COUNT"
-            find "K线缓存" -name "*.csv" | head -20 || true
-            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
-            echo "CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
           else
-            echo "⚠️ 没找到 kline_cache 或 K线缓存。"
+            echo "⚠️ 没找到 kline_cache。"
+            mkdir -p kline_cache
           fi
 
           echo "最终识别K线CSV数量：$CSV_COUNT"
 
           if [ "$CSV_COUNT" -ge 100 ]; then
             echo "✅ K线缓存可用，允许运行破界。"
-            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           else
             echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
-            echo "⚠️ 不再直接失败，允许破界战法继续运行，并使用 AkShare / 基础模型兜底拉取K线。"
-            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
-
-            mkdir -p kline_cache
-            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-            echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            echo "⚠️ 重要：这里不再 exit 1。"
+            echo "⚠️ 允许破界战法继续运行，由 AkShare / 基础模型兜底拉取K线。"
           fi
+
+          echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+          echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+          echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
 
       - name: 安装Python环境
         uses: actions/setup-python@v5
@@ -248,19 +225,20 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
+
           if [ -f requirements.txt ]; then
             echo "发现 requirements.txt，先安装仓库依赖。"
             pip install -r requirements.txt
           fi
 
-          echo "强制补装破界战法必需依赖，避免 requirements.txt 缺包。"
+          echo "强制补装破界战法必需依赖。"
           pip install pandas numpy requests akshare baostock openpyxl
 
           python - <<'PY'
           import pandas, numpy, requests
           import akshare
           import baostock
-          print("依赖验证通过：pandas/numpy/requests/akshare/baostock")
+          print("依赖验证通过")
           PY
 
       - name: 语法检查
@@ -270,28 +248,19 @@ jobs:
       - name: 运行破界战法
         if: ${{ env.SHOULD_RUN_POJIE == '1' }}
         env:
-          RAW_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
-          RAW_SEND_TG: ${{ github.event.inputs.send_telegram || 'true' }}
+          RAW_MODE: ${{ github.event.inputs.run_mode }}
+          RAW_SEND_TG: ${{ github.event.inputs.send_telegram }}
         run: |
-          echo "触发类型：${{ github.event_name }}"
           echo "运行模式：$RAW_MODE"
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
 
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            RUN_MODE="daily"
-            SEND_TG="false"
-          else
-            RUN_MODE="$RAW_MODE"
-            SEND_TG="$RAW_SEND_TG"
-          fi
-
-          if [ "$RUN_MODE" = "selfcheck" ]; then
+          if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
             python "$MODEL_FILE" --模式 selfcheck
           else
-            if [ "$SEND_TG" = "true" ]; then
+            if [ "$RAW_SEND_TG" = "true" ]; then
               echo "执行破界正式扫描，并发送Telegram。"
               python "$MODEL_FILE" --模式 daily --最多股票数量 "$MAX_STOCKS" --输出数量 "$RESULT_LIMIT" --发送Telegram
             else
@@ -310,3 +279,13 @@ jobs:
             *_pojie*
             破界*
           if-no-files-found: ignore
+
+      - name: 保存K线缓存
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            kline_cache
+            K线缓存
+          key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
