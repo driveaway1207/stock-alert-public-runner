@@ -165,7 +165,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V25.6.1一号员工选股模型｜核心线/神经线双线精修版+HVN/LVN解耦+强同源去重+严格No-Lookahead真实回测版"
+MODEL_VERSION = "V25.6.2一号员工选股模型｜综合评分硬风控闭环修复版+核心线/神经线双线精修版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -11305,9 +11305,34 @@ def _report_deep_score(row):
     return safe_float(row.get('v20_final_score', row.get('v201_score', row.get('v212_final_score', 0))))
 
 
+def _valid_score_field(row, key):
+    """报告/排序共用：判断某个评分字段是否真实生成，避免综合分静默回退深度分。"""
+    try:
+        if key not in row:
+            return False
+        v = row.get(key)
+        if v is None or v == "":
+            return False
+        return float(v) == float(v)
+    except Exception:
+        return False
+
+
 def _report_composite_score(row):
-    """综合评分：最终排序优先使用融合后的交易分；缺失时回退深度评分。只用于报告展示。"""
-    return safe_float(row.get('v22_composite_trade_score', row.get('v212_final_score', row.get('v20_final_score', 0))))
+    """综合评分：只展示真实生成的融合交易分；不再静默回退深度评分。"""
+    if _valid_score_field(row, 'v22_composite_trade_score'):
+        return safe_float(row.get('v22_composite_trade_score'))
+    if _valid_score_field(row, 'v212_final_score'):
+        return safe_float(row.get('v212_final_score'))
+    return None
+
+
+def _report_composite_score_source(row):
+    if _valid_score_field(row, 'v22_composite_trade_score'):
+        return 'V22融合交易分'
+    if _valid_score_field(row, 'v212_final_score'):
+        return 'V21.2交易机会分'
+    return '未独立生成'
 
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None, lifecycle_tracking=None):
     global TELEGRAM_PENDING_IMAGES
@@ -11356,10 +11381,21 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
         _tier_raw = str(s.get('v20_trade_tier', '未分层'))
         _tier_show = _human_trade_tier(_tier_raw)
         _warn = _human_trade_warning(_tier_raw)
+        _close_show = safe_float(s.get('v20_close', s.get('close', s.get('收盘', 0))))
+        _date_show = str(s.get('date', '') or s.get('日期', '') or '').strip()
+        if _close_show > 0:
+            if _date_show:
+                lines.append(f"当前收盘价：<b>{_close_show:.2f}</b>（截至{html.escape(_date_show)}收盘）")
+            else:
+                lines.append(f"当前收盘价：<b>{_close_show:.2f}</b>")
         _composite_score = _report_composite_score(s)
+        _composite_source = _report_composite_score_source(s)
         _base_score = _report_base_score(s)
         _deep_score = _report_deep_score(s)
-        lines.append(f"操作等级：<b>{html.escape(_tier_show)}</b>｜综合评分<b>{_composite_score:.1f}</b>（基础评分{_base_score:.1f}，深度评分{_deep_score:.1f}）｜{html.escape(_warn)}")
+        if _composite_score is None:
+            lines.append(f"操作等级：<b>{html.escape(_tier_show)}</b>｜深度评分<b>{_deep_score:.1f}</b>（基础评分{_base_score:.1f}，综合评分未独立生成）｜{html.escape(_warn)}")
+        else:
+            lines.append(f"操作等级：<b>{html.escape(_tier_show)}</b>｜综合评分<b>{_composite_score:.1f}</b>（基础评分{_base_score:.1f}，深度评分{_deep_score:.1f}，口径={html.escape(_composite_source)}）｜{html.escape(_warn)}")
         lines.append(f"入选/降级原因：{html.escape(str(s.get('v20_tier_reason','')))}")
         lines.append(f"V24.1实盘风控：流动性{html.escape(str(s.get('v241_liquidity_tier','')))}｜成交额{safe_float(s.get('v241_amount_effective',0))/100000000:.2f}亿｜仓位建议{html.escape(str(s.get('v241_position_text','')))}｜{html.escape(str(s.get('v241_position_reason',''))[:90])}")
         if safe_float(s.get('v201_precise_trigger_line',0)) > 0:
@@ -11627,10 +11663,24 @@ def v20_trade_metrics(row):
     comfort_low = safe_float(plan.get("comfort_buy_low", 0))
     comfort_high = safe_float(plan.get("comfort_buy_high", 0))
     hard_stop = safe_float(plan.get("hard_stop_price", 0))
+    giveup_price = safe_float(plan.get("giveup_price", hard_stop))
     target1 = safe_float(plan.get("target1_price", 0))
     target2 = safe_float(plan.get("target2_price", 0))
 
-    defense_dist = close / defense - 1 if close > 0 and defense > 0 else 0.0
+    defense_dist_signed = close / defense - 1 if close > 0 and defense > 0 else 0.0
+    broken_defense = bool(close > 0 and defense > 0 and close < defense * 0.995)
+    broken_hard_stop = bool(close > 0 and hard_stop > 0 and close < hard_stop * 0.998)
+    broken_giveup = bool(close > 0 and giveup_price > 0 and close < giveup_price * 0.998)
+    invalid_reasons = []
+    if broken_hard_stop:
+        invalid_reasons.append(f"收盘价{close:.2f}低于硬止损{hard_stop:.2f}")
+    if broken_giveup and (giveup_price != hard_stop):
+        invalid_reasons.append(f"收盘价{close:.2f}低于放弃价{giveup_price:.2f}")
+    if broken_defense:
+        invalid_reasons.append(f"收盘价{close:.2f}低于防守价{defense:.2f}")
+    trade_invalidated = bool(broken_defense or broken_hard_stop or broken_giveup)
+    # 评分用防守距离：跌破防守/硬止损时不能再被当作“距离防守很近”加分，直接给极大风险距离。
+    defense_dist_for_score = 999.0 if trade_invalidated else max(0.0, defense_dist_signed)
     target_dist = 0.0
     if final_pressure > close > 0:
         target_dist = final_pressure / close - 1
@@ -11655,7 +11705,14 @@ def v20_trade_metrics(row):
         "close": float(close),
         "defense": float(defense),
         "hard_stop": float(hard_stop),
-        "defense_dist": float(max(0.0, defense_dist)),
+        "giveup_price": float(giveup_price),
+        "defense_dist": float(defense_dist_for_score),
+        "defense_dist_signed": float(defense_dist_signed),
+        "broken_defense": bool(broken_defense),
+        "broken_hard_stop": bool(broken_hard_stop),
+        "broken_giveup": bool(broken_giveup),
+        "trade_invalidated": bool(trade_invalidated),
+        "trade_invalid_reason": "；".join(invalid_reasons),
         "rr": float(rr),
         "trade_q": float(trade_q),
         "pullback": float(pullback),
@@ -11683,6 +11740,37 @@ def v20_trade_metrics(row):
         "target1": float(target1),
         "target2": float(target2),
     }
+
+
+def v2562_apply_trade_invalidation(row, reason=None):
+    """V25.6.2硬风控闭环：交易假设已失效时，统一压分、空仓、剔除最终正式输出。
+    只处理最终风控链路，不改原有结构/量价/压力带模型。
+    """
+    r = row if isinstance(row, dict) else dict(row)
+    m = {}
+    try:
+        m = v20_trade_metrics(r)
+    except Exception:
+        m = {}
+    invalid = bool(r.get('v20_trade_invalidated', False) or m.get('trade_invalidated', False))
+    invalid_reason = reason or str(r.get('v20_trade_invalid_reason', '') or m.get('trade_invalid_reason', '') or '')
+    if not invalid:
+        return r
+    r['v20_trade_invalidated'] = True
+    r['v20_trade_invalid_reason'] = invalid_reason or '收盘价已跌破防守/硬止损，原交易假设失效'
+    r['v20_trade_tier'] = 'C档已破位/放弃'
+    r['v20_tier_reason'] = r['v20_trade_invalid_reason']
+    r['v212_final_score'] = min(safe_float(r.get('v212_final_score', 0)), 35.0)
+    r['v22_composite_trade_score'] = 0.0
+    r['v22_score_valid'] = False
+    r['v22_invalid_reason'] = r['v20_trade_invalid_reason']
+    r['v212_action'] = '交易假设失效/不进入最终Top'
+    r['v22_action'] = '交易假设失效/不进入最终Top'
+    r['v241_position_pct'] = 0.0
+    r['v241_position_text'] = '仓位0%｜已破位失效'
+    r['v241_position_reason'] = r['v20_trade_invalid_reason']
+    r['exclude_from_final'] = True
+    return r
 
 
 def detect_v201_low_volume_precise_trigger_line_from_row(row):
@@ -12115,6 +12203,14 @@ def v22_composite_trade_score(row):
     """最终排序分：只融合V20质量分与V21/V22交易分；不重新拆信号打分。"""
     v20 = safe_float(row.get("v20_final_score_raw", row.get("v20_final_score", 0)))
     v212 = safe_float(row.get("v212_final_score", 0))
+    try:
+        m = v20_trade_metrics(row)
+        if bool(m.get("trade_invalidated", False)):
+            return 0.0
+    except Exception:
+        pass
+    if bool(row.get("v20_trade_invalidated", False)) or bool(row.get("exclude_from_final", False)):
+        return 0.0
     risk_penalty = 0.0
     if row.get("v14_blocked") or str(row.get("v20_trade_tier", "")).startswith("硬风险"):
         risk_penalty += 100.0
@@ -13334,6 +13430,13 @@ def apply_v212_opportunity_to_row(row):
     if str(r.get('v20_trade_tier','')).startswith('C档'):
         final-=6; gate.append('旧模型交易层为C档')
     final=_v212_clip(final)
+    try:
+        _m_inv = v20_trade_metrics(r)
+    except Exception:
+        _m_inv = {}
+    if bool(_m_inv.get('trade_invalidated', False)):
+        final = min(final, 35.0)
+        gate.append(_m_inv.get('trade_invalid_reason', '收盘价低于防守/硬止损，交易假设失效'))
     # 推荐动作：只保留预判试仓/确认加仓，不输出已加速为新买点。
     state=execution['v212_state']
     if final>=V212_MIN_FORMAL_SCORE and state in ['预判试仓区','确认加仓区'] and execution['v212_risk_pct']<=V212_MAX_CONFIRM_RISK:
@@ -13398,7 +13501,12 @@ def apply_v212_opportunity_to_row(row):
     # 保留旧V20分，不再用V21.2覆盖旧分，避免职责混乱；新增V22融合排序分单独承载最终排序。
     r['v22_signal_audit'] = v22_signal_ownership_audit(r)
     r['v22_composite_trade_score'] = v22_composite_trade_score(r)
+    r['v22_score_valid'] = True
     r['v22_action'] = action.replace('V21.2', 'V22') if isinstance(action, str) else action
+    try:
+        r = v2562_apply_trade_invalidation(r)
+    except Exception:
+        pass
     return r
 
 
@@ -13531,6 +13639,13 @@ def v241_position_plan(row):
     """V24.1 动态仓位：Top3不等权，结合等级、RR、流动性、买点距离、市场环境。"""
     if V24_1_ENABLE_DYNAMIC_POSITION != "1":
         return {"v241_position_pct": 0.0, "v241_position_text": "动态仓位关闭", "v241_position_reason": ""}
+    try:
+        _m_inv = v20_trade_metrics(row)
+        if bool(row.get('v20_trade_invalidated', False)) or bool(_m_inv.get('trade_invalidated', False)) or bool(row.get('exclude_from_final', False)):
+            _reason = str(row.get('v20_trade_invalid_reason', '') or _m_inv.get('trade_invalid_reason', '') or '收盘价低于防守/硬止损，交易假设失效')
+            return {"v241_position_pct": 0.0, "v241_position_text": "仓位0%｜已破位失效", "v241_position_reason": _reason}
+    except Exception:
+        pass
     tier = str(row.get("v20_trade_tier", ""))
     rr = safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0))))
     defense_dist = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
@@ -13606,6 +13721,8 @@ def classify_v20_trade_tier(row):
     m = v20_trade_metrics(row)
     layers = v201_simplified_layer_scores(row)
     score = layers["v201_score"]
+    if bool(m.get("trade_invalidated", False)):
+        return "C档已破位/放弃", str(m.get("trade_invalid_reason", "收盘价低于防守/硬止损，交易假设失效"))
     tier_reasons = []
 
     severe_overheat = (m["rsi"] >= V20_OVERHEAT_RSI and m["cci"] >= V20_OVERHEAT_CCI) or m["bias20"] >= 0.22 or (m["bias20"] >= 0.18 and m["bias60"] >= 0.18)
@@ -13775,10 +13892,23 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             r = apply_v212_opportunity_to_row(r)
         except Exception as _e:
             r["v212_error"] = str(_e)[:200]
+        try:
+            r = v2562_apply_trade_invalidation(r)
+        except Exception:
+            pass
+        # 若V21.2/V22综合分生成失败，不再静默退回深度分参与最终正式排序；保留诊断。
+        if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
+            r["v22_score_valid"] = False
+            r["v22_invalid_reason"] = r.get("v212_error", "综合交易评分未独立生成")
+            r["exclude_from_final"] = True
 
         if r.get("v14_blocked") or tier.startswith("硬风险"):
             r["v20_pool"] = "硬风险剔除"
             r["v20_skip_reason"] = tier_reason
+            diagnostics.append(r)
+        elif bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
+            r["v20_pool"] = "风控剔除"
+            r["v20_skip_reason"] = str(r.get("v20_trade_invalid_reason", r.get("v22_invalid_reason", "交易假设失效/综合分无效")))
             diagnostics.append(r)
         else:
             candidates.append(r)
@@ -13802,8 +13932,8 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         key=lambda x: (
             1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
             tier_rank(x),
-            safe_float(x.get("v22_composite_trade_score", x.get("v212_final_score", x.get("v20_final_score", 0)))),
-            safe_float(x.get("v212_final_score", x.get("v20_final_score", 0))),
+            safe_float(x.get("v22_composite_trade_score", 0)) if _valid_score_field(x, "v22_composite_trade_score") else -1.0,
+            safe_float(x.get("v212_final_score", 0)) if _valid_score_field(x, "v212_final_score") else -1.0,
             safe_float(x.get("v201_trade_quality", 0)),
             safe_float(x.get("v20_rr", 0)),
             safe_float(x.get("v201_structure_position", 0)) + safe_float(x.get("v201_volume_behavior", 0)),
@@ -13821,6 +13951,18 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
 
     final = []
     for r in candidates:
+        if bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
+            rr = dict(r)
+            rr["v20_pool"] = "风控剔除"
+            rr["v20_skip_reason"] = str(rr.get("v20_trade_invalid_reason", "交易假设失效"))
+            diagnostics.append(rr)
+            continue
+        if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
+            rr = dict(r)
+            rr["v20_pool"] = "综合分无效剔除"
+            rr["v20_skip_reason"] = str(rr.get("v22_invalid_reason", "综合交易评分未独立生成"))
+            diagnostics.append(rr)
+            continue
         key = f"{r.get('date','')}_{r.get('code','')}"
         if V14_IGNORE_HISTORY_FOR_RERUN != "1" and key in history:
             rr = dict(r)
