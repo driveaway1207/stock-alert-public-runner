@@ -532,7 +532,8 @@ def risk_filter(d: pd.DataFrame, row_meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    d = normalize_kline(df)
+    # 先做外部字段兼容，避免一号员工/BaoStock/缓存返回字段差异导致 volume/open/high/low/close KeyError。
+    d = normalize_external_kline_df(df)
     if d is None or len(d) < 180:
         return None
     zones = find_coreline_zones(d)
@@ -877,8 +878,8 @@ def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         "收盘": "close", "收盘价": "close", "Close": "close",
         "最高": "high", "最高价": "high", "High": "high",
         "最低": "low", "最低价": "low", "Low": "low",
-        "成交量": "volume", "成交量(手)": "volume", "vol": "volume", "Volume": "volume",
-        "成交额": "amount", "成交额(元)": "amount", "Amount": "amount",
+        "成交量": "volume", "成交量(手)": "volume", "成交量(股)": "volume", "成交量(万手)": "volume", "volume": "volume", "vol": "volume", "Volume": "volume",
+        "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount", "amount": "amount", "Amount": "amount",
         "涨跌幅": "pct_chg", "pctChg": "pct_chg",
         "换手率": "turnover", "turn": "turnover",
     }
