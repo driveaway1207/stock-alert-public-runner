@@ -604,11 +604,17 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     return best_result
 
 
-def build_report(results: List[Dict[str, Any]], scanned: int, failed: int) -> str:
+def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, no_kline: int = 0) -> str:
     lines = []
+    valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
+    not_selected = max(0, valid_scanned - len(results))
     lines.append(f"【破界｜核心线突破独立战法】")
     lines.append(f"生成时间：{now_bj()}")
-    lines.append(f"扫描：{scanned}只，失败/无数据：{failed}只，候选：{len(results)}只")
+    lines.append(
+        f"扫描：{scanned}只，K线有效：{valid_scanned}只，"
+        f"候选：{len(results)}只，未入选：{not_selected}只，"
+        f"无K线/数据不足：{no_kline}只，异常失败：{failed}只"
+    )
     lines.append("")
     if not results:
         lines.append("今日暂无破界候选。")
@@ -868,35 +874,86 @@ def get_stock_list_safe(base) -> pd.DataFrame:
     return pd.DataFrame(columns=["代码", "名称", "bs_code"])
 
 def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """把一号员工缓存/AkShare/其它CSV统一成破界 normalize_kline 能识别的字段。"""
+    """
+    把一号员工缓存 / BaoStock / AkShare / 各类CSV统一成破界模型字段。
+
+    关键修复：
+    1）兼容一号员工真实缓存 kline_cache/base/sh_*.csv；
+    2）兼容字段名：volume / vol / 成交量 / 成交量(手) / amount / value / 成交额；
+    3）如果缺 volume 但有 amount+close，自动用 amount/close 近似反推 volume；
+    4）如果缺 amount 但有 volume+close，自动用 volume*close 近似 amount；
+    5）无论来源如何，返回前必须包含：date/open/high/low/close/volume/amount，避免后续 'volume' KeyError。
+    """
     if df is None or getattr(df, "empty", True):
         return None
-    d = df.copy()
-    # 字段名先统一清理：去空格/BOM，避免 CSV 里出现隐藏字符导致找不到 volume/date。
-    d.columns = [str(c).strip().replace("\ufeff", "") for c in d.columns]
-    # 常见英文小写字段兼容。
-    lower_alias = {c: c.lower().strip() for c in d.columns}
-    d = d.rename(columns=lower_alias)
-    rename_map = {
-        "日期": "date", "交易日期": "date", "trade_date": "date", "date": "date", "Date": "date", "datetime": "date", "time": "date",
-        "开盘": "open", "开盘价": "open", "open": "open", "Open": "open",
-        "收盘": "close", "收盘价": "close", "close": "close", "Close": "close",
-        "最高": "high", "最高价": "high", "high": "high", "High": "high",
-        "最低": "low", "最低价": "low", "low": "low", "Low": "low",
-        "成交量": "volume", "成交量(手)": "volume", "成交量(股)": "volume", "成交量(万手)": "volume", "volume": "volume", "vol": "volume", "Volume": "volume",
-        "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount", "amount": "amount", "value": "amount", "turnover": "amount", "Amount": "amount",
-        "涨跌幅": "pct_chg", "pctChg": "pct_chg",
-        "换手率": "turnover", "turn": "turnover",
-    }
-    d = d.rename(columns={c: rename_map.get(c, c) for c in d.columns})
-    if "date" not in d.columns or not all(c in d.columns for c in ["open", "high", "low", "close", "volume"]):
-        return None
-    if "amount" not in d.columns:
-        d["amount"] = 0.0
-    keep = ["date", "open", "high", "low", "close", "volume", "amount"]
-    d = d[keep].copy()
-    return normalize_kline(d)
 
+    d = df.copy()
+    d.columns = [str(c).strip().replace("\ufeff", "") for c in d.columns]
+
+    def norm_col(c: str) -> str:
+        x = str(c).strip().replace("\ufeff", "")
+        xl = x.lower().strip()
+        mapping = {
+            "日期": "date", "交易日期": "date", "trade_date": "date", "datetime": "date", "time": "date", "date": "date",
+            "开盘": "open", "开盘价": "open", "open": "open",
+            "最高": "high", "最高价": "high", "high": "high",
+            "最低": "low", "最低价": "low", "low": "low",
+            "收盘": "close", "收盘价": "close", "close": "close",
+            "成交量": "volume", "成交量(手)": "volume", "成交量(股)": "volume", "成交量(万手)": "volume",
+            "volume": "volume", "vol": "volume", "volumn": "volume",
+            "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount", "amount": "amount", "value": "amount", "turnover_value": "amount",
+            "涨跌幅": "pct_chg", "pctchg": "pct_chg", "pct_chg": "pct_chg",
+            "换手率": "turnover_rate", "turn": "turnover_rate", "turnover": "turnover_rate",
+        }
+        return mapping.get(x, mapping.get(xl, xl))
+
+    d = d.rename(columns={c: norm_col(c) for c in d.columns})
+
+    # 如果重命名后出现重复列，例如同时有 vol 和 volume，保留第一个非空更多的列。
+    if len(set(d.columns)) != len(d.columns):
+        merged = pd.DataFrame(index=d.index)
+        for col in dict.fromkeys(list(d.columns)):
+            same = d.loc[:, d.columns == col]
+            if same.shape[1] == 1:
+                merged[col] = same.iloc[:, 0]
+            else:
+                # 逐行取第一个非空值。
+                merged[col] = same.bfill(axis=1).iloc[:, 0]
+        d = merged
+
+    # 必要字段检查，volume/amount 可互相反推，但 OHLC/date 必须存在。
+    required_price = ["date", "open", "high", "low", "close"]
+    if not all(c in d.columns for c in required_price):
+        return None
+
+    # 日期标准化。
+    d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    for c in ["open", "high", "low", "close", "volume", "amount"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    # 关键兜底：防止后续任何模块再报 'volume'。
+    if "volume" not in d.columns:
+        if "amount" in d.columns:
+            d["volume"] = d["amount"] / d["close"].replace(0, np.nan)
+        else:
+            d["volume"] = 0.0
+
+    if "amount" not in d.columns:
+        d["amount"] = d["volume"] * d["close"]
+
+    d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+    d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(d["volume"] * pd.to_numeric(d["close"], errors="coerce"))
+
+    d = d[["date", "open", "high", "low", "close", "volume", "amount"]].copy()
+    d = d.dropna(subset=["date", "open", "high", "low", "close"])
+    d = d[(d["open"] > 0) & (d["high"] > 0) & (d["low"] > 0) & (d["close"] > 0)]
+    if d.empty:
+        return None
+
+    # 如果 volume 全为0，说明源文件没有有效量能；不让程序报错，但这种票模型会自然难出高分。
+    return normalize_kline(d)
 
 def local_kline_candidate_paths(bs_code: str) -> List[str]:
     """
@@ -1210,6 +1267,8 @@ def main():
         "scanned": scanned,
         "failed": failed,
         "no_kline": no_kline,
+        "valid_kline": max(0, scanned - failed - no_kline),
+        "not_selected": max(0, scanned - failed - no_kline - len(results)),
         "results": results,
         "failed_items_sample": failed_items[:200],
     }
@@ -1220,7 +1279,7 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    report = build_report(results, scanned, failed + no_kline)
+    report = build_report(results, scanned, failed=failed, no_kline=no_kline)
     if not results:
         report += "\n\n诊断：本次流程已跑通，但没有达到最低分的破界候选。"
         if no_kline > 0:
@@ -1233,7 +1292,7 @@ def main():
 
     print(report)
     print(f"破界结果已保存：{json_path} / {txt_path}")
-    print(f"破界失败/无数据清单已保存：{failed_path}")
+    print(f"破界异常/无K线清单已保存：{failed_path}")
 
     if args.发送Telegram and not args.不发送Telegram and hasattr(base, "send_telegram"):
         try:
