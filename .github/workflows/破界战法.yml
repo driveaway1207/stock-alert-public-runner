@@ -3,23 +3,23 @@ name: 破界战法选股模型
 on:
   workflow_dispatch:
     inputs:
-      模式:
-        description: "运行模式：daily=正式扫描；selfcheck=自检"
+      run_mode:
+        description: "运行模式：selfcheck=自检；daily=正式扫描"
         required: true
         default: "selfcheck"
         type: choice
         options:
           - selfcheck
           - daily
-      最多股票数量:
+      max_stocks:
         description: "最多扫描股票数量；0=不限制。第一次建议300"
         required: true
         default: "300"
-      输出数量:
+      result_limit:
         description: "输出候选数量"
         required: true
         default: "10"
-      发送Telegram:
+      send_telegram:
         description: "是否发送Telegram"
         required: true
         default: "false"
@@ -46,22 +46,18 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MODEL_FILE: "破界战法.py"
 
-      # Telegram：只有 daily 且发送Telegram=true 或定时运行时才发送
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 复用一号员工缓存/股票池
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
-      MODEL_UNIVERSE_FILE: ""
 
-      # 默认控制运行规模
-      MAX_STOCKS: ${{ github.event.inputs.最多股票数量 || '0' }}
-      RESULT_LIMIT: ${{ github.event.inputs.输出数量 || '10' }}
+      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
+      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
 
     steps:
       - name: 下载仓库代码
@@ -104,15 +100,14 @@ jobs:
 
       - name: 运行破界战法
         env:
-          RAW_MODE: ${{ github.event.inputs.模式 || 'daily' }}
-          RAW_SEND_TG: ${{ github.event.inputs.发送Telegram || 'true' }}
+          RAW_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
+          RAW_SEND_TG: ${{ github.event.inputs.send_telegram || 'true' }}
         run: |
           echo "触发类型：${{ github.event_name }}"
           echo "运行模式：$RAW_MODE"
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
 
-          # 定时运行固定 daily，并默认发送Telegram
           if [ "${{ github.event_name }}" = "schedule" ]; then
             RUN_MODE="daily"
             SEND_TG="true"
