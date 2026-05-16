@@ -19,7 +19,7 @@ import math
 import time
 import argparse
 import importlib.util
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
@@ -626,6 +626,369 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int) -> st
     return "\n".join(lines)
 
 
+
+# ========================= 数据入口增强补丁：参考一号员工数据层 =========================
+# 目标：破界战法仍然独立运行，但数据入口更稳：
+# 1）优先复用一号员工的 get_a_stock_list / get_daily_kline；
+# 2）股票池为空时，不再 raise 导致 GitHub Actions 失败；
+# 3）自动尝试一号员工的缓存股票池、AkShare 股票池、本地 kline_cache 反推股票池；
+# 4）最后启用应急股票池，保证流程能跑完并产出诊断报告；
+# 5）K线优先读本地缓存，再走一号员工入口，再走 AkShare 直接兜底。
+
+VALID_STOCK_PREFIXES_POJIE = (
+    "sh.600", "sh.601", "sh.603", "sh.605", "sh.688",
+    "sz.000", "sz.001", "sz.002", "sz.003", "sz.300", "sz.301",
+)
+
+
+def plain_code_from_any(value: Any) -> str:
+    text = str(value).strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:].zfill(6)
+    return ""
+
+
+def bs_code_from_plain(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith(("600", "601", "603", "605", "688")):
+        return "sh." + code
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "sz." + code
+    return ""
+
+
+def normalize_stock_list_df(df: pd.DataFrame, source: str = "unknown") -> pd.DataFrame:
+    """统一股票池字段为：代码、名称、bs_code。"""
+    empty = pd.DataFrame(columns=["代码", "名称", "bs_code"])
+    if df is None or getattr(df, "empty", True):
+        return empty
+    d = df.copy()
+
+    # BaoStock 常见字段：code / code_name
+    if "code" in d.columns and ("代码" not in d.columns):
+        d["bs_code"] = d["code"].astype(str)
+        d["代码"] = d["bs_code"].apply(plain_code_from_any)
+        if "code_name" in d.columns:
+            d["名称"] = d["code_name"].astype(str)
+        elif "name" in d.columns:
+            d["名称"] = d["name"].astype(str)
+        else:
+            d["名称"] = ""
+    else:
+        code_col = None
+        name_col = None
+        bs_col = None
+        for c in ["代码", "股票代码", "symbol", "证券代码", "code"]:
+            if c in d.columns:
+                code_col = c
+                break
+        for c in ["名称", "股票名称", "股票简称", "name", "code_name"]:
+            if c in d.columns:
+                name_col = c
+                break
+        for c in ["bs_code", "baostock_code"]:
+            if c in d.columns:
+                bs_col = c
+                break
+        if code_col is None and bs_col is None:
+            print(f"破界股票池标准化失败：source={source} columns={list(d.columns)[:20]}")
+            return empty
+        if code_col is not None:
+            d["代码"] = d[code_col].apply(plain_code_from_any)
+        else:
+            d["代码"] = d[bs_col].apply(plain_code_from_any)
+        d["名称"] = d[name_col].astype(str) if name_col else ""
+        if bs_col:
+            d["bs_code"] = d[bs_col].astype(str)
+        else:
+            d["bs_code"] = d["代码"].apply(bs_code_from_plain)
+
+    d["代码"] = d["代码"].astype(str).str.zfill(6)
+    d["名称"] = d["名称"].fillna("").astype(str)
+    d["bs_code"] = d["bs_code"].fillna("").astype(str)
+    bad_bs = ~d["bs_code"].str.startswith(("sh.", "sz."), na=False)
+    if bad_bs.any():
+        d.loc[bad_bs, "bs_code"] = d.loc[bad_bs, "代码"].apply(bs_code_from_plain)
+    d = d[d["bs_code"].str.startswith(VALID_STOCK_PREFIXES_POJIE, na=False)].copy()
+    d = d[~d["名称"].str.contains("ST|\\*ST|退", regex=True, na=False)].copy()
+    d = d.drop_duplicates(subset=["代码"])
+    return d[["代码", "名称", "bs_code"]].reset_index(drop=True)
+
+
+def stock_list_from_local_kline_cache() -> pd.DataFrame:
+    """没有股票池接口时，从 kline_cache 里的CSV文件名反推股票池。"""
+    roots = []
+    for env_key in ["FULL_HISTORY_CACHE_DIR", "CACHE_DIR"]:
+        v = os.environ.get(env_key, "").strip()
+        if v:
+            roots.append(v)
+    roots.extend(["kline_cache", "K线缓存", "kline_cache/base", "kline_cache/deep"])
+
+    rows = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if not fn.lower().endswith(".csv") or fn.startswith("_"):
+                    continue
+                code = plain_code_from_any(fn[:12])
+                if not code or code in seen:
+                    continue
+                bs_code = bs_code_from_plain(code)
+                if not bs_code:
+                    continue
+                rows.append({"代码": code, "名称": "", "bs_code": bs_code})
+                seen.add(code)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        print(f"破界：从本地K线缓存反推股票池成功，数量={len(df)}")
+    return normalize_stock_list_df(df, source="local_cache")
+
+
+def get_emergency_stock_list() -> pd.DataFrame:
+    """应急股票池：只在所有正式股票池入口失败时使用，避免 GitHub Actions 因股票池为空直接失败。"""
+    rows = [
+        ("000001", "平安银行"), ("000002", "万科A"), ("000063", "中兴通讯"), ("000333", "美的集团"),
+        ("000338", "潍柴动力"), ("000538", "云南白药"), ("000568", "泸州老窖"), ("000651", "格力电器"),
+        ("000725", "京东方A"), ("000858", "五粮液"), ("000938", "紫光股份"), ("000977", "浪潮信息"),
+        ("002049", "紫光国微"), ("002129", "TCL中环"), ("002156", "通富微电"), ("002230", "科大讯飞"),
+        ("002241", "歌尔股份"), ("002371", "北方华创"), ("002415", "海康威视"), ("002475", "立讯精密"),
+        ("002594", "比亚迪"), ("002709", "天赐材料"), ("002812", "恩捷股份"), ("002916", "深南电路"),
+        ("300014", "亿纬锂能"), ("300033", "同花顺"), ("300059", "东方财富"), ("300122", "智飞生物"),
+        ("300124", "汇川技术"), ("300274", "阳光电源"), ("300308", "中际旭创"), ("300316", "晶盛机电"),
+        ("300394", "天孚通信"), ("300408", "三环集团"), ("300750", "宁德时代"), ("300760", "迈瑞医疗"),
+        ("300782", "卓胜微"), ("300896", "爱美客"), ("600000", "浦发银行"), ("600009", "上海机场"),
+        ("600010", "包钢股份"), ("600030", "中信证券"), ("600031", "三一重工"), ("600036", "招商银行"),
+        ("600050", "中国联通"), ("600111", "北方稀土"), ("600276", "恒瑞医药"), ("600309", "万华化学"),
+        ("600406", "国电南瑞"), ("600438", "通威股份"), ("600519", "贵州茅台"), ("600570", "恒生电子"),
+        ("600585", "海螺水泥"), ("600690", "海尔智家"), ("600703", "三安光电"), ("600760", "中航沈飞"),
+        ("600809", "山西汾酒"), ("600887", "伊利股份"), ("600893", "航发动力"), ("600900", "长江电力"),
+        ("601012", "隆基绿能"), ("601088", "中国神华"), ("601166", "兴业银行"), ("601318", "中国平安"),
+        ("601398", "工商银行"), ("601601", "中国太保"), ("601628", "中国人寿"), ("601668", "中国建筑"),
+        ("601688", "华泰证券"), ("601857", "中国石油"), ("601888", "中国中免"), ("603019", "中科曙光"),
+        ("603259", "药明康德"), ("603288", "海天味业"), ("603501", "韦尔股份"), ("603799", "华友钴业"),
+        ("603986", "兆易创新"), ("688008", "澜起科技"), ("688012", "中微公司"), ("688036", "传音控股"),
+        ("688111", "金山办公"), ("688126", "沪硅产业"), ("688256", "寒武纪"), ("688981", "中芯国际"),
+    ]
+    df = pd.DataFrame(rows, columns=["代码", "名称"])
+    df["bs_code"] = df["代码"].apply(bs_code_from_plain)
+    print(f"破界：启用应急股票池，数量={len(df)}")
+    return normalize_stock_list_df(df, source="emergency")
+
+
+def get_stock_list_from_akshare_direct() -> pd.DataFrame:
+    try:
+        import akshare as ak
+    except Exception as e:
+        print(f"破界：AkShare未安装或导入失败，无法直接取股票池：{e}")
+        return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+    for attempt in range(1, 4):
+        try:
+            print(f"破界股票池获取：source=akshare stage=stock_zh_a_spot_em retry={attempt}/3")
+            df = ak.stock_zh_a_spot_em()
+            out = normalize_stock_list_df(df, source="akshare_direct")
+            if not out.empty:
+                print(f"破界：AkShare直接股票池获取成功，数量={len(out)}")
+                return out
+        except Exception as e:
+            print(f"破界：AkShare直接股票池失败 retry={attempt}/3 error={str(e)[:180]}")
+            time.sleep(1.2 * attempt)
+    return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+
+def get_stock_list_safe(base) -> pd.DataFrame:
+    """参考一号员工：缓存股票池优先，联网失败不阻断，最终应急池兜底。"""
+    # 先尝试一号员工的缓存股票池函数，避免 BaoStock/AkShare 网络波动。
+    for fn_name in ["get_a_stock_list_from_full_cache_universe", "get_a_stock_list"]:
+        fn = getattr(base, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            print(f"破界：尝试股票池入口 base.{fn_name}()")
+            df = fn()
+            out = normalize_stock_list_df(df, source=f"base.{fn_name}")
+            if not out.empty:
+                print(f"破界：股票池可用 source=base.{fn_name} stocks={len(out)}")
+                return out
+        except Exception as e:
+            print(f"破界：股票池入口失败 source=base.{fn_name} error={str(e)[:180]}")
+
+    # 再试一号员工暴露的 AkShare 股票池备用函数。
+    fn = getattr(base, "get_a_stock_list_from_akshare", None)
+    if fn is not None:
+        try:
+            print("破界：尝试 base.get_a_stock_list_from_akshare()")
+            df = fn()
+            out = normalize_stock_list_df(df, source="base.akshare")
+            if not out.empty:
+                print(f"破界：base AkShare备用股票池可用 stocks={len(out)}")
+                return out
+        except Exception as e:
+            print(f"破界：base AkShare股票池失败 error={str(e)[:180]}")
+
+    # 直接 AkShare。
+    out = get_stock_list_from_akshare_direct()
+    if not out.empty:
+        return out
+
+    # 本地缓存反推。
+    out = stock_list_from_local_kline_cache()
+    if not out.empty:
+        return out
+
+    # 最后应急股票池。可以通过 POJIE_DISABLE_EMERGENCY_UNIVERSE=1 关闭。
+    if os.environ.get("POJIE_DISABLE_EMERGENCY_UNIVERSE", "0") != "1":
+        return get_emergency_stock_list()
+
+    return pd.DataFrame(columns=["代码", "名称", "bs_code"])
+
+
+def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """把一号员工缓存/AkShare/其它CSV统一成破界 normalize_kline 能识别的字段。"""
+    if df is None or getattr(df, "empty", True):
+        return None
+    d = df.copy()
+    rename_map = {
+        "日期": "date", "交易日期": "date", "trade_date": "date", "Date": "date", "datetime": "date", "time": "date",
+        "开盘": "open", "开盘价": "open", "Open": "open",
+        "收盘": "close", "收盘价": "close", "Close": "close",
+        "最高": "high", "最高价": "high", "High": "high",
+        "最低": "low", "最低价": "low", "Low": "low",
+        "成交量": "volume", "成交量(手)": "volume", "vol": "volume", "Volume": "volume",
+        "成交额": "amount", "成交额(元)": "amount", "Amount": "amount",
+        "涨跌幅": "pct_chg", "pctChg": "pct_chg",
+        "换手率": "turnover", "turn": "turnover",
+    }
+    d = d.rename(columns={c: rename_map.get(c, c) for c in d.columns})
+    if "date" not in d.columns or not all(c in d.columns for c in ["open", "high", "low", "close", "volume"]):
+        return None
+    if "amount" not in d.columns:
+        d["amount"] = 0.0
+    keep = ["date", "open", "high", "low", "close", "volume", "amount"]
+    d = d[keep].copy()
+    return normalize_kline(d)
+
+
+def local_kline_candidate_paths(bs_code: str) -> List[str]:
+    code = plain_code_from_any(bs_code)
+    bs_file = str(bs_code).replace(".", "_")
+    roots = []
+    for env_key in ["FULL_HISTORY_CACHE_DIR", "CACHE_DIR"]:
+        v = os.environ.get(env_key, "").strip()
+        if v:
+            roots.append(v)
+    roots.extend(["kline_cache", "K线缓存", "kline_cache/base", "kline_cache/deep"])
+    paths = []
+    for root in roots:
+        if not root:
+            continue
+        paths.extend([
+            os.path.join(root, f"{code}.csv"),
+            os.path.join(root, f"{bs_file}.csv"),
+            os.path.join(root, "base", f"{bs_file}.csv"),
+            os.path.join(root, "deep", f"{bs_file}.csv"),
+            os.path.join(root, "base", f"{code}.csv"),
+            os.path.join(root, "deep", f"{code}.csv"),
+        ])
+    # 去重保持顺序
+    seen = set()
+    out = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def read_local_kline_cache_for_pojie(bs_code: str) -> Optional[pd.DataFrame]:
+    for path in local_kline_candidate_paths(bs_code):
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path, dtype={"date": str})
+            out = normalize_external_kline_df(df)
+            if out is not None and len(out) >= 120:
+                print(f"破界K线：读取本地缓存成功 symbol={bs_code} file={path} rows={len(out)}")
+                return out
+        except Exception as e:
+            print(f"破界K线：读取本地缓存失败 symbol={bs_code} file={path} error={str(e)[:120]}")
+    return None
+
+
+def get_daily_kline_akshare_direct(bs_code: str, lookback_days: int = 2600) -> Optional[pd.DataFrame]:
+    try:
+        import akshare as ak
+    except Exception:
+        return None
+    symbol = plain_code_from_any(bs_code)
+    if not symbol:
+        return None
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=int(lookback_days))).strftime("%Y%m%d")
+    for attempt in range(1, 3):
+        try:
+            time.sleep(0.15 * attempt)
+            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            out = normalize_external_kline_df(df)
+            if out is not None and len(out) >= 120:
+                print(f"破界K线：AkShare直接补拉成功 symbol={bs_code} rows={len(out)}")
+                return out
+        except Exception as e:
+            if attempt <= 1:
+                print(f"破界K线：AkShare直接补拉失败 symbol={bs_code} retry={attempt}/2 error={str(e)[:160]}")
+    return None
+
+
+def get_daily_kline_safe(base, bs_code: str) -> Optional[pd.DataFrame]:
+    """优先缓存，其次一号员工数据入口，最后 AkShare 直接兜底。"""
+    cached = read_local_kline_cache_for_pojie(bs_code)
+    if cached is not None:
+        return cached
+
+    # 尽量复用一号员工成熟的 get_daily_kline：里面已有全历史缓存、旧缓存、BaoStock、AkShare兜底逻辑。
+    if hasattr(base, "get_daily_kline"):
+        try:
+            df = base.get_daily_kline(bs_code, cache_scope="deep")
+            out = normalize_external_kline_df(df)
+            if out is not None:
+                return out
+        except TypeError:
+            try:
+                df = base.get_daily_kline(bs_code)
+                out = normalize_external_kline_df(df)
+                if out is not None:
+                    return out
+            except Exception as e:
+                print(f"破界K线：base.get_daily_kline旧签名失败 symbol={bs_code} error={str(e)[:160]}")
+        except Exception as e:
+            print(f"破界K线：base.get_daily_kline失败 symbol={bs_code} error={str(e)[:160]}")
+
+    return get_daily_kline_akshare_direct(bs_code)
+
+
+def write_empty_report(reason: str, scanned: int = 0, failed: int = 0) -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    payload = {
+        "version": MODEL_VERSION,
+        "generated_at": now_bj(),
+        "scanned": scanned,
+        "failed": failed,
+        "results": [],
+        "reason": reason,
+    }
+    json_path = os.path.join(OUTPUT_DIR, "pojie_signals.json")
+    txt_path = os.path.join(OUTPUT_DIR, "pojie_report.txt")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"【破界｜核心线突破独立战法】\n{reason}\n扫描：{scanned}只，失败/无数据：{failed}只\n")
+    print(f"破界：{reason}")
+    print(f"破界空报告已保存：{json_path} / {txt_path}")
+
 def parse_args():
     p = argparse.ArgumentParser(description="破界：核心线突破独立战法")
     p.add_argument("--模式", default="daily", choices=["daily", "selfcheck"], help="daily=执行破界选股；selfcheck=只做自检")
@@ -641,63 +1004,126 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 默认打开一号员工数据层兜底变量，避免 GitHub 上股票池/K线接口短暂失败就退出。
+    os.environ.setdefault("USE_FULL_HISTORY_CACHE", "1")
+    os.environ.setdefault("STOCK_LIST_FALLBACK_AKSHARE", "1")
+    os.environ.setdefault("KLINE_FALLBACK_AKSHARE", "1")
+    os.environ.setdefault("ALLOW_STALE_KLINE_CACHE", "1")
+
     base = load_base_module(args.基础模型文件)
-    required = ["get_a_stock_list", "get_daily_kline"]
-    missing = [x for x in required if not hasattr(base, x)]
-    if missing:
-        raise RuntimeError(f"基础模型缺少必要函数：{missing}")
+
+    # BaoStock 登录不作为硬门槛；能登录就让一号员工数据层少报 you don't login，不能登录也继续走缓存/AkShare。
+    if hasattr(base, "baostock_login"):
+        try:
+            ok = base.baostock_login()
+            print(f"破界：尝试调用一号员工 BaoStock 登录，ok={ok}")
+        except Exception as e:
+            print(f"破界：BaoStock登录异常但不阻断：{e}")
+
     if args.模式 == "selfcheck":
-        print(f"{MODEL_VERSION} 自检通过：基础模型入口存在。")
+        required = ["get_a_stock_list", "get_daily_kline"]
+        missing = [x for x in required if not hasattr(base, x)]
+        if missing:
+            print(f"{MODEL_VERSION} 自检提醒：基础模型缺少 {missing}，但破界内置兜底仍可运行。")
+        else:
+            print(f"{MODEL_VERSION} 自检通过：基础模型入口存在。")
         return
 
-    stock_list = base.get_a_stock_list()
+    stock_list = get_stock_list_safe(base)
+    stock_list = normalize_stock_list_df(stock_list, source="final")
+
     if stock_list is None or len(stock_list) == 0:
-        raise RuntimeError("股票池为空，无法执行破界扫描")
+        write_empty_report("股票池为空：基础模型、AkShare、本地缓存、应急股票池均不可用，本次不强制失败。")
+        return
+
     if args.最多股票数量 and args.最多股票数量 > 0:
         stock_list = stock_list.head(args.最多股票数量)
+
+    print(f"破界：最终扫描股票池数量={len(stock_list)}")
+    print(stock_list.head(20).to_string(index=False))
+
     results = []
     scanned = 0
     failed = 0
+    no_kline = 0
     start = time.time()
+    failed_items = []
+
     for _, row in stock_list.iterrows():
+        scanned += 1
         code = str(row.get("代码", row.get("code", ""))).zfill(6)
         bs_code = str(row.get("bs_code", ""))
         name = str(row.get("名称", row.get("name", "")))
         if not bs_code or bs_code == "nan":
-            if code.startswith(("600", "601", "603", "605", "688")):
-                bs_code = "sh." + code
-            else:
-                bs_code = "sz." + code
+            bs_code = bs_code_from_plain(code)
+        if not bs_code:
+            failed += 1
+            failed_items.append({"code": code, "name": name, "stage": "bad_bs_code"})
+            continue
+
         try:
-            try:
-                df = base.get_daily_kline(bs_code, cache_scope="deep")
-            except TypeError:
-                df = base.get_daily_kline(bs_code)
+            df = get_daily_kline_safe(base, bs_code)
+            if df is None or len(df) < 120:
+                no_kline += 1
+                failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline"})
+                continue
             res = scan_one(code, name, df)
-            scanned += 1
             if res and res["score"] >= args.最低分:
                 results.append(res)
         except Exception as e:
             failed += 1
-            if failed <= 5:
+            failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]})
+            if failed <= 20:
                 print(f"破界扫描失败：{code} {name} {e}")
-        if scanned % 200 == 0:
-            print(f"破界进度：{scanned}/{len(stock_list)} 候选={len(results)} 失败={failed} 耗时={int(time.time()-start)}s")
+
+        if scanned % 50 == 0:
+            print(f"破界进度：{scanned}/{len(stock_list)} 候选={len(results)} 无K线={no_kline} 失败={failed} 耗时={int(time.time()-start)}s")
+
     results = sorted(results, key=lambda x: (x["signal_level"] == "S", x["score"]), reverse=True)[:args.输出数量]
-    payload = {"version": MODEL_VERSION, "generated_at": now_bj(), "scanned": scanned, "failed": failed, "results": results}
+    payload = {
+        "version": MODEL_VERSION,
+        "generated_at": now_bj(),
+        "scanned": scanned,
+        "failed": failed,
+        "no_kline": no_kline,
+        "results": results,
+        "failed_items_sample": failed_items[:200],
+    }
     json_path = os.path.join(OUTPUT_DIR, "pojie_signals.json")
     txt_path = os.path.join(OUTPUT_DIR, "pojie_report.txt")
+    failed_path = os.path.join(OUTPUT_DIR, "pojie_failed_items.json")
+
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    report = build_report(results, scanned, failed)
+
+    report = build_report(results, scanned, failed + no_kline)
+    if not results:
+        report += "\n\n诊断：本次流程已跑通，但没有达到最低分的破界候选。"
+        if no_kline > 0:
+            report += f"\nK线无数据/不足：{no_kline}只。请优先检查 kline_cache 是否有有效CSV，或稍后重跑 AkShare。"
+
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(report)
+    with open(failed_path, "w", encoding="utf-8") as f:
+        json.dump(failed_items, f, ensure_ascii=False, indent=2)
+
     print(report)
     print(f"破界结果已保存：{json_path} / {txt_path}")
+    print(f"破界失败/无数据清单已保存：{failed_path}")
 
     if args.发送Telegram and not args.不发送Telegram and hasattr(base, "send_telegram"):
-        # 由基础模型里的 ENABLE_TELEGRAM/TELEGRAM_TOKEN/CHAT_ID 控制是否真的发送。
-        base.send_telegram(report)
+        try:
+            base.send_telegram(report)
+        except Exception as e:
+            print(f"Telegram发送失败，但不影响本次运行：{e}")
+
+    # 尽量登出 BaoStock，但不强制。
+    if hasattr(base, "baostock_logout"):
+        try:
+            base.baostock_logout()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
