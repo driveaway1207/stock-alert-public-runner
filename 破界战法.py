@@ -57,6 +57,72 @@ def now_bj() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+
+def force_kline_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    最后一层防御：任何进入扫描/重采样/评分函数的数据，都强制具备 date/open/high/low/close/volume/amount。
+    这不是重新拉数据，只是字段兜底，防止某些缓存列名异常导致 KeyError('volume')。
+    """
+    if df is None:
+        return pd.DataFrame()
+    d = df.copy()
+    d.columns = [str(c).strip().replace("\ufeff", "") for c in d.columns]
+    # 再做一次轻量列名归一，避免部分函数拿到未标准化切片。
+    colmap = {}
+    for c in d.columns:
+        x = str(c).strip().replace("\ufeff", "")
+        xl = x.lower().strip()
+        if x in ["日期", "交易日期"] or xl in ["date", "trade_date", "datetime", "time"]:
+            colmap[c] = "date"
+        elif x in ["开盘", "开盘价"] or xl == "open":
+            colmap[c] = "open"
+        elif x in ["最高", "最高价"] or xl == "high":
+            colmap[c] = "high"
+        elif x in ["最低", "最低价"] or xl == "low":
+            colmap[c] = "low"
+        elif x in ["收盘", "收盘价"] or xl == "close":
+            colmap[c] = "close"
+        elif x in ["成交量", "成交量(手)", "成交量(股)", "成交量(万手)"] or xl in ["volume", "vol", "volumn"]:
+            colmap[c] = "volume"
+        elif x in ["成交额", "成交额(元)", "成交额(万元)"] or xl in ["amount", "value", "turnover_value"]:
+            colmap[c] = "amount"
+        elif x in ["涨跌幅"] or xl in ["pctchg", "pct_chg"]:
+            colmap[c] = "pct_chg"
+    if colmap:
+        d = d.rename(columns=colmap)
+    # 合并重复列。
+    if len(set(d.columns)) != len(d.columns):
+        merged = pd.DataFrame(index=d.index)
+        for col in dict.fromkeys(list(d.columns)):
+            same = d.loc[:, d.columns == col]
+            merged[col] = same.bfill(axis=1).iloc[:, 0] if same.shape[1] > 1 else same.iloc[:, 0]
+        d = merged
+    # 必要列兜底。
+    for c in ["open", "high", "low", "close"]:
+        if c not in d.columns:
+            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    if "date" not in d.columns:
+        d["date"] = pd.date_range(end=pd.Timestamp.today().normalize(), periods=len(d)).astype(str)
+    if "amount" in d.columns:
+        d["amount"] = pd.to_numeric(d["amount"], errors="coerce")
+    if "volume" in d.columns:
+        d["volume"] = pd.to_numeric(d["volume"], errors="coerce")
+    if "volume" not in d.columns or d["volume"].isna().all():
+        if "amount" in d.columns and not d["amount"].isna().all():
+            d["volume"] = d["amount"] / d["close"].replace(0, np.nan)
+        else:
+            d["volume"] = 0.0
+    if "amount" not in d.columns or d["amount"].isna().all():
+        d["amount"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0) * pd.to_numeric(d["close"], errors="coerce").fillna(0)
+    d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+    d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(0.0)
+    if "pct_chg" not in d.columns:
+        d["pct_chg"] = pd.to_numeric(d["close"], errors="coerce").pct_change().fillna(0) * 100
+    else:
+        d["pct_chg"] = pd.to_numeric(d["pct_chg"], errors="coerce").fillna(0)
+    return d
+
 def load_base_module(path: str):
     """动态导入现有一号员工文件，只复用数据入口和Telegram，不改原文件。"""
     candidates = []
@@ -79,24 +145,85 @@ def load_base_module(path: str):
 
 
 def normalize_kline(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    if df is None or df.empty:
+    """
+    统一K线字段的唯一入口。
+
+    这版把 volume 问题彻底放到最底层解决：
+    - 兼容一号员工缓存：kline_cache/base/sh_600000.csv、kline_cache/000001.csv；
+    - 兼容中文字段：日期/开盘/最高/最低/收盘/成交量/成交额；
+    - 兼容英文字段：date/open/high/low/close/volume/vol/amount/value；
+    - 缺 volume 但有 amount+close：用 amount/close 反推；
+    - 缺 amount 但有 volume+close：用 volume*close 反推；
+    - 返回前强制包含 volume，避免后面任何模块再报 KeyError('volume')。
+    """
+    if df is None or getattr(df, "empty", True):
         return None
+
     d = df.copy()
-    if "date" not in d.columns:
-        return None
-    d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    for c in ["open", "high", "low", "close", "volume", "amount"]:
-        if c not in d.columns:
-            if c == "amount":
-                d[c] = 0.0
+    d.columns = [str(c).strip().replace("\ufeff", "") for c in d.columns]
+
+    def _norm_col(c: str) -> str:
+        x = str(c).strip().replace("\ufeff", "")
+        xl = x.lower().strip()
+        mapping = {
+            "日期": "date", "交易日期": "date", "trade_date": "date", "datetime": "date", "time": "date", "date": "date",
+            "开盘": "open", "开盘价": "open", "open": "open",
+            "最高": "high", "最高价": "high", "high": "high",
+            "最低": "low", "最低价": "low", "low": "low",
+            "收盘": "close", "收盘价": "close", "close": "close",
+            "成交量": "volume", "成交量(手)": "volume", "成交量(股)": "volume", "成交量(万手)": "volume",
+            "volume": "volume", "vol": "volume", "volumn": "volume",
+            "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount",
+            "amount": "amount", "value": "amount", "turnover_value": "amount",
+            "涨跌幅": "pct_chg", "pctchg": "pct_chg", "pct_chg": "pct_chg",
+            "换手率": "turnover_rate", "turn": "turnover_rate", "turnover": "turnover_rate",
+        }
+        return mapping.get(x, mapping.get(xl, xl))
+
+    d = d.rename(columns={c: _norm_col(c) for c in d.columns})
+
+    # 处理重名列，例如同时存在 vol 与 volume。
+    if len(set(d.columns)) != len(d.columns):
+        merged = pd.DataFrame(index=d.index)
+        for col in dict.fromkeys(list(d.columns)):
+            same = d.loc[:, d.columns == col]
+            if same.shape[1] == 1:
+                merged[col] = same.iloc[:, 0]
             else:
-                return None
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+                merged[col] = same.bfill(axis=1).iloc[:, 0]
+        d = merged
+
+    # OHLC/date 必须存在；volume/amount 可以互相反推。
+    required_price = ["date", "open", "high", "low", "close"]
+    if not all(c in d.columns for c in required_price):
+        return None
+
+    d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    for c in ["open", "high", "low", "close", "volume", "amount"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "volume" not in d.columns:
+        if "amount" in d.columns:
+            d["volume"] = d["amount"] / d["close"].replace(0, np.nan)
+        else:
+            d["volume"] = 0.0
+
+    if "amount" not in d.columns:
+        d["amount"] = d["volume"] * d["close"]
+
+    d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+    d["amount"] = pd.to_numeric(d["amount"], errors="coerce")
+    d["amount"] = d["amount"].fillna(d["volume"] * pd.to_numeric(d["close"], errors="coerce"))
+
+    d = d[["date", "open", "high", "low", "close", "volume", "amount"]].copy()
+    d = d.dropna(subset=["date", "open", "high", "low", "close"])
     d = d[(d["open"] > 0) & (d["high"] > 0) & (d["low"] > 0) & (d["close"] > 0)]
     d = d.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     if len(d) < 120:
         return None
+
     d["preclose"] = d["close"].shift(1)
     d["pct_chg"] = d["close"].pct_change().fillna(0) * 100
     d["body"] = d["close"] - d["open"]
@@ -116,9 +243,16 @@ def normalize_kline(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     d["atr20_pct"] = ((d["high"] - d["low"]).rolling(20).mean() / d["close"].replace(0, np.nan)).fillna(0)
     return d
 
-
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    d = df.copy().set_index("date")
+    d = force_kline_schema(df)
+    if d is None or d.empty or "date" not in d.columns:
+        return pd.DataFrame()
+    d = d.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date", "open", "high", "low", "close"])
+    if d.empty:
+        return pd.DataFrame()
+    d = d.set_index("date").sort_index()
     out = pd.DataFrame()
     out["open"] = d["open"].resample(rule).first()
     out["high"] = d["high"].resample(rule).max()
@@ -126,8 +260,8 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out["close"] = d["close"].resample(rule).last()
     out["volume"] = d["volume"].resample(rule).sum()
     out["amount"] = d["amount"].resample(rule).sum()
-    out = out.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index()
-    return normalize_kline(out) if len(out) >= 20 else out
+    out = out.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return normalize_kline(out) if len(out) >= 20 else force_kline_schema(out)
 
 
 def detect_gap_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
@@ -161,7 +295,9 @@ def detect_semantic_coreline_candidates(d: pd.DataFrame, timeframe: str) -> List
     res = []
     if d is None or len(d) < 25:
         return res
-    d = d.copy().reset_index(drop=True)
+    d = force_kline_schema(d).reset_index(drop=True)
+    if "volume" not in d.columns:
+        d["volume"] = 0.0
     vol_ma = d["volume"].rolling(10).mean()
     for i in range(6, len(d)):
         row = d.iloc[i]
@@ -290,6 +426,7 @@ def cluster_corelines(candidates: List[Dict[str, Any]], current_price: float, at
 
 def build_timeframes(daily: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     # 年线/季线样本少时仍可输出，但评分会自然降权。
+    daily = force_kline_schema(daily)
     return {
         "D": daily.tail(260).reset_index(drop=True),
         "W": resample_ohlcv(daily, "W-FRI"),
@@ -300,6 +437,7 @@ def build_timeframes(daily: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
+    daily = force_kline_schema(daily)
     tfs = build_timeframes(daily)
     candidates: List[Dict[str, Any]] = []
     for tf, df in tfs.items():
@@ -315,9 +453,13 @@ def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
 def segment_metrics(seg: pd.DataFrame) -> Dict[str, float]:
     if seg is None or len(seg) < 5:
         return {"price_center": 0, "low_center": 0, "vol_mean": 0, "amount_mean": 0, "vol_cv": 9, "atr_pct": 9, "down_big": 9, "flat_ratio": 0}
-    s = seg.copy()
+    s = force_kline_schema(seg)
+    if "volume" not in s.columns:
+        s["volume"] = 0.0
+    if "amount" not in s.columns:
+        s["amount"] = s["volume"] * s["close"]
     vol = pd.to_numeric(s["volume"], errors="coerce").replace(0, np.nan)
-    amount = pd.to_numeric(s.get("amount", s["volume"] * s["close"]), errors="coerce").replace(0, np.nan)
+    amount = pd.to_numeric(s["amount"], errors="coerce").replace(0, np.nan)
     price_center = safe_float(s["close"].median())
     low_center = safe_float(s["low"].median())
     vol_mean = safe_float(vol.mean())
@@ -332,6 +474,7 @@ def segment_metrics(seg: pd.DataFrame) -> Dict[str, float]:
 
 def score_left_buildup(d: pd.DataFrame, coreline: Dict[str, Any]) -> Dict[str, Any]:
     """突破前蓄势：阶段对阶段抬升 + 阶段内平量稳定。"""
+    d = force_kline_schema(d)
     if d is None or len(d) < 90:
         return {"score": 0.0, "level": "不足", "reasons": ["样本不足"]}
     current_price = safe_float(d["close"].iloc[-1])
@@ -414,6 +557,7 @@ def score_left_buildup(d: pd.DataFrame, coreline: Dict[str, Any]) -> Dict[str, A
 
 
 def detect_breakout(d: pd.DataFrame, zone: Dict[str, Any]) -> Dict[str, Any]:
+    d = force_kline_schema(d)
     row = d.iloc[-1]
     pre = d.iloc[-2] if len(d) >= 2 else row
     close, open_, high, low = [safe_float(row[x]) for x in ["close", "open", "high", "low"]]
@@ -506,6 +650,7 @@ def calc_space_rr(d: pd.DataFrame, zone: Dict[str, Any], all_zones: List[Dict[st
 
 
 def risk_filter(d: pd.DataFrame, row_meta: Dict[str, Any]) -> Dict[str, Any]:
+    d = force_kline_schema(d)
     close = safe_float(d["close"].iloc[-1])
     high250 = safe_float(d["high"].tail(250).max())
     low250 = safe_float(d["low"].tail(250).min())
@@ -534,6 +679,8 @@ def risk_filter(d: pd.DataFrame, row_meta: Dict[str, Any]) -> Dict[str, Any]:
 def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # 先做外部字段兼容，避免一号员工/BaoStock/缓存返回字段差异导致 volume/open/high/low/close KeyError。
     d = normalize_external_kline_df(df)
+    if d is not None:
+        d = force_kline_schema(d)
     if d is None or len(d) < 180:
         return None
     zones = find_coreline_zones(d)
