@@ -165,7 +165,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V25.5一号员工选股模型｜核心压力/支撑线吃肉模型融合版+daily/backtest同逻辑+严格No-Lookahead真实回测版"
+MODEL_VERSION = "V25.6.1一号员工选股模型｜核心线/神经线双线精修版+HVN/LVN解耦+强同源去重+严格No-Lookahead真实回测版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -403,11 +403,16 @@ V20_REVIEW_WINDOWS = [1, 3, 5, 8, 13, 20]
 
 # V20.1 A档硬门槛：宁可少给A，也不要把“买点未到/压力未破”的票写成正式可交易。
 V20_A_MIN_SCORE = float(os.environ.get("V20_A_MIN_SCORE", "82"))
+# V25.6：正式A档不降级；新增A- / B+动态分层，避免把观察票包装成正式A。
+V20_A_MINUS_MIN_SCORE = float(os.environ.get("V20_A_MINUS_MIN_SCORE", "79"))
+V20_BPLUS_MIN_SCORE = float(os.environ.get("V20_BPLUS_MIN_SCORE", "75"))
 V20_A_MIN_RR = float(os.environ.get("V20_A_MIN_RR", "1.5"))
 V20_A_MIN_TRADE_QUALITY = float(os.environ.get("V20_A_MIN_TRADE_QUALITY", "5"))
 V20_MAX_DEFENSE_DIST_A = float(os.environ.get("V20_MAX_DEFENSE_DIST_A", "0.08"))
 V20_MAX_DEFENSE_DIST_A_STRICT = float(os.environ.get("V20_MAX_DEFENSE_DIST_A_STRICT", "0.05"))
 V20_MAX_NEAR_PRESSURE_A = float(os.environ.get("V20_MAX_NEAR_PRESSURE_A", "0.05"))
+V20_TRADE_QUALITY_FLOOR_BPLUS = float(os.environ.get("V20_TRADE_QUALITY_FLOOR_BPLUS", "3"))
+V20_TRADE_QUALITY_FLOOR_A_MINUS = float(os.environ.get("V20_TRADE_QUALITY_FLOOR_A_MINUS", "5"))
 V20_OVERHEAT_RSI = float(os.environ.get("V20_OVERHEAT_RSI", "85"))
 V20_OVERHEAT_CCI = float(os.environ.get("V20_OVERHEAT_CCI", "250"))
 V20_BUY_ZONE_MISS_PCT = float(os.environ.get("V20_BUY_ZONE_MISS_PCT", "0.035"))
@@ -5975,7 +5980,7 @@ def _xhu_combine_pressure_setup_grade(zone_grade, day_grade, zone_score, day_sco
 
 
 
-# ========================= V25.5 核心压力/支撑线吃肉模型 =========================
+# ========================= V25.6 核心线/神经线双线融合模型 =========================
 # 定位：替代旧“多周期压力带突破”主入口，但保留旧字段名，避免一号员工其它模块调用断裂。
 # 原则：大级别定方向，中周期复合验证，小周期只做日线高级突破与回踩执行；不再把普通压力带堆成核心线。
 
@@ -6155,6 +6160,9 @@ def _cl_candidate_line_from_period(pdf, period="Y", current_close=0.0):
         f"影线端点{meta.get('wick_endpoint_count',0)}处，影线1/2位{meta.get('half_count',0)}处，"
         f"收盘共振{close_hits}次，高低点共振{high_low_hits}次{protect_note}"
     )
+    latest_date = str(d["date"].iloc[-1]) if "date" in d.columns and len(d) else ""
+    top_dates = [b.get("date", "") for b in top3_bars] if top3_bars else []
+    time_decay_weight = _cl_time_decay_weight_from_dates(latest_date, top_dates, period=period)
     return {
         "valid": True,
         "period": period,
@@ -6171,8 +6179,196 @@ def _cl_candidate_line_from_period(pdf, period="Y", current_close=0.0):
         "high_low_hits": int(high_low_hits),
         "distance_pct": float(dist),
         "top_bars": top,
+        # V25.6：资金交换核心线。后续跨周期合并时再判断它是主核心线、次核心线还是远端参考。
+        "line_family": "exchange_core",
+        "is_exchange_line": True,
+        "is_neural_line": False,
+        "large_period_evidence": period in ("Y", "Q", "M"),
+        "fund_memory_score": float(min(25.0, 8.0 + len(top3_bars) * 4.0 + min(5.0, reaction_bonus * 0.20))),
+        "resonance_score": float(min(40.0, reaction_bonus * 0.65 + meta.get("wick_endpoint_count", 0) * 3.0 + meta.get("half_count", 0) * 1.5)),
+        "time_decay_weight": float(time_decay_weight),
     }
 
+
+def _cl_line_from_neural_anchor(anchor, period="D", current_close=0.0):
+    """
+    V25.6：把已有的共振锚点转成“神经线”候选。
+    神经线强调反复争夺/事件密度，不等同于主供应区上沿；只有跨周期和大周期资金证据足够时才升级为核心线。
+    """
+    price = safe_float(anchor.get("price", 0))
+    if price <= 0:
+        return None
+    dist = price / max(current_close, 1e-9) - 1 if current_close > 0 else 9.99
+    if dist < -0.12 or dist > 0.35:
+        return None
+    resonance_count = int(anchor.get("resonance_count", 0) or 0)
+    resonance_priority = safe_float(anchor.get("resonance_priority", 0))
+    base = min(100.0, 34.0 + resonance_count * 5.0 + resonance_priority * 1.10 + _cl_period_rank_weight(period) * 3.0)
+    return {
+        "valid": True,
+        "period": period,
+        "line": float(price),
+        "band_low": float(anchor.get("band_low", price * (1 - _cl_period_tolerance(period) * 0.50))),
+        "band_high": float(anchor.get("band_high", price * (1 + _cl_period_tolerance(period) * 0.50))),
+        "score": float(max(0.0, min(100.0, base))),
+        "grade": _xhu_letter_grade(base, cuts=(85, 70, 55, 40)),
+        "desc": f"{period}线神经线{price:.2f}：{anchor.get('resonance_desc','共振锚点')}，共振{resonance_count}处",
+        "top_ranks": [],
+        "wick_endpoint_count": 0,
+        "half_count": 0,
+        "close_hits": 0,
+        "high_low_hits": 0,
+        "distance_pct": float(dist),
+        "top_bars": [],
+        "line_family": "neural_resonance",
+        "is_exchange_line": False,
+        "is_neural_line": True,
+        "large_period_evidence": period in ("Y", "Q", "M"),
+        "fund_memory_score": float(6.0 if period in ("Y", "Q", "M") else 3.0),
+        "resonance_score": float(min(40.0, resonance_count * 5.0 + resonance_priority * 0.85)),
+        "time_decay_weight": 1.0,
+    }
+
+
+
+
+def _cl_parse_dt_safe(x):
+    try:
+        ts = pd.to_datetime(x, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
+def _cl_time_decay_weight_from_dates(latest_date, dates, period="D"):
+    """
+    V25.6精修：时间半衰权重。远古成交密集/孤立高点不能与近3-5年结构同权；
+    年/季线允许保留长期记忆，但仍要衰减，避免历史弱HVN污染核心线。
+    """
+    try:
+        latest = _cl_parse_dt_safe(latest_date)
+        parsed = [_cl_parse_dt_safe(x) for x in (dates or [])]
+        parsed = [x for x in parsed if x is not None]
+        if latest is None or not parsed:
+            return 1.0
+        # 用最近参与锚点日期代表这条线的时效性；老点仍可凭共振留下，但不能无限抬权。
+        ref = max(parsed)
+        years = max(0.0, (latest - ref).days / 365.25)
+        half_life = {"D": 1.2, "W": 2.0, "M": 3.5, "Q": 5.0, "Y": 7.0}.get(str(period), 3.0)
+        decay = float(0.5 ** (years / max(half_life, 0.1)))
+        return max(0.25, min(1.0, decay))
+    except Exception:
+        return 1.0
+
+
+def _cl_dynamic_merge_tolerance(lines, current_close=0.0):
+    """跨周期线合并容差：按候选周期与当前价附近程度自适应，避免固定2.2%过宽/过窄。"""
+    if not lines:
+        return 0.014
+    periods = set(str(x.get("period", "")) for x in lines)
+    has_big = bool(periods & {"Y", "Q", "M"})
+    has_day_only = periods <= {"D", "W"}
+    base = 0.018 if has_big else (0.012 if has_day_only else 0.015)
+    # 当前价越高，百分比容差仍保持一致；远离当前价的远端历史线略放宽，当前附近核心线略收紧。
+    dists = [abs(safe_float(x.get("line", 0)) / max(current_close, 1e-9) - 1.0) for x in lines if safe_float(x.get("line", 0)) > 0 and current_close > 0]
+    med_dist = float(np.median(dists)) if dists else 0.1
+    if med_dist <= 0.12:
+        base *= 0.82
+    elif med_dist >= 0.45:
+        base *= 1.15
+    return max(0.006, min(0.026, base))
+
+
+def _cl_profile_features_for_zone(df, lower, upper, current_close=0.0):
+    """
+    V25.6精修：低成本Volume Profile特征。
+    - HVN：该价格簇是否处于高成交密集/主供应需求区。
+    - LVN/Thinness：突破压力线后，上方是否进入低成交真空区。
+    只在深度候选内调用，使用日线近似分桶，不改变主流程。
+    """
+    res = {
+        "hvn_score": 0.0,
+        "lvn_above_score": 0.0,
+        "profile_boundary_score": 0.0,
+        "upper_supply_thinness_score": 6.0,
+        "fake_breakout_count": 0,
+        "fake_breakout_high": 0.0,
+        "profile_desc": "无Profile特征",
+    }
+    try:
+        if df is None or len(df) < 80 or lower <= 0 or upper <= 0:
+            return res
+        d = _cl_prepare_period_df(df).copy().tail(1500)
+        if d.empty:
+            return res
+        price = d["close"].astype(float)
+        vol = d["volume"].astype(float)
+        # 时间衰减：最近3-5年权重更高，远期历史仍保留但衰减。
+        weights = np.ones(len(d), dtype=float)
+        if "date" in d.columns:
+            latest = _cl_parse_dt_safe(d["date"].iloc[-1])
+            if latest is not None:
+                ds = pd.to_datetime(d["date"], errors="coerce")
+                age_years = ((latest - ds).dt.days.fillna(0).clip(lower=0) / 365.25).astype(float)
+                weights = np.maximum(0.25, 0.5 ** (age_years / 4.0)).to_numpy()
+        bucket_pct = max(0.003, min(0.012, safe_float(_xhu_bucket_pct_for_df(d, "D"), 0.005)))
+        minp = max(0.01, float(min(d["low"].min(), lower) * 0.96))
+        maxp = max(minp * 1.02, float(max(d["high"].max(), upper) * 1.04))
+        edges = _xhu_make_log_edges(minp, maxp, bucket_pct)
+        if len(edges) < 5:
+            return res
+        # 用收盘价近似成交分布；实体顶底/影线已在共振线模块处理，避免重复重算。
+        idx = np.searchsorted(edges, price.to_numpy(), side="right") - 1
+        idx = np.clip(idx, 0, len(edges) - 2)
+        bucket_vol = np.zeros(len(edges) - 1, dtype=float)
+        np.add.at(bucket_vol, idx, vol.to_numpy() * weights)
+        mids = (edges[:-1] + edges[1:]) / 2.0
+        zone_mask = (mids >= lower * 0.997) & (mids <= upper * 1.003)
+        if not zone_mask.any():
+            # 取离中位线最近的桶兜底。
+            center = (lower + upper) / 2.0
+            nearest = int(np.argmin(np.abs(mids / center - 1.0)))
+            zone_mask[nearest] = True
+        zone_density = float(bucket_vol[zone_mask].sum() / max(zone_mask.sum(), 1))
+        valid = bucket_vol[bucket_vol > 0]
+        if len(valid) >= 5:
+            pct = float((valid <= zone_density).sum() / len(valid))
+        else:
+            pct = 0.50
+        hvn_score = 15.0 if pct >= 0.88 else (11.0 if pct >= 0.75 else (7.0 if pct >= 0.60 else 3.0))
+        # 上方LVN/供应稀薄：看突破线到上方20%-35%空间内的成交密度。
+        up_cap = max(upper * 1.20, upper + (upper - lower) * 4.0)
+        if current_close > 0:
+            up_cap = max(up_cap, min(maxp, upper * 1.35))
+        above_mask = (mids > upper * 1.003) & (mids <= min(maxp, up_cap))
+        above_density = float(bucket_vol[above_mask].mean()) if above_mask.any() else 0.0
+        global_density = float(valid.mean()) if len(valid) else max(zone_density, 1.0)
+        thin_ratio = above_density / max(zone_density, global_density * 0.3, 1e-9)
+        upper_supply_thinness = 15.0 if thin_ratio <= 0.28 else (11.5 if thin_ratio <= 0.45 else (8.0 if thin_ratio <= 0.70 else (4.0 if thin_ratio <= 1.0 else 1.5)))
+        lvn_above = min(15.0, upper_supply_thinness)
+        # 边界分：高成交区上沿 + 上方低密区，才是吃肉线。
+        boundary = min(20.0, hvn_score * 0.70 + upper_supply_thinness * 0.65)
+        # 假突破记忆：过去冲过该区上沿但收不住/长上影回落。
+        rng = (d["high"] - d["low"]).replace(0, np.nan)
+        body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
+        upper_ratio = ((d["high"] - body_top) / rng).fillna(0)
+        fake = (d["high"] >= upper * 0.995) & (d["close"] < upper * 0.995) & (upper_ratio >= 0.22)
+        fake_count = int(fake.tail(500).sum())
+        fake_high = float(d.loc[fake, "high"].max()) if fake.any() else 0.0
+        res.update({
+            "hvn_score": float(hvn_score),
+            "lvn_above_score": float(lvn_above),
+            "profile_boundary_score": float(boundary),
+            "upper_supply_thinness_score": float(upper_supply_thinness),
+            "fake_breakout_count": int(fake_count),
+            "fake_breakout_high": float(fake_high),
+            "profile_desc": f"HVN分位{pct:.0%}，上方供给稀薄{upper_supply_thinness:.1f}/15，假突破{fake_count}次",
+        })
+        return res
+    except Exception:
+        return res
 
 def _cl_all_period_core_lines(df, current_close):
     lines = []
@@ -6188,22 +6384,46 @@ def _cl_all_period_core_lines(df, current_close):
             r = _cl_candidate_line_from_period(pdf2, period=period, current_close=current_close)
             if r.get("valid"):
                 lines.append(r)
+            # V25.6：额外抽取神经线候选。它们参与共振/强弱中枢判断，但不会单独以日线小线升级成主核心线。
+            neural_anchors = _xhu_resonance_core_lines(pdf2, period=period, current_close=current_close, lookback=min(len(pdf2), 520 if period == "D" else 260))
+            for a in neural_anchors[:3]:
+                nr = _cl_line_from_neural_anchor(a, period=period, current_close=current_close)
+                if nr:
+                    lines.append(nr)
         except Exception as e:
-            print(f"核心线单周期识别失败：period={period} error={str(e)[:80]}")
-    # 大级别定方向：排序时年/季显著优先；月/周用于复合验证和上方压力排名。
+            print(f"核心线/神经线单周期识别失败：period={period} error={str(e)[:80]}")
+    # 大级别定方向：排序时年/季/月显著优先；周/日用于复合验证和执行校准。
+    # V25.6精修：加入时间半衰，远古弱HVN不能与近期结构同权；年/季/月仍保留长期记忆。
     for r in lines:
-        r["rank_score"] = safe_float(r.get("score", 0)) + _cl_period_rank_weight(r.get("period", "")) * 8.0
+        decay = safe_float(r.get("time_decay_weight", 1.0), 1.0)
+        r["rank_score"] = safe_float(r.get("score", 0)) * (0.70 + 0.30 * decay) + _cl_period_rank_weight(r.get("period", "")) * 8.0
+        if r.get("is_neural_line"):
+            # 神经线靠共振吃分；单独日线神经线不能压过大级别核心线。
+            r["rank_score"] += safe_float(r.get("resonance_score", 0)) * 0.18
+            if r.get("period") == "D":
+                r["rank_score"] -= 10.0
+        if r.get("is_exchange_line"):
+            r["rank_score"] += safe_float(r.get("fund_memory_score", 0)) * 0.25
         # 近当前且上方可突破的线，交易价值更高；远端线保留用于空间排名。
         dist = safe_float(r.get("distance_pct", 9.99))
         if -0.05 <= dist <= 0.25:
             r["rank_score"] += 8.0
         if r.get("period") in ("Y", "Q"):
             r["rank_score"] += 12.0
+        elif r.get("period") == "M":
+            r["rank_score"] += 6.0
     return sorted(lines, key=lambda x: safe_float(x.get("rank_score", 0)), reverse=True)
 
 
-def _cl_merge_nearby_pressure_lines(lines, current_close):
-    """跨周期才做合并/排名：近距离且强度相近的线合并为压力区，取上沿作为确认价。"""
+def _cl_merge_nearby_pressure_lines(lines, current_close, source_df=None):
+    """
+    V25.6精修：跨周期合并核心线/神经线。
+    重点：
+    1）先合并候选线，再分别计算“核心线分”和“神经线分”；
+    2）核心线更重视主供应/需求边界、HVN上沿与上方LVN真空；
+    3）神经线更重视多事件反复共振；
+    4）单一日线触发线不允许升级成核心线。
+    """
     if not lines:
         return []
     pts = []
@@ -6211,19 +6431,21 @@ def _cl_merge_nearby_pressure_lines(lines, current_close):
         price = safe_float(r.get("line", 0))
         if price <= 0:
             continue
-        # 只对当前价附近及上方压力做排名；远低于当前的当作支撑记忆。
+        # 只对当前价附近及上方压力做排名；远低于当前的当作支撑记忆，暂不混入压力突破模型。
         if current_close > 0 and price < current_close * 0.88:
             continue
-        pts.append({"price": price, "weight": max(1.0, safe_float(r.get("rank_score", 0)) / 20.0), "line": r})
+        decay = safe_float(r.get("time_decay_weight", 1.0), 1.0)
+        pts.append({"price": price, "weight": max(1.0, safe_float(r.get("rank_score", 0)) / 20.0) * (0.80 + 0.20 * decay), "line": r})
     pts = sorted(pts, key=lambda x: x["price"])
     groups = []
-    for p in pts:
+    for p0 in pts:
         placed = False
         for g in groups:
             center = safe_float(g.get("center", 0))
-            # 跨周期5%内如果强线接近，视为同一核心压力区；弱小线不会推翻第一核心线，但会记录为拦路压力。
-            if center > 0 and abs(p["price"] / center - 1) <= 0.035:
-                g["items"].append(p)
+            group_lines = [x["line"] for x in g.get("items", [])] + [p0["line"]]
+            tol = _cl_dynamic_merge_tolerance(group_lines, current_close=current_close)
+            if center > 0 and abs(p0["price"] / center - 1) <= tol:
+                g["items"].append(p0)
                 total = sum(x["weight"] for x in g["items"])
                 g["center"] = sum(x["price"] * x["weight"] for x in g["items"]) / max(total, 1e-9)
                 g["lower"] = min(x["price"] for x in g["items"])
@@ -6231,31 +6453,106 @@ def _cl_merge_nearby_pressure_lines(lines, current_close):
                 placed = True
                 break
         if not placed:
-            groups.append({"center": p["price"], "lower": p["price"], "upper": p["price"], "items": [p]})
+            groups.append({"center": p0["price"], "lower": p0["price"], "upper": p0["price"], "items": [p0]})
     out = []
     for g in groups:
         items = g["items"]
         periods = sorted(set(x["line"].get("period", "") for x in items))
-        period_bonus = sum(_cl_period_rank_weight(x["line"].get("period", "")) for x in items)
+        period_count = len(periods)
+        large_periods = [x for x in periods if x in ("Y", "Q", "M")]
+        large_count = len(large_periods)
+        period_bonus = sum(_cl_period_rank_weight(x["line"].get("period", "")) * safe_float(x["line"].get("time_decay_weight", 1.0), 1.0) for x in items)
+        exchange_items = [x for x in items if bool(x["line"].get("is_exchange_line", False))]
+        neural_items = [x for x in items if bool(x["line"].get("is_neural_line", False))]
         best_item = sorted(items, key=lambda x: safe_float(x["line"].get("rank_score", 0)), reverse=True)[0]
-        score = min(100.0, safe_float(best_item["line"].get("score", 0)) * 0.72 + period_bonus * 5.0 + len(items) * 4.0)
+
+        raw_resonance = sum(safe_float(x["line"].get("resonance_score", 0)) * safe_float(x["line"].get("time_decay_weight", 1.0), 1.0) for x in items)
+        close_hits = sum(int(x["line"].get("close_hits", 0) or 0) for x in items)
+        high_low_hits = sum(int(x["line"].get("high_low_hits", 0) or 0) for x in items)
+        dist_center = safe_float(g.get("center", 0)) / max(current_close, 1e-9) - 1 if current_close > 0 else 9.99
+        pf = _cl_profile_features_for_zone(source_df, safe_float(g.get("lower", 0)), safe_float(g.get("upper", 0)), current_close=current_close)
+
+        # 神经线分：共振性必须占主导，强调这条线是不是股票的“结构中枢神经”。
+        neural_resonance_part = min(40.0, raw_resonance * 0.45 + period_count * 4.0 + len(neural_items) * 5.0 + close_hits * 0.8 + high_low_hits * 0.45)
+        event_density_part = min(25.0, len(items) * 3.5 + close_hits * 0.9 + high_low_hits * 0.55 + safe_float(pf.get("fake_breakout_count", 0)) * 1.0)
+        neural_fund_part = min(15.0, sum(safe_float(x["line"].get("fund_memory_score", 0)) * safe_float(x["line"].get("time_decay_weight", 1.0), 1.0) for x in items) * 0.35 + len(exchange_items) * 3.0)
+        neural_period_part = min(10.0, period_count * 2.2 + large_count * 1.5)
+        neural_trade_part = 10.0 if -0.06 <= dist_center <= 0.18 else (6.0 if -0.10 <= dist_center <= 0.32 else 2.0)
+        neural_score = min(100.0, neural_resonance_part + event_density_part + neural_fund_part + neural_period_part + neural_trade_part)
+
+        # 核心线分：核心线是主供应/需求边界，不是最高价。权重按最新方法论调整。
+        # 联合共振35、大量/倍量资金25、HVN/LVN边界20、突破后稀薄度15、当前可交易5。
+        core_resonance_part = min(35.0, neural_resonance_part * 0.66 + period_count * 3.0 + large_count * 3.5 + safe_float(pf.get("fake_breakout_count", 0)) * 0.6)
+        core_fund_part = min(25.0, sum(safe_float(x["line"].get("fund_memory_score", 0)) * safe_float(x["line"].get("time_decay_weight", 1.0), 1.0) for x in exchange_items) * 0.70 + large_count * 3.5)
+        width_pct = safe_float(g.get("upper", 0)) / max(safe_float(g.get("lower", 0)), 1e-9) - 1 if safe_float(g.get("lower", 0)) > 0 else 9.99
+        compact_bonus = max(0.0, 1.0 - width_pct / 0.035) * 5.0
+        boundary_part = min(20.0, period_bonus * 0.85 + len(exchange_items) * 2.4 + compact_bonus + safe_float(pf.get("profile_boundary_score", 0)) * 0.55)
+        thinness_part = min(15.0, safe_float(pf.get("upper_supply_thinness_score", 6.0), 6.0))
+        trade_part = 5.0 if -0.06 <= dist_center <= 0.22 else (2.8 if 0.22 < dist_center <= 0.45 else 0.8)
+        core_score = min(100.0, core_resonance_part + core_fund_part + boundary_part + thinness_part + trade_part)
+
+        has_large_exchange = any(x["line"].get("period") in ("Y", "Q", "M") and x["line"].get("is_exchange_line") for x in items)
+        has_large_evidence = large_count >= 1
+        is_neural = neural_score >= 58 and (period_count >= 2 or len(items) >= 3 or len(neural_items) >= 2)
+        is_core = core_score >= 60 and has_large_evidence and (has_large_exchange or len(exchange_items) >= 2) and (core_resonance_part >= 12 or period_count >= 2)
+        # 单一历史极值/单一日线平台线不允许升级核心线。
+        if period_count <= 1 and len(items) <= 1:
+            is_core = False
+        if is_core and is_neural and abs(core_score - neural_score) <= 30:
+            role = "核心神经共振区"
+        elif is_core and core_score >= 74:
+            role = "主核心线"
+        elif is_core:
+            role = "次核心线"
+        elif is_neural:
+            role = "神经线"
+        else:
+            role = "日线触发/普通压力线"
+
+        # 最终排序分：核心线优先于神经线；日线触发线不能拿A档。
+        if role == "核心神经共振区":
+            score = max(core_score, neural_score) + 8.0
+        elif role in ("主核心线", "次核心线"):
+            score = core_score
+        elif role == "神经线":
+            score = min(74.0, neural_score)
+        else:
+            score = min(46.0, max(core_score, neural_score) * 0.62)
+        score = max(0.0, min(100.0, score))
         grade = _xhu_letter_grade(score, cuts=(85, 70, 55, 40))
         out.append({
             "lower": float(g["lower"]), "upper": float(g["upper"]), "center": float(g["center"]),
             "confirm_price": float(g["upper"]),
             "score": float(score), "grade": grade,
+            "core_score": float(core_score),
+            "neural_score": float(neural_score),
+            "core_resonance_part": float(core_resonance_part),
+            "core_fund_part": float(core_fund_part),
+            "profile_boundary_part": float(boundary_part),
+            "upper_supply_thinness_part": float(thinness_part),
+            "hvn_score": float(pf.get("hvn_score", 0)),
+            "lvn_above_score": float(pf.get("lvn_above_score", 0)),
+            "fake_breakout_count": int(pf.get("fake_breakout_count", 0)),
+            "fake_breakout_high": float(pf.get("fake_breakout_high", 0)),
+            "profile_desc": pf.get("profile_desc", ""),
+            "role": role,
             "periods": periods,
+            "large_periods": large_periods,
+            "period_count": int(period_count),
+            "large_count": int(large_count),
+            "exchange_count": int(len(exchange_items)),
+            "neural_count": int(len(neural_items)),
             "best_line": best_item["line"],
-            "desc": " + ".join([x["line"].get("desc", "") for x in sorted(items, key=lambda x: safe_float(x["line"].get("rank_score", 0)), reverse=True)[:3]]),
+            "desc": f"{role}；核心分{core_score:.1f}，神经分{neural_score:.1f}；{pf.get('profile_desc','')}；" + " + ".join([x["line"].get("desc", "") for x in sorted(items, key=lambda x: safe_float(x["line"].get("rank_score", 0)), reverse=True)[:3]]),
         })
-    # 压力排名：先按大级别/质量排，再兼顾价格由近及远。
-    return sorted(out, key=lambda z: (safe_float(z.get("score", 0)), _cl_period_rank_weight(z.get("best_line", {}).get("period", ""))), reverse=True)
-
+    role_order = {"核心神经共振区": 5, "主核心线": 4, "次核心线": 3, "神经线": 2, "日线触发/普通压力线": 1}
+    return sorted(out, key=lambda z: (role_order.get(z.get("role", ""), 0), safe_float(z.get("score", 0)), safe_float(z.get("upper_supply_thinness_part", 0))), reverse=True)
 
 def _cl_choose_primary_core_zone(zones, current_close):
     if not zones:
         return None
-    # 优先选择“当前价上方或刚突破附近”的最高级核心区；过远的远端线只用于下一压力。
+    # V25.6：核心线优先于神经线；单一日线触发线不能被交易距离加成推成“核心线”。
+    role_bonus_map = {"核心神经共振区": 30.0, "主核心线": 24.0, "次核心线": 15.0, "神经线": 6.0, "日线触发/普通压力线": -18.0}
     candidates = []
     for z in zones:
         cp = safe_float(z.get("confirm_price", z.get("upper", 0)))
@@ -6267,8 +6564,9 @@ def _cl_choose_primary_core_zone(zones, current_close):
             trade_bonus += 8.0
         elif dist > 0.65:
             trade_bonus -= 16.0
-        big_bonus = 10.0 if any(p in z.get("periods", []) for p in ["Y", "Q"]) else 0.0
-        candidates.append((safe_float(z.get("score", 0)) + trade_bonus + big_bonus, z))
+        big_bonus = 12.0 if any(p in z.get("periods", []) for p in ["Y", "Q"]) else (6.0 if "M" in z.get("periods", []) else 0.0)
+        role_bonus = role_bonus_map.get(z.get("role", ""), 0.0)
+        candidates.append((safe_float(z.get("score", 0)) + trade_bonus + big_bonus + role_bonus, z))
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -6321,6 +6619,14 @@ def _cl_prep_quality(df, level):
         score += 4; reasons.append(f"量能压缩/低量{low_vol_days}日")
     elif cv2 < cv1 * 0.90:
         score += 2; reasons.append("量能波动下降")
+    # V25.6：突破前“量能中枢抬高但波动转平稳”是蓄势质量，不单独变成战法加分，避免与资金行为模块重复。
+    v_mean1 = safe_float(v1.mean()) if len(v1) else 0.0
+    v_mean2 = safe_float(v2.mean()) if len(v2) else 0.0
+    vol_center_ratio = v_mean2 / v_mean1 if v_mean1 > 0 else 0.0
+    if 1.05 <= vol_center_ratio <= 1.80 and cv2 <= cv1 * 1.05:
+        score += 2.5; reasons.append("量能中枢抬高且趋稳")
+    elif 0.88 <= vol_center_ratio <= 1.25 and cv2 < cv1 * 0.82:
+        score += 1.5; reasons.append("平量蓄势")
     # 小K收敛：振幅下降。
     amp = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
     a1 = safe_float(amp.iloc[-60:-30].median()); a2 = safe_float(amp.iloc[-20:].median())
@@ -6404,6 +6710,14 @@ def _cl_grade_breakout_day(df, core_zone):
         score += 10; reasons.append("量能健康")
     else:
         score -= 6; reasons.append("量能不理想")
+    # V25.6精修：假突破记忆越多，再突破越需要实体/收盘/量能同时过硬；否则按二次假突破风险处理。
+    fake_count = int(core_zone.get("fake_breakout_count", 0) or 0)
+    if breakout and fake_count >= 2:
+        strict_ok = (body_above >= 0.65 and close_pos >= 0.78 and healthy_vol and upper_shadow_ratio <= 0.25)
+        if strict_ok:
+            score -= min(5.0, fake_count * 1.0); reasons.append(f"假突破记忆{fake_count}次，已较强确认")
+        else:
+            score -= min(14.0, fake_count * 3.0); reasons.append(f"假突破记忆{fake_count}次，确认不足")
     if wick_probe:
         score -= 22; reasons.append("影线试探失败")
     score = max(0.0, min(100.0, score))
@@ -6441,7 +6755,7 @@ def _cl_build_coreline_model(df, code=""):
     lines = _cl_all_period_core_lines(d, cur_close)
     if not lines:
         return empty
-    zones = _cl_merge_nearby_pressure_lines(lines, cur_close)
+    zones = _cl_merge_nearby_pressure_lines(lines, cur_close, source_df=d)
     if not zones:
         return empty
     core_zone = _cl_choose_primary_core_zone(zones, cur_close)
@@ -6450,54 +6764,99 @@ def _cl_build_coreline_model(df, code=""):
     overhead = _cl_overhead_ranking(zones, core_zone, cur_close)
     next_major = None
     for z in overhead:
-        if safe_float(z.get("score", 0)) >= 55:
-            next_major = z; break
+        # V25.6：下一压力必须至少是中级强度；神经线可作为拦路压力，但孤立历史高点不默认压成最终线。
+        if safe_float(z.get("score", 0)) >= 55 and str(z.get("role", "")) != "日线触发/普通压力线":
+            # 孤立远端历史点即使在上方，也不默认作为“最终压力”；必须有中级以上角色/共振证据。
+            if int(z.get("period_count", 0) or 0) >= 2 or safe_float(z.get("core_score", 0)) >= 66 or safe_float(z.get("neural_score", 0)) >= 70:
+                next_major = z; break
     core_confirm = safe_float(core_zone.get("confirm_price", core_zone.get("upper", 0)))
     meat_space = 0.0
     if next_major and core_confirm > 0:
         meat_space = safe_float(next_major.get("confirm_price", next_major.get("upper", 0))) / core_confirm - 1
     else:
-        # 没找到下一高级压力，不乱猜，只给保守空间字段为0，并在desc里提示。
+        # 没找到下一高级压力，不乱猜历史高点为最终压力；这反而可能代表主供应区上方稀薄，但需要日线确认。
         meat_space = 0.0
     prep = _cl_prep_quality(d, core_confirm)
     day = _cl_grade_breakout_day(d, core_zone)
-    core_score = safe_float(core_zone.get("score", 0))
-    # 模型分：核心线质量为主，日线突破为触发；蓄势小权重；空间只做轻校准，避免总分失控。
+    zone_score = safe_float(core_zone.get("score", 0))
+    core_score_raw = safe_float(core_zone.get("core_score", zone_score))
+    neural_score_raw = safe_float(core_zone.get("neural_score", 0))
+    role = str(core_zone.get("role", "")) or "日线触发/普通压力线"
+
+    # V25.6模型分：线角色决定权重。突破主核心线 > 突破次核心线 > 突破神经线 > 突破日线触发线。
+    role_setup_weight = {
+        "核心神经共振区": 1.18,
+        "主核心线": 1.00,
+        "次核心线": 0.76,
+        "神经线": 0.48,
+        "日线触发/普通压力线": 0.25,
+    }.get(role, 0.35)
     setup_score = 0.0
-    if core_score >= 85:
-        setup_score += 5.5
-    elif core_score >= 70:
-        setup_score += 4.0
-    elif core_score >= 55:
-        setup_score += 2.0
+    if role in ("核心神经共振区", "主核心线", "次核心线"):
+        if core_score_raw >= 85:
+            setup_score += 5.5
+        elif core_score_raw >= 70:
+            setup_score += 4.0
+        elif core_score_raw >= 55:
+            setup_score += 2.0
+    elif role == "神经线":
+        if neural_score_raw >= 80:
+            setup_score += 2.5
+        elif neural_score_raw >= 65:
+            setup_score += 1.5
+    setup_score *= role_setup_weight
     setup_score += min(5.0, prep.get("mapped_score", 0)) * 0.55
-    if meat_space >= 0.25:
+    # 供应稀薄/吃肉空间只轻校准，不把历史最高价机械当最终线。
+    setup_score += min(1.2, safe_float(core_zone.get("upper_supply_thinness_part", 0)) / 15.0 * 1.2)
+    if next_major is None and role in ("核心神经共振区", "主核心线"):
+        setup_score += 1.4
+    elif meat_space >= 0.25:
         setup_score += 2.0
     elif meat_space >= 0.12:
         setup_score += 1.0
-    if day.get("breakout_day_grade") == "S":
-        setup_score += 8.0
-    elif day.get("breakout_day_grade") == "A":
-        setup_score += 6.0
-    elif day.get("breakout_day_grade") == "B":
-        setup_score += 2.5
+    day_grade = day.get("breakout_day_grade")
+    breakout_role_weight = {
+        "核心神经共振区": 1.12,
+        "主核心线": 0.95,
+        "次核心线": 0.68,
+        "神经线": 0.42,
+        "日线触发/普通压力线": 0.22,
+    }.get(role, 0.35)
+    if day_grade == "S":
+        setup_score += 8.0 * breakout_role_weight
+    elif day_grade == "A":
+        setup_score += 6.0 * breakout_role_weight
+    elif day_grade == "B":
+        setup_score += 2.5 * breakout_role_weight
     score = max(0.0, min(18.0, setup_score))
+
+    # 评级：神经线突破可以转强，但不能和主核心线突破同档；普通触发线最多观察。
     model_grade = "D"
-    if core_score >= 85 and day.get("breakout_day_grade") in ("S", "A"):
-        model_grade = "S" if day.get("breakout_day_grade") == "S" and score >= 14 else "A"
-    elif core_score >= 70 and day.get("breakout_day_grade") in ("S", "A", "B"):
-        model_grade = "B" if day.get("breakout_day_grade") == "B" else "A"
-    elif core_score >= 70:
-        model_grade = "C"  # 核心线好但尚未触发，基础筛选/跟踪用；不直接正式推送。
+    if role == "核心神经共振区" and zone_score >= 82 and day_grade in ("S", "A"):
+        model_grade = "S" if day_grade == "S" and score >= 14 else "A"
+    elif role == "主核心线" and core_score_raw >= 76 and day_grade in ("S", "A"):
+        model_grade = "A"
+    elif role == "次核心线" and core_score_raw >= 68 and day_grade in ("S", "A", "B"):
+        model_grade = "B" if day_grade == "B" else "A"
+    elif role == "神经线" and neural_score_raw >= 70 and day_grade in ("S", "A"):
+        model_grade = "B"
+    elif zone_score >= 70 and role in ("核心神经共振区", "主核心线", "次核心线"):
+        model_grade = "C"  # 线好但尚未触发，基础筛选/跟踪用；不直接正式推送。
+    elif role == "神经线" and neural_score_raw >= 65:
+        model_grade = "C"
+
     core_line = core_zone.get("best_line", {})
     next_desc = ""
     if next_major:
-        next_desc = f"；下一高级压力{safe_float(next_major.get('confirm_price',0)):.2f}，吃肉空间约{meat_space*100:.1f}%"
+        next_desc = f"；下一强压力{safe_float(next_major.get('confirm_price',0)):.2f}({next_major.get('role','')})，间距约{meat_space*100:.1f}%"
     else:
-        next_desc = "；暂未识别到更高一级强压力，空间需后续由更高/更细周期继续校准"
+        next_desc = "；未把孤立历史高点机械当最终压力，当前核心区上方供应需由后续价格继续确认"
     desc = (
-        f"核心压力/支撑区{safe_float(core_zone.get('lower',0)):.2f}-{safe_float(core_zone.get('upper',0)):.2f}，"
+        f"{role}{safe_float(core_zone.get('lower',0)):.2f}-{safe_float(core_zone.get('upper',0)):.2f}，"
         f"确认价{core_confirm:.2f}，等级{core_zone.get('grade','D')}，周期{','.join(core_zone.get('periods', []))}；"
+        f"核心分{core_score_raw:.1f}，神经分{neural_score_raw:.1f}；"
+        f"HVN{safe_float(core_zone.get('hvn_score',0)):.1f}，LVN/稀薄{safe_float(core_zone.get('upper_supply_thinness_part',0)):.1f}，"
+        f"假突破{int(core_zone.get('fake_breakout_count',0) or 0)}次；"
         f"{core_zone.get('desc','')}{next_desc}；突破前蓄势：{prep.get('desc','')}；日线：{day.get('desc','')}"
     )
     return {
@@ -6510,7 +6869,15 @@ def _cl_build_coreline_model(df, code=""):
         "confirm_price": float(core_confirm),
         "core_line_price": float(safe_float(core_line.get("line", core_confirm))),
         "core_line_desc": core_line.get("desc", ""),
-        "core_quality_score": float(core_score),
+        "core_quality_score": float(zone_score),
+        "core_score_raw": float(core_score_raw),
+        "neural_score_raw": float(neural_score_raw),
+        "hvn_score": float(core_zone.get("hvn_score", 0.0)),
+        "lvn_above_score": float(core_zone.get("lvn_above_score", 0.0)),
+        "upper_supply_thinness_score": float(core_zone.get("upper_supply_thinness_part", 0.0)),
+        "fake_breakout_count": int(core_zone.get("fake_breakout_count", 0) or 0),
+        "fake_breakout_high": float(core_zone.get("fake_breakout_high", 0.0)),
+        "line_role": role,
         "periods": ",".join(core_zone.get("periods", [])),
         "desc": desc,
         "breakout_day_grade": day.get("breakout_day_grade", "D"),
@@ -6524,10 +6891,9 @@ def _cl_build_coreline_model(df, code=""):
         "overhead_pressures": overhead[:8],
     }
 
-
 def detect_xuanhu_pressure_band_breakout_model(df, code=""):
     """
-    V25.5：核心压力/支撑线吃肉模型主入口。
+    V25.6：核心线/神经线双线融合主入口。
     兼容旧 xhu_pressure_* 字段，但语义从“普通多周期压力带”升级为：
     1）大级别唯一核心线；2）跨周期压力排名；3）吃肉空间；4）日线高级突破；5）蓄势小权重校准。
     """
@@ -6557,13 +6923,19 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_coreline_next_major_pressure": 0.0,
         "xhu_coreline_prep_score20": 0.0,
         "xhu_coreline_prep_desc": "",
+        "xhu_coreline_role": "",
+        "xhu_coreline_core_score": 0.0,
+        "xhu_coreline_neural_score": 0.0,
+        "xhu_coreline_hvn_score": 0.0,
+        "xhu_coreline_lvn_above_score": 0.0,
+        "xhu_coreline_upper_supply_thinness": 0.0,
     }
     if ENABLE_XHU_PRESSURE_BREAKOUT != "1" or df is None or len(df) < 180:
         return empty
     try:
         m = _cl_build_coreline_model(df, code=code)
     except Exception as e:
-        print(f"V25.5核心线模型失败：code={code} error={str(e)[:120]}")
+        print(f"V25.6核心线模型失败：code={code} error={str(e)[:120]}")
         return empty
     if not m.get("valid"):
         return empty
@@ -6588,15 +6960,21 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_effective_confirm_price": float(m.get("confirm_price", 0.0)),
         "xhu_pressure_merge_gap_pct": 0.0,
         "xhu_breakout_desc": m.get("breakout_desc", ""),
-        "xhu_fake_breakout_count": 0,
-        "xhu_fake_breakout_high": 0.0,
+        "xhu_fake_breakout_count": int(m.get("fake_breakout_count", 0) or 0),
+        "xhu_fake_breakout_high": float(m.get("fake_breakout_high", 0.0)),
         "xhu_coreline_meat_space_pct": float(m.get("meat_space_pct", 0.0)),
         "xhu_coreline_next_major_pressure": float(m.get("next_major_pressure", 0.0)),
         "xhu_coreline_prep_score20": float(m.get("prep_score20", 0.0)),
         "xhu_coreline_prep_desc": m.get("prep_desc", ""),
-        "xhu_pressure_json": json.dumps(ranked, ensure_ascii=False)[:1800],
+        "xhu_coreline_role": m.get("line_role", ""),
+        "xhu_coreline_core_score": float(m.get("core_score_raw", 0.0)),
+        "xhu_coreline_neural_score": float(m.get("neural_score_raw", 0.0)),
+        "xhu_coreline_hvn_score": float(m.get("hvn_score", 0.0)),
+        "xhu_coreline_lvn_above_score": float(m.get("lvn_above_score", 0.0)),
+        "xhu_coreline_upper_supply_thinness": float(m.get("upper_supply_thinness_score", 0.0)),
+        "xhu_pressure_json": json.dumps(ranked, ensure_ascii=False)[:2200],
     }
-# ========================= V25.5 核心压力/支撑线吃肉模型 END =========================
+# ========================= V25.6 核心线/神经线双线融合模型 END =========================
 
 
 # ========================= V20.2 底部反转强势形态模块 =========================
@@ -10884,25 +11262,71 @@ def data_quality_report_line(row):
 # ======================= V19.4.1 数据质量提示模块 END =======================
 
 
+
+def _human_trade_tier(tier):
+    """报告展示用：把后台分层压缩成人能直接看懂的操作等级。只影响报告，不影响评分/排序。"""
+    t = str(tier or "").strip()
+    if t.startswith("A"):
+        return "A确认"
+    if t.startswith("B+"):
+        return "B+观察"
+    if t.startswith("B"):
+        return "B观察"
+    if t.startswith("C"):
+        return "C观察"
+    if "硬风险" in t or "剔除" in t:
+        return "硬风险剔除"
+    return t or "未分层"
+
+
+def _human_trade_warning(tier):
+    """报告展示用：每只票标题下方必须第一眼提示是否能开盘直接买。"""
+    t = str(tier or "").strip()
+    if t.startswith("A"):
+        return "可以重点盯盘，但仍要按计划价执行；高开太多或冲高回落不追。"
+    if t.startswith("B+"):
+        return "目前只是观察票，不是开盘直接买入票；不回踩、不确认、不追。"
+    if t.startswith("B"):
+        return "目前只是观察票，不是开盘直接买入票；等回踩或突破确认。"
+    if t.startswith("C"):
+        return "目前只做后台跟踪，不具备直接交易条件。"
+    if "硬风险" in t or "剔除" in t:
+        return "命中硬风险或硬约束，不作为正式交易候选。"
+    return "按确认条件执行，不满足条件不追。"
+
+
+def _report_base_score(row):
+    """基础评分：全市场海选/旧主模型底座分。只用于报告展示。"""
+    return safe_float(row.get('v16_final_score', row.get('v14_original_total_score', row.get('v14_final_score', row.get('total_score', 0)))))
+
+
+def _report_deep_score(row):
+    """深度评分：进入深度分析后的质量分。只用于报告展示。"""
+    return safe_float(row.get('v20_final_score', row.get('v201_score', row.get('v212_final_score', 0))))
+
+
+def _report_composite_score(row):
+    """综合评分：最终排序优先使用融合后的交易分；缺失时回退深度评分。只用于报告展示。"""
+    return safe_float(row.get('v22_composite_trade_score', row.get('v212_final_score', row.get('v20_final_score', 0))))
+
 def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fail=0, deep_count=0, v14_diagnostics=None, lifecycle_tracking=None):
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
     lines.append(f"📊 <b>{html.escape(MODEL_VERSION)}</b>")
-    lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
+    lines.append(f"🗓 使用K线日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
     lines.append(f"股票池：{stock_count}只 | K线成功：{kline_success}只 | 失败：{kline_fail}只 | 深度评分：{deep_count}只")
-    lines.append(f"正式输出：<b>{len(final_signals)}</b>只，固定目标{V20_FIXED_TOP_N}只；注意Top3可能包含A/B+/B/C分层。")
+    lines.append(f"今日输出：<b>{len(final_signals)}</b>只，固定目标{V20_FIXED_TOP_N}只；包含观察级，不等于全部可直接买入。")
     if final_signals:
         _tier_stat = {}
         for _s in final_signals:
             _t = str(_s.get("v20_trade_tier", "未分层"))
             _tier_stat[_t] = _tier_stat.get(_t, 0) + 1
-        lines.append(f"V20分层：{html.escape(str(_tier_stat))}")
-    lines.append("口径：V25.5保留历史有效底座；将旧压力带主入口升级为“核心压力/支撑线吃肉模型”，大级别找唯一核心线，中周期做压力排名，日线只负责高级突破与回踩执行。基础层重召回，深度层重精度，最终层重交易。")
-    lines.append("说明：分数用于排序，不代表无脑买入；硬雷区仍剔除，普通缺点进入风险提示。次日按确认条件/放弃条件执行。")
-    lines.append("报告默认发送文字版价格计划；同时保存stock_candidates.json、v20_3_1_score_cards.json、v20_3_1_condition_probability_table.json、v20_3_1_signal_lifecycle.json。今日新推荐与近期推荐跟踪分开，避免健康回调票从报告里“消失”。")
+        lines.append(f"等级分布：{html.escape(str(_tier_stat))}")
+    lines.append("口径：V25.6保留历史有效底座；在V25.5基础上把旧压力带主入口细化为“核心线/神经线双线模型”。核心线负责主供应/主需求边界与吃肉空间，神经线负责结构强弱中枢；大级别定线，中周期校准，日线只负责高级突破与回踩执行。")
+    lines.append("说明：综合评分用于最终排序，括号里的基础评分/深度评分用于说明分数来源；分数不代表无脑买入，次日必须按确认条件和放弃条件执行。")
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
@@ -10929,9 +11353,14 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
 
     for i, s in enumerate(final_signals, 1):
         lines.append(f"<b>{i}. {html.escape(str(s.get('name','')))}({html.escape(str(s.get('code','')))})</b>")
-        lines.append(f"原模型分：{safe_float(s.get('v16_final_score', s.get('v14_original_total_score', s.get('total_score', 0)))):.1f}；V20.3分：<b>{safe_float(s.get('v20_final_score', 0)):.1f}</b>；分层：{html.escape(str(s.get('v20_trade_tier','未分层')))}")
-        lines.append(f"V20层级：<b>{html.escape(str(s.get('v20_trade_tier','未分层')))}</b>｜原因：{html.escape(str(s.get('v20_tier_reason','')))}")
-        lines.append(f"七层评分：结构{safe_float(s.get('v201_structure_position',0)):.1f}｜压力{safe_float(s.get('v201_pressure_support',0)):.1f}｜资金{safe_float(s.get('v201_volume_behavior',0)):.1f}｜触发{safe_float(s.get('v201_trigger_confirmation',0)):.1f}｜交易{safe_float(s.get('v201_trade_quality',0)):.1f}｜风险{safe_float(s.get('v201_risk_filter',0)):.1f}")
+        _tier_raw = str(s.get('v20_trade_tier', '未分层'))
+        _tier_show = _human_trade_tier(_tier_raw)
+        _warn = _human_trade_warning(_tier_raw)
+        _composite_score = _report_composite_score(s)
+        _base_score = _report_base_score(s)
+        _deep_score = _report_deep_score(s)
+        lines.append(f"操作等级：<b>{html.escape(_tier_show)}</b>｜综合评分<b>{_composite_score:.1f}</b>（基础评分{_base_score:.1f}，深度评分{_deep_score:.1f}）｜{html.escape(_warn)}")
+        lines.append(f"入选/降级原因：{html.escape(str(s.get('v20_tier_reason','')))}")
         lines.append(f"V24.1实盘风控：流动性{html.escape(str(s.get('v241_liquidity_tier','')))}｜成交额{safe_float(s.get('v241_amount_effective',0))/100000000:.2f}亿｜仓位建议{html.escape(str(s.get('v241_position_text','')))}｜{html.escape(str(s.get('v241_position_reason',''))[:90])}")
         if safe_float(s.get('v201_precise_trigger_line',0)) > 0:
             _precise_status = "已计算" if bool(s.get('v201_precise_trigger_valid', False)) else "待日线平台精算"
@@ -11321,6 +11750,128 @@ def detect_v20_main_hypothesis(row):
     return "综合结构机会"
 
 
+
+def v256_line_role_weight(row):
+    """V25.6：线角色权重。用于把核心线/神经线拆入七层，而不是作为孤立战法加分。"""
+    role = str(row.get("xhu_coreline_role", "") or row.get("coreline_role", ""))
+    if "核心神经" in role:
+        return 1.15
+    if "主核心" in role:
+        return 1.00
+    if "次核心" in role:
+        return 0.75
+    if "神经" in role:
+        return 0.50
+    if "触发" in role or "普通" in role:
+        return 0.30
+    return 0.0
+
+
+def v256_market_regime_breakout_multiplier():
+    """V25.6.1：市场环境只影响“突破确认”强度，不改主流程、不改基础扫描。"""
+    regime = str(globals().get("V24_1_MARKET_REGIME", "neutral") or "neutral").lower().strip()
+    if regime in ["panic", "crash"]:
+        return 0.55
+    if regime in ["bear", "weak"]:
+        return 0.68
+    if regime in ["range", "choppy"]:
+        return 0.88
+    if regime in ["bull", "strong"]:
+        return 1.05
+    return 1.00
+
+
+def v256_breakout_day_quality(row):
+    """V25.6：把跳空、涨停、放量、强收盘、短上影等合并为日线突破质量，不再分散重复加分。"""
+    grade = str(row.get("xhu_breakout_day_grade", "") or row.get("breakout_day_grade", "")).upper()
+    base = {"S": 10.0, "A": 7.5, "B": 4.0, "C": 1.5}.get(grade[:1], 0.0)
+    # 兼容已有突破描述/质量字段，不单独重复奖励K线形态。
+    explicit = safe_float(row.get("xhu_coreline_breakout_score", row.get("xhu_breakout_score", 0)))
+    if explicit > 0:
+        base = max(base, min(10.0, explicit))
+    role_w = v256_line_role_weight(row)
+    # V25.6.1：熊市/恐慌中压力突破假信号更多，只下调突破确认强度，不改线本身质量。
+    regime_mul = v256_market_regime_breakout_multiplier()
+    return max(0.0, min(12.0, base * (0.35 + role_w * 0.65) * regime_mul))
+
+
+def v256_same_source_dedup(row, structure_position, pressure_support, volume_behavior, trigger_confirmation):
+    """V25.6.1：同源去重与强封顶。
+
+    只处理七层后置分内部的重复来源，不改原始基础/深度字段、不改主流程。
+    目标：凹口/平台/最大量K/压力带/核心线属于同一结构簇时，只给“最强项+少量共振”；
+    跳空/涨停/倍量/强收盘/突破线统一归入日线突破质量，避免重复堆分。
+    """
+    struct0 = float(structure_position)
+    press0 = float(pressure_support)
+    vol0 = float(volume_behavior)
+    trig0 = float(trigger_confirmation)
+
+    role = str(row.get("xhu_coreline_role", "") or "")
+    core_score = safe_float(row.get("xhu_coreline_core_score", 0))
+    neural_score = safe_float(row.get("xhu_coreline_neural_score", 0))
+    xhu_score = safe_float(row.get("score_xhu_pressure_breakout", row.get("xhu_pressure_breakout_score", 0)))
+    platform_like = max(
+        safe_float(row.get("score_structure_core", 0)),
+        safe_float(row.get("base_structure_potential_score", 0)),
+        safe_float(row.get("score_advanced_ao_kou", 0)),
+        safe_float(row.get("score_fibo_reclaim", 0)),
+        safe_float(row.get("bottom_pattern_score", row.get("score_bottom_reversal_pattern", 0))),
+    )
+
+    notes = []
+
+    # 结构/压力同源强封顶：只有“平台/凹口/底部结构”和“压力/核心线”同时很强时才压，避免误伤单一优质结构。
+    if xhu_score > 0 and platform_like > 0 and struct0 > 8.0 and press0 > 8.0:
+        total = struct0 + press0
+        cap = min(total * 0.78, 29.0)
+        if total > cap:
+            # 核心线负责主供应/需求边界，结构位置负责大背景；两者保留但压掉重复来源。
+            structure_position = min(struct0, cap * 0.50)
+            pressure_support = min(press0, cap * 0.55)
+            notes.append(f"结构/压力同源强封顶{total:.1f}->{cap:.1f}")
+
+    # 普通日线触发线不能被包装成核心压力；神经线可判断强弱，但不能等价主核心突破。
+    if ("触发" in role or "普通" in role) and core_score < 55 and pressure_support > 10.5:
+        pressure_support = 10.5
+        notes.append("普通触发线压力分封顶")
+    if "神经" in role and "核心神经" not in role and core_score < 65 and pressure_support > 13.5:
+        pressure_support = 13.5
+        notes.append("神经线非主核心压力分封顶")
+
+    # HVN/LVN去重：HVN是压力/供应证据，LVN是突破后的加速通道证据；两者不能都当压力大加分。
+    hvn = safe_float(row.get("xhu_coreline_hvn_score", 0))
+    lvn = safe_float(row.get("xhu_coreline_lvn_above_score", row.get("xhu_coreline_upper_supply_thinness", 0)))
+    fake_count = int(safe_float(row.get("xhu_fake_breakout_count", 0)))
+    breakout_q = v256_breakout_day_quality(row)
+    if hvn < 4.0 and pressure_support > 14.0 and core_score < 70:
+        pressure_support = 14.0
+        notes.append("HVN不足压制压力高分")
+    if fake_count >= 2 and breakout_q < 6.5:
+        pressure_support = max(0.0, pressure_support - min(4.0, 0.9 * fake_count))
+        notes.append(f"假突破记忆惩罚{fake_count}次")
+    if lvn > hvn * 1.6 and pressure_support > 16.0 and breakout_q < 5.0:
+        # 上方低量真空本身不是压力；没有有效突破前不能把LVN误当压力质量高分。
+        pressure_support = 16.0
+        notes.append("LVN未突破前不当压力高分")
+
+    # 触发/资金同源：同一日跳空、涨停、放量、强收盘、突破核心线统一归入突破质量。
+    if breakout_q >= 7.0 and (vol0 + trig0) > 28.0:
+        cap = 28.0
+        ratio = cap / max(vol0 + trig0, 1e-9)
+        volume_behavior = max(0.0, vol0 * ratio)
+        trigger_confirmation = max(0.0, trig0 * ratio)
+        notes.append(f"资金/触发同源封顶{vol0+trig0:.1f}->{cap:.1f}")
+
+    return {
+        "structure_position": float(max(0.0, min(20.0, structure_position))),
+        "pressure_support": float(max(0.0, min(20.0, pressure_support))),
+        "volume_behavior": float(max(0.0, min(20.0, volume_behavior))),
+        "trigger_confirmation": float(max(0.0, min(15.0, trigger_confirmation))),
+        "dedup_note": "；".join(notes),
+        "breakout_quality_score": float(breakout_q),
+    }
+
 def v201_simplified_layer_scores(row):
     """V20.1七层评分：在后置层合并同源指标，避免战法重复堆分。"""
     m = v20_trade_metrics(row)
@@ -11371,8 +11922,16 @@ def v201_simplified_layer_scores(row):
     structure_position += min(4.0, bottom_pattern * 0.35)
     structure_position = max(0.0, min(20.0, structure_position))
 
-    # 3）压力支撑层：压力带质量 + 是否有精准触发线。C/D不直接归零，但不能单独推A。
+    # 3）压力支撑层：压力带质量 + 核心线/神经线质量 + HVN/LVN/假突破记忆。
+    # V25.6：这里是“线质量/空间边界”拆入七层，不新增孤立战法分。
     precise = detect_v201_low_volume_precise_trigger_line_from_row(row)
+    core_role = str(row.get("xhu_coreline_role", "") or "")
+    core_score = _v20_float(row, "xhu_coreline_core_score")
+    neural_score = _v20_float(row, "xhu_coreline_neural_score")
+    hvn_score = _v20_float(row, "xhu_coreline_hvn_score")
+    lvn_score = _v20_float(row, "xhu_coreline_lvn_above_score", "xhu_coreline_upper_supply_thinness")
+    fake_break_count = int(safe_float(row.get("xhu_fake_breakout_count", 0)))
+    breakout_quality = v256_breakout_day_quality(row)
     pressure_support = 0.0
     if m["pressure_grade_rank"] >= 4:
         pressure_support += 7.0
@@ -11384,8 +11943,25 @@ def v201_simplified_layer_scores(row):
         pressure_support -= 2.0
     pressure_support += min(6.0, pressure * 0.45)
     pressure_support += min(4.0, pressure_quality * 0.10)
-    if precise["line"] > 0:
-        pressure_support += 2.0 if precise["valid"] else 0.5
+    # V25.6：核心线/神经线不单独成为战法，拆入压力支撑层。主核心线权重高于神经线；
+    # HVN/LVN用于判断主供应区上沿与突破后供应稀薄度；假突破记忆只做条件性惩罚。
+    if "核心神经" in core_role:
+        pressure_support += min(4.2, core_score * 0.035 + neural_score * 0.018)
+    elif "主核心" in core_role:
+        pressure_support += min(3.6, core_score * 0.040)
+    elif "次核心" in core_role:
+        pressure_support += min(2.4, core_score * 0.030)
+    elif "神经" in core_role:
+        pressure_support += min(1.8, neural_score * 0.020)
+    # V25.6.1：HVN是供应/压力证据；LVN更多代表突破后的加速通道，不再和HVN同口径堆压力分。
+    hvn_effective = hvn_score / (1.0 + 0.28 * max(0, fake_break_count))
+    pressure_support += min(1.9, hvn_effective * 0.070)
+    if core_score >= 60 or "核心" in core_role:
+        pressure_support += min(1.1, lvn_score * 0.040)
+    if fake_break_count >= 2 and breakout_quality < 6.5:
+        pressure_support -= min(4.0, 0.9 * fake_break_count)
+    # 日线精准触发线只负责执行点，不再直接抬高核心压力层；触发层单独使用。
+    precise_trigger_exec_score = 1.8 if (precise["line"] > 0 and precise["valid"]) else (0.4 if precise["line"] > 0 else 0.0)
     if m["confirm_far"] and m["pressure_grade_rank"] <= 2:
         pressure_support -= 3.0
     pressure_support = max(0.0, min(20.0, pressure_support))
@@ -11395,6 +11971,9 @@ def v201_simplified_layer_scores(row):
     volume_behavior += min(7.0, carry * 0.45)
     volume_behavior += min(5.0, flat * 1.25)
     volume_behavior += min(5.0, timing * 0.40)
+    # V25.6：突破前量能中枢抬高、量能转平稳、波动压缩只作为资金行为小权重校准，
+    # 不单独形成新战法，避免与爆发前夜/平台蓄势模块重复。
+    volume_behavior += min(2.2, _v20_float(row, "xhu_coreline_prep_score20") * 0.10)
     volume_behavior += min(2.0, bottom_vol_quality)
     if _v20_float(row, "vr1") > 3.5 and m["bias20"] > 0.12:
         volume_behavior -= 3.0
@@ -11403,6 +11982,10 @@ def v201_simplified_layer_scores(row):
     # 5）触发确认层：K线质量 + 回踩/承接确认，不再单独奖励每个形态。
     trigger_confirmation = 0.0
     trigger_confirmation += min(6.0, kline_attack * 0.16)
+    # V25.6：跳空/涨停/放量/强收盘/短上影统一为“日线突破质量”，不再拆散重复加分。
+    trigger_confirmation += min(4.0, breakout_quality * 0.32)
+    # V25.6.1：日线精准触发线与核心压力带解耦，放入执行/触发确认层。
+    trigger_confirmation += min(1.8, precise_trigger_exec_score)
     trigger_confirmation += min(6.0, pullback * 0.70)
     trigger_confirmation += min(3.0, bottom_trigger_quality)
     if m["buy_zone_miss"]:
@@ -11433,6 +12016,13 @@ def v201_simplified_layer_scores(row):
         trade_quality -= 5.0
     trade_quality = max(0.0, min(25.0, trade_quality))
 
+    # V25.6：同源去重/封顶。只压七层内部重复来源，不改原始模型字段。
+    dedup = v256_same_source_dedup(row, structure_position, pressure_support, volume_behavior, trigger_confirmation)
+    structure_position = dedup["structure_position"]
+    pressure_support = dedup["pressure_support"]
+    volume_behavior = dedup["volume_behavior"]
+    trigger_confirmation = dedup["trigger_confirmation"]
+
     # 7）反馈校准层：由条件概率表提供，样本不足默认为0。
     feedback = v20_condition_probability_hint(row) if V20_ENABLE_CONDITION_FEEDBACK == "1" else {"score_adj": 0.0, "text": "条件概率反馈关闭", "sample_count": 0}
     feedback_adj = max(-10.0, min(10.0, float(feedback.get("score_adj", 0.0) or 0.0)))
@@ -11459,6 +12049,16 @@ def v201_simplified_layer_scores(row):
         "bottom_pattern_score": float(bottom_pattern),
         "bottom_pattern_volume_quality": float(bottom_vol_quality),
         "bottom_pattern_trigger_quality": float(bottom_trigger_quality),
+        "v256_same_source_dedup_note": str(dedup.get("dedup_note", "")),
+        "v256_breakout_quality_score": float(dedup.get("breakout_quality_score", breakout_quality)),
+        "v256_line_role": core_role,
+        "v256_core_score": float(core_score),
+        "v256_neural_score": float(neural_score),
+        "v256_hvn_score": float(hvn_score),
+        "v256_lvn_score": float(lvn_score),
+        "v256_hvn_effective_score": float(hvn_effective),
+        "v256_fake_breakout_count": int(fake_break_count),
+        "v256_regime_breakout_multiplier": float(v256_market_regime_breakout_multiplier()),
     }
 
 
@@ -13020,6 +13620,8 @@ def classify_v20_trade_tier(row):
     pressure_c = m["pressure_grade_rank"] == 2
     buy_zone_miss = bool(m["buy_zone_miss"])
     confirm_far = bool(m["confirm_far"])
+    low_trade_quality_bplus = layers["trade_quality"] < V20_TRADE_QUALITY_FLOOR_BPLUS
+    low_trade_quality_aminus = layers["trade_quality"] < V20_TRADE_QUALITY_FLOOR_A_MINUS
 
     if severe_overheat:
         tier_reasons.append("过热/乖离偏高")
@@ -13039,6 +13641,8 @@ def classify_v20_trade_tier(row):
         tier_reasons.append("当前价明显高于标准买区，买点未到/不舒服")
     if confirm_far and pressure_c:
         tier_reasons.append("仍未接近最终确认价，压力带C仅观察")
+    if low_trade_quality_bplus:
+        tier_reasons.append("交易质量过低，最高只能观察")
 
     # C档：硬性交易风险，不表达为正式买点。
     if severe_overheat or pressure_too_near or no_rr or too_far_defense:
@@ -13058,6 +13662,8 @@ def classify_v20_trade_tier(row):
         can_a = False
     if defense_not_comfy:
         can_a = False
+    if low_trade_quality_aminus:
+        can_a = False
     if q_data or pressure_d or buy_zone_miss or liquidity_not_formal:
         can_a = False
     if pressure_c and not strong_context_for_c:
@@ -13068,6 +13674,24 @@ def classify_v20_trade_tier(row):
     if can_a:
         return "A档正式可交易候选", "结构、承接、买点、防守位和风险收益比共同合格"
 
+    # V25.6：A-是“高质量观察/相对最优救援”，不是正式A，不允许表达为开盘直接买。
+    # 适用于分数接近A，但买点舒适度、压力确认或交易质量尚差一口气的情况。
+    can_a_minus = (
+        score >= V20_A_MINUS_MIN_SCORE
+        and not liquidity_not_formal
+        and not pressure_d
+        and not severe_overheat
+        and not pressure_too_near
+        and not no_rr
+        and not too_far_defense
+        and not q_data
+        and layers["trade_quality"] >= V20_TRADE_QUALITY_FLOOR_A_MINUS
+        and (m["rr"] >= 1.35 or m["target_dist"] >= 0.10 or strong_context_for_c)
+    )
+    if can_a_minus:
+        reason = "；".join(tier_reasons) if tier_reasons else "接近A档，但仍需突破/回踩确认，按观察执行"
+        return "A-观察候选", reason
+
     # V24.1：流动性未达正式门槛时，最多观察，不给B+以上正式表达。
     if liquidity_not_formal:
         reason = "；".join(tier_reasons) if tier_reasons else str(liq_profile.get("v241_liquidity_reason", "流动性未达正式候选门槛"))
@@ -13076,7 +13700,8 @@ def classify_v20_trade_tier(row):
         return "C档今日不交易", reason
 
     # B+：质量较好，但因为压力未破/买点未触发/压力C等原因不能给A。
-    if score >= 78 or layers["trade_quality"] >= 12 or strong_context_for_c:
+    # V25.6：B+可承接相对最优Top3，但交易质量太低时最高只能B。
+    if (score >= V20_BPLUS_MIN_SCORE or layers["trade_quality"] >= 12 or strong_context_for_c) and not low_trade_quality_bplus:
         reason = "；".join(tier_reasons) if tier_reasons else "结构质量较好，但A档确认条件未全部满足"
         return "B+重点观察候选", reason
 
@@ -13161,6 +13786,8 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     def tier_rank(x):
         t = str(x.get("v20_trade_tier", ""))
         if t.startswith("A档"):
+            return 5
+        if t.startswith("A-"):
             return 4
         if t.startswith("B+档") or t.startswith("B+重点"):
             return 3
@@ -13253,6 +13880,20 @@ def _v20_compact_row(r, pool=""):
         "v201_precise_trigger_line": safe_float(r.get("v201_precise_trigger_line", 0)),
         "v201_precise_trigger_valid": bool(r.get("v201_precise_trigger_valid", False)),
         "v201_precise_trigger_note": r.get("v201_precise_trigger_note", ""),
+        # V25.6核心线/神经线诊断字段：给回测、三号员工和人工复盘使用，不影响daily主流程。
+        "v256_line_role": r.get("v201_v256_line_role", r.get("v256_line_role", r.get("xhu_coreline_role", ""))),
+        "v256_core_score": safe_float(r.get("v201_v256_core_score", r.get("xhu_coreline_core_score", 0))),
+        "v256_neural_score": safe_float(r.get("v201_v256_neural_score", r.get("xhu_coreline_neural_score", 0))),
+        "v256_hvn_score": safe_float(r.get("v201_v256_hvn_score", r.get("xhu_coreline_hvn_score", 0))),
+        "v256_lvn_score": safe_float(r.get("v201_v256_lvn_score", r.get("xhu_coreline_lvn_above_score", 0))),
+        "v256_upper_supply_thinness": safe_float(r.get("xhu_coreline_upper_supply_thinness", 0)),
+        "v256_fake_breakout_count": int(safe_float(r.get("v201_v256_fake_breakout_count", r.get("xhu_fake_breakout_count", 0)))),
+        "v256_breakout_quality_score": safe_float(r.get("v201_v256_breakout_quality_score", 0)),
+        "v256_same_source_dedup_note": r.get("v201_v256_same_source_dedup_note", ""),
+        "xhu_pressure_core_lower": safe_float(r.get("xhu_pressure_core_lower", 0)),
+        "xhu_pressure_core_upper": safe_float(r.get("xhu_pressure_core_upper", 0)),
+        "xhu_effective_confirm_price": safe_float(r.get("xhu_effective_confirm_price", 0)),
+        "xhu_pressure_desc": r.get("xhu_pressure_desc", ""),
         "bottom_pattern_type": r.get("bottom_pattern_type", ""),
         "bottom_pattern_score": safe_float(r.get("score_bottom_reversal_pattern", r.get("bottom_pattern_score", 0))),
         "bottom_pattern_neckline": safe_float(r.get("bottom_pattern_neckline", 0)),
