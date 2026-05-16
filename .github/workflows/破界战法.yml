@@ -52,12 +52,12 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 复用一号员工的数据入口/缓存口径
+      # 破界优先只读缓存，避免 GitHub 上 BaoStock/AkShare 股票池临时断流导致失败。
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
 
-      # BaoStock 股票池异常时允许 AkShare 兜底
+      # 允许兜底，但不能依赖公开源作为主股票池。
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
@@ -73,6 +73,38 @@ jobs:
           pwd
           echo "当前仓库根目录文件："
           ls -la
+
+      - name: 恢复A股K线缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kline_cache
+            outputs
+          key: a-stock-kline-cache-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            a-stock-kline-cache-${{ runner.os }}-
+            a-stock-kline-cache-
+            kline-cache-${{ runner.os }}-
+            kline-cache-
+            stock-kline-cache-
+
+      - name: 检查缓存状态
+        run: |
+          echo "检查 kline_cache："
+          if [ -d kline_cache ]; then
+            echo "✅ kline_cache 存在"
+            echo "缓存CSV数量：$(find kline_cache -name '*.csv' | wc -l)"
+            find kline_cache -maxdepth 1 -name '*.csv' | head -20 || true
+          else
+            echo "⚠️ kline_cache 不存在，破界会尝试公开源兜底，但不稳定。"
+          fi
+
+          echo "检查 outputs："
+          if [ -d outputs ]; then
+            find outputs -maxdepth 2 -type f | head -30 || true
+          else
+            echo "outputs 不存在"
+          fi
 
       - name: 检查破界主程序
         run: |
