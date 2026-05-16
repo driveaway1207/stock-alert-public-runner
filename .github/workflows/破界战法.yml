@@ -1,4 +1,4 @@
-name: 破界战法2.0
+name: 破界战法2.0专业核心压力线版
 
 on:
   workflow_dispatch:
@@ -18,15 +18,15 @@ on:
       result_limit:
         description: "输出候选数量"
         required: true
-        default: "10"
+        default: "20"
       send_telegram:
         description: "是否发送Telegram"
         required: true
-        default: "false"
+        default: "true"
         type: choice
         options:
-          - "false"
           - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -62,9 +62,9 @@ jobs:
       POJIE_PARALLEL_MIN_STOCKS: "300"
       POJIE_FAST_PREFILTER: "1"
       POJIE_STRATEGY_PROFILE: "balanced"
-      POJIE_MIN_CORELINE_SCORE: "52"
+      POJIE_MIN_CORELINE_SCORE: "58"
       POJIE_OUTPUT_OBSERVATION: "1"
-      破界_最低分: "62"
+      破界_最低分: "58"
 
       # 日志/进度优化：默认不逐只打印K线成功，避免Actions刷屏。
       POJIE_VERBOSE_KLINE: "0"
@@ -73,7 +73,7 @@ jobs:
       POJIE_PROGRESS_SECONDS: "30"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
-      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
+      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '20' }}
 
     steps:
       - name: 下载仓库代码
@@ -89,10 +89,10 @@ jobs:
           echo "workflow 文件："
           ls -la .github/workflows || true
 
-      - name: 检查破界战法2.0主程序
+      - name: 检查破界战法2.0专业核心压力线版主程序
         shell: bash
         run: |
-          echo "检查破界战法2.0主程序：$MODEL_FILE"
+          echo "检查破界战法2.0专业核心压力线版主程序：$MODEL_FILE"
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             ls -la
@@ -277,6 +277,7 @@ jobs:
           echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
           echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
           echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
+          echo "推送策略：默认发送Telegram；即使候选为0，也推送总结报告。"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
