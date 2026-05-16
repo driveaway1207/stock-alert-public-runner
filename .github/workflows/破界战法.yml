@@ -231,10 +231,13 @@ jobs:
             echo "✅ K线缓存可用，允许运行破界。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           else
-            echo "❌ K线缓存不可用或数量过少：$CSV_COUNT"
-            echo "请先运行 A Stock Kline Cache Acceptance，确保产物名为 kline-cache-accepted。"
-            echo "SHOULD_RUN_POJIE=0" >> "$GITHUB_ENV"
-            exit 1
+            echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
+            echo "⚠️ 不再直接失败，允许破界战法继续运行，并使用 AkShare / 基础模型兜底拉取K线。"
+            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+
+            mkdir -p kline_cache
+            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
           fi
 
       - name: 安装Python环境
