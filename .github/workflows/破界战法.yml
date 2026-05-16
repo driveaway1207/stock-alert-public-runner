@@ -11,17 +11,14 @@ on:
         options:
           - selfcheck
           - daily
-
       max_stocks:
-        description: "最多扫描股票数量；0=不限制。第一次建议100"
+        description: "最多扫描股票数量；0=不限制。建议先100，稳定后可300/0"
         required: true
         default: "100"
-
       result_limit:
         description: "输出候选数量"
         required: true
         default: "10"
-
       send_telegram:
         description: "是否发送Telegram"
         required: true
@@ -54,10 +51,13 @@ jobs:
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
+      MODEL_UNIVERSE_FILE: "outputs/model_usable_universe_pojie.csv"
 
       STOCK_LIST_FALLBACK_AKSHARE: "0"
       KLINE_FALLBACK_AKSHARE: "0"
+      POJIE_ALLOW_AKSHARE_STOCK_LIST: "0"
       POJIE_ALLOW_AKSHARE_KLINE: "0"
+      POJIE_REMOTE_ON_CACHE_MISS: "1"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '100' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
@@ -65,98 +65,6 @@ jobs:
     steps:
       - name: 下载仓库代码
         uses: actions/checkout@v4
-
-      - name: 显示当前运行环境
-        shell: bash
-        run: |
-          echo "当前路径："
-          pwd
-
-          echo "仓库根目录文件："
-          ls -la
-
-          echo "workflow 文件："
-          ls -la .github/workflows || true
-
-          echo "Python版本："
-          python3 --version || true
-
-      - name: 检查破界主程序
-        shell: bash
-        run: |
-          echo "检查破界主程序：$MODEL_FILE"
-
-          if [ ! -f "$MODEL_FILE" ]; then
-            echo "❌ 没找到破界主程序：$MODEL_FILE"
-            echo "当前目录文件如下："
-            ls -la
-            exit 1
-          fi
-
-          echo "✅ 找到破界主程序：$MODEL_FILE"
-
-      - name: 恢复一号员工K线缓存
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            kline_cache
-            K线缓存
-            outputs
-          key: a-kline-cache-${{ github.ref_name }}
-          restore-keys: |
-            a-kline-cache-${{ github.ref_name }}-
-            a-kline-cache-
-
-      - name: 检查K线缓存状态
-        shell: bash
-        run: |
-          echo "开始检查K线缓存状态..."
-
-          if [ "${{ github.event.inputs.run_mode }}" = "selfcheck" ]; then
-            echo "当前是 selfcheck，自检模式不需要K线缓存。"
-            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          mkdir -p kline_cache
-
-          echo "kline_cache 目录："
-          ls -la kline_cache || true
-
-          echo "K线缓存 目录："
-          ls -la "K线缓存" || true
-
-          ROOT_COUNT=$(find kline_cache -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          BASE_COUNT=$(find kline_cache/base -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          DEEP_COUNT=$(find kline_cache/deep -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          CN_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l || echo 0)
-
-          TOTAL_COUNT=$((ROOT_COUNT + BASE_COUNT + DEEP_COUNT + CN_COUNT))
-
-          echo "kline_cache 根目录CSV数量：$ROOT_COUNT"
-          echo "kline_cache/base CSV数量：$BASE_COUNT"
-          echo "kline_cache/deep CSV数量：$DEEP_COUNT"
-          echo "K线缓存 CSV数量：$CN_COUNT"
-          echo "最终识别K线CSV数量：$TOTAL_COUNT"
-
-          echo "展示前20个缓存文件："
-          find kline_cache "K线缓存" -name "*.csv" 2>/dev/null | head -20 || true
-
-          if [ "$TOTAL_COUNT" -ge 1 ]; then
-            echo "✅ 已发现K线缓存，破界会优先读取缓存。"
-          else
-            echo "⚠️ 当前没有发现K线缓存。"
-            echo "⚠️ 破界会先尝试一号员工数据入口，补拉主通道为 BaoStock，AkShare 已默认关闭。"
-          fi
-
-          echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
-          echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-          echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-          echo "KLINE_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
-          echo "STOCK_LIST_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
-          echo "POJIE_ALLOW_AKSHARE_KLINE=0" >> "$GITHUB_ENV"
 
       - name: 安装Python环境
         uses: actions/setup-python@v5
@@ -177,12 +85,242 @@ jobs:
           pip install pandas numpy requests baostock akshare openpyxl
 
           python - <<'PY'
-          import pandas
-          import numpy
-          import requests
-          import baostock
+          import pandas, numpy, requests, baostock
           print("依赖验证通过：pandas / numpy / requests / baostock")
           PY
+
+      - name: 显示当前运行环境
+        shell: bash
+        run: |
+          echo "当前路径：$(pwd)"
+          echo "仓库根目录文件："
+          ls -la
+          echo "workflow 文件："
+          ls -la .github/workflows || true
+          echo "Python版本：$(python --version)"
+
+      - name: 检查破界主程序
+        shell: bash
+        run: |
+          echo "检查破界主程序：$MODEL_FILE"
+          if [ ! -f "$MODEL_FILE" ]; then
+            echo "❌ 没找到破界主程序：$MODEL_FILE"
+            echo "当前目录文件如下："
+            ls -la
+            exit 1
+          fi
+          echo "✅ 找到破界主程序：$MODEL_FILE"
+
+      - name: 恢复GitHub缓存里的K线
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kline_cache
+            K线缓存
+            outputs
+          key: pojie-cache-probe-${{ github.ref_name }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            kline-cache-${{ github.ref_name }}-
+            kline-cache-
+            stock-alert-kline-cache-${{ github.ref_name }}-
+            stock-alert-kline-cache-
+            a-stock-kline-cache-${{ github.ref_name }}-
+            a-stock-kline-cache-
+            daily-kline-cache-${{ github.ref_name }}-
+            daily-kline-cache-
+            full-history-kline-
+
+      - name: 尝试从最近成功工作流下载K线产物
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          mkdir -p artifact_pool
+          echo "尝试用 gh CLI 下载最近成功的K线产物；找不到不会报红、不阻断。"
+
+          WORKFLOWS=(
+            "a_stock_kline_cache_acceptance.yml"
+            "stock_alert.yml"
+            "破界战法.yml"
+          )
+          ARTIFACTS=(
+            "kline-cache-accepted"
+            "K线缓存"
+            "kline_cache"
+            "full-history-kline-cache"
+            "a-stock-kline-cache"
+            "daily-kline-cache"
+            "破界战法运行结果"
+          )
+
+          for wf in "${WORKFLOWS[@]}"; do
+            echo "查询 workflow: $wf"
+            RUN_IDS=$(gh run list --workflow "$wf" --branch "${{ github.ref_name }}" --status success --limit 5 --json databaseId --jq '.[].databaseId' 2>/dev/null)
+            for rid in $RUN_IDS; do
+              echo "尝试 run_id=$rid"
+              for art in "${ARTIFACTS[@]}"; do
+                mkdir -p "artifact_pool/${wf}_${rid}_${art}"
+                gh run download "$rid" -n "$art" -D "artifact_pool/${wf}_${rid}_${art}" >/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                  echo "✅ 下载到产物：workflow=$wf run_id=$rid artifact=$art"
+                else
+                  rm -rf "artifact_pool/${wf}_${rid}_${art}"
+                fi
+              done
+            done
+          done
+
+          echo "artifact_pool 文件预览："
+          find artifact_pool -maxdepth 5 -type f | head -80 || true
+          exit 0
+
+      - name: 统一整理一号员工K线缓存
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
+        shell: bash
+        run: |
+          mkdir -p kline_cache outputs
+          python - <<'PY'
+          import os, re, json, shutil
+          from pathlib import Path
+          import pandas as pd
+
+          ROOTS = ["kline_cache", "K线缓存", "artifact_pool", "outputs"]
+          OUT_DIR = Path("kline_cache")
+          OUT_DIR.mkdir(exist_ok=True)
+          Path("outputs").mkdir(exist_ok=True)
+
+          colmap = {
+              "日期":"date", "交易日期":"date", "trade_date":"date", "Date":"date", "datetime":"date", "time":"date",
+              "开盘":"open", "开盘价":"open", "Open":"open", "open":"open",
+              "最高":"high", "最高价":"high", "High":"high", "high":"high",
+              "最低":"low", "最低价":"low", "Low":"low", "low":"low",
+              "收盘":"close", "收盘价":"close", "Close":"close", "close":"close",
+              "成交量":"volume", "成交量(手)":"volume", "成交量(股)":"volume", "成交量(万手)":"volume", "Volume":"volume", "volume":"volume", "vol":"volume",
+              "成交额":"amount", "成交额(元)":"amount", "成交额(万元)":"amount", "Amount":"amount", "amount":"amount",
+              "涨跌幅":"pct_chg", "pctChg":"pct_chg", "pct_chg":"pct_chg",
+              "换手率":"turnover", "turn":"turnover", "turnover":"turnover",
+          }
+
+          def code_from_path(p: Path):
+              m = re.search(r"(\d{6})", p.name)
+              return m.group(1) if m else ""
+
+          def normalize_csv(path: Path):
+              code = code_from_path(path)
+              if not code:
+                  return None, "no_code"
+              if path.name.startswith("_"):
+                  return None, "meta"
+              try:
+                  df = pd.read_csv(path, dtype=str, low_memory=False)
+              except Exception as e:
+                  return None, f"read_error:{e}"
+              if df is None or df.empty:
+                  return None, "empty"
+              df.columns = [str(c).strip() for c in df.columns]
+              df = df.rename(columns={c: colmap.get(c, c) for c in df.columns})
+              required = ["date", "open", "high", "low", "close", "volume"]
+              if not all(c in df.columns for c in required):
+                  return None, f"bad_columns:{list(df.columns)[:12]}"
+              if "amount" not in df.columns:
+                  df["amount"] = "0"
+              keep = ["date", "open", "high", "low", "close", "volume", "amount"]
+              df = df[keep].copy()
+              df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+              for c in ["open", "high", "low", "close", "volume", "amount"]:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
+              df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+              df = df[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
+              df = df.sort_values("date").drop_duplicates("date", keep="last")
+              if len(df) < 120:
+                  return None, f"too_few_rows:{len(df)}"
+              return (code, df), "ok"
+
+          all_csv = []
+          for root in ROOTS:
+              rp = Path(root)
+              if rp.exists():
+                  all_csv.extend([p for p in rp.rglob("*.csv") if p.is_file()])
+
+          print(f"发现CSV总数={len(all_csv)}")
+          ok, skipped = 0, {}
+          latest = {}
+          for path in all_csv:
+              norm, reason = normalize_csv(path)
+              if norm is None:
+                  skipped[reason] = skipped.get(reason, 0) + 1
+                  continue
+              code, df = norm
+              old = latest.get(code)
+              if old is None or len(df) > len(old[1]) or str(df["date"].max()) > str(old[1]["date"].max()):
+                  latest[code] = (path, df)
+
+          universe = []
+          for code, (src, df) in latest.items():
+              out = OUT_DIR / f"{code}.csv"
+              df.to_csv(out, index=False, encoding="utf-8")
+              bs_code = ("sh." + code) if code.startswith(("600","601","603","605","688")) else ("sz." + code)
+              universe.append({"代码": code, "名称": "", "bs_code": bs_code, "K线最新日期": str(df["date"].max()), "K线行数": len(df), "来源文件": str(src)})
+              ok += 1
+
+          uni = pd.DataFrame(universe).sort_values("代码") if universe else pd.DataFrame(columns=["代码","名称","bs_code","K线最新日期","K线行数","来源文件"])
+          uni.to_csv("outputs/model_usable_universe_pojie.csv", index=False, encoding="utf-8")
+
+          print(f"✅ 标准化后可用K线文件数={ok}")
+          print("跳过原因汇总：")
+          print(json.dumps(skipped, ensure_ascii=False, indent=2)[:3000])
+          if ok:
+              print("前20个可用缓存：")
+              print(uni.head(20).to_string(index=False))
+          PY
+
+      - name: 检查K线缓存状态
+        shell: bash
+        run: |
+          echo "开始检查K线缓存状态..."
+
+          if [ "${{ github.event.inputs.run_mode }}" = "selfcheck" ]; then
+            echo "当前是 selfcheck，自检模式不需要K线缓存。"
+            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          mkdir -p kline_cache outputs
+          ROOT_COUNT=$(find kline_cache -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          BASE_COUNT=$(find kline_cache/base -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          DEEP_COUNT=$(find kline_cache/deep -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          CN_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          TOTAL_COUNT=$((ROOT_COUNT + BASE_COUNT + DEEP_COUNT + CN_COUNT))
+
+          echo "kline_cache 根目录CSV数量：$ROOT_COUNT"
+          echo "kline_cache/base CSV数量：$BASE_COUNT"
+          echo "kline_cache/deep CSV数量：$DEEP_COUNT"
+          echo "K线缓存 CSV数量：$CN_COUNT"
+          echo "最终识别K线CSV数量：$TOTAL_COUNT"
+          echo "展示前20个缓存文件："
+          find kline_cache "K线缓存" -name "*.csv" 2>/dev/null | head -20 || true
+
+          if [ "$TOTAL_COUNT" -ge 1 ]; then
+            echo "✅ 已发现并标准化K线缓存，破界会优先读取缓存；缓存命中不联网。"
+          else
+            echo "⚠️ 当前没有发现可用K线缓存。"
+            echo "⚠️ 破界会先尝试一号员工数据入口，补拉主通道为 BaoStock，AkShare 已默认关闭。"
+          fi
+
+          echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+          echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+          echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+          echo "MODEL_UNIVERSE_FILE=outputs/model_usable_universe_pojie.csv" >> "$GITHUB_ENV"
+          echo "KLINE_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
+          echo "STOCK_LIST_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
+          echo "POJIE_ALLOW_AKSHARE_KLINE=0" >> "$GITHUB_ENV"
+          echo "POJIE_ALLOW_AKSHARE_STOCK_LIST=0" >> "$GITHUB_ENV"
 
       - name: 语法检查
         shell: bash
@@ -201,6 +339,7 @@ jobs:
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
+          echo "模型股票池文件：$MODEL_UNIVERSE_FILE"
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
           echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
 
