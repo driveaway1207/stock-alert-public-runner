@@ -28,9 +28,6 @@ on:
           - "false"
           - "true"
 
-  # 可选：一号员工跑完后自动触发破界。
-  # 注意：这里要求一号员工 workflow 名称必须正好叫“一号员工选股模型 V25.6”。
-  # 如果你不想自动跟跑，可以删除 workflow_run 这一段。
   workflow_run:
     workflows:
       - 一号员工选股模型 V25.6
@@ -47,7 +44,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
-    # 只有手动触发，或一号员工成功完成后，才运行。
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     env:
@@ -60,12 +56,10 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 破界默认使用一号员工缓存结构
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache/base"
       CACHE_DIR: "kline_cache"
 
-      # 公开源只做兜底，不作为主入口
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
@@ -77,12 +71,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 显示当前生产路径
+        shell: bash
         run: |
           pwd
           echo "当前仓库根目录文件："
           ls -la
 
       - name: 检查破界主程序
+        shell: bash
         run: |
           echo "检查破界主程序：$MODEL_FILE"
           if [ ! -f "$MODEL_FILE" ]; then
@@ -93,58 +89,81 @@ jobs:
           fi
           echo "✅ 找到破界主程序：$MODEL_FILE"
 
-      - name: 尝试下载一号员工最新运行结果
+      - name: 尝试下载最新K线验收产物
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: stock_alert.yml
-          name: 一号员工选股结果
-          path: artifact_download
+          workflow: A Stock Kline Cache Acceptance
+          name: kline-cache-accepted
+          path: kline_artifact
           search_artifacts: true
           if_no_artifact_found: warn
 
-      - name: 尝试从一号员工产物恢复K线
+      - name: 从K线验收产物恢复K线
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
         shell: bash
         run: |
-          echo "开始检查一号员工产物..."
+          echo "开始从 K线验收产物 恢复K线..."
+
+          rm -rf kline_cache K线缓存
           mkdir -p kline_cache
 
-          if [ -d artifact_download ]; then
-            echo "artifact_download 文件列表："
-            find artifact_download -maxdepth 4 -type f | head -80 || true
+          if [ -d "kline_artifact" ]; then
+            echo "kline_artifact 文件列表："
+            find kline_artifact -maxdepth 5 -type f | head -120 || true
 
-            # 情况1：artifact 里本身已经解压出了 kline_cache
-            if [ -d "artifact_download/kline_cache" ]; then
-              echo "发现 artifact_download/kline_cache，复制到当前 kline_cache"
-              cp -r artifact_download/kline_cache/* kline_cache/ || true
+            if [ -d "kline_artifact/kline_cache" ]; then
+              echo "发现 kline_artifact/kline_cache"
+              cp -r kline_artifact/kline_cache/* kline_cache/ || true
             fi
 
-            # 情况2：artifact 里有压缩包
-            ZIP_FILE=$(find artifact_download -name "*.zip" | head -n 1 || true)
+            if [ -d "kline_artifact/K线缓存" ]; then
+              echo "发现 kline_artifact/K线缓存"
+              cp -r kline_artifact/K线缓存/* kline_cache/ || true
+            fi
+
+            ZIP_FILE=$(find kline_artifact -name "*.zip" | head -n 1 || true)
             if [ -n "$ZIP_FILE" ]; then
-              echo "发现zip产物：$ZIP_FILE，开始解压"
-              rm -rf artifact_unzip
-              mkdir -p artifact_unzip
-              unzip -o "$ZIP_FILE" -d artifact_unzip || true
+              echo "发现zip：$ZIP_FILE，开始解压"
+              rm -rf kline_unzip
+              mkdir -p kline_unzip
+              unzip -o "$ZIP_FILE" -d kline_unzip || true
 
               echo "解压后文件列表："
-              find artifact_unzip -maxdepth 5 -type f | head -100 || true
+              find kline_unzip -maxdepth 5 -type f | head -120 || true
 
-              if [ -d "artifact_unzip/kline_cache" ]; then
-                echo "发现 artifact_unzip/kline_cache，复制到当前 kline_cache"
-                cp -r artifact_unzip/kline_cache/* kline_cache/ || true
+              if [ -d "kline_unzip/kline_cache" ]; then
+                cp -r kline_unzip/kline_cache/* kline_cache/ || true
               fi
-
-              if [ -d "artifact_unzip/K线缓存" ]; then
-                echo "发现 artifact_unzip/K线缓存，复制到当前 kline_cache"
-                cp -r artifact_unzip/K线缓存/* kline_cache/ || true
+              if [ -d "kline_unzip/K线缓存" ]; then
+                cp -r kline_unzip/K线缓存/* kline_cache/ || true
               fi
             fi
+
+            if [ -d "kline_artifact/base" ]; then
+              mkdir -p kline_cache/base
+              cp -r kline_artifact/base/* kline_cache/base/ || true
+            fi
+            if [ -d "kline_artifact/deep" ]; then
+              mkdir -p kline_cache/deep
+              cp -r kline_artifact/deep/* kline_cache/deep/ || true
+            fi
+
+            ROOT_CSV_COUNT=$(find kline_artifact -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
+            if [ "$ROOT_CSV_COUNT" -gt 0 ]; then
+              mkdir -p kline_cache/base
+              cp kline_artifact/*.csv kline_cache/base/ || true
+            fi
           else
-            echo "没有下载到一号员工产物，继续尝试 GitHub cache。"
+            echo "没有下载到 kline_artifact。"
           fi
 
-          echo "产物恢复后 kline_cache CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+          echo "产物恢复后："
+          echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+          echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+          echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+          find kline_cache -name "*.csv" | head -20 || true
 
       - name: 尝试恢复GitHub缓存里的K线
         if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
@@ -164,7 +183,6 @@ jobs:
         run: |
           echo "开始检查K线缓存状态..."
 
-          # selfcheck 不需要K线
           if [ "${{ github.event.inputs.run_mode || 'daily' }}" = "selfcheck" ] && [ "${{ github.event_name }}" != "workflow_run" ]; then
             echo "当前是 selfcheck，自检模式不需要K线缓存。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
@@ -214,7 +232,7 @@ jobs:
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           else
             echo "❌ K线缓存不可用或数量过少：$CSV_COUNT"
-            echo "破界不再临时强拉全市场，避免公开源断流和GitHub超时。"
+            echo "请先运行 A Stock Kline Cache Acceptance，确保产物名为 kline-cache-accepted。"
             echo "SHOULD_RUN_POJIE=0" >> "$GITHUB_ENV"
             exit 1
           fi
