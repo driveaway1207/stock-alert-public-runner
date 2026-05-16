@@ -18,6 +18,7 @@ import json
 import math
 import time
 import argparse
+import glob
 import importlib.util
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
@@ -629,11 +630,11 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int) -> st
 
 # ========================= 数据入口增强补丁：参考一号员工数据层 =========================
 # 目标：破界战法仍然独立运行，但数据入口更稳：
-# 1）优先复用一号员工的 get_a_stock_list / get_daily_kline；
-# 2）股票池为空时，不再 raise 导致 GitHub Actions 失败；
-# 3）自动尝试一号员工的缓存股票池、AkShare 股票池、本地 kline_cache 反推股票池；
-# 4）最后启用应急股票池，保证流程能跑完并产出诊断报告；
-# 5）K线优先读本地缓存，再走一号员工入口，再走 AkShare 直接兜底。
+# 1）K线严格按“缓存优先”：先读一号员工事前缓存，命中就绝不联网；
+# 2）缓存缺失/无效时，才调用一号员工 get_daily_kline 走 BaoStock 主通道补拉；
+# 3）默认禁止 AkShare 拉K线，除非显式设置 POJIE_ALLOW_AKSHARE_KLINE=1；
+# 4）股票池优先缓存/本地反推，再用一号员工入口，避免无缓存时直接失败；
+# 5）最后启用应急股票池，保证流程能跑完并产出诊断报告。
 
 VALID_STOCK_PREFIXES_POJIE = (
     "sh.600", "sh.601", "sh.603", "sh.605", "sh.688",
@@ -801,51 +802,69 @@ def get_stock_list_from_akshare_direct() -> pd.DataFrame:
 
 
 def get_stock_list_safe(base) -> pd.DataFrame:
-    """参考一号员工：缓存股票池优先，联网失败不阻断，最终应急池兜底。"""
-    # 先尝试一号员工的缓存股票池函数，避免 BaoStock/AkShare 网络波动。
-    for fn_name in ["get_a_stock_list_from_full_cache_universe", "get_a_stock_list"]:
-        fn = getattr(base, fn_name, None)
-        if fn is None:
-            continue
-        try:
-            print(f"破界：尝试股票池入口 base.{fn_name}()")
-            df = fn()
-            out = normalize_stock_list_df(df, source=f"base.{fn_name}")
-            if not out.empty:
-                print(f"破界：股票池可用 source=base.{fn_name} stocks={len(out)}")
-                return out
-        except Exception as e:
-            print(f"破界：股票池入口失败 source=base.{fn_name} error={str(e)[:180]}")
-
-    # 再试一号员工暴露的 AkShare 股票池备用函数。
-    fn = getattr(base, "get_a_stock_list_from_akshare", None)
+    """
+    股票池逻辑：
+    1）先走一号员工全历史缓存股票池函数；
+    2）再从本地 kline_cache 反推股票池；
+    3）再走一号员工 get_a_stock_list，通常会优先缓存，必要时才 BaoStock；
+    4）默认不直接用 AkShare 股票池，除非 POJIE_ALLOW_AKSHARE_STOCK_LIST=1；
+    5）最后应急池兜底。
+    """
+    # 1. 一号员工缓存股票池：最符合你现在“先有缓存、破界消费缓存”的用法。
+    fn = getattr(base, "get_a_stock_list_from_full_cache_universe", None)
     if fn is not None:
         try:
-            print("破界：尝试 base.get_a_stock_list_from_akshare()")
+            print("破界：优先尝试一号员工全历史缓存股票池 base.get_a_stock_list_from_full_cache_universe()")
             df = fn()
-            out = normalize_stock_list_df(df, source="base.akshare")
+            out = normalize_stock_list_df(df, source="base.full_cache_universe")
             if not out.empty:
-                print(f"破界：base AkShare备用股票池可用 stocks={len(out)}")
+                print(f"破界：股票池可用 source=base.full_cache_universe stocks={len(out)}")
                 return out
         except Exception as e:
-            print(f"破界：base AkShare股票池失败 error={str(e)[:180]}")
+            print(f"破界：一号员工缓存股票池失败 error={str(e)[:180]}")
 
-    # 直接 AkShare。
-    out = get_stock_list_from_akshare_direct()
-    if not out.empty:
-        return out
-
-    # 本地缓存反推。
+    # 2. 本地缓存反推：只要 kline_cache 里有CSV，就不需要联网取股票池。
     out = stock_list_from_local_kline_cache()
     if not out.empty:
+        print(f"破界：股票池可用 source=local_kline_cache stocks={len(out)}")
         return out
 
-    # 最后应急股票池。可以通过 POJIE_DISABLE_EMERGENCY_UNIVERSE=1 关闭。
+    # 3. 一号员工标准股票池入口：一号员工内部是缓存优先，必要时 BaoStock 主通道。
+    fn = getattr(base, "get_a_stock_list", None)
+    if fn is not None:
+        try:
+            print("破界：本地缓存股票池为空，尝试一号员工标准股票池 base.get_a_stock_list()")
+            df = fn()
+            out = normalize_stock_list_df(df, source="base.get_a_stock_list")
+            if not out.empty:
+                print(f"破界：股票池可用 source=base.get_a_stock_list stocks={len(out)}")
+                return out
+        except Exception as e:
+            print(f"破界：base.get_a_stock_list失败 error={str(e)[:180]}")
+
+    # 4. AkShare 股票池默认关闭；只有显式打开才用。
+    if os.environ.get("POJIE_ALLOW_AKSHARE_STOCK_LIST", "0") == "1":
+        fn = getattr(base, "get_a_stock_list_from_akshare", None)
+        if fn is not None:
+            try:
+                print("破界：显式允许，尝试 base.get_a_stock_list_from_akshare()")
+                df = fn()
+                out = normalize_stock_list_df(df, source="base.akshare_stock_list")
+                if not out.empty:
+                    print(f"破界：base AkShare备用股票池可用 stocks={len(out)}")
+                    return out
+            except Exception as e:
+                print(f"破界：base AkShare股票池失败 error={str(e)[:180]}")
+
+        out = get_stock_list_from_akshare_direct()
+        if not out.empty:
+            return out
+
+    # 5. 最后应急股票池。
     if os.environ.get("POJIE_DISABLE_EMERGENCY_UNIVERSE", "0") != "1":
         return get_emergency_stock_list()
 
     return pd.DataFrame(columns=["代码", "名称", "bs_code"])
-
 
 def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """把一号员工缓存/AkShare/其它CSV统一成破界 normalize_kline 能识别的字段。"""
@@ -874,14 +893,32 @@ def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 
 def local_kline_candidate_paths(bs_code: str) -> List[str]:
+    """
+    只读缓存优先：兼容一号员工常见缓存结构。
+    支持：
+    1）kline_cache/600000.csv 这种全历史扁平缓存；
+    2）kline_cache/base/sh_600000.csv、kline_cache/deep/sh_600000.csv；
+    3）K线缓存/600000.csv；
+    4）任意子目录里文件名包含 6位代码 的csv。
+    """
     code = plain_code_from_any(bs_code)
     bs_file = str(bs_code).replace(".", "_")
+
     roots = []
     for env_key in ["FULL_HISTORY_CACHE_DIR", "CACHE_DIR"]:
         v = os.environ.get(env_key, "").strip()
         if v:
             roots.append(v)
-    roots.extend(["kline_cache", "K线缓存", "kline_cache/base", "kline_cache/deep"])
+
+    roots.extend([
+        "kline_cache",
+        "K线缓存",
+        "kline_cache/base",
+        "kline_cache/deep",
+        "./kline_cache",
+        "./K线缓存",
+    ])
+
     paths = []
     for root in roots:
         if not root:
@@ -894,15 +931,21 @@ def local_kline_candidate_paths(bs_code: str) -> List[str]:
             os.path.join(root, "base", f"{code}.csv"),
             os.path.join(root, "deep", f"{code}.csv"),
         ])
-    # 去重保持顺序
+        # 兜底：递归找包含6位代码的csv，解决缓存目录层级/命名不一致问题。
+        try:
+            if os.path.exists(root):
+                paths.extend(glob.glob(os.path.join(root, "**", f"*{code}*.csv"), recursive=True))
+                paths.extend(glob.glob(os.path.join(root, "**", f"*{bs_file}*.csv"), recursive=True))
+        except Exception:
+            pass
+
     seen = set()
     out = []
     for p in paths:
-        if p not in seen:
+        if p and p not in seen:
             seen.add(p)
             out.append(p)
     return out
-
 
 def read_local_kline_cache_for_pojie(bs_code: str) -> Optional[pd.DataFrame]:
     for path in local_kline_candidate_paths(bs_code):
@@ -944,31 +987,66 @@ def get_daily_kline_akshare_direct(bs_code: str, lookback_days: int = 2600) -> O
 
 
 def get_daily_kline_safe(base, bs_code: str) -> Optional[pd.DataFrame]:
-    """优先缓存，其次一号员工数据入口，最后 AkShare 直接兜底。"""
+    """
+    K线数据逻辑，严格按你要的顺序：
+
+    1）先查一号员工事前缓存 / GitHub恢复缓存 / 本地 kline_cache。
+       命中有效CSV后，直接返回，绝不联网。
+
+    2）只有缓存没有、缓存字段坏、或K线少于120根时，才补拉。
+       补拉默认走一号员工 get_daily_kline，也就是 BaoStock 主通道。
+
+    3）默认禁止 AkShare K线兜底。
+       即使 workflow 里写了 KLINE_FALLBACK_AKSHARE=1，本函数也会临时改成0，
+       防止一号员工内部自动跳到 AkShare。
+
+    4）只有显式设置 POJIE_ALLOW_AKSHARE_KLINE=1，才允许最后用 AkShare。
+    """
+    # 第一步：缓存优先。命中就不拉。
     cached = read_local_kline_cache_for_pojie(bs_code)
-    if cached is not None:
+    if cached is not None and len(cached) >= 120:
         return cached
 
-    # 尽量复用一号员工成熟的 get_daily_kline：里面已有全历史缓存、旧缓存、BaoStock、AkShare兜底逻辑。
-    if hasattr(base, "get_daily_kline"):
-        try:
-            df = base.get_daily_kline(bs_code, cache_scope="deep")
-            out = normalize_external_kline_df(df)
-            if out is not None:
-                return out
-        except TypeError:
+    # 第二步：缓存没有，才允许远程补拉。默认允许 BaoStock 补拉。
+    remote_on_miss = os.environ.get("POJIE_REMOTE_ON_CACHE_MISS", "1")
+    if remote_on_miss != "1":
+        print(f"破界K线：缓存未命中，且 POJIE_REMOTE_ON_CACHE_MISS=0，跳过 symbol={bs_code}")
+        return None
+
+    allow_akshare = os.environ.get("POJIE_ALLOW_AKSHARE_KLINE", "0") == "1"
+
+    # 防止 workflow 里 KLINE_FALLBACK_AKSHARE=1 导致一号员工内部跳到AkShare。
+    old_ak_env = os.environ.get("KLINE_FALLBACK_AKSHARE")
+    if not allow_akshare:
+        os.environ["KLINE_FALLBACK_AKSHARE"] = "0"
+
+    # 第三步：调用一号员工数据入口。这个入口内部：缓存 -> BaoStock；AkShare已被上面关掉。
+    try:
+        if hasattr(base, "get_daily_kline"):
             try:
+                print(f"破界K线：缓存未命中，开始BaoStock主通道补拉 symbol={bs_code}")
+                df = base.get_daily_kline(bs_code, cache_scope="deep")
+            except TypeError:
                 df = base.get_daily_kline(bs_code)
-                out = normalize_external_kline_df(df)
-                if out is not None:
-                    return out
-            except Exception as e:
-                print(f"破界K线：base.get_daily_kline旧签名失败 symbol={bs_code} error={str(e)[:160]}")
-        except Exception as e:
-            print(f"破界K线：base.get_daily_kline失败 symbol={bs_code} error={str(e)[:160]}")
 
-    return get_daily_kline_akshare_direct(bs_code)
+            out = normalize_external_kline_df(df)
+            if out is not None and len(out) >= 120:
+                print(f"破界K线：BaoStock/一号员工入口补拉成功 symbol={bs_code} rows={len(out)}")
+                return out
+    except Exception as e:
+        print(f"破界K线：BaoStock/一号员工入口补拉失败 symbol={bs_code} error={str(e)[:180]}")
+    finally:
+        if old_ak_env is None:
+            os.environ.pop("KLINE_FALLBACK_AKSHARE", None)
+        else:
+            os.environ["KLINE_FALLBACK_AKSHARE"] = old_ak_env
 
+    # 第四步：AkShare 只在显式允许时作为最后兜底。
+    if allow_akshare:
+        print(f"破界K线：显式允许AkShare，开始最后兜底 symbol={bs_code}")
+        return get_daily_kline_akshare_direct(bs_code)
+
+    return None
 
 def write_empty_report(reason: str, scanned: int = 0, failed: int = 0) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1005,11 +1083,15 @@ def main():
     args = parse_args()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 默认打开一号员工数据层兜底变量，避免 GitHub 上股票池/K线接口短暂失败就退出。
+    # 破界数据层原则：缓存优先；缓存命中绝不拉；缓存缺失才走 BaoStock 主通道补拉。
     os.environ.setdefault("USE_FULL_HISTORY_CACHE", "1")
-    os.environ.setdefault("STOCK_LIST_FALLBACK_AKSHARE", "1")
-    os.environ.setdefault("KLINE_FALLBACK_AKSHARE", "1")
     os.environ.setdefault("ALLOW_STALE_KLINE_CACHE", "1")
+    os.environ.setdefault("POJIE_REMOTE_ON_CACHE_MISS", "1")
+    os.environ.setdefault("POJIE_ALLOW_AKSHARE_KLINE", "0")
+    os.environ.setdefault("POJIE_ALLOW_AKSHARE_STOCK_LIST", "0")
+    # 硬覆盖：防止 workflow 里设置 KLINE_FALLBACK_AKSHARE=1 后，一号员工内部自动改用 AkShare 拉K线。
+    if os.environ.get("POJIE_ALLOW_AKSHARE_KLINE", "0") != "1":
+        os.environ["KLINE_FALLBACK_AKSHARE"] = "0"
 
     base = load_base_module(args.基础模型文件)
 
@@ -1040,6 +1122,8 @@ def main():
     if args.最多股票数量 and args.最多股票数量 > 0:
         stock_list = stock_list.head(args.最多股票数量)
 
+    print("破界：K线模式=缓存优先；缓存命中不联网；缓存缺失才用 BaoStock 主通道补拉；AkShare默认禁用。")
+    print(f"破界：POJIE_REMOTE_ON_CACHE_MISS={os.environ.get('POJIE_REMOTE_ON_CACHE_MISS', '1')}，POJIE_ALLOW_AKSHARE_KLINE={os.environ.get('POJIE_ALLOW_AKSHARE_KLINE', '0')}，KLINE_FALLBACK_AKSHARE={os.environ.get('KLINE_FALLBACK_AKSHARE', '0')}")
     print(f"破界：最终扫描股票池数量={len(stock_list)}")
     print(stock_list.head(20).to_string(index=False))
 
@@ -1064,9 +1148,10 @@ def main():
 
         try:
             df = get_daily_kline_safe(base, bs_code)
+            df = normalize_external_kline_df(df)
             if df is None or len(df) < 120:
                 no_kline += 1
-                failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline"})
+                failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline_or_bad_columns"})
                 continue
             res = scan_one(code, name, df)
             if res and res["score"] >= args.最低分:
