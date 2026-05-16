@@ -52,12 +52,13 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 破界优先只读缓存，避免 GitHub 上 BaoStock/AkShare 股票池临时断流导致失败。
+      # 与一号员工保持一致：优先使用中文K线缓存目录
       USE_FULL_HISTORY_CACHE: "1"
-      FULL_HISTORY_CACHE_DIR: "kline_cache"
-      CACHE_DIR: "kline_cache"
+      FULL_HISTORY_CACHE_DIR: "K线缓存"
+      CACHE_DIR: "K线缓存"
+      ALLOW_STALE_KLINE_CACHE: "0"
 
-      # 允许兜底，但不能依赖公开源作为主股票池。
+      # 公开源只做兜底，不作为主入口
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
@@ -74,36 +75,58 @@ jobs:
           echo "当前仓库根目录文件："
           ls -la
 
-      - name: 恢复A股K线缓存
+      - name: 尝试恢复GitHub缓存里的K线
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'schedule' }}
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: |
+            K线缓存
             kline_cache
-            outputs
-          key: a-stock-kline-cache-${{ runner.os }}-${{ github.ref_name }}
+          key: a-kline-cache-${{ github.ref_name }}
           restore-keys: |
-            a-stock-kline-cache-${{ runner.os }}-
-            a-stock-kline-cache-
-            kline-cache-${{ runner.os }}-
-            kline-cache-
-            stock-kline-cache-
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
 
-      - name: 检查缓存状态
+      - name: 检查K线缓存状态
+        shell: bash
         run: |
-          echo "检查 kline_cache："
-          if [ -d kline_cache ]; then
-            echo "✅ kline_cache 存在"
-            echo "缓存CSV数量：$(find kline_cache -name '*.csv' | wc -l)"
-            find kline_cache -maxdepth 1 -name '*.csv' | head -20 || true
-          else
-            echo "⚠️ kline_cache 不存在，破界会尝试公开源兜底，但不稳定。"
+          echo "开始检查K线缓存状态..."
+
+          if [ "${{ github.event.inputs.run_mode || 'daily' }}" = "selfcheck" ] && [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "当前是 selfcheck，自检模式不需要K线缓存。"
+            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+            exit 0
           fi
 
-          echo "检查 outputs："
-          if [ -d outputs ]; then
-            find outputs -maxdepth 2 -type f | head -30 || true
+          if [ -d "K线缓存" ]; then
+            echo "✅ 找到中文K线缓存文件夹：K线缓存"
+            echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            echo "CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
+
+          elif [ -d "kline_cache" ]; then
+            echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
+            echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
+            echo "K线缓存CSV数量：$CSV_COUNT"
+
           else
-            echo "outputs 不存在"
+            echo "⚠️ 没找到 K线缓存 或 kline_cache。"
+            CSV_COUNT=0
+          fi
+
+          if [ "$CSV_COUNT" -ge 1000 ]; then
+            echo "✅ K线缓存可用。"
+            echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+          else
+            echo "❌ K线缓存不可用或数量过少：$CSV_COUNT"
+            echo "破界战法不直接触发全量补缓存，避免和一号员工缓存任务冲突。"
+            echo "请先运行 A Stock Full Kline Cache Auto Backfill 或等一号员工缓存验收完成。"
+            echo "SHOULD_RUN_POJIE=0" >> "$GITHUB_ENV"
+            exit 1
           fi
 
       - name: 检查破界主程序
@@ -146,6 +169,7 @@ jobs:
           python -m py_compile "$MODEL_FILE"
 
       - name: 运行破界战法
+        if: ${{ env.SHOULD_RUN_POJIE == '1' }}
         env:
           RAW_MODE: ${{ github.event.inputs.run_mode || 'daily' }}
           RAW_SEND_TG: ${{ github.event.inputs.send_telegram || 'true' }}
@@ -154,6 +178,7 @@ jobs:
           echo "运行模式：$RAW_MODE"
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
+          echo "K线目录：$FULL_HISTORY_CACHE_DIR"
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
             RUN_MODE="daily"
