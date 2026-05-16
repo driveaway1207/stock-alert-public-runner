@@ -1,8 +1,5 @@
 {
-  "mode": "backtest",
-  "start": "2022-04-08",
-  "end": "2023-04-08",
-  "max_dates": "60",
-  "base_limit": "200",
-  "created_by": "stock_alert_workflow"
+  "mode": "daily",
+  "created_by": "stock_alert_workflow_v25_5",
+  "note": "workflow_run 会强制 daily，不会继承 backtest。"
 }
