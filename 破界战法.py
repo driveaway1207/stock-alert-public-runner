@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-破界｜核心线突破独立选股模型 V1.0
+破界战法2.0｜核心压力线突破/临界战法
 
 定位：独立战法员工，不改一号员工主模型。
 核心思想：
@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界V1.5｜只读缓存+10并行+无补拉人性化进度版"
+MODEL_VERSION = "破界战法2.0｜核心线重校准+宽严双层筛选+只读缓存加速版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -41,8 +41,11 @@ POJIE_PROGRESS_EVERY = int(os.environ.get("POJIE_PROGRESS_EVERY", "200"))
 POJIE_PROGRESS_SECONDS = int(os.environ.get("POJIE_PROGRESS_SECONDS", "30"))
 POJIE_VERBOSE_KLINE = os.environ.get("POJIE_VERBOSE_KLINE", "0") == "1"
 POJIE_LOG_FIRST_N = int(os.environ.get("POJIE_LOG_FIRST_N", "5"))
-# 保守预筛：只跳过“明显没有触发K”的股票，默认开启。若要完全不预筛，设 POJIE_FAST_PREFILTER=0。
+# 2.0 默认使用 BALANCED：核心线更重“共振/临界”，筛选不再只盯强突破当天。
+POJIE_STRATEGY_PROFILE = os.environ.get("POJIE_STRATEGY_PROFILE", "balanced").strip().lower()
 POJIE_FAST_PREFILTER = os.environ.get("POJIE_FAST_PREFILTER", "1") == "1"
+POJIE_MIN_CORELINE_SCORE = float(os.environ.get("POJIE_MIN_CORELINE_SCORE", "52" if POJIE_STRATEGY_PROFILE != "strict" else "62"))
+POJIE_OUTPUT_OBSERVATION = os.environ.get("POJIE_OUTPUT_OBSERVATION", "1") == "1"
 
 KLINE_STATS = {
     "cache_hit": 0,
@@ -317,6 +320,88 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return normalize_kline(out) if len(out) >= 20 else force_kline_schema(out)
 
 
+
+def detect_resonance_coreline_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
+    """
+    破界2.0核心线重校准：
+    不只依赖单根语义K线，还加入“共振点最多的核心线”：
+    - 阶段高点/次高点
+    - 收盘价/实体顶密集区
+    - 上影线反压密集区
+    - 近似成交密集区（按百分比价格桶）
+    这一步解决“核心压力线没选准”的问题。
+    """
+    res: List[Dict[str, Any]] = []
+    if d is None or len(d) < 40:
+        return res
+    d = force_kline_schema(d).reset_index(drop=True)
+    cur = safe_float(d["close"].iloc[-1])
+    if cur <= 0:
+        return res
+    # 周期越大，回看越长；日线只拿近一年左右，避免远古线干扰。
+    lookback_map = {"D": 260, "W": 180, "M": 120, "Q": 80, "Y": 40}
+    dd = d.tail(lookback_map.get(timeframe, 180)).copy().reset_index(drop=True)
+    if len(dd) < 30:
+        return res
+    # 只保留与当前有交易价值的线：不是离当前太远的历史线。
+    low_bound = cur * 0.68
+    high_bound = cur * 1.22
+    date_last = str(pd.to_datetime(dd["date"].iloc[-1]).date())
+
+    # 1）阶段高点/次高点/滚动高点：压力线核心来源。
+    for n, w in [(20, 1.4), (40, 1.8), (60, 2.0), (120, 2.4), (250, 2.8)]:
+        if len(dd) >= min(n, 30):
+            seg = dd.tail(min(n, len(dd)))
+            h = safe_float(seg["high"].max())
+            if low_bound <= h <= high_bound:
+                res.append({"price": h, "source": f"近{n}周期阶段高点/压力上沿", "timeframe": timeframe, "date": date_last, "weight": w})
+            # 次高收盘/实体顶比单纯影线更稳。
+            body_top = seg[["open", "close"]].max(axis=1)
+            bt = safe_float(body_top.quantile(0.92))
+            if low_bound <= bt <= high_bound:
+                res.append({"price": bt, "source": f"近{n}周期实体顶/收盘共振线", "timeframe": timeframe, "date": date_last, "weight": w + 0.4})
+            ch = safe_float(seg["close"].quantile(0.94))
+            if low_bound <= ch <= high_bound:
+                res.append({"price": ch, "source": f"近{n}周期高位收盘共振线", "timeframe": timeframe, "date": date_last, "weight": w + 0.2})
+
+    # 2）价格桶共振：简化版 Volume Profile / Price-by-Volume。
+    # 用百分比桶，避免低价/高价股票固定金额失真。
+    prices = []
+    weights = []
+    for i, row in dd.iterrows():
+        decay = 0.55 + 0.45 * (i + 1) / max(1, len(dd))
+        v = max(1.0, safe_float(row.get("amount"), 0) / 1e8)
+        o, h, l, c = [safe_float(row.get(x)) for x in ["open", "high", "low", "close"]]
+        bt, bb = max(o, c), min(o, c)
+        cp = safe_float(row.get("close_pos"), 0.5)
+        upper = safe_float(row.get("upper_shadow_ratio"), 0)
+        for px, wt, src in [
+            (c, 1.8, "收盘"),
+            (bt, 1.5, "实体顶"),
+            (h, 1.1 + (0.6 if upper >= 0.25 else 0), "影线高点"),
+            (bb, 0.9, "实体底"),
+        ]:
+            if low_bound <= px <= high_bound:
+                prices.append(px)
+                weights.append(max(0.1, wt * decay * min(3.0, v ** 0.35)))
+    if prices:
+        bin_pct = 0.006 if timeframe in ["D", "W"] else 0.010
+        buckets: Dict[int, Dict[str, float]] = {}
+        for px, wt in zip(prices, weights):
+            key = int(round(math.log(px / cur) / bin_pct))
+            b = buckets.setdefault(key, {"w": 0.0, "pxw": 0.0, "cnt": 0})
+            b["w"] += wt
+            b["pxw"] += px * wt
+            b["cnt"] += 1
+        top = sorted(buckets.values(), key=lambda x: (x["w"], x["cnt"]), reverse=True)[:8]
+        for b in top:
+            if b["w"] <= 0 or b["cnt"] < 4:
+                continue
+            px = b["pxw"] / b["w"]
+            if low_bound <= px <= high_bound:
+                res.append({"price": px, "source": f"价格桶成交/实体/收盘共振区 cnt={int(b['cnt'])}", "timeframe": timeframe, "date": date_last, "weight": min(3.2, 1.2 + b["cnt"] / 10)})
+    return [x for x in res if safe_float(x.get("price")) > 0]
+
 def detect_gap_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
     res = []
     for i in range(1, len(d)):
@@ -458,11 +543,12 @@ def cluster_corelines(candidates: List[Dict[str, Any]], current_price: float, at
         usability = 5 if 0.01 <= dist <= 0.35 else (2 if dist < 0.5 else -4)
         score = multi_tf_score + semantic_score + reaction_score + gap_bonus + bigk_bonus + stability_score + usability
         score = max(0, min(100, score))
-        if score >= 85:
+        # 2.0：核心线分级略放宽，但仍要求多来源共振；严选可用 POJIE_STRATEGY_PROFILE=strict。
+        if score >= (84 if POJIE_STRATEGY_PROFILE == "strict" else 80):
             level = "S"
-        elif score >= 75:
+        elif score >= (74 if POJIE_STRATEGY_PROFILE == "strict" else 68):
             level = "A"
-        elif score >= 62:
+        elif score >= (62 if POJIE_STRATEGY_PROFILE == "strict" else 55):
             level = "B"
         else:
             level = "C"
@@ -497,7 +583,9 @@ def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
         if df is None or len(df) < 15:
             continue
         lookback = {"D": 220, "W": 180, "M": 120, "Q": 80, "Y": 40}.get(tf, 100)
-        candidates.extend(detect_semantic_coreline_candidates(df.tail(lookback).reset_index(drop=True), tf))
+        window_df = df.tail(lookback).reset_index(drop=True)
+        candidates.extend(detect_semantic_coreline_candidates(window_df, tf))
+        candidates.extend(detect_resonance_coreline_candidates(window_df, tf))
     cur = safe_float(daily["close"].iloc[-1])
     atr = safe_float(daily["atr20_pct"].iloc[-1], 0.02)
     return cluster_corelines(candidates, cur, atr)
@@ -628,7 +716,11 @@ def detect_breakout(d: pd.DataFrame, zone: Dict[str, Any]) -> Dict[str, Any]:
     pct_chg = safe_float(row.get("pct_chg", 0))
     volr = safe_float(row["volume"] / safe_float(row.get("vol_ma20", 0), row["volume"]), 1)
     gap_break = safe_float(row["low"]) > safe_float(pre["high"]) * 1.003 and close > zhigh
-    effective = close > zhigh * 1.003 and body_above_ratio >= 0.45 and close_pos >= 0.68 and upper <= 0.42
+    if POJIE_STRATEGY_PROFILE == "strict":
+        effective = close > zhigh * 1.003 and body_above_ratio >= 0.45 and close_pos >= 0.68 and upper <= 0.42
+    else:
+        # 2.0 平衡模式：允许“刚突破/临界突破”进入观察，不再只认非常漂亮的大阳突破。
+        effective = close > zhigh * 1.001 and body_above_ratio >= 0.28 and close_pos >= 0.58 and upper <= 0.55
     score = 0.0
     reasons = []
     if close > zhigh * 1.003:
@@ -740,10 +832,21 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     if not zones:
         return None
     close = safe_float(d["close"].iloc[-1])
-    # 破界关注：当前价附近或刚突破的S/A/B+核心线。
-    valid_zones = [z for z in zones if z["level"] in ["S", "A", "B"] and safe_float(z["center"]) <= close * 1.10 and safe_float(z["center"]) >= close * 0.72]
+    # 2.0：核心压力线可能略有偏差，因此不只看S/A/B强线，也允许近价C级共振线进入观察。
+    valid_zones = []
+    for z in zones:
+        center = safe_float(z["center"])
+        zscore = safe_float(z.get("score"))
+        if center <= 0:
+            continue
+        near = close * 0.66 <= center <= close * 1.16
+        high_quality = z["level"] in ["S", "A", "B"] and zscore >= POJIE_MIN_CORELINE_SCORE
+        nearby_c = z["level"] == "C" and abs(center / close - 1) <= 0.045 and zscore >= max(45, POJIE_MIN_CORELINE_SCORE - 8)
+        if near and (high_quality or nearby_c):
+            valid_zones.append(z)
     if not valid_zones:
-        valid_zones = zones[:1]
+        # 若没有强核心线，至少拿最接近现价的前几条做低等级观察，避免“核心线选偏”导致全市场空。
+        valid_zones = sorted(zones[:8], key=lambda z: abs(safe_float(z["center"]) / close - 1) if close > 0 else 99)[:3]
     best_result = None
     for z in valid_zones[:5]:
         core_score = safe_float(z["score"])
@@ -753,16 +856,16 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
         risk = risk_filter(d, {"名称": name})
         if risk["hard_exclude"]:
             continue
-        total = core_score * 0.30 + safe_float(buildup["score"]) * (25 / 35) + safe_float(breakout["score"]) * (25 / 30) + safe_float(rr["score"]) + safe_float(risk["penalty"])
-        # 未有效突破只能观察，不能高分正式入选。
+        total = core_score * 0.32 + safe_float(buildup["score"]) * (27 / 35) + safe_float(breakout["score"]) * (27 / 30) + safe_float(rr["score"]) + safe_float(risk["penalty"])
+        # 2.0：未完全有效突破也可以作为“临界观察”，但封顶，不能冒充强确认。
         if not breakout["effective"]:
-            total = min(total, 72)
+            total = min(total, 76 if POJIE_OUTPUT_OBSERVATION else 69)
         total = max(0, min(100, total))
         if total >= 88 and breakout["effective"] and z["level"] == "S" and rr["rr"] >= 2.0:
             level = "S"
         elif total >= 80 and breakout["effective"]:
             level = "A"
-        elif total >= 70:
+        elif total >= (68 if POJIE_STRATEGY_PROFILE != "strict" else 70):
             level = "B"
         else:
             level = "C"
@@ -779,6 +882,7 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
             "coreline_zone": [round(safe_float(z["low"]), 3), round(safe_float(z["high"]), 3)],
             "coreline_level": z["level"],
             "coreline_score": round(core_score, 2),
+            "strategy_profile": POJIE_STRATEGY_PROFILE,
             "coreline_sources": z["sources"][:12],
             "coreline_timeframes": z["timeframes"],
             "buildup_score": round(safe_float(buildup["score"]), 2),
@@ -808,7 +912,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     lines = []
     valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
     not_selected = max(0, valid_scanned - len(results))
-    lines.append(f"【破界｜核心线突破独立战法】")
+    lines.append(f"【破界战法2.0｜核心线突破/临界观察独立战法】")
     lines.append(f"生成时间：{now_bj()}")
     lines.append(
         f"扫描：{scanned}只，K线有效：{valid_scanned}只，"
@@ -1380,7 +1484,7 @@ def parse_args():
     p.add_argument("--基础模型文件", default=DEFAULT_BASE_MODEL_FILE, help="复用的一号员工主文件，默认 stock_alert.py")
     p.add_argument("--最多股票数量", type=int, default=int(os.environ.get("破界_最多股票数量", "0")), help="调试用，0=不限制")
     p.add_argument("--输出数量", type=int, default=int(os.environ.get("破界_输出数量", "10")), help="破界候选最多输出数量")
-    p.add_argument("--最低分", type=float, default=float(os.environ.get("破界_最低分", "70")), help="最低输出分数")
+    p.add_argument("--最低分", type=float, default=float(os.environ.get("破界_最低分", "62" if os.environ.get("POJIE_STRATEGY_PROFILE", "balanced").lower() != "strict" else "70")), help="最低输出分数")
     p.add_argument("--发送Telegram", action="store_true", help="开启后调用基础模型 send_telegram 推送")
     p.add_argument("--不发送Telegram", action="store_true", help="强制不推送")
     return p.parse_args()
@@ -1411,15 +1515,22 @@ def quick_trigger_prefilter(df: pd.DataFrame) -> bool:
     pre_high_60 = safe_float(d["high"].shift(1).tail(60).max())
     vol_ma20 = safe_float(d["volume"].tail(20).mean())
     # 只要有一个攻击/临界迹象，就进入完整模型。
-    if pct_chg >= 1.8:
+    # 2.0预筛：更像“基础条件”，不过度严苛；只排除明显死水/远离压力的票。
+    if pct_chg >= 1.0:
         return True
-    if close_pos >= 0.70 and pct_chg >= 0.5:
+    if close_pos >= 0.62 and pct_chg >= 0.0:
         return True
-    if pre_high_20 > 0 and close >= pre_high_20 * 0.992:
+    if pre_high_20 > 0 and close >= pre_high_20 * 0.975:
         return True
-    if pre_high_60 > 0 and high >= pre_high_60 * 0.995 and close_pos >= 0.55:
+    if pre_high_60 > 0 and high >= pre_high_60 * 0.975 and close_pos >= 0.45:
         return True
-    if vol_ma20 > 0 and volume >= vol_ma20 * 1.35 and close_pos >= 0.55:
+    if vol_ma20 > 0 and volume >= vol_ma20 * 1.12 and close_pos >= 0.45:
+        return True
+    ma20 = safe_float(d["ma20"].iloc[-1]) if "ma20" in d.columns else 0
+    ma60 = safe_float(d["ma60"].iloc[-1]) if "ma60" in d.columns else 0
+    if ma20 > 0 and close >= ma20 * 0.985 and pre_high_60 > 0 and close >= pre_high_60 * 0.94:
+        return True
+    if ma60 > 0 and close >= ma60 * 0.99 and pre_high_60 > 0 and close >= pre_high_60 * 0.93:
         return True
     # 跳空/缺口类也保留。
     if len(d) >= 2:
@@ -1502,7 +1613,8 @@ def main():
     if args.最多股票数量 and args.最多股票数量 > 0:
         stock_list = stock_list.head(args.最多股票数量)
 
-    print("破界：K线模式=只读缓存；缓存命中不联网；缓存缺失直接跳过；BaoStock/AkShare默认禁用。")
+    print("破界战法2.0：K线模式=只读缓存；缓存命中不联网；缓存缺失直接跳过；BaoStock/AkShare默认禁用。")
+    print(f"破界战法2.0：策略档位={POJIE_STRATEGY_PROFILE}，最低核心线分={POJIE_MIN_CORELINE_SCORE}，观察候选输出={POJIE_OUTPUT_OBSERVATION}")
     print(f"破界：POJIE_REMOTE_ON_CACHE_MISS={os.environ.get('POJIE_REMOTE_ON_CACHE_MISS', '1')}，POJIE_ALLOW_AKSHARE_KLINE={os.environ.get('POJIE_ALLOW_AKSHARE_KLINE', '0')}，KLINE_FALLBACK_AKSHARE={os.environ.get('KLINE_FALLBACK_AKSHARE', '0')}")
     print(f"破界：最终扫描股票池数量={len(stock_list)}")
     print(stock_list.head(20).to_string(index=False))
