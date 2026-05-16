@@ -52,9 +52,14 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
+      # 复用一号员工的数据入口/缓存口径
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
+
+      # BaoStock 股票池异常时允许 AkShare 兜底
+      STOCK_LIST_FALLBACK_AKSHARE: "1"
+      KLINE_FALLBACK_AKSHARE: "1"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
@@ -89,10 +94,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
+            echo "发现 requirements.txt，先安装仓库依赖。"
             pip install -r requirements.txt
-          else
-            pip install pandas numpy requests akshare baostock
           fi
+
+          echo "强制补装破界战法必需依赖，避免 requirements.txt 缺包。"
+          pip install pandas numpy requests akshare baostock openpyxl
+
+          echo "验证关键依赖是否可导入。"
+          python - <<'PY'
+          import pandas, numpy, requests
+          import akshare
+          import baostock
+          print("依赖验证通过：pandas/numpy/requests/akshare/baostock")
+          PY
 
       - name: 语法检查
         run: |
