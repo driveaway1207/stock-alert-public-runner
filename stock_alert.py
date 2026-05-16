@@ -165,7 +165,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V25.3一号员工选股模型｜V24.1生产核心完整融合+daily/backtest同逻辑+严格No-Lookahead真实回测版"
+MODEL_VERSION = "V25.5一号员工选股模型｜核心压力/支撑线吃肉模型融合版+daily/backtest同逻辑+严格No-Lookahead真实回测版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -5974,8 +5974,563 @@ def _xhu_combine_pressure_setup_grade(zone_grade, day_grade, zone_score, day_sco
     return "C", 3.0
 
 
+
+# ========================= V25.5 核心压力/支撑线吃肉模型 =========================
+# 定位：替代旧“多周期压力带突破”主入口，但保留旧字段名，避免一号员工其它模块调用断裂。
+# 原则：大级别定方向，中周期复合验证，小周期只做日线高级突破与回踩执行；不再把普通压力带堆成核心线。
+
+def _cl_col(df, names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _cl_prepare_period_df(pdf):
+    if pdf is None or pdf.empty:
+        return pd.DataFrame()
+    d = pdf.copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume", "turnover", "turnover_rate", "换手率"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    return d
+
+
+def _cl_period_tolerance(period):
+    # 同周期找线容差：年/季宽一点，日/周窄一点；用于“是否同一价位附近”，不是把同周期做很多线。
+    return {"Y": 0.030, "Q": 0.025, "M": 0.018, "W": 0.012, "D": 0.008}.get(str(period), 0.012)
+
+
+def _cl_period_rank_weight(period):
+    return {"Y": 5.0, "Q": 4.2, "M": 3.2, "W": 2.2, "D": 1.2}.get(str(period), 1.0)
+
+
+def _cl_top_exchange_bars(pdf, n=5):
+    """取最大筹码交换K：以成交量/换手率为主，成交额不参与主排序。"""
+    d = _cl_prepare_period_df(pdf)
+    if d.empty:
+        return []
+    turn_col = _cl_col(d, ["turnover_rate", "turnover", "换手率"])
+    vol_rank = d["volume"].rank(method="min", ascending=False)
+    if turn_col:
+        turn_rank = d[turn_col].fillna(0).rank(method="min", ascending=False)
+        # 越小越好：成交量主导，换手率辅助。
+        d["_exchange_rank"] = vol_rank * 0.65 + turn_rank * 0.35
+    else:
+        d["_exchange_rank"] = vol_rank
+    top = d.sort_values("_exchange_rank", ascending=True).head(int(n)).copy()
+    out = []
+    for rank, (_, r) in enumerate(top.iterrows(), 1):
+        op = safe_float(r.get("open", 0)); hi = safe_float(r.get("high", 0)); lo = safe_float(r.get("low", 0)); cl = safe_float(r.get("close", 0))
+        if min(op, hi, lo, cl) <= 0 or hi < lo:
+            continue
+        out.append({
+            "rank": rank,
+            "date": str(r.get("date", "")),
+            "open": op, "high": hi, "low": lo, "close": cl,
+            "body_top": max(op, cl), "body_bottom": min(op, cl),
+            "upper_mid": (hi + max(op, cl)) / 2.0,
+            "lower_mid": (lo + min(op, cl)) / 2.0,
+            "volume": safe_float(r.get("volume", 0)),
+            "turnover": safe_float(r.get(turn_col, 0)) if turn_col else 0.0,
+        })
+    return out
+
+
+def _cl_weighted_median(points):
+    pts = [(safe_float(x[0]), max(0.01, safe_float(x[1], 1))) for x in points if safe_float(x[0]) > 0]
+    if not pts:
+        return 0.0
+    pts.sort(key=lambda x: x[0])
+    total = sum(w for _, w in pts)
+    acc = 0.0
+    for price, w in pts:
+        acc += w
+        if acc >= total / 2:
+            return price
+    return pts[-1][0]
+
+
+def _cl_candidate_line_from_period(pdf, period="Y", current_close=0.0):
+    """单周期核心线：优先第一/第二大量K影线共振；实体边界保护；默认只输出1根。"""
+    d = _cl_prepare_period_df(pdf)
+    empty = {"valid": False, "period": period, "line": 0.0, "score": 0.0, "grade": "D", "desc": "无核心线"}
+    if len(d) < (6 if period in ("Y", "Q") else 20):
+        return empty
+    tol = _cl_period_tolerance(period)
+    top = _cl_top_exchange_bars(d, n=5)
+    if len(top) < 2:
+        return empty
+
+    # 1）影线点为主：高/低影线端点 + 影线1/2位（长影线1/2是远端强压力候选，但不默认压过端点共振）。
+    pts = []
+    for b in top:
+        rw = {1: 3.2, 2: 2.7, 3: 1.7, 4: 1.1, 5: 1.0}.get(int(b["rank"]), 1.0)
+        pts.append({"price": b["high"], "kind": "上影高点", "rank": b["rank"], "weight": rw * 1.35})
+        pts.append({"price": b["low"], "kind": "下影低点", "rank": b["rank"], "weight": rw * 1.35})
+        # 只在影线长度足够时记录半分位，作为远端/目标压力线索，不主导核心线。
+        rng = max(b["high"] - b["low"], 1e-9)
+        if (b["high"] - b["body_top"]) / rng >= 0.28:
+            pts.append({"price": b["upper_mid"], "kind": "上影1/2位", "rank": b["rank"], "weight": rw * 0.85})
+        if (b["body_bottom"] - b["low"]) / rng >= 0.28:
+            pts.append({"price": b["lower_mid"], "kind": "下影1/2位", "rank": b["rank"], "weight": rw * 0.85})
+
+    # 2）在这些影线点里找“同周期唯一最强共振”。
+    clusters = _xhu_cluster_price_points(pts, tolerance_pct=tol)
+    if not clusters:
+        return empty
+
+    scored = []
+    for cl in clusters:
+        ps = cl.get("points", [])
+        ranks = sorted(set(int(p.get("rank", 99)) for p in ps))
+        kinds = [str(p.get("kind", "")) for p in ps]
+        wick_endpoint_count = sum(1 for k in kinds if k in ("上影高点", "下影低点"))
+        half_count = sum(1 for k in kinds if "1/2" in k)
+        first_second = (1 in ranks) + (2 in ranks)
+        top3 = sum(1 for r in ranks if r <= 3)
+        compact = 1.0
+        center0 = safe_float(cl.get("center", 0))
+        if center0 > 0 and ps:
+            spread = (max(safe_float(p.get("price", 0)) for p in ps) / max(min(safe_float(p.get("price", 1e9)) for p in ps), 1e-9) - 1)
+            compact = max(0.0, 1.0 - spread / max(tol * 2.2, 1e-9))
+        # 核心：第一/第二大量K + 影线端点共振 + 精准度；影线1/2只作辅助。
+        score = 0.0
+        score += first_second * 22.0
+        score += max(0, first_second - 1) * 10.0
+        score += min(18.0, wick_endpoint_count * 5.0)
+        score += min(8.0, half_count * 2.0)
+        score += min(10.0, top3 * 3.3)
+        score += compact * 12.0
+        score += _cl_period_rank_weight(period) * 2.0
+        scored.append((score, cl, {"ranks": ranks, "wick_endpoint_count": wick_endpoint_count, "half_count": half_count, "compact": compact}))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_cl, meta = scored[0]
+    if best_score < 36:
+        return empty
+
+    raw_line = safe_float(best_cl.get("center", 0))
+    # 3）大量K实体保护原则：不能为了影线共振，把前三大量K实体顶/底斩断。
+    top3_bars = [b for b in top if int(b.get("rank", 99)) <= 3]
+    entity_points = []
+    protect_note = ""
+    for b in top3_bars:
+        rw = {1: 3.0, 2: 2.4, 3: 1.5}.get(int(b["rank"]), 1.0)
+        # 如果实体边界距离影线候选不远，优先作为修正点；不远定义比同周期容差稍宽。
+        for ep, label in [(b["body_top"], "实顶"), (b["body_bottom"], "实底")]:
+            if ep > 0 and raw_line > 0 and abs(ep / raw_line - 1) <= tol * 1.45:
+                entity_points.append((ep, rw))
+    line = raw_line
+    if entity_points:
+        # 加权中位数保留影线主导，同时让前三大量K实体边界参与修正。
+        line = _cl_weighted_median([(raw_line, 4.0)] + entity_points)
+        if abs(line / raw_line - 1) > tol * 0.18:
+            protect_note = f"；前三大量K实体边界修正{raw_line:.2f}->{line:.2f}"
+            best_score += 8.0
+        else:
+            protect_note = "；前三大量K实体边界确认"
+    else:
+        # 若无实体确认但影线足够强，也可以成立，但评级略降。
+        best_score -= 4.0
+
+    # 4）后续反应验证：历史K线在该线附近触碰/收盘反应越多，线越稳定。
+    close_hits = int((abs(d["close"] / line - 1) <= tol).sum()) if line > 0 else 0
+    high_low_hits = int(((abs(d["high"] / line - 1) <= tol) | (abs(d["low"] / line - 1) <= tol)).sum()) if line > 0 else 0
+    reaction_bonus = min(16.0, close_hits * 1.8 + high_low_hits * 1.2)
+    best_score += reaction_bonus
+
+    # 5）当前交易价值：离当前过远的线暂不作为“日线突破后吃肉”的当前核心线，但仍可记录为远端线。
+    dist = line / max(current_close, 1e-9) - 1 if current_close > 0 and line > 0 else 9.99
+    if -0.08 <= dist <= 0.45:
+        best_score += 6.0
+    elif dist > 0.80:
+        best_score -= 10.0
+
+    score = max(0.0, min(100.0, best_score))
+    grade = _xhu_letter_grade(score, cuts=(85, 70, 55, 40))
+    ranks_txt = "/".join(str(x) for x in meta.get("ranks", []))
+    desc = (
+        f"{period}线核心压力/支撑线{line:.2f}：前五大量/高换手K影线共振，参与排名{ranks_txt}，"
+        f"影线端点{meta.get('wick_endpoint_count',0)}处，影线1/2位{meta.get('half_count',0)}处，"
+        f"收盘共振{close_hits}次，高低点共振{high_low_hits}次{protect_note}"
+    )
+    return {
+        "valid": True,
+        "period": period,
+        "line": float(line),
+        "band_low": float(line * (1 - tol * 0.35)),
+        "band_high": float(line * (1 + tol * 0.35)),
+        "score": float(score),
+        "grade": grade,
+        "desc": desc,
+        "top_ranks": meta.get("ranks", []),
+        "wick_endpoint_count": int(meta.get("wick_endpoint_count", 0)),
+        "half_count": int(meta.get("half_count", 0)),
+        "close_hits": int(close_hits),
+        "high_low_hits": int(high_low_hits),
+        "distance_pct": float(dist),
+        "top_bars": top,
+    }
+
+
+def _cl_all_period_core_lines(df, current_close):
+    lines = []
+    for period, pdf, lookback in _xhu_period_dfs(df):
+        try:
+            # 对大级别多给一点历史；日线只做参考，不负责定义第一核心线。
+            if period == "D":
+                pdf2 = pdf.tail(520)
+            elif period == "W":
+                pdf2 = pdf.tail(260)
+            else:
+                pdf2 = pdf
+            r = _cl_candidate_line_from_period(pdf2, period=period, current_close=current_close)
+            if r.get("valid"):
+                lines.append(r)
+        except Exception as e:
+            print(f"核心线单周期识别失败：period={period} error={str(e)[:80]}")
+    # 大级别定方向：排序时年/季显著优先；月/周用于复合验证和上方压力排名。
+    for r in lines:
+        r["rank_score"] = safe_float(r.get("score", 0)) + _cl_period_rank_weight(r.get("period", "")) * 8.0
+        # 近当前且上方可突破的线，交易价值更高；远端线保留用于空间排名。
+        dist = safe_float(r.get("distance_pct", 9.99))
+        if -0.05 <= dist <= 0.25:
+            r["rank_score"] += 8.0
+        if r.get("period") in ("Y", "Q"):
+            r["rank_score"] += 12.0
+    return sorted(lines, key=lambda x: safe_float(x.get("rank_score", 0)), reverse=True)
+
+
+def _cl_merge_nearby_pressure_lines(lines, current_close):
+    """跨周期才做合并/排名：近距离且强度相近的线合并为压力区，取上沿作为确认价。"""
+    if not lines:
+        return []
+    pts = []
+    for r in lines:
+        price = safe_float(r.get("line", 0))
+        if price <= 0:
+            continue
+        # 只对当前价附近及上方压力做排名；远低于当前的当作支撑记忆。
+        if current_close > 0 and price < current_close * 0.88:
+            continue
+        pts.append({"price": price, "weight": max(1.0, safe_float(r.get("rank_score", 0)) / 20.0), "line": r})
+    pts = sorted(pts, key=lambda x: x["price"])
+    groups = []
+    for p in pts:
+        placed = False
+        for g in groups:
+            center = safe_float(g.get("center", 0))
+            # 跨周期5%内如果强线接近，视为同一核心压力区；弱小线不会推翻第一核心线，但会记录为拦路压力。
+            if center > 0 and abs(p["price"] / center - 1) <= 0.035:
+                g["items"].append(p)
+                total = sum(x["weight"] for x in g["items"])
+                g["center"] = sum(x["price"] * x["weight"] for x in g["items"]) / max(total, 1e-9)
+                g["lower"] = min(x["price"] for x in g["items"])
+                g["upper"] = max(x["price"] for x in g["items"])
+                placed = True
+                break
+        if not placed:
+            groups.append({"center": p["price"], "lower": p["price"], "upper": p["price"], "items": [p]})
+    out = []
+    for g in groups:
+        items = g["items"]
+        periods = sorted(set(x["line"].get("period", "") for x in items))
+        period_bonus = sum(_cl_period_rank_weight(x["line"].get("period", "")) for x in items)
+        best_item = sorted(items, key=lambda x: safe_float(x["line"].get("rank_score", 0)), reverse=True)[0]
+        score = min(100.0, safe_float(best_item["line"].get("score", 0)) * 0.72 + period_bonus * 5.0 + len(items) * 4.0)
+        grade = _xhu_letter_grade(score, cuts=(85, 70, 55, 40))
+        out.append({
+            "lower": float(g["lower"]), "upper": float(g["upper"]), "center": float(g["center"]),
+            "confirm_price": float(g["upper"]),
+            "score": float(score), "grade": grade,
+            "periods": periods,
+            "best_line": best_item["line"],
+            "desc": " + ".join([x["line"].get("desc", "") for x in sorted(items, key=lambda x: safe_float(x["line"].get("rank_score", 0)), reverse=True)[:3]]),
+        })
+    # 压力排名：先按大级别/质量排，再兼顾价格由近及远。
+    return sorted(out, key=lambda z: (safe_float(z.get("score", 0)), _cl_period_rank_weight(z.get("best_line", {}).get("period", ""))), reverse=True)
+
+
+def _cl_choose_primary_core_zone(zones, current_close):
+    if not zones:
+        return None
+    # 优先选择“当前价上方或刚突破附近”的最高级核心区；过远的远端线只用于下一压力。
+    candidates = []
+    for z in zones:
+        cp = safe_float(z.get("confirm_price", z.get("upper", 0)))
+        dist = cp / max(current_close, 1e-9) - 1 if current_close > 0 else 9.99
+        trade_bonus = 0.0
+        if -0.06 <= dist <= 0.22:
+            trade_bonus += 18.0
+        elif 0.22 < dist <= 0.45:
+            trade_bonus += 8.0
+        elif dist > 0.65:
+            trade_bonus -= 16.0
+        big_bonus = 10.0 if any(p in z.get("periods", []) for p in ["Y", "Q"]) else 0.0
+        candidates.append((safe_float(z.get("score", 0)) + trade_bonus + big_bonus, z))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _cl_overhead_ranking(zones, core_zone, current_close):
+    if not core_zone:
+        return []
+    core_upper = safe_float(core_zone.get("confirm_price", core_zone.get("upper", 0)))
+    ranked = []
+    for z in zones:
+        up = safe_float(z.get("confirm_price", z.get("upper", 0)))
+        if up <= core_upper * 1.005:
+            continue
+        gap = up / max(core_upper, 1e-9) - 1
+        strength = safe_float(z.get("score", 0))
+        rank_name = "高级压力" if strength >= 70 else ("中级压力" if strength >= 55 else "弱压力")
+        ranked.append({**z, "gap_from_core_pct": float(gap), "pressure_rank_name": rank_name})
+    return sorted(ranked, key=lambda x: (safe_float(x.get("confirm_price", 0))))
+
+
+def _cl_prep_quality(df, level):
+    """突破前蓄势质量：内部20分，最终只作为小权重校准。"""
+    empty = {"score20": 0.0, "mapped_score": 0.0, "desc": "无蓄势数据"}
+    if df is None or len(df) < 80 or level <= 0:
+        return empty
+    d = _cl_prepare_period_df(df).tail(80).reset_index(drop=True)
+    if len(d) < 50:
+        return empty
+    close = d["close"]
+    vol = d["volume"]
+    score = 0.0; reasons = []
+    near = (abs(close / level - 1) <= 0.12)
+    near_days = int(near.tail(40).sum())
+    if near_days >= 25:
+        score += 4; reasons.append(f"贴线蓄势{near_days}日")
+    elif near_days >= 14:
+        score += 2.5; reasons.append(f"贴线天数{near_days}日")
+    # 重心抬高：20日中位数高于前20日，低点抬高。
+    med1 = safe_float(close.iloc[-40:-20].median()); med2 = safe_float(close.iloc[-20:].median())
+    low1 = safe_float(d["low"].iloc[-40:-20].min()); low2 = safe_float(d["low"].iloc[-20:].min())
+    if med2 > med1 * 1.015 and low2 >= low1 * 0.98:
+        score += 4; reasons.append("重心/低点抬高")
+    elif med2 >= med1 * 0.995:
+        score += 2; reasons.append("重心稳定")
+    # 量能压缩/地量倍缩量：后20日量能CV下降，低量K增多。
+    v1 = vol.iloc[-60:-30]; v2 = vol.iloc[-30:]
+    cv1 = safe_float(v1.std() / max(v1.mean(), 1e-9)); cv2 = safe_float(v2.std() / max(v2.mean(), 1e-9))
+    low_vol_days = int((v2 <= safe_float(v1.quantile(0.30))).sum()) if len(v1) else 0
+    if cv2 < cv1 * 0.78 and low_vol_days >= 6:
+        score += 4; reasons.append(f"量能压缩/低量{low_vol_days}日")
+    elif cv2 < cv1 * 0.90:
+        score += 2; reasons.append("量能波动下降")
+    # 小K收敛：振幅下降。
+    amp = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
+    a1 = safe_float(amp.iloc[-60:-30].median()); a2 = safe_float(amp.iloc[-20:].median())
+    if a2 < a1 * 0.75:
+        score += 3; reasons.append("小K/波动收敛")
+    elif a2 < a1 * 0.90:
+        score += 1.5; reasons.append("波动略收敛")
+    # 失败试探后不破：近60日冲击核心线失败但后续低点不崩。
+    rng = (d["high"] - d["low"]).replace(0, np.nan)
+    body_top = pd.concat([d["open"], d["close"]], axis=1).max(axis=1)
+    upper_ratio = (d["high"] - body_top) / rng
+    probes = d[(d["high"] >= level * 0.995) & (d["close"] < level * 0.995) & (upper_ratio >= 0.25)]
+    if len(probes) >= 1:
+        last_probe_i = int(probes.index[-1])
+        after = d.iloc[last_probe_i+1:]
+        if not after.empty and safe_float(after["low"].min()) >= safe_float(d["low"].iloc[max(0,last_probe_i-20):last_probe_i+1].min()) * 0.96:
+            score += 3; reasons.append("试探失败后未破位")
+    # 无放量长阴破坏。
+    pct = d["close"].pct_change() * 100
+    vol_ma = vol.rolling(20).mean()
+    bad = ((pct <= -5) & (vol >= vol_ma * 1.6)).tail(40).sum()
+    if int(bad) == 0:
+        score += 2; reasons.append("无放量长阴破坏")
+    score = max(0.0, min(20.0, score))
+    mapped = min(5.0, score / 20.0 * 5.0)
+    return {"score20": float(score), "mapped_score": float(mapped), "desc": "、".join(reasons[:6]) or "蓄势一般"}
+
+
+def _cl_grade_breakout_day(df, core_zone):
+    empty = {"breakout_day_grade": "D", "breakout_score": 0.0, "desc": "无核心线高级突破", "breakout_core": False}
+    if df is None or len(df) < 2 or not core_zone:
+        return empty
+    d = _cl_prepare_period_df(df)
+    if len(d) < 2:
+        return empty
+    cur = d.iloc[-1]; prev = d.iloc[-2]
+    level = safe_float(core_zone.get("confirm_price", core_zone.get("upper", 0)))
+    op = safe_float(cur.get("open", 0)); cl = safe_float(cur.get("close", 0)); hi = safe_float(cur.get("high", 0)); lo = safe_float(cur.get("low", 0))
+    vol = safe_float(cur.get("volume", 0)); prev_vol = safe_float(prev.get("volume", 0))
+    if min(level, op, cl, hi, lo) <= 0:
+        return empty
+    rng = max(hi - lo, 1e-9)
+    body_top = max(op, cl); body_bottom = min(op, cl); body_len = max(body_top - body_bottom, 1e-9)
+    close_pos = (cl - lo) / rng
+    upper_shadow_ratio = (hi - body_top) / rng
+    entity_pct = abs(cl / op - 1) if op > 0 else 0.0
+    body_above = max(0.0, body_top - max(body_bottom, level)) / body_len
+    gap_up = op > level * 1.003 and safe_float(prev.get("close", 0)) < level * 1.01
+    breakout = cl >= level * 1.003
+    wick_probe = hi >= level and not breakout
+    vr1 = vol / prev_vol if prev_vol > 0 else 0.0
+    vol_ma20 = safe_float(d["volume"].tail(20).mean()) if len(d) >= 20 else 0.0
+    volr = vol / vol_ma20 if vol_ma20 > 0 else 0.0
+    pct_chg = safe_float(cur.get("pct_chg", (cl / safe_float(prev.get("close", cl)) - 1) * 100))
+    limit_like = pct_chg >= 9.3 or (pct_chg >= 18 and str(cur.get("code", "")).startswith("3"))
+    healthy_vol = ((1.35 <= vr1 <= 3.6) or (1.25 <= volr <= 4.5)) and not (vr1 > 5.0 and volr > 6.0)
+    if limit_like and close_pos >= 0.85 and breakout:
+        healthy_vol = healthy_vol or (volr >= 1.0 and vr1 <= 6.0)
+    score = 0.0; reasons = []
+    if breakout:
+        score += 28; reasons.append("收盘突破核心压力/支撑线")
+    if gap_up:
+        score += 10; reasons.append("跳空越过核心线")
+    if body_above >= 0.65:
+        score += 14; reasons.append("实体大部在线上")
+    elif body_above >= 0.35:
+        score += 7; reasons.append("实体部分站上线")
+    if entity_pct >= 0.07:
+        score += 10; reasons.append("大阳实体")
+    elif entity_pct >= 0.035:
+        score += 5; reasons.append("实体推进")
+    if close_pos >= 0.85:
+        score += 8; reasons.append("强收盘")
+    elif close_pos >= 0.70:
+        score += 4; reasons.append("较强收盘")
+    if upper_shadow_ratio <= 0.18:
+        score += 5
+    elif upper_shadow_ratio >= 0.35:
+        score -= 10; reasons.append("上影偏长")
+    if healthy_vol:
+        score += 10; reasons.append("量能健康")
+    else:
+        score -= 6; reasons.append("量能不理想")
+    if wick_probe:
+        score -= 22; reasons.append("影线试探失败")
+    score = max(0.0, min(100.0, score))
+    if breakout and score >= 75:
+        grade = "S"
+    elif breakout and score >= 60:
+        grade = "A"
+    elif hi >= level * 0.995 and score >= 38:
+        grade = "B"
+    elif hi >= level * 0.985:
+        grade = "C"
+    else:
+        grade = "D"
+    return {
+        "breakout_day_grade": grade,
+        "breakout_score": float(score),
+        "desc": "；".join(reasons[:8]) or "无高级突破",
+        "breakout_core": bool(breakout),
+        "close_position": float(close_pos),
+        "upper_shadow_ratio": float(upper_shadow_ratio),
+        "volume_confirm": bool(healthy_vol),
+    }
+
+
+def _cl_build_coreline_model(df, code=""):
+    empty = {"valid": False, "desc": "无有效核心压力/支撑线"}
+    if df is None or len(df) < 180:
+        return empty
+    d = _cl_prepare_period_df(df)
+    if len(d) < 180:
+        return empty
+    cur_close = safe_float(d.iloc[-1].get("close", 0))
+    if cur_close <= 0:
+        return empty
+    lines = _cl_all_period_core_lines(d, cur_close)
+    if not lines:
+        return empty
+    zones = _cl_merge_nearby_pressure_lines(lines, cur_close)
+    if not zones:
+        return empty
+    core_zone = _cl_choose_primary_core_zone(zones, cur_close)
+    if not core_zone:
+        return empty
+    overhead = _cl_overhead_ranking(zones, core_zone, cur_close)
+    next_major = None
+    for z in overhead:
+        if safe_float(z.get("score", 0)) >= 55:
+            next_major = z; break
+    core_confirm = safe_float(core_zone.get("confirm_price", core_zone.get("upper", 0)))
+    meat_space = 0.0
+    if next_major and core_confirm > 0:
+        meat_space = safe_float(next_major.get("confirm_price", next_major.get("upper", 0))) / core_confirm - 1
+    else:
+        # 没找到下一高级压力，不乱猜，只给保守空间字段为0，并在desc里提示。
+        meat_space = 0.0
+    prep = _cl_prep_quality(d, core_confirm)
+    day = _cl_grade_breakout_day(d, core_zone)
+    core_score = safe_float(core_zone.get("score", 0))
+    # 模型分：核心线质量为主，日线突破为触发；蓄势小权重；空间只做轻校准，避免总分失控。
+    setup_score = 0.0
+    if core_score >= 85:
+        setup_score += 5.5
+    elif core_score >= 70:
+        setup_score += 4.0
+    elif core_score >= 55:
+        setup_score += 2.0
+    setup_score += min(5.0, prep.get("mapped_score", 0)) * 0.55
+    if meat_space >= 0.25:
+        setup_score += 2.0
+    elif meat_space >= 0.12:
+        setup_score += 1.0
+    if day.get("breakout_day_grade") == "S":
+        setup_score += 8.0
+    elif day.get("breakout_day_grade") == "A":
+        setup_score += 6.0
+    elif day.get("breakout_day_grade") == "B":
+        setup_score += 2.5
+    score = max(0.0, min(18.0, setup_score))
+    model_grade = "D"
+    if core_score >= 85 and day.get("breakout_day_grade") in ("S", "A"):
+        model_grade = "S" if day.get("breakout_day_grade") == "S" and score >= 14 else "A"
+    elif core_score >= 70 and day.get("breakout_day_grade") in ("S", "A", "B"):
+        model_grade = "B" if day.get("breakout_day_grade") == "B" else "A"
+    elif core_score >= 70:
+        model_grade = "C"  # 核心线好但尚未触发，基础筛选/跟踪用；不直接正式推送。
+    core_line = core_zone.get("best_line", {})
+    next_desc = ""
+    if next_major:
+        next_desc = f"；下一高级压力{safe_float(next_major.get('confirm_price',0)):.2f}，吃肉空间约{meat_space*100:.1f}%"
+    else:
+        next_desc = "；暂未识别到更高一级强压力，空间需后续由更高/更细周期继续校准"
+    desc = (
+        f"核心压力/支撑区{safe_float(core_zone.get('lower',0)):.2f}-{safe_float(core_zone.get('upper',0)):.2f}，"
+        f"确认价{core_confirm:.2f}，等级{core_zone.get('grade','D')}，周期{','.join(core_zone.get('periods', []))}；"
+        f"{core_zone.get('desc','')}{next_desc}；突破前蓄势：{prep.get('desc','')}；日线：{day.get('desc','')}"
+    )
+    return {
+        "valid": True,
+        "score": float(score),
+        "model_grade": model_grade,
+        "zone_grade": core_zone.get("grade", "D"),
+        "core_lower": float(core_zone.get("lower", 0)),
+        "core_upper": float(core_zone.get("upper", 0)),
+        "confirm_price": float(core_confirm),
+        "core_line_price": float(safe_float(core_line.get("line", core_confirm))),
+        "core_line_desc": core_line.get("desc", ""),
+        "core_quality_score": float(core_score),
+        "periods": ",".join(core_zone.get("periods", [])),
+        "desc": desc,
+        "breakout_day_grade": day.get("breakout_day_grade", "D"),
+        "breakout_desc": day.get("desc", ""),
+        "breakout_score": float(day.get("breakout_score", 0)),
+        "prep_score20": float(prep.get("score20", 0)),
+        "prep_desc": prep.get("desc", ""),
+        "meat_space_pct": float(meat_space),
+        "next_major_pressure": float(safe_float(next_major.get("confirm_price", 0)) if next_major else 0),
+        "ranked_pressures": zones[:8],
+        "overhead_pressures": overhead[:8],
+    }
+
+
 def detect_xuanhu_pressure_band_breakout_model(df, code=""):
-    """V15选股模型压力带突破主模型：底层压力区生成 -> 多周期重叠合并 -> 日K突破评级 -> 模型评级。"""
+    """
+    V25.5：核心压力/支撑线吃肉模型主入口。
+    兼容旧 xhu_pressure_* 字段，但语义从“普通多周期压力带”升级为：
+    1）大级别唯一核心线；2）跨周期压力排名；3）吃肉空间；4）日线高级突破；5）蓄势小权重校准。
+    """
     empty = {
         "score_xhu_pressure_breakout": 0.0,
         "xhu_pressure_model_grade": "D",
@@ -5989,8 +6544,8 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_pressure_quality_score": 0.0,
         "xhu_pressure_overlap_score": 0.0,
         "xhu_pressure_periods": "",
-        "xhu_pressure_desc": "无有效多周期压力带",
-        "xhu_breakout_desc": "无有效突破",
+        "xhu_pressure_desc": "无有效核心压力/支撑线",
+        "xhu_breakout_desc": "无核心线高级突破",
         "xhu_fake_breakout_count": 0,
         "xhu_fake_breakout_high": 0.0,
         "xhu_resonance_core_line": 0.0,
@@ -5998,60 +6553,50 @@ def detect_xuanhu_pressure_band_breakout_model(df, code=""):
         "xhu_effective_confirm_price": 0.0,
         "xhu_pressure_merge_gap_pct": 0.0,
         "xhu_pressure_json": "[]",
+        "xhu_coreline_meat_space_pct": 0.0,
+        "xhu_coreline_next_major_pressure": 0.0,
+        "xhu_coreline_prep_score20": 0.0,
+        "xhu_coreline_prep_desc": "",
     }
     if ENABLE_XHU_PRESSURE_BREAKOUT != "1" or df is None or len(df) < 180:
         return empty
-    cur_close = safe_float(df.iloc[-1].get("close", 0))
-    if cur_close <= 0:
+    try:
+        m = _cl_build_coreline_model(df, code=code)
+    except Exception as e:
+        print(f"V25.5核心线模型失败：code={code} error={str(e)[:120]}")
         return empty
-    zones = []
-    for period, pdf, lookback in _xhu_period_dfs(df):
-        try:
-            zones.extend(_xhu_extract_period_pressure_zones(pdf, period=period, lookback=lookback, current_close=cur_close))
-        except Exception as e:
-            print(f"V15压力带单周期生成失败：period={period} code={code} error={str(e)[:80]}")
-    if not zones:
+    if not m.get("valid"):
         return empty
-    composite = _xhu_merge_multi_period_zones(zones, cur_close)
-    if not composite.get("valid"):
-        return empty
-    day = _xhu_grade_breakout_day(df, composite)
-    setup_grade, setup_score = _xhu_combine_pressure_setup_grade(
-        composite.get("pressure_zone_grade", "D"), day.get("breakout_day_grade", "D"),
-        composite.get("pressure_quality_score", 0), day.get("breakout_score", 0)
-    )
-    # 空间与过热修正：完整穿透后若上方仍有年线/远端压力贴脸，不能过度抬分；这里先轻度修正，V14继续降级。
-    close = cur_close
-    final_upper = safe_float(composite.get("final_union_upper", 0))
-    dist_after = close / final_upper - 1 if final_upper > 0 else 0.0
-    if setup_grade == "S" and dist_after < 0.003:
-        setup_score -= 1.0
-    # 输出给一号员工：A/S可作为正式候选资格之一；B/C/D只观察。
-    score = max(0.0, min(18.0, setup_score))
-    related = composite.get("related_zones", [])
+    ranked = m.get("ranked_pressures", [])
     return {
-        "score_xhu_pressure_breakout": float(score),
-        "xhu_pressure_model_grade": setup_grade,
-        "xhu_pressure_zone_grade": composite.get("pressure_zone_grade", "D"),
-        "xhu_breakout_day_grade": day.get("breakout_day_grade", "D"),
-        "xhu_pressure_core_lower": float(composite.get("core_lower", 0.0)),
-        "xhu_pressure_core_upper": float(composite.get("core_upper", 0.0)),
-        "xhu_pressure_union_lower": float(composite.get("union_lower", 0.0)),
-        "xhu_pressure_union_upper": float(composite.get("union_upper", 0.0)),
-        "xhu_final_union_upper": float(composite.get("final_union_upper", 0.0)),
-        "xhu_pressure_quality_score": float(composite.get("pressure_quality_score", 0.0)),
-        "xhu_pressure_overlap_score": float(composite.get("overlap_score", 0.0)),
-        "xhu_pressure_periods": ",".join(sorted(set(z.get("period", "") for z in related))),
-        "xhu_pressure_desc": composite.get("desc", ""),
-        "xhu_resonance_core_line": float(composite.get("resonance_core_line", 0.0)),
-        "xhu_resonance_core_desc": composite.get("resonance_core_desc", ""),
-        "xhu_effective_confirm_price": float(composite.get("effective_confirm_price", composite.get("final_union_upper", 0.0))),
-        "xhu_pressure_merge_gap_pct": float(composite.get("pressure_merge_gap_pct", 0.0)),
-        "xhu_breakout_desc": day.get("desc", ""),
-        "xhu_fake_breakout_count": int(day.get("fake_breakout_count", 0)),
-        "xhu_fake_breakout_high": float(day.get("fake_breakout_high", 0.0)),
-        "xhu_pressure_json": json.dumps(related, ensure_ascii=False)[:1800],
+        "score_xhu_pressure_breakout": float(m.get("score", 0.0)),
+        "xhu_pressure_model_grade": m.get("model_grade", "D"),
+        "xhu_pressure_zone_grade": m.get("zone_grade", "D"),
+        "xhu_breakout_day_grade": m.get("breakout_day_grade", "D"),
+        "xhu_pressure_core_lower": float(m.get("core_lower", 0.0)),
+        "xhu_pressure_core_upper": float(m.get("core_upper", 0.0)),
+        # union/effective 字段保留：现在表示核心压力/支撑区确认价，而不是旧大并集压力带。
+        "xhu_pressure_union_lower": float(m.get("core_lower", 0.0)),
+        "xhu_pressure_union_upper": float(m.get("confirm_price", 0.0)),
+        "xhu_final_union_upper": float(m.get("confirm_price", 0.0)),
+        "xhu_pressure_quality_score": float(m.get("core_quality_score", 0.0)),
+        "xhu_pressure_overlap_score": float(m.get("core_quality_score", 0.0)),
+        "xhu_pressure_periods": m.get("periods", ""),
+        "xhu_pressure_desc": m.get("desc", ""),
+        "xhu_resonance_core_line": float(m.get("core_line_price", 0.0)),
+        "xhu_resonance_core_desc": m.get("core_line_desc", ""),
+        "xhu_effective_confirm_price": float(m.get("confirm_price", 0.0)),
+        "xhu_pressure_merge_gap_pct": 0.0,
+        "xhu_breakout_desc": m.get("breakout_desc", ""),
+        "xhu_fake_breakout_count": 0,
+        "xhu_fake_breakout_high": 0.0,
+        "xhu_coreline_meat_space_pct": float(m.get("meat_space_pct", 0.0)),
+        "xhu_coreline_next_major_pressure": float(m.get("next_major_pressure", 0.0)),
+        "xhu_coreline_prep_score20": float(m.get("prep_score20", 0.0)),
+        "xhu_coreline_prep_desc": m.get("prep_desc", ""),
+        "xhu_pressure_json": json.dumps(ranked, ensure_ascii=False)[:1800],
     }
+# ========================= V25.5 核心压力/支撑线吃肉模型 END =========================
 
 
 # ========================= V20.2 底部反转强势形态模块 =========================
@@ -10343,7 +10888,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     global TELEGRAM_PENDING_IMAGES
     TELEGRAM_PENDING_IMAGES = []
     lines = []
-    lines.append("📊 <b>一号员工选股模型 V20.3 基础筛选重构+动态风险指标库版</b>")
+    lines.append(f"📊 <b>{html.escape(MODEL_VERSION)}</b>")
     lines.append(f"🗓 排查日期：{', '.join(dates) if dates else '未知'}")
     lines.append(f"⏱ 运行时间：{bj_time_str()} 北京时间")
     lines.extend(build_data_gate_header_lines())
@@ -10355,7 +10900,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
             _t = str(_s.get("v20_trade_tier", "未分层"))
             _tier_stat[_t] = _tier_stat.get(_t, 0) + 1
         lines.append(f"V20分层：{html.escape(str(_tier_stat))}")
-    lines.append("口径：V20.3保留V20.2全部结构；新增多通道基础召回、动态风险指标库前置风控、近期推荐强制跟踪入池和基础入围原因审计。基础层重召回、深度层重精度、最终层重交易。")
+    lines.append("口径：V25.5保留历史有效底座；将旧压力带主入口升级为“核心压力/支撑线吃肉模型”，大级别找唯一核心线，中周期做压力排名，日线只负责高级突破与回踩执行。基础层重召回，深度层重精度，最终层重交易。")
     lines.append("说明：分数用于排序，不代表无脑买入；硬雷区仍剔除，普通缺点进入风险提示。次日按确认条件/放弃条件执行。")
     lines.append("报告默认发送文字版价格计划；同时保存stock_candidates.json、v20_3_1_score_cards.json、v20_3_1_condition_probability_table.json、v20_3_1_signal_lifecycle.json。今日新推荐与近期推荐跟踪分开，避免健康回调票从报告里“消失”。")
     lines.append("━━━━━━━━━━━━━━")
