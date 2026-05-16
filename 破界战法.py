@@ -20,6 +20,7 @@ import time
 import argparse
 import glob
 import importlib.util
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -27,9 +28,61 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界V1.1｜缓存优先+BaoStock补拉稳定版"
+MODEL_VERSION = "破界V1.4｜缓存优先+并行加速+人性化进度版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
+
+
+# ========================= 速度 / 日志控制 =========================
+# 全量跑通后默认并行扫描缓存；如果今天没有缓存，需要 BaoStock 补拉，程序会自动回落为顺序补拉。
+POJIE_WORKERS = max(1, int(os.environ.get("POJIE_WORKERS", "4")))
+POJIE_PARALLEL_MIN_STOCKS = int(os.environ.get("POJIE_PARALLEL_MIN_STOCKS", "300"))
+POJIE_PROGRESS_EVERY = int(os.environ.get("POJIE_PROGRESS_EVERY", "200"))
+POJIE_PROGRESS_SECONDS = int(os.environ.get("POJIE_PROGRESS_SECONDS", "30"))
+POJIE_VERBOSE_KLINE = os.environ.get("POJIE_VERBOSE_KLINE", "0") == "1"
+POJIE_LOG_FIRST_N = int(os.environ.get("POJIE_LOG_FIRST_N", "5"))
+# 保守预筛：只跳过“明显没有触发K”的股票，默认开启。若要完全不预筛，设 POJIE_FAST_PREFILTER=0。
+POJIE_FAST_PREFILTER = os.environ.get("POJIE_FAST_PREFILTER", "1") == "1"
+
+KLINE_STATS = {
+    "cache_hit": 0,
+    "cache_miss": 0,
+    "remote_fetch": 0,
+    "remote_success": 0,
+    "remote_fail": 0,
+    "cache_read_error": 0,
+    "prefilter_skip": 0,
+}
+
+
+def fmt_duration(seconds: float) -> str:
+    try:
+        seconds = int(max(0, seconds))
+    except Exception:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s2 = seconds % 60
+    if h > 0:
+        return f"{h}小时{m}分{s2}秒"
+    if m > 0:
+        return f"{m}分{s2}秒"
+    return f"{s2}秒"
+
+
+def progress_text(done: int, total: int, start_ts: float, results: int, no_kline: int, failed: int) -> str:
+    elapsed = time.time() - start_ts
+    speed = done / elapsed if elapsed > 0 else 0
+    eta = (total - done) / speed if speed > 0 and total and done < total else 0
+    pct_done = done / total * 100 if total else 0
+    valid = max(0, done - no_kline - failed)
+    return (
+        f"破界进度：{done}/{total} ({pct_done:.1f}%) | "
+        f"K线有效={valid} 候选={results} 无K线={no_kline} 失败={failed} | "
+        f"缓存命中={KLINE_STATS.get('cache_hit', 0)} 跳过无触发={KLINE_STATS.get('prefilter_skip', 0)} "
+        f"补拉成功={KLINE_STATS.get('remote_success', 0)} | "
+        f"耗时={fmt_duration(elapsed)} 剩余≈{fmt_duration(eta)}"
+    )
 
 
 def safe_float(x, default=0.0) -> float:
@@ -1176,10 +1229,16 @@ def read_local_kline_cache_for_pojie(bs_code: str) -> Optional[pd.DataFrame]:
                 df = pd.read_csv(path, dtype=str, encoding="gbk")
             out = normalize_external_kline_df(df)
             if out is not None and len(out) >= 120:
-                print(f"破界K线：读取本地缓存成功 symbol={bs_code} file={path} rows={len(out)}")
+                KLINE_STATS["cache_hit"] = KLINE_STATS.get("cache_hit", 0) + 1
+                # 默认只打印少量命中样本；需要逐只排查时设置 POJIE_VERBOSE_KLINE=1。
+                if POJIE_VERBOSE_KLINE or KLINE_STATS["cache_hit"] <= POJIE_LOG_FIRST_N:
+                    print(f"破界K线：读取本地缓存成功[{KLINE_STATS['cache_hit']}] symbol={bs_code} file={path} rows={len(out)}")
                 return out
         except Exception as e:
-            print(f"破界K线：读取本地缓存失败 symbol={bs_code} file={path} error={str(e)[:120]}")
+            KLINE_STATS["cache_read_error"] = KLINE_STATS.get("cache_read_error", 0) + 1
+            if POJIE_VERBOSE_KLINE or KLINE_STATS["cache_read_error"] <= POJIE_LOG_FIRST_N:
+                print(f"破界K线：读取本地缓存失败[{KLINE_STATS['cache_read_error']}] symbol={bs_code} file={path} error={str(e)[:120]}")
+    KLINE_STATS["cache_miss"] = KLINE_STATS.get("cache_miss", 0) + 1
     return None
 
 
@@ -1265,18 +1324,24 @@ def get_daily_kline_safe(base, bs_code: str) -> Optional[pd.DataFrame]:
     try:
         if hasattr(base, "get_daily_kline"):
             try:
-                print(f"破界K线：缓存未命中，开始BaoStock主通道补拉 symbol={bs_code}")
+                KLINE_STATS["remote_fetch"] = KLINE_STATS.get("remote_fetch", 0) + 1
+                if POJIE_VERBOSE_KLINE or KLINE_STATS["remote_fetch"] <= POJIE_LOG_FIRST_N:
+                    print(f"破界K线：缓存未命中，开始BaoStock主通道补拉[{KLINE_STATS['remote_fetch']}] symbol={bs_code}")
                 df = base.get_daily_kline(bs_code, cache_scope="deep")
             except TypeError:
                 df = base.get_daily_kline(bs_code)
 
             out = normalize_external_kline_df(df)
             if out is not None and len(out) >= 120:
-                print(f"破界K线：BaoStock/一号员工入口补拉成功 symbol={bs_code} rows={len(out)}")
+                KLINE_STATS["remote_success"] = KLINE_STATS.get("remote_success", 0) + 1
+                if POJIE_VERBOSE_KLINE or KLINE_STATS["remote_success"] <= POJIE_LOG_FIRST_N:
+                    print(f"破界K线：BaoStock/一号员工入口补拉成功[{KLINE_STATS['remote_success']}] symbol={bs_code} rows={len(out)}")
                 save_pojie_normalized_kline_cache(bs_code, out)
                 return out
     except Exception as e:
-        print(f"破界K线：BaoStock/一号员工入口补拉失败 symbol={bs_code} error={str(e)[:180]}")
+        KLINE_STATS["remote_fail"] = KLINE_STATS.get("remote_fail", 0) + 1
+        if POJIE_VERBOSE_KLINE or KLINE_STATS["remote_fail"] <= POJIE_LOG_FIRST_N:
+            print(f"破界K线：BaoStock/一号员工入口补拉失败[{KLINE_STATS['remote_fail']}] symbol={bs_code} error={str(e)[:180]}")
     finally:
         if old_ak_env is None:
             os.environ.pop("KLINE_FALLBACK_AKSHARE", None)
@@ -1320,6 +1385,77 @@ def parse_args():
     p.add_argument("--不发送Telegram", action="store_true", help="强制不推送")
     return p.parse_args()
 
+
+
+def quick_trigger_prefilter(df: pd.DataFrame) -> bool:
+    """
+    保守预筛：只过滤掉明显没有“破界触发K”的股票。
+    目的是节省全量扫描时间；如果要完全不预筛，设置 POJIE_FAST_PREFILTER=0。
+    返回 True = 需要进入完整 scan_one；False = 明显无触发，直接未入选。
+    """
+    if not POJIE_FAST_PREFILTER:
+        return True
+    d = normalize_external_kline_df(df)
+    if d is None or len(d) < 120:
+        return True
+    last = d.iloc[-1]
+    close = safe_float(last.get("close"))
+    if close <= 0:
+        return True
+    pct_chg = safe_float(last.get("pct_chg"))
+    close_pos = safe_float(last.get("close_pos"), 0.5)
+    high = safe_float(last.get("high"))
+    low = safe_float(last.get("low"))
+    volume = safe_float(last.get("volume"))
+    pre_high_20 = safe_float(d["high"].shift(1).tail(20).max())
+    pre_high_60 = safe_float(d["high"].shift(1).tail(60).max())
+    vol_ma20 = safe_float(d["volume"].tail(20).mean())
+    # 只要有一个攻击/临界迹象，就进入完整模型。
+    if pct_chg >= 1.8:
+        return True
+    if close_pos >= 0.70 and pct_chg >= 0.5:
+        return True
+    if pre_high_20 > 0 and close >= pre_high_20 * 0.992:
+        return True
+    if pre_high_60 > 0 and high >= pre_high_60 * 0.995 and close_pos >= 0.55:
+        return True
+    if vol_ma20 > 0 and volume >= vol_ma20 * 1.35 and close_pos >= 0.55:
+        return True
+    # 跳空/缺口类也保留。
+    if len(d) >= 2:
+        pre_high = safe_float(d["high"].iloc[-2])
+        if pre_high > 0 and low > pre_high * 1.003:
+            return True
+    return False
+
+
+def scan_worker_cache_only(row: Dict[str, Any]) -> Dict[str, Any]:
+    """并行缓存扫描worker：只读本地缓存，不做BaoStock联网。"""
+    code = str(row.get("代码", row.get("code", ""))).zfill(6)
+    bs_code = str(row.get("bs_code", ""))
+    name = str(row.get("名称", row.get("name", "")))
+    if not bs_code or bs_code == "nan":
+        bs_code = bs_code_from_plain(code)
+    if not bs_code:
+        return {"status": "failed", "failed_item": {"code": code, "name": name, "stage": "bad_bs_code"}, "kline_stats": {}}
+    try:
+        df = read_local_kline_cache_for_pojie(bs_code)
+        df = normalize_external_kline_df(df)
+        if df is None or len(df) < 120:
+            return {"status": "cache_miss", "code": code, "name": name, "bs_code": bs_code, "kline_stats": {"cache_miss": 1}}
+        if not quick_trigger_prefilter(df):
+            return {"status": "not_selected", "prefilter_skip": 1, "kline_stats": {"cache_hit": 1}}
+        res = scan_one(code, name, df)
+        if res:
+            return {"status": "candidate", "result": res, "kline_stats": {"cache_hit": 1}}
+        return {"status": "not_selected", "kline_stats": {"cache_hit": 1}}
+    except Exception as e:
+        return {"status": "failed", "failed_item": {"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]}, "kline_stats": {}}
+
+
+def merge_kline_stats(delta: Dict[str, int]) -> None:
+    for k, v in (delta or {}).items():
+        KLINE_STATS[k] = KLINE_STATS.get(k, 0) + int(v or 0)
 
 def main():
     args = parse_args()
@@ -1375,37 +1511,107 @@ def main():
     no_kline = 0
     start = time.time()
     failed_items = []
+    cache_miss_rows = []
+    last_progress_ts = start
 
-    for _, row in stock_list.iterrows():
-        scanned += 1
-        code = str(row.get("代码", row.get("code", ""))).zfill(6)
-        bs_code = str(row.get("bs_code", ""))
-        name = str(row.get("名称", row.get("name", "")))
-        if not bs_code or bs_code == "nan":
-            bs_code = bs_code_from_plain(code)
-        if not bs_code:
-            failed += 1
-            failed_items.append({"code": code, "name": name, "stage": "bad_bs_code"})
-            continue
+    rows = stock_list.to_dict("records")
+    use_parallel = POJIE_WORKERS > 1 and len(rows) >= POJIE_PARALLEL_MIN_STOCKS
 
-        try:
-            df = get_daily_kline_safe(base, bs_code)
-            df = normalize_external_kline_df(df)
-            if df is None or len(df) < 120:
-                no_kline += 1
-                failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline_or_bad_columns"})
+    if use_parallel:
+        print(f"破界：启用并行缓存扫描 workers={POJIE_WORKERS}；缓存缺失的股票会在并行后再顺序BaoStock补拉。")
+        with ProcessPoolExecutor(max_workers=POJIE_WORKERS) as ex:
+            futures = [ex.submit(scan_worker_cache_only, row) for row in rows]
+            for fut in as_completed(futures):
+                scanned += 1
+                try:
+                    item = fut.result()
+                except Exception as e:
+                    failed += 1
+                    failed_items.append({"stage": "worker_exception", "error": str(e)[:200]})
+                    item = {}
+                merge_kline_stats(item.get("kline_stats", {}))
+                status = item.get("status")
+                if item.get("prefilter_skip"):
+                    KLINE_STATS["prefilter_skip"] = KLINE_STATS.get("prefilter_skip", 0) + 1
+                if status == "candidate":
+                    r = item.get("result")
+                    if r and safe_float(r.get("score")) >= args.最低分:
+                        results.append(r)
+                elif status == "cache_miss":
+                    cache_miss_rows.append({"代码": item.get("code"), "名称": item.get("name"), "bs_code": item.get("bs_code")})
+                elif status == "failed":
+                    failed += 1
+                    failed_items.append(item.get("failed_item", {"stage": "failed"}))
+
+                now_ts = time.time()
+                if (POJIE_PROGRESS_EVERY > 0 and scanned % POJIE_PROGRESS_EVERY == 0) or (now_ts - last_progress_ts >= POJIE_PROGRESS_SECONDS) or scanned == len(rows):
+                    print(progress_text(scanned, len(rows), start, len(results), no_kline + len(cache_miss_rows), failed))
+                    last_progress_ts = now_ts
+
+        # 只有缓存缺失的少数股票，才顺序走一号员工/BaoStock补拉；避免并发打BaoStock。
+        if cache_miss_rows and os.environ.get("POJIE_REMOTE_ON_CACHE_MISS", "1") == "1":
+            print(f"破界：并行阶段缓存缺失 {len(cache_miss_rows)} 只，开始顺序BaoStock补拉。")
+            for row in cache_miss_rows:
+                code = str(row.get("代码", "")).zfill(6)
+                bs_code = str(row.get("bs_code", "")) or bs_code_from_plain(code)
+                name = str(row.get("名称", ""))
+                try:
+                    df = get_daily_kline_safe(base, bs_code)
+                    df = normalize_external_kline_df(df)
+                    if df is None or len(df) < 120:
+                        no_kline += 1
+                        failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline_or_bad_columns"})
+                        continue
+                    if not quick_trigger_prefilter(df):
+                        KLINE_STATS["prefilter_skip"] = KLINE_STATS.get("prefilter_skip", 0) + 1
+                        continue
+                    res = scan_one(code, name, df)
+                    if res and res["score"] >= args.最低分:
+                        results.append(res)
+                except Exception as e:
+                    failed += 1
+                    failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]})
+                    if failed <= 20:
+                        print(f"破界扫描失败：{code} {name} {e}")
+        else:
+            no_kline += len(cache_miss_rows)
+    else:
+        print("破界：使用顺序扫描模式。")
+        for _, row in stock_list.iterrows():
+            scanned += 1
+            code = str(row.get("代码", row.get("code", ""))).zfill(6)
+            bs_code = str(row.get("bs_code", ""))
+            name = str(row.get("名称", row.get("name", "")))
+            if not bs_code or bs_code == "nan":
+                bs_code = bs_code_from_plain(code)
+            if not bs_code:
+                failed += 1
+                failed_items.append({"code": code, "name": name, "stage": "bad_bs_code"})
                 continue
-            res = scan_one(code, name, df)
-            if res and res["score"] >= args.最低分:
-                results.append(res)
-        except Exception as e:
-            failed += 1
-            failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]})
-            if failed <= 20:
-                print(f"破界扫描失败：{code} {name} {e}")
 
-        if scanned % 50 == 0:
-            print(f"破界进度：{scanned}/{len(stock_list)} 候选={len(results)} 无K线={no_kline} 失败={failed} 耗时={int(time.time()-start)}s")
+            try:
+                df = get_daily_kline_safe(base, bs_code)
+                df = normalize_external_kline_df(df)
+                if df is None or len(df) < 120:
+                    no_kline += 1
+                    failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline_or_bad_columns"})
+                    continue
+                if not quick_trigger_prefilter(df):
+                    KLINE_STATS["prefilter_skip"] = KLINE_STATS.get("prefilter_skip", 0) + 1
+                    continue
+                res = scan_one(code, name, df)
+                if res and res["score"] >= args.最低分:
+                    results.append(res)
+            except Exception as e:
+                failed += 1
+                failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]})
+                if failed <= 20:
+                    print(f"破界扫描失败：{code} {name} {e}")
+
+            now_ts = time.time()
+            if (POJIE_PROGRESS_EVERY > 0 and scanned % POJIE_PROGRESS_EVERY == 0) or (now_ts - last_progress_ts >= POJIE_PROGRESS_SECONDS) or scanned == len(stock_list):
+                print(progress_text(scanned, len(stock_list), start, len(results), no_kline, failed))
+                last_progress_ts = now_ts
 
     results = sorted(results, key=lambda x: (x["signal_level"] == "S", x["score"]), reverse=True)[:args.输出数量]
     payload = {
@@ -1418,6 +1624,9 @@ def main():
         "not_selected": max(0, scanned - failed - no_kline - len(results)),
         "results": results,
         "failed_items_sample": failed_items[:200],
+        "kline_stats": KLINE_STATS,
+        "workers": POJIE_WORKERS,
+        "fast_prefilter": POJIE_FAST_PREFILTER,
     }
     json_path = os.path.join(OUTPUT_DIR, "pojie_signals.json")
     txt_path = os.path.join(OUTPUT_DIR, "pojie_report.txt")
@@ -1437,7 +1646,14 @@ def main():
     with open(failed_path, "w", encoding="utf-8") as f:
         json.dump(failed_items, f, ensure_ascii=False, indent=2)
 
+    stats_path = os.path.join(OUTPUT_DIR, "pojie_kline_stats.json")
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(KLINE_STATS, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(OUTPUT_DIR, "pojie_remote_fetch_count.txt"), "w", encoding="utf-8") as f:
+        f.write(str(int(KLINE_STATS.get("remote_success", 0) or 0)))
+
     print(report)
+    print("破界K线汇总：" + json.dumps(KLINE_STATS, ensure_ascii=False))
     print(f"破界结果已保存：{json_path} / {txt_path}")
     print(f"破界异常/无K线清单已保存：{failed_path}")
 
