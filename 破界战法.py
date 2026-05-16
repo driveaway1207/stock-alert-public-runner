@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界战法2.0｜核心线重校准+宽严双层筛选+只读缓存加速版"
+MODEL_VERSION = "破界战法2.0｜专业核心压力线版｜多周期核心线+宽严双层选股"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -44,7 +44,7 @@ POJIE_LOG_FIRST_N = int(os.environ.get("POJIE_LOG_FIRST_N", "5"))
 # 2.0 默认使用 BALANCED：核心线更重“共振/临界”，筛选不再只盯强突破当天。
 POJIE_STRATEGY_PROFILE = os.environ.get("POJIE_STRATEGY_PROFILE", "balanced").strip().lower()
 POJIE_FAST_PREFILTER = os.environ.get("POJIE_FAST_PREFILTER", "1") == "1"
-POJIE_MIN_CORELINE_SCORE = float(os.environ.get("POJIE_MIN_CORELINE_SCORE", "52" if POJIE_STRATEGY_PROFILE != "strict" else "62"))
+POJIE_MIN_CORELINE_SCORE = float(os.environ.get("POJIE_MIN_CORELINE_SCORE", "58" if POJIE_STRATEGY_PROFILE != "strict" else "68"))
 POJIE_OUTPUT_OBSERVATION = os.environ.get("POJIE_OUTPUT_OBSERVATION", "1") == "1"
 
 KLINE_STATS = {
@@ -1567,6 +1567,429 @@ def scan_worker_cache_only(row: Dict[str, Any]) -> Dict[str, Any]:
 def merge_kline_stats(delta: Dict[str, int]) -> None:
     for k, v in (delta or {}).items():
         KLINE_STATS[k] = KLINE_STATS.get(k, 0) + int(v or 0)
+
+
+
+# ========================= 破界战法2.0 专业核心压力线引擎 =========================
+# 说明：以下函数覆盖上方同名函数。核心线标准不放宽，只把“选股逻辑”分层放宽。
+# 核心压力线按一号员工体系重构：大周期优先、最大量阳K/实体位、次高次低收盘共振、
+# 实体顶底共振、上影/缺口/假突破记忆、百分比价格桶成交密集区、核心带+确认上沿。
+
+def _tf_base_weight(tf: str) -> float:
+    return {"Y": 6.0, "Q": 5.0, "M": 4.0, "W": 2.6, "D": 1.25}.get(str(tf), 1.0)
+
+
+def _cycle_lookback(tf: str) -> int:
+    return {"D": 520, "W": 260, "M": 144, "Q": 96, "Y": 48}.get(str(tf), 200)
+
+
+def _effective_max_volume_yang_k(row: pd.Series) -> bool:
+    o, h, l, c = [safe_float(row.get(x)) for x in ["open", "high", "low", "close"]]
+    if c <= o or c <= 0 or h <= l:
+        return False
+    body = abs(c - o)
+    shadows = max(0.0, h - max(o, c)) + max(0.0, min(o, c) - l)
+    body_pct = body / c if c else 0
+    close_pos = safe_float(row.get("close_pos", (c - l) / (h - l) if h > l else 0.5), 0.5)
+    return body_pct >= 0.018 and body >= shadows * 0.50 and close_pos >= 0.45
+
+
+def detect_major_cycle_anchor_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
+    """大级别核心锚点：年/季/月/周/日最大量阳K、次大量阳K、阶段最高、假突破高点。"""
+    res: List[Dict[str, Any]] = []
+    if d is None or len(d) < 12:
+        return res
+    x = force_kline_schema(d).tail(_cycle_lookback(timeframe)).reset_index(drop=True)
+    if len(x) < 12:
+        return res
+    cur = safe_float(x["close"].iloc[-1])
+    if cur <= 0:
+        return res
+    low_bound, high_bound = cur * 0.55, cur * 1.35
+    tfw = _tf_base_weight(timeframe)
+    vol = pd.to_numeric(x["volume"], errors="coerce").fillna(0)
+    if vol.max() > 0:
+        # 前3大量K，只重奖有效最大量阳K；阴线/十字/小实体只作为低权重供应参考。
+        top_idx = list(vol.sort_values(ascending=False).head(min(5, len(x))).index)
+        for rank, i in enumerate(top_idx, 1):
+            row = x.loc[i]
+            o, h, l, c = [safe_float(row.get(k)) for k in ["open", "high", "low", "close"]]
+            if not (low_bound <= h <= high_bound or low_bound <= max(o, c) <= high_bound):
+                continue
+            date = str(pd.to_datetime(row.get("date")).date()) if pd.notna(pd.to_datetime(row.get("date"), errors="coerce")) else ""
+            body_top, body_bottom = max(o, c), min(o, c)
+            is_eff_yang = _effective_max_volume_yang_k(row)
+            base_w = tfw * (1.55 if rank == 1 else 1.18 if rank <= 3 else 0.9)
+            if is_eff_yang:
+                res.append({"price": h, "source": f"{timeframe}级第{rank}大量有效阳K高点/核心确认线", "timeframe": timeframe, "date": date, "weight": base_w + 3.0})
+                res.append({"price": body_top, "source": f"{timeframe}级第{rank}大量有效阳K实体顶", "timeframe": timeframe, "date": date, "weight": base_w + 2.4})
+                res.append({"price": body_bottom, "source": f"{timeframe}级第{rank}大量有效阳K实体底/箱体底", "timeframe": timeframe, "date": date, "weight": base_w + 1.6})
+            else:
+                # 非有效阳K不能当箱底，但其高点/实体顶可作为供应参考，权重降低。
+                res.append({"price": h, "source": f"{timeframe}级第{rank}大量K高点供应参考", "timeframe": timeframe, "date": date, "weight": base_w * 0.55})
+                res.append({"price": body_top, "source": f"{timeframe}级第{rank}大量K实体顶供应参考", "timeframe": timeframe, "date": date, "weight": base_w * 0.50})
+    # 年/季/月等大级别阶段高点、次高收盘价共振。
+    for n, mult in [(12, 1.0), (24, 1.2), (36, 1.35), (60, 1.55), (100, 1.75)]:
+        if len(x) < min(n, 12):
+            continue
+        seg = x.tail(min(n, len(x))).copy()
+        hi = safe_float(seg["high"].max())
+        if low_bound <= hi <= high_bound:
+            res.append({"price": hi, "source": f"{timeframe}级近{n}根阶段最高点", "timeframe": timeframe, "date": str(pd.to_datetime(seg['date'].iloc[-1]).date()), "weight": tfw * mult})
+        close_q = safe_float(seg["close"].quantile(0.94))
+        body_top_q = safe_float(seg[["open", "close"]].max(axis=1).quantile(0.92))
+        for px, src, extra in [(close_q, "次高/高位收盘共振", 1.4), (body_top_q, "实体顶共振", 1.6)]:
+            if low_bound <= px <= high_bound:
+                res.append({"price": px, "source": f"{timeframe}级近{n}根{src}", "timeframe": timeframe, "date": str(pd.to_datetime(seg['date'].iloc[-1]).date()), "weight": tfw * mult + extra})
+    # 假突破/流动性扫单记忆：上影反压、突破后收不住。
+    body_top = x[["open", "close"]].max(axis=1)
+    prev_high = x["high"].rolling(20, min_periods=5).max().shift(1)
+    upper_ratio = (x["high"] - body_top) / x["close"].replace(0, np.nan)
+    fail_mask = (x["high"] >= prev_high * 0.995) & (x["close"] <= x["high"] * 0.965) & (upper_ratio >= 0.025)
+    for i in list(x[fail_mask].tail(8).index):
+        row = x.loc[i]
+        px = safe_float(row["high"])
+        if low_bound <= px <= high_bound:
+            res.append({"price": px, "source": f"{timeframe}级假突破/长上影扫单高点", "timeframe": timeframe, "date": str(pd.to_datetime(row['date']).date()), "weight": tfw + 2.2})
+    return res
+
+
+def detect_volume_profile_resonance_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
+    """百分比/对数价格桶 Volume Profile：成交密集区+实体/收盘/影线共振。"""
+    res: List[Dict[str, Any]] = []
+    if d is None or len(d) < 30:
+        return res
+    x = force_kline_schema(d).tail(_cycle_lookback(timeframe)).reset_index(drop=True)
+    cur = safe_float(x["close"].iloc[-1])
+    if cur <= 0:
+        return res
+    # 波动率自适应桶宽：越大周期桶越宽，日/周更细。
+    atr_like = safe_float(((x["high"] - x["low"]) / x["close"].replace(0, np.nan)).tail(60).median(), 0.025)
+    base_bin = {"D": 0.0055, "W": 0.0075, "M": 0.010, "Q": 0.014, "Y": 0.018}.get(timeframe, 0.008)
+    bin_pct = max(base_bin, min(base_bin * 2.0, atr_like * 0.38))
+    buckets: Dict[int, Dict[str, float]] = {}
+    low_bound, high_bound = cur * 0.55, cur * 1.35
+    for i, row in x.iterrows():
+        o, h, l, c, amt = [safe_float(row.get(k)) for k in ["open", "high", "low", "close", "amount"]]
+        if c <= 0:
+            continue
+        decay = 0.50 + 0.50 * (i + 1) / max(1, len(x))
+        amt_w = max(1.0, min(4.0, (amt / 1e8) ** 0.30 if amt > 0 else 1.0))
+        body_top, body_bottom = max(o, c), min(o, c)
+        # 次高/收盘/实体顶权重高于普通影线。
+        points = [
+            (c, 2.2, "收盘共振"), (body_top, 2.0, "实体顶共振"),
+            (body_bottom, 1.2, "实体底共振"), (h, 1.1, "影线高点"), (l, 0.7, "影线低点"),
+        ]
+        for px, wt, label in points:
+            if not (low_bound <= px <= high_bound):
+                continue
+            key = int(round(math.log(px / cur) / bin_pct))
+            b = buckets.setdefault(key, {"w": 0.0, "pxw": 0.0, "cnt": 0, "close_cnt": 0, "body_cnt": 0, "shadow_cnt": 0})
+            weight = wt * decay * amt_w * _tf_base_weight(timeframe)
+            b["w"] += weight; b["pxw"] += px * weight; b["cnt"] += 1
+            if "收盘" in label: b["close_cnt"] += 1
+            if "实体" in label: b["body_cnt"] += 1
+            if "影线" in label: b["shadow_cnt"] += 1
+    for b in sorted(buckets.values(), key=lambda y: (y["w"], y["close_cnt"], y["body_cnt"], y["cnt"]), reverse=True)[:12]:
+        if b["w"] <= 0 or b["cnt"] < (5 if timeframe in ["D", "W"] else 3):
+            continue
+        px = b["pxw"] / b["w"]
+        res.append({"price": px, "source": f"{timeframe}级成交密集/收盘实体共振桶 cnt={int(b['cnt'])} close={int(b['close_cnt'])} body={int(b['body_cnt'])}", "timeframe": timeframe, "date": str(pd.to_datetime(x['date'].iloc[-1]).date()), "weight": min(7.5, 1.5 + b["cnt"] * 0.18 + b["close_cnt"] * 0.25 + b["body_cnt"] * 0.22)})
+    return res
+
+
+def detect_gap_and_shadow_resonance_candidates(d: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
+    res: List[Dict[str, Any]] = []
+    if d is None or len(d) < 25:
+        return res
+    x = force_kline_schema(d).tail(_cycle_lookback(timeframe)).reset_index(drop=True)
+    cur = safe_float(x["close"].iloc[-1])
+    if cur <= 0:
+        return res
+    low_bound, high_bound = cur * 0.55, cur * 1.35
+    tfw = _tf_base_weight(timeframe)
+    for i in range(1, len(x)):
+        row = x.loc[i]
+        pre = x.loc[i - 1]
+        date = str(pd.to_datetime(row["date"]).date())
+        # 缺口边界：未回补/反复共振才在 cluster 里提权。
+        if safe_float(row["low"]) > safe_float(pre["high"]) * 1.003:
+            for px, src, wt in [(safe_float(pre["high"]), "向上跳空缺口下沿/前高", 1.8), (safe_float(row["low"]), "向上跳空缺口上沿/当日低", 1.5)]:
+                if low_bound <= px <= high_bound:
+                    res.append({"price": px, "source": f"{timeframe}级{src}", "timeframe": timeframe, "date": date, "weight": tfw + wt})
+        if safe_float(row["high"]) < safe_float(pre["low"]) * 0.997:
+            for px, src, wt in [(safe_float(pre["low"]), "向下跳空缺口上沿/前低", 2.0), (safe_float(row["high"]), "向下跳空缺口下沿/当日高", 1.7)]:
+                if low_bound <= px <= high_bound:
+                    res.append({"price": px, "source": f"{timeframe}级{src}", "timeframe": timeframe, "date": date, "weight": tfw + wt})
+        upper = safe_float(row.get("upper_shadow_ratio", 0))
+        lower = safe_float(row.get("lower_shadow_ratio", 0))
+        volr = safe_float(row["volume"] / safe_float(x["volume"].rolling(10).mean().iloc[i], row["volume"]), 1)
+        if upper >= 0.32 and volr >= 1.05:
+            px = safe_float(row["high"])
+            if low_bound <= px <= high_bound:
+                res.append({"price": px, "source": f"{timeframe}级放量上影线共振/供应反应", "timeframe": timeframe, "date": date, "weight": tfw + 1.8})
+        if lower >= 0.36 and volr >= 1.05:
+            px = safe_float(row["low"])
+            if low_bound <= px <= high_bound:
+                res.append({"price": px, "source": f"{timeframe}级放量下影线需求反应", "timeframe": timeframe, "date": date, "weight": tfw + 1.0})
+    return res
+
+
+def cluster_corelines(candidates: List[Dict[str, Any]], current_price: float, atr_pct: float) -> List[Dict[str, Any]]:
+    if not candidates or current_price <= 0:
+        return []
+    # 自适应容差：按百分比，不用固定金额；大波动适度放宽，但最高有限。
+    tol_pct = max(0.0045, min(0.022, (atr_pct or 0.018) * 0.42))
+    cands = sorted([c for c in candidates if safe_float(c.get("price")) > 0], key=lambda x: safe_float(x["price"]))
+    clusters: List[List[Dict[str, Any]]] = []
+    cur_list: List[Dict[str, Any]] = []
+    for c in cands:
+        px = safe_float(c["price"])
+        if not cur_list:
+            cur_list = [c]; continue
+        center = np.average([safe_float(x["price"]) for x in cur_list], weights=[max(0.1, safe_float(x.get("weight", 1))) for x in cur_list])
+        if abs(px / center - 1) <= tol_pct:
+            cur_list.append(c)
+        else:
+            clusters.append(cur_list); cur_list = [c]
+    if cur_list:
+        clusters.append(cur_list)
+    zones: List[Dict[str, Any]] = []
+    for mem in clusters:
+        prices = [safe_float(m["price"]) for m in mem]
+        weights = [max(0.1, safe_float(m.get("weight", 1))) * _tf_base_weight(str(m.get("timeframe", "D"))) for m in mem]
+        center = float(np.average(prices, weights=weights))
+        low, high = min(prices), max(prices)
+        sources = [str(m.get("source", "")) for m in mem]
+        tfs = sorted(set(str(m.get("timeframe", "")) for m in mem if m.get("timeframe")))
+        source_types = len(set(sources))
+        reaction_count = len(mem)
+        # 核心线质量：大周期 > 成交密集/最大量 > 次高收盘/实体 > 影线/缺口；多周期共振提权。
+        tf_score = min(32, sum(_tf_base_weight(tf) for tf in tfs) * 3.2)
+        major_bonus = 0
+        if any(tf in tfs for tf in ["Y", "Q"]): major_bonus += 10
+        if "M" in tfs: major_bonus += 6
+        semantic_score = 0
+        for key, val in [("大量有效阳K", 12), ("最大量", 9), ("成交密集", 8), ("次高", 7), ("收盘共振", 7), ("实体顶", 7), ("假突破", 8), ("上影", 5), ("缺口", 5), ("平台", 4), ("凹口", 4)]:
+            if any(key in s for s in sources): semantic_score += val
+        semantic_score = min(38, semantic_score)
+        reaction_score = min(20, reaction_count * 1.6 + source_types * 1.1)
+        dist = center / current_price - 1
+        usability = 8 if -0.03 <= dist <= 0.18 else (3 if -0.10 <= dist <= 0.30 else -8)
+        width_pct = (high / low - 1) if low > 0 else 0
+        width_score = 5 if width_pct <= max(0.012, tol_pct * 1.6) else (2 if width_pct <= 0.04 else -3)
+        score = max(0, min(100, tf_score + major_bonus + semantic_score + reaction_score + usability + width_score))
+        if score >= 88: level = "S"
+        elif score >= 76: level = "A"
+        elif score >= 62: level = "B"
+        else: level = "C"
+        confirm_line = high  # 心理压力/突破确认线：核心带上沿，实盘最有价值。
+        zones.append({
+            "center": center, "low": low, "high": high, "confirm_line": confirm_line,
+            "score": float(score), "level": level, "members": mem, "sources": sources[:24], "timeframes": tfs,
+            "reaction_count": reaction_count, "source_types": source_types,
+            "semantic_count": semantic_score, "distance_to_current": dist,
+            "zone_width_pct": width_pct,
+        })
+    # 稀缺性：只保留靠近当前且质量较高的核心带，不罗列普通线。
+    zones = [z for z in zones if safe_float(z["score"]) >= 50 and -0.18 <= safe_float(z["distance_to_current"]) <= 0.35]
+    return sorted(zones, key=lambda z: (z["score"], -abs(safe_float(z["distance_to_current"]))), reverse=True)
+
+
+def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
+    daily = force_kline_schema(daily)
+    tfs = build_timeframes(daily)
+    candidates: List[Dict[str, Any]] = []
+    for tf, df in tfs.items():
+        if df is None or len(df) < 12:
+            continue
+        window_df = df.tail(_cycle_lookback(tf)).reset_index(drop=True)
+        candidates.extend(detect_major_cycle_anchor_candidates(window_df, tf))
+        candidates.extend(detect_volume_profile_resonance_candidates(window_df, tf))
+        candidates.extend(detect_gap_and_shadow_resonance_candidates(window_df, tf))
+        # 保留原语义候选作为辅助，但权重被 cluster 的大周期/语义规则重新校准。
+        candidates.extend(detect_semantic_coreline_candidates(window_df, tf))
+    cur = safe_float(daily["close"].iloc[-1])
+    atr = safe_float(daily["atr20_pct"].iloc[-1], 0.02)
+    return cluster_corelines(candidates, cur, atr)
+
+
+def detect_breakout(d: pd.DataFrame, zone: Dict[str, Any]) -> Dict[str, Any]:
+    d = force_kline_schema(d)
+    row = d.iloc[-1]
+    pre = d.iloc[-2] if len(d) >= 2 else row
+    close, open_, high, low = [safe_float(row[x]) for x in ["close", "open", "high", "low"]]
+    line = safe_float(zone.get("confirm_line", zone.get("high", zone.get("center"))))
+    zcenter = safe_float(zone.get("center", line))
+    zlow = safe_float(zone.get("low", zcenter))
+    body_top, body_bottom = max(open_, close), min(open_, close)
+    body_above_ratio = 0.0
+    if body_top > body_bottom and line > 0:
+        body_above_ratio = max(0.0, min(1.0, (body_top - max(body_bottom, line)) / (body_top - body_bottom)))
+    close_pos = safe_float(row.get("close_pos", 0.5))
+    upper = safe_float(row.get("upper_shadow_ratio", 0))
+    vr1 = safe_float(row.get("vr1", 0))
+    volr = safe_float(row["volume"] / safe_float(row.get("vol_ma20", 0), row["volume"]), 1)
+    pct_chg = safe_float(row.get("pct_chg", 0))
+    gap_break = safe_float(row["low"]) > safe_float(pre["high"]) * 1.003 and close > line
+    # 核心线标准不放宽：有效突破必须看核心带上沿/心理压力线，而不是中心线。
+    effective = close > line * 1.002 and body_above_ratio >= 0.30 and close_pos >= 0.60 and upper <= 0.52
+    score = 0.0; reasons = []
+    if close > line * 1.006:
+        score += 9; reasons.append("收盘明确站上心理压力线/核心上沿")
+    elif close > line * 1.002:
+        score += 6; reasons.append("收盘小幅站上心理压力线")
+    elif high >= line and close >= zcenter:
+        score += 2; reasons.append("盘中触及压力线但收盘未完全确认")
+    if body_above_ratio >= 0.55:
+        score += 7; reasons.append("实体大部分在压力线上方")
+    elif body_above_ratio >= 0.30:
+        score += 4; reasons.append("实体部分站上压力线")
+    if close_pos >= 0.80:
+        score += 5; reasons.append("收盘位置强")
+    elif close_pos >= 0.62:
+        score += 3; reasons.append("收盘位置尚可")
+    if upper <= 0.25:
+        score += 4; reasons.append("上影线短，非冲高回落")
+    elif upper > 0.52:
+        score -= 6; reasons.append("上影线偏长，有假突破风险")
+    if 1.8 <= vr1 <= 2.5:
+        score += 6; reasons.append("标准倍量突破")
+    elif 1.25 <= vr1 <= 3.2 or 1.15 <= volr <= 3.8:
+        score += 4; reasons.append("健康放量/温和放量")
+    elif vr1 > 5 or volr > 6:
+        score -= 5; reasons.append("极端爆量，防分歧派发")
+    if gap_break:
+        score += 4; reasons.append("跳空越过心理压力线")
+    if pct_chg >= 3 and close > open_:
+        score += 3; reasons.append("突破K为有效阳线")
+    if high >= line and close < zcenter:
+        score -= 9; reasons.append("冲线后收回核心带下方，假突破风险")
+    return {"effective": bool(effective), "score": float(max(0, min(30, score))), "reasons": reasons[:10], "body_above_ratio": body_above_ratio, "close_pos": close_pos, "vr1": vr1, "volr": volr}
+
+
+def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    d = normalize_external_kline_df(df)
+    if d is not None:
+        d = force_kline_schema(d)
+    if d is None or len(d) < 180:
+        return None
+    zones = find_coreline_zones(d)
+    if not zones:
+        return None
+    close = safe_float(d["close"].iloc[-1])
+    valid_zones = []
+    for z in zones[:8]:
+        line = safe_float(z.get("confirm_line", z.get("high")))
+        if line <= 0:
+            continue
+        dist = line / close - 1 if close > 0 else 99
+        # 核心压力线质量不放宽：必须至少B级、分数达标；放宽的是选股状态（贴近/临界/突破都可进深度）。
+        if z["level"] in ["S", "A", "B"] and safe_float(z.get("score")) >= POJIE_MIN_CORELINE_SCORE and -0.08 <= dist <= 0.20:
+            valid_zones.append(z)
+    if not valid_zones:
+        return None
+    best_result = None
+    for z in valid_zones[:4]:
+        core_score = safe_float(z["score"])
+        buildup = score_left_buildup(d, z)
+        breakout = detect_breakout(d, z)
+        rr = calc_space_rr(d, z, zones)
+        risk = risk_filter(d, {"名称": name})
+        if risk["hard_exclude"]:
+            continue
+        line = safe_float(z.get("confirm_line", z.get("high")))
+        dist_to_line = line / close - 1 if close > 0 and line > 0 else 0
+        # 放宽选股逻辑：贴近/临界/小突破也可以输出，但必须降低评级、不能冒充有效突破。
+        proximity_bonus = 0
+        proximity_reasons = []
+        if -0.015 <= dist_to_line <= 0.025:
+            proximity_bonus += 5; proximity_reasons.append("贴近心理压力线/临界状态")
+        elif 0.025 < dist_to_line <= 0.08:
+            proximity_bonus += 2; proximity_reasons.append("距离心理压力线不远，可观察")
+        if safe_float(buildup["score"]) >= 21 and 0 <= dist_to_line <= 0.10:
+            proximity_bonus += 3; proximity_reasons.append("线下蓄势较好，允许提前观察")
+        total = core_score * 0.34 + safe_float(buildup["score"]) * (25 / 35) + safe_float(breakout["score"]) * (25 / 30) + safe_float(rr["score"]) + proximity_bonus + safe_float(risk["penalty"])
+        if not breakout["effective"]:
+            total = min(total, 78)  # 临界观察封顶
+        total = max(0, min(100, total))
+        if total >= 88 and breakout["effective"] and z["level"] == "S" and rr["rr"] >= 2.0:
+            level = "S"
+        elif total >= 80 and breakout["effective"]:
+            level = "A"
+        elif total >= 68:
+            level = "B"
+        elif total >= 58:
+            level = "C"
+        else:
+            continue
+        result = {
+            "employee": "破界",
+            "version": MODEL_VERSION,
+            "symbol": symbol, "name": name,
+            "date": str(pd.to_datetime(d["date"].iloc[-1]).date()),
+            "close": round(close, 3),
+            "signal_level": level,
+            "score": round(float(total), 2),
+            "coreline": round(safe_float(z["center"]), 3),
+            "psychological_pressure_line": round(line, 3),
+            "coreline_zone": [round(safe_float(z["low"]), 3), round(safe_float(z["high"]), 3)],
+            "coreline_level": z["level"], "coreline_score": round(core_score, 2),
+            "distance_to_pressure": round(dist_to_line, 4),
+            "strategy_profile": POJIE_STRATEGY_PROFILE,
+            "coreline_sources": z["sources"][:14], "coreline_timeframes": z["timeframes"],
+            "buildup_score": round(safe_float(buildup["score"]), 2), "buildup_level": buildup["level"], "buildup_reasons": buildup["reasons"],
+            "breakout_effective": bool(breakout["effective"]), "breakout_score": round(safe_float(breakout["score"]), 2), "breakout_reasons": breakout["reasons"],
+            "proximity_reasons": proximity_reasons,
+            "defense_price": round(safe_float(rr["defense"]), 3), "next_pressure": round(safe_float(rr["next_pressure"]), 3),
+            "space": round(safe_float(rr["space"]), 4), "risk_distance": round(safe_float(rr["risk"]), 4), "rr": round(safe_float(rr["rr"]), 2),
+            "space_reasons": rr["reasons"], "risk_reasons": risk["reasons"],
+            "long_pos_250": round(safe_float(risk["long_pos_250"]), 4), "bias20": round(safe_float(risk["bias20"]), 4),
+            "confirm_condition": "日线高级K实体站上心理压力线，或回踩心理压力线/突破K实体中位缩量止跌后再转强。",
+            "giveup_condition": "放量长上影回落到心理压力线下方，或跌破突破K实底/交易防守位，破界失败。",
+        }
+        if best_result is None or result["score"] > best_result["score"]:
+            best_result = result
+    return best_result
+
+
+def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, no_kline: int = 0) -> str:
+    lines = []
+    valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
+    not_selected = max(0, valid_scanned - len(results))
+    lines.append("【破界战法2.0｜专业核心压力线版】")
+    lines.append(f"生成时间：{now_bj()}")
+    lines.append(f"扫描：{scanned}只，K线有效：{valid_scanned}只，入选：{len(results)}只，未入选：{not_selected}只，无K线/数据不足：{no_kline}只，异常失败：{failed}只")
+    lines.append("核心线口径：大周期优先；最大量有效阳K、次高/收盘共振、实体顶底、上影/缺口/假突破、成交密集区共同定位；心理压力线=核心压力带上沿。")
+    if results:
+        summary = []
+        for r in results:
+            summary.append(f"{r['symbol']} {r['name']}({r['signal_level']} {r['score']}分 收盘{r['close']} 心理线{r.get('psychological_pressure_line', r.get('coreline'))} 距离{safe_float(r.get('distance_to_pressure')):.1%})")
+        lines.append("")
+        lines.append(f"本次选出 {len(results)} 只：" + "；".join(summary))
+    else:
+        lines.append("")
+        lines.append("本次选出 0 只：没有股票同时满足专业核心压力线质量与破界/临界观察条件。")
+    lines.append("")
+    if not results:
+        lines.append("今日暂无破界候选。")
+        return "\n".join(lines)
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r['symbol']} {r['name']}｜{r['signal_level']}｜{r['score']}分｜收盘{r['close']}｜心理压力线{r.get('psychological_pressure_line', r.get('coreline'))}｜距离{safe_float(r.get('distance_to_pressure')):.1%}")
+        lines.append(f"   核心压力带：{r['coreline_zone']}｜中心{r['coreline']}｜{r['coreline_level']}级｜{r['coreline_score']}分｜周期{','.join(r['coreline_timeframes'])}")
+        lines.append(f"   线源：{'；'.join(r['coreline_sources'][:6])}")
+        lines.append(f"   蓄势：{r['buildup_level']} {r['buildup_score']}分｜{'；'.join(r['buildup_reasons'][:4])}")
+        br = '有效突破' if r['breakout_effective'] else '临界/观察'
+        extra = ('；' + '；'.join(r.get('proximity_reasons', [])[:2])) if r.get('proximity_reasons') else ''
+        lines.append(f"   突破状态：{br} {r['breakout_score']}分｜{'；'.join(r['breakout_reasons'][:4])}{extra}")
+        lines.append(f"   交易参数：防守{r['defense_price']}｜上方压力{r['next_pressure']}｜空间{r['space']:.1%}｜风险{r['risk_distance']:.1%}｜RR={r['rr']}")
+        if r['risk_reasons']:
+            lines.append(f"   风险：{'；'.join(r['risk_reasons'][:3])}")
+        lines.append(f"   确认：{r['confirm_condition']}")
+        lines.append(f"   放弃：{r['giveup_condition']}")
+        lines.append("")
+    return "\n".join(lines)
 
 def main():
     args = parse_args()
