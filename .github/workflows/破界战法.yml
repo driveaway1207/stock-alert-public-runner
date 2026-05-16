@@ -55,15 +55,14 @@ jobs:
       FULL_HISTORY_CACHE_DIR: "kline_cache"
       CACHE_DIR: "kline_cache"
 
-      # 破界默认逻辑：缓存优先；缓存缺失才用 BaoStock 主通道补拉；AkShare 默认彻底关闭。
       STOCK_LIST_FALLBACK_AKSHARE: "0"
       KLINE_FALLBACK_AKSHARE: "0"
       POJIE_ALLOW_AKSHARE_KLINE: "0"
-      POJIE_ALLOW_AKSHARE_STOCK_LIST: "0"
       POJIE_REMOTE_ON_CACHE_MISS: "1"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '100' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
+      BRANCH_NAME: ${{ github.ref_name }}
 
     steps:
       - name: 下载仓库代码
@@ -74,25 +73,136 @@ jobs:
         run: |
           echo "当前路径："
           pwd
+
           echo "仓库根目录文件："
           ls -la
+
           echo "workflow 文件："
           ls -la .github/workflows || true
+
+          echo "当前分支：$BRANCH_NAME"
 
       - name: 检查破界主程序
         shell: bash
         run: |
           echo "检查破界主程序：$MODEL_FILE"
+
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             echo "当前目录文件如下："
             ls -la
             exit 1
           fi
+
           echo "✅ 找到破界主程序：$MODEL_FILE"
 
-      - name: 恢复一号员工K线缓存
+      - name: 查找真正的一号员工K线大缓存
+        id: find_kline_cache
         if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          echo "开始查找真正的一号员工K线大缓存..."
+          echo "仓库：$GITHUB_REPOSITORY"
+          echo "分支：$BRANCH_NAME"
+
+          python - <<'PY'
+          import os
+          import json
+          import subprocess
+          from datetime import datetime
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          branch = os.environ.get("BRANCH_NAME", "main")
+          ref = f"refs/heads/{branch}"
+
+          prefixes = [
+              f"a-kline-cache-{branch}-",
+              f"kline-cache-{branch}-",
+              f"stock-alert-kline-cache-{branch}-",
+              f"a-stock-kline-cache-{branch}-",
+              f"daily-kline-cache-{branch}-",
+              f"full-history-kline-{branch}-",
+              f"pojie-kline-cache-{branch}-",
+          ]
+
+          min_size = int(os.environ.get("POJIE_MIN_CACHE_BYTES", "1000000"))
+
+          cmd = [
+              "gh",
+              "api",
+              "--paginate",
+              f"/repos/{repo}/actions/caches?per_page=100"
+          ]
+
+          try:
+              raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+          except Exception as e:
+              print("⚠️ gh api 查询缓存失败：", e)
+              print("cache_key=")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write("cache_key=\n")
+              raise SystemExit(0)
+
+          caches = []
+          for part in raw.splitlines():
+              part = part.strip()
+              if not part:
+                  continue
+              try:
+                  obj = json.loads(part)
+                  caches.extend(obj.get("actions_caches", []))
+              except Exception:
+                  pass
+
+          print(f"GitHub cache 总数：{len(caches)}")
+
+          candidates = []
+          for c in caches:
+              key = str(c.get("key", ""))
+              size = int(c.get("size_in_bytes") or 0)
+              cref = str(c.get("ref", ""))
+              last = str(c.get("last_accessed_at") or c.get("created_at") or "")
+
+              prefix_ok = any(key.startswith(p) for p in prefixes)
+              ref_ok = (cref == ref) or (not cref)
+
+              if prefix_ok and ref_ok:
+                  candidates.append({
+                      "key": key,
+                      "size": size,
+                      "ref": cref,
+                      "last": last,
+                  })
+
+          candidates = sorted(
+              candidates,
+              key=lambda x: (x["size"], x["last"]),
+              reverse=True
+          )
+
+          print("候选缓存前20个：")
+          for c in candidates[:20]:
+              print(f"key={c['key']} size={c['size']} ref={c['ref']} last={c['last']}")
+
+          usable = [c for c in candidates if c["size"] >= min_size]
+
+          if usable:
+              best = usable[0]
+              print(f"✅ 选中真正K线缓存：key={best['key']} size={best['size']}")
+              cache_key = best["key"]
+          else:
+              print(f"⚠️ 没找到大于 {min_size} bytes 的K线缓存。")
+              print("⚠️ 不会恢复225B这类空缓存，后续如无本地缓存，将由BaoStock补拉。")
+              cache_key = ""
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"cache_key={cache_key}\n")
+          PY
+
+      - name: 恢复真正的一号员工K线缓存
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' && steps.find_kline_cache.outputs.cache_key != '' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -100,18 +210,18 @@ jobs:
             kline_cache
             K线缓存
             outputs
-          key: a-kline-cache-${{ github.ref_name }}
-          restore-keys: |
-            a-kline-cache-${{ github.ref_name }}-
-            a-kline-cache-
-            kline-cache-${{ github.ref_name }}-
-            kline-cache-
-            stock-alert-kline-cache-${{ github.ref_name }}-
-            stock-alert-kline-cache-
-            a-stock-kline-cache-${{ github.ref_name }}-
-            a-stock-kline-cache-
+          key: ${{ steps.find_kline_cache.outputs.cache_key }}
+
+      - name: 没找到大缓存时跳过缓存恢复
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' && steps.find_kline_cache.outputs.cache_key == '' }}
+        shell: bash
+        run: |
+          echo "⚠️ 未找到可用的大K线缓存，本次跳过缓存恢复。"
+          echo "⚠️ 后续破界.py如缓存未命中，将使用BaoStock主通道补拉。"
+          echo "⚠️ AkShare已关闭。"
 
       - name: 检查K线缓存状态
+        id: check_kline_cache
         shell: bash
         run: |
           echo "开始检查K线缓存状态..."
@@ -119,46 +229,84 @@ jobs:
           if [ "${{ github.event.inputs.run_mode }}" = "selfcheck" ]; then
             echo "当前是 selfcheck，自检模式不需要K线缓存。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
+            echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
             exit 0
           fi
 
           mkdir -p kline_cache
+          mkdir -p kline_cache/base
+          mkdir -p kline_cache/deep
+          mkdir -p outputs
 
-          ROOT_COUNT=$(find kline_cache -maxdepth 1 -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          BASE_COUNT=$(find kline_cache/base -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          DEEP_COUNT=$(find kline_cache/deep -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          CN_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l || echo 0)
-          OUTPUT_COUNT=$(find outputs -name "*.csv" 2>/dev/null | wc -l || echo 0)
+          python - <<'PY'
+          import os
+          import json
+          from pathlib import Path
 
-          TOTAL_COUNT=$((ROOT_COUNT + BASE_COUNT + DEEP_COUNT + CN_COUNT))
+          paths = {
+              "kline_cache_root": Path("kline_cache"),
+              "kline_cache_base": Path("kline_cache/base"),
+              "kline_cache_deep": Path("kline_cache/deep"),
+              "cn_cache": Path("K线缓存"),
+              "outputs": Path("outputs"),
+          }
 
-          echo "kline_cache 根目录CSV数量：$ROOT_COUNT"
-          echo "kline_cache/base CSV数量：$BASE_COUNT"
-          echo "kline_cache/deep CSV数量：$DEEP_COUNT"
-          echo "K线缓存 CSV数量：$CN_COUNT"
-          echo "outputs CSV数量：$OUTPUT_COUNT"
-          echo "最终识别K线缓存CSV数量：$TOTAL_COUNT"
+          counts = {}
+          for name, p in paths.items():
+              if p.exists():
+                  if name == "kline_cache_root":
+                      counts[name] = len(list(p.glob("*.csv")))
+                  else:
+                      counts[name] = len(list(p.rglob("*.csv")))
+              else:
+                  counts[name] = 0
 
-          echo "展示前30个K线缓存文件："
-          find kline_cache "K线缓存" -name "*.csv" 2>/dev/null | head -30 || true
+          total_kline = (
+              counts["kline_cache_root"]
+              + counts["kline_cache_base"]
+              + counts["kline_cache_deep"]
+              + counts["cn_cache"]
+          )
 
-          if [ "$TOTAL_COUNT" -ge 1 ]; then
-            echo "✅ 已发现一号员工K线缓存。"
-            echo "✅ 本次不统一重写全部CSV，直接交给破界.py按股票代码懒加载读取。"
-            echo "✅ 缓存命中不联网；缓存缺失才允许BaoStock主通道补拉。"
-          else
-            echo "⚠️ 当前没有发现K线缓存。"
-            echo "⚠️ 破界.py会尝试一号员工数据入口，补拉主通道为BaoStock，AkShare已关闭。"
-          fi
+          print(f"kline_cache 根目录CSV数量：{counts['kline_cache_root']}")
+          print(f"kline_cache/base CSV数量：{counts['kline_cache_base']}")
+          print(f"kline_cache/deep CSV数量：{counts['kline_cache_deep']}")
+          print(f"K线缓存 CSV数量：{counts['cn_cache']}")
+          print(f"outputs CSV数量：{counts['outputs']}")
+          print(f"最终识别K线缓存CSV数量：{total_kline}")
 
-          echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
-          echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-          echo "CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
-          echo "KLINE_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
-          echo "STOCK_LIST_FALLBACK_AKSHARE=0" >> "$GITHUB_ENV"
-          echo "POJIE_ALLOW_AKSHARE_KLINE=0" >> "$GITHUB_ENV"
-          echo "POJIE_ALLOW_AKSHARE_STOCK_LIST=0" >> "$GITHUB_ENV"
-          echo "POJIE_REMOTE_ON_CACHE_MISS=1" >> "$GITHUB_ENV"
+          print("展示前30个K线缓存文件：")
+          shown = 0
+          for root in [Path("kline_cache"), Path("K线缓存")]:
+              if not root.exists():
+                  continue
+              for f in root.rglob("*.csv"):
+                  print(str(f))
+                  shown += 1
+                  if shown >= 30:
+                      break
+              if shown >= 30:
+                  break
+
+          has_cache = 1 if total_kline >= 1 else 0
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("SHOULD_RUN_POJIE=1\n")
+              f.write("FULL_HISTORY_CACHE_DIR=kline_cache\n")
+              f.write("CACHE_DIR=kline_cache\n")
+              f.write("KLINE_FALLBACK_AKSHARE=0\n")
+              f.write("STOCK_LIST_FALLBACK_AKSHARE=0\n")
+              f.write("POJIE_ALLOW_AKSHARE_KLINE=0\n")
+              f.write(f"HAS_KLINE_CACHE={has_cache}\n")
+
+          if has_cache:
+              print("✅ 已发现K线缓存。")
+              print("✅ 本次不统一重写全部CSV，直接交给破界.py按股票代码懒加载读取。")
+              print("✅ 缓存命中不联网；缓存缺失才允许BaoStock主通道补拉。")
+          else:
+              print("⚠️ 当前没有发现K线缓存。")
+              print("⚠️ 破界.py会尝试一号员工数据入口，补拉主通道为BaoStock，AkShare已关闭。")
+          PY
 
       - name: 安装Python环境
         uses: actions/setup-python@v5
@@ -203,8 +351,10 @@ jobs:
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
+          echo "是否已恢复K线缓存：$HAS_KLINE_CACHE"
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
           echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
+          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
@@ -230,8 +380,32 @@ jobs:
             破界*
           if-no-files-found: ignore
 
-      - name: 保存K线缓存
+      - name: 检查是否需要保存破界补拉缓存
         if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          total = 0
+          for p in [Path("kline_cache"), Path("K线缓存")]:
+              if p.exists():
+                  total += len(list(p.rglob("*.csv")))
+
+          print(f"运行结束后K线CSV数量：{total}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              if total >= 1:
+                  f.write("SAVE_POJIE_CACHE=1\n")
+                  print("✅ 有K线文件，允许保存破界专用缓存。")
+              else:
+                  f.write("SAVE_POJIE_CACHE=0\n")
+                  print("⚠️ 没有K线文件，不保存缓存，避免再次产生225B空缓存。")
+          PY
+
+      - name: 保存破界专用K线缓存
+        if: ${{ always() && env.SAVE_POJIE_CACHE == '1' }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -239,4 +413,4 @@ jobs:
             kline_cache
             K线缓存
             outputs
-          key: a-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
+          key: pojie-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
