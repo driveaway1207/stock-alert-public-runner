@@ -12,9 +12,9 @@ on:
           - selfcheck
           - daily
       max_stocks:
-        description: "最多扫描股票数量；0=不限制。建议先100"
+        description: "最多扫描股票数量；0=全量扫描"
         required: true
-        default: "100"
+        default: "0"
       result_limit:
         description: "输出候选数量"
         required: true
@@ -57,7 +57,18 @@ jobs:
       POJIE_ALLOW_AKSHARE_KLINE: "0"
       POJIE_REMOTE_ON_CACHE_MISS: "1"
 
-      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '100' }}
+      # 性能优化：全量默认4进程并行读缓存；缓存缺失仍会顺序BaoStock补拉，避免并发打数据源。
+      POJIE_WORKERS: "4"
+      POJIE_PARALLEL_MIN_STOCKS: "300"
+      POJIE_FAST_PREFILTER: "1"
+
+      # 日志/进度优化：默认不逐只打印K线成功，避免Actions刷屏。
+      POJIE_VERBOSE_KLINE: "0"
+      POJIE_LOG_FIRST_N: "5"
+      POJIE_PROGRESS_EVERY: "300"
+      POJIE_PROGRESS_SECONDS: "30"
+
+      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
 
     steps:
@@ -189,7 +200,7 @@ jobs:
           print(f"K线缓存 CSV数量：{items['cn_cache']}")
           print(f"outputs CSV数量：{items['outputs']}")
           print(f"最终识别K线缓存CSV数量：{total}")
-          print('展示前30个K线缓存文件：')
+          print('展示前10个K线缓存文件：')
           n=0
           for root in [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]:
               if not root.exists():
@@ -197,9 +208,9 @@ jobs:
               for f in root.rglob('*.csv'):
                   print(str(f))
                   n += 1
-                  if n >= 30:
+                  if n >= 10:
                       break
-              if n >= 30:
+              if n >= 10:
                   break
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
               f.write('SHOULD_RUN_POJIE=1\n')
@@ -258,6 +269,7 @@ jobs:
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
           echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
           echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
+          echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
@@ -288,19 +300,36 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import os
+          import os, json
           from pathlib import Path
+
           total = 0
           for root in [Path('kline_cache'), Path('K线缓存')]:
               if root.exists():
                   total += len(list(root.rglob('*.csv')))
+
+          remote_success = 0
+          signals = Path('outputs/pojie/pojie_signals.json')
+          if signals.exists():
+              try:
+                  data = json.loads(signals.read_text(encoding='utf-8'))
+                  remote_success = int(data.get('kline_stats', {}).get('remote_success', 0) or 0)
+              except Exception as e:
+                  print(f'读取破界K线统计失败：{e}')
+
           print(f'运行结束后K线CSV数量：{total}')
+          print(f'本次BaoStock补拉成功数量：{remote_success}')
+
+          # 优化原则：如果只是读取已有缓存、没有新增补拉，就不重复保存巨大cache，节省时间和GitHub存储。
+          should_save = (total >= 1000 and remote_success > 0)
+
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
-              f.write(f"SAVE_POJIE_CACHE={1 if total >= 1000 else 0}\n")
-          if total >= 1000:
-              print('✅ K线数量足够，允许保存破界专用缓存。')
+              f.write(f"SAVE_POJIE_CACHE={1 if should_save else 0}\n")
+
+          if should_save:
+              print('✅ 本次有BaoStock补拉并且K线数量足够，保存破界专用缓存。')
           else:
-              print('⚠️ K线数量不足1000，不保存缓存，避免产生空缓存。')
+              print('✅ 本次未新增补拉或K线数量不足，不重复保存缓存，避免浪费时间/存储。')
           PY
 
       - name: 保存破界专用K线缓存
