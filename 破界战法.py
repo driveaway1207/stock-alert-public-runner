@@ -872,14 +872,19 @@ def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or getattr(df, "empty", True):
         return None
     d = df.copy()
+    # 字段名先统一清理：去空格/BOM，避免 CSV 里出现隐藏字符导致找不到 volume/date。
+    d.columns = [str(c).strip().replace("\ufeff", "") for c in d.columns]
+    # 常见英文小写字段兼容。
+    lower_alias = {c: c.lower().strip() for c in d.columns}
+    d = d.rename(columns=lower_alias)
     rename_map = {
-        "日期": "date", "交易日期": "date", "trade_date": "date", "Date": "date", "datetime": "date", "time": "date",
-        "开盘": "open", "开盘价": "open", "Open": "open",
-        "收盘": "close", "收盘价": "close", "Close": "close",
-        "最高": "high", "最高价": "high", "High": "high",
-        "最低": "low", "最低价": "low", "Low": "low",
+        "日期": "date", "交易日期": "date", "trade_date": "date", "date": "date", "Date": "date", "datetime": "date", "time": "date",
+        "开盘": "open", "开盘价": "open", "open": "open", "Open": "open",
+        "收盘": "close", "收盘价": "close", "close": "close", "Close": "close",
+        "最高": "high", "最高价": "high", "high": "high", "High": "high",
+        "最低": "low", "最低价": "low", "low": "low", "Low": "low",
         "成交量": "volume", "成交量(手)": "volume", "成交量(股)": "volume", "成交量(万手)": "volume", "volume": "volume", "vol": "volume", "Volume": "volume",
-        "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount", "amount": "amount", "Amount": "amount",
+        "成交额": "amount", "成交额(元)": "amount", "成交额(万元)": "amount", "amount": "amount", "value": "amount", "turnover": "amount", "Amount": "amount",
         "涨跌幅": "pct_chg", "pctChg": "pct_chg",
         "换手率": "turnover", "turn": "turnover",
     }
@@ -895,53 +900,61 @@ def normalize_external_kline_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 def local_kline_candidate_paths(bs_code: str) -> List[str]:
     """
-    只读缓存优先：兼容一号员工常见缓存结构。
-    支持：
-    1）kline_cache/600000.csv 这种全历史扁平缓存；
-    2）kline_cache/base/sh_600000.csv、kline_cache/deep/sh_600000.csv；
-    3）K线缓存/600000.csv；
-    4）任意子目录里文件名包含 6位代码 的csv。
+    一号员工缓存懒加载路径，优先匹配真实缓存格式：
+    kline_cache/base/sh_600000.csv / kline_cache/base/sz_000001.csv。
+    命中任意有效CSV就直接用，不联网。
     """
     code = plain_code_from_any(bs_code)
-    bs_file = str(bs_code).replace(".", "_")
+    if not code:
+        return []
+    if str(bs_code).startswith(("sh.", "sz.")):
+        bs_norm = str(bs_code)
+    else:
+        bs_norm = ("sh." + code) if code.startswith(("600", "601", "603", "605", "688")) else ("sz." + code)
+    bs_file = bs_norm.replace(".", "_")
 
     roots = []
     for env_key in ["FULL_HISTORY_CACHE_DIR", "CACHE_DIR"]:
         v = os.environ.get(env_key, "").strip()
         if v:
             roots.append(v)
-
-    roots.extend([
-        "kline_cache",
-        "K线缓存",
-        "kline_cache/base",
-        "kline_cache/deep",
-        "./kline_cache",
-        "./K线缓存",
-    ])
+    roots.extend(["kline_cache", "K线缓存", "."])
 
     paths = []
     for root in roots:
         if not root:
             continue
+        # 最高优先级：一号员工实际缓存格式。
         paths.extend([
-            os.path.join(root, f"{code}.csv"),
-            os.path.join(root, f"{bs_file}.csv"),
             os.path.join(root, "base", f"{bs_file}.csv"),
             os.path.join(root, "deep", f"{bs_file}.csv"),
+            os.path.join(root, f"{bs_file}.csv"),
             os.path.join(root, "base", f"{code}.csv"),
             os.path.join(root, "deep", f"{code}.csv"),
+            os.path.join(root, f"{code}.csv"),
         ])
-        # 兜底：递归找包含6位代码的csv，解决缓存目录层级/命名不一致问题。
+
+    # 常见固定目录再补一次，防止环境变量指到 kline_cache 后漏掉中文目录。
+    for root in ["kline_cache", "K线缓存"]:
+        paths.extend([
+            os.path.join(root, "base", f"{bs_file}.csv"),
+            os.path.join(root, "deep", f"{bs_file}.csv"),
+            os.path.join(root, f"{bs_file}.csv"),
+            os.path.join(root, "base", f"{code}.csv"),
+            os.path.join(root, "deep", f"{code}.csv"),
+            os.path.join(root, f"{code}.csv"),
+        ])
+
+    # 最后才递归兜底，避免每只股票先扫大目录导致慢。
+    for root in ["kline_cache", "K线缓存"]:
         try:
             if os.path.exists(root):
-                paths.extend(glob.glob(os.path.join(root, "**", f"*{code}*.csv"), recursive=True))
                 paths.extend(glob.glob(os.path.join(root, "**", f"*{bs_file}*.csv"), recursive=True))
+                paths.extend(glob.glob(os.path.join(root, "**", f"*{code}*.csv"), recursive=True))
         except Exception:
             pass
 
-    seen = set()
-    out = []
+    seen, out = set(), []
     for p in paths:
         if p and p not in seen:
             seen.add(p)
@@ -953,7 +966,10 @@ def read_local_kline_cache_for_pojie(bs_code: str) -> Optional[pd.DataFrame]:
         if not path or not os.path.exists(path):
             continue
         try:
-            df = pd.read_csv(path, dtype={"date": str})
+            try:
+                df = pd.read_csv(path, dtype=str, encoding="utf-8")
+            except UnicodeDecodeError:
+                df = pd.read_csv(path, dtype=str, encoding="gbk")
             out = normalize_external_kline_df(df)
             if out is not None and len(out) >= 120:
                 print(f"破界K线：读取本地缓存成功 symbol={bs_code} file={path} rows={len(out)}")
@@ -1208,7 +1224,7 @@ def main():
     if not results:
         report += "\n\n诊断：本次流程已跑通，但没有达到最低分的破界候选。"
         if no_kline > 0:
-            report += f"\nK线无数据/不足：{no_kline}只。请优先检查 kline_cache 是否有有效CSV，或稍后重跑 AkShare。"
+            report += f"\nK线无数据/不足：{no_kline}只。请优先检查 kline_cache 是否有有效CSV，或检查 BaoStock 补拉/一号员工缓存。"
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(report)
