@@ -28,14 +28,14 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界V1.4｜缓存优先+并行加速+人性化进度版"
+MODEL_VERSION = "破界V1.5｜只读缓存+10并行+无补拉人性化进度版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
 
 # ========================= 速度 / 日志控制 =========================
 # 全量跑通后默认并行扫描缓存；如果今天没有缓存，需要 BaoStock 补拉，程序会自动回落为顺序补拉。
-POJIE_WORKERS = max(1, int(os.environ.get("POJIE_WORKERS", "4")))
+POJIE_WORKERS = max(1, int(os.environ.get("POJIE_WORKERS", "10")))
 POJIE_PARALLEL_MIN_STOCKS = int(os.environ.get("POJIE_PARALLEL_MIN_STOCKS", "300"))
 POJIE_PROGRESS_EVERY = int(os.environ.get("POJIE_PROGRESS_EVERY", "200"))
 POJIE_PROGRESS_SECONDS = int(os.environ.get("POJIE_PROGRESS_SECONDS", "30"))
@@ -1461,10 +1461,10 @@ def main():
     args = parse_args()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 破界数据层原则：缓存优先；缓存命中绝不拉；缓存缺失才走 BaoStock 主通道补拉。
+    # 破界数据层原则：只读缓存；缓存命中不联网；缓存缺失直接跳过。
     os.environ.setdefault("USE_FULL_HISTORY_CACHE", "1")
     os.environ.setdefault("ALLOW_STALE_KLINE_CACHE", "1")
-    os.environ.setdefault("POJIE_REMOTE_ON_CACHE_MISS", "1")
+    os.environ.setdefault("POJIE_REMOTE_ON_CACHE_MISS", "0")
     os.environ.setdefault("POJIE_ALLOW_AKSHARE_KLINE", "0")
     os.environ.setdefault("POJIE_ALLOW_AKSHARE_STOCK_LIST", "0")
     # 硬覆盖：防止 workflow 里设置 KLINE_FALLBACK_AKSHARE=1 后，一号员工内部自动改用 AkShare 拉K线。
@@ -1473,13 +1473,15 @@ def main():
 
     base = load_base_module(args.基础模型文件)
 
-    # BaoStock 登录不作为硬门槛；能登录就让一号员工数据层少报 you don't login，不能登录也继续走缓存/AkShare。
-    if hasattr(base, "baostock_login"):
+    # 破界战法默认只读缓存，不做BaoStock补拉；因此默认不登录BaoStock，节省时间并避免数据源压力。
+    if os.environ.get("POJIE_REMOTE_ON_CACHE_MISS", "0") == "1" and hasattr(base, "baostock_login"):
         try:
             ok = base.baostock_login()
             print(f"破界：尝试调用一号员工 BaoStock 登录，ok={ok}")
         except Exception as e:
             print(f"破界：BaoStock登录异常但不阻断：{e}")
+    else:
+        print("破界：只读缓存模式，跳过BaoStock登录。")
 
     if args.模式 == "selfcheck":
         required = ["get_a_stock_list", "get_daily_kline"]
@@ -1500,7 +1502,7 @@ def main():
     if args.最多股票数量 and args.最多股票数量 > 0:
         stock_list = stock_list.head(args.最多股票数量)
 
-    print("破界：K线模式=缓存优先；缓存命中不联网；缓存缺失才用 BaoStock 主通道补拉；AkShare默认禁用。")
+    print("破界：K线模式=只读缓存；缓存命中不联网；缓存缺失直接跳过；BaoStock/AkShare默认禁用。")
     print(f"破界：POJIE_REMOTE_ON_CACHE_MISS={os.environ.get('POJIE_REMOTE_ON_CACHE_MISS', '1')}，POJIE_ALLOW_AKSHARE_KLINE={os.environ.get('POJIE_ALLOW_AKSHARE_KLINE', '0')}，KLINE_FALLBACK_AKSHARE={os.environ.get('KLINE_FALLBACK_AKSHARE', '0')}")
     print(f"破界：最终扫描股票池数量={len(stock_list)}")
     print(stock_list.head(20).to_string(index=False))
@@ -1518,7 +1520,7 @@ def main():
     use_parallel = POJIE_WORKERS > 1 and len(rows) >= POJIE_PARALLEL_MIN_STOCKS
 
     if use_parallel:
-        print(f"破界：启用并行缓存扫描 workers={POJIE_WORKERS}；缓存缺失的股票会在并行后再顺序BaoStock补拉。")
+        print(f"破界：启用并行只读缓存扫描 workers={POJIE_WORKERS}；缓存缺失股票直接记为无K线，不再补拉。")
         with ProcessPoolExecutor(max_workers=POJIE_WORKERS) as ex:
             futures = [ex.submit(scan_worker_cache_only, row) for row in rows]
             for fut in as_completed(futures):
@@ -1548,35 +1550,14 @@ def main():
                     print(progress_text(scanned, len(rows), start, len(results), no_kline + len(cache_miss_rows), failed))
                     last_progress_ts = now_ts
 
-        # 只有缓存缺失的少数股票，才顺序走一号员工/BaoStock补拉；避免并发打BaoStock。
-        if cache_miss_rows and os.environ.get("POJIE_REMOTE_ON_CACHE_MISS", "1") == "1":
-            print(f"破界：并行阶段缓存缺失 {len(cache_miss_rows)} 只，开始顺序BaoStock补拉。")
-            for row in cache_miss_rows:
-                code = str(row.get("代码", "")).zfill(6)
-                bs_code = str(row.get("bs_code", "")) or bs_code_from_plain(code)
-                name = str(row.get("名称", ""))
-                try:
-                    df = get_daily_kline_safe(base, bs_code)
-                    df = normalize_external_kline_df(df)
-                    if df is None or len(df) < 120:
-                        no_kline += 1
-                        failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "no_kline_or_bad_columns"})
-                        continue
-                    if not quick_trigger_prefilter(df):
-                        KLINE_STATS["prefilter_skip"] = KLINE_STATS.get("prefilter_skip", 0) + 1
-                        continue
-                    res = scan_one(code, name, df)
-                    if res and res["score"] >= args.最低分:
-                        results.append(res)
-                except Exception as e:
-                    failed += 1
-                    failed_items.append({"code": code, "name": name, "bs_code": bs_code, "stage": "scan_exception", "error": str(e)[:200]})
-                    if failed <= 20:
-                        print(f"破界扫描失败：{code} {name} {e}")
-        else:
+        # 只读缓存模式：底层战法不做任何补拉。缓存缺失直接记录为无K线/缓存缺失。
+        if cache_miss_rows:
             no_kline += len(cache_miss_rows)
+            print(f"破界：并行阶段缓存缺失 {len(cache_miss_rows)} 只；只读缓存模式下不再BaoStock补拉。")
+            for row in cache_miss_rows[:300]:
+                failed_items.append({"code": row.get("代码"), "name": row.get("名称"), "bs_code": row.get("bs_code"), "stage": "cache_miss_readonly_no_remote"})
     else:
-        print("破界：使用顺序扫描模式。")
+        print("破界：使用顺序只读缓存扫描模式。")
         for _, row in stock_list.iterrows():
             scanned += 1
             code = str(row.get("代码", row.get("code", ""))).zfill(6)
@@ -1590,7 +1571,7 @@ def main():
                 continue
 
             try:
-                df = get_daily_kline_safe(base, bs_code)
+                df = read_local_kline_cache_for_pojie(bs_code)
                 df = normalize_external_kline_df(df)
                 if df is None or len(df) < 120:
                     no_kline += 1
