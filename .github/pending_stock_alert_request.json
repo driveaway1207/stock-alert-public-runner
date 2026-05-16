@@ -1,5 +1,0 @@
-{
-  "mode": "daily",
-  "created_by": "stock_alert_workflow_v25_5",
-  "note": "workflow_run 会强制 daily，不会继承 backtest。"
-}
