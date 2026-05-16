@@ -6,7 +6,7 @@ on:
     - cron: '0 10 * * 1-5'
 
   # K线验收成功后，自动启动一号员工
-  # 注意：这里永远强制 daily，不再继承 pending 里的 backtest，避免再次跑满3小时。
+  # 重要：这里永远强制 daily，不再继承 pending 里的 backtest，避免再次跑满3小时。
   workflow_run:
     workflows:
       - A Stock Kline Cache Acceptance
@@ -76,12 +76,14 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 一号员工主程序：基于最新 V25.5 文件名
-      MODEL_FILE: 'stock_alert_v25_5.py'
+      # 当前仓库真实主程序文件名。日志显示仓库里存在 stock_alert.py，不存在 stock_alert_v25_5.py。
+      # 所以这里必须指向 stock_alert.py；不要改成不存在的文件名。
+      MODEL_FILE: 'stock_alert.py'
       MODEL_VERSION: 'V25.5'
 
       # 关键保护：生产任务默认禁止自动回测
       RUN_V25_BACKTEST: '0'
+      V25_1_MODE: 'daily'
 
       # pending 请求文件：只用于“没缓存时先缓存，缓存完成后继续跑 daily”。
       # workflow_run 自动触发时不会继承 pending 的 backtest。
@@ -136,7 +138,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # GitHub CLI
+      # GitHub CLI：用于没缓存时自动启动K线缓存任务
       GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
 
     steps:
@@ -466,12 +468,17 @@ jobs:
 
           elif [ "$RUN_MODE" = "backtest" ]; then
             echo "启动压缩回测：只回测最多${BT_MAX_DATES:-15}个交易日，每日最终Top${BT_TOPN:-3}。"
+            export ENABLE_TELEGRAM=0
+            export RUN_V25_BACKTEST=1
+            export V25_1_MODE=backtest
             CMD="python \"$MODEL_FILE\" --mode backtest --start ${BT_START:-2022-04-08} --end ${BT_END:-2023-04-08} --max-dates ${BT_MAX_DATES:-15} --topn ${BT_TOPN:-3} --deep-limit ${BT_DEEP_LIMIT:-3} --base-limit ${BT_BASE_LIMIT:-3}"
             echo "$CMD"
             eval "$CMD"
 
           else
             echo "启动每日选股：固定 daily，允许 Telegram 推送。"
+            export RUN_V25_BACKTEST=0
+            export V25_1_MODE=daily
             python "$MODEL_FILE" --mode daily
           fi
 
