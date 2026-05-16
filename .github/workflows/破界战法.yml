@@ -28,9 +28,14 @@ on:
           - "false"
           - "true"
 
-  schedule:
-    # 北京时间18:20运行。GitHub使用UTC，所以是10:20。
-    - cron: "20 10 * * 1-5"
+  # 可选：一号员工跑完后自动触发破界。
+  # 注意：这里要求一号员工 workflow 名称必须正好叫“一号员工选股模型 V25.6”。
+  # 如果你不想自动跟跑，可以删除 workflow_run 这一段。
+  workflow_run:
+    workflows:
+      - 一号员工选股模型 V25.6
+    types:
+      - completed
 
 permissions:
   contents: read
@@ -42,6 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # 只有手动触发，或一号员工成功完成后，才运行。
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
     env:
       PYTHONUNBUFFERED: "1"
       MODEL_FILE: "破界战法.py"
@@ -52,15 +60,16 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-      # 一号员工当前缓存结构：kline_cache/base/*.csv + kline_cache/deep/*.csv
+      # 破界默认使用一号员工缓存结构
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache/base"
       CACHE_DIR: "kline_cache"
 
+      # 公开源只做兜底，不作为主入口
       STOCK_LIST_FALLBACK_AKSHARE: "1"
       KLINE_FALLBACK_AKSHARE: "1"
 
-      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
+      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '10' }}
 
     steps:
@@ -73,8 +82,72 @@ jobs:
           echo "当前仓库根目录文件："
           ls -la
 
+      - name: 检查破界主程序
+        run: |
+          echo "检查破界主程序：$MODEL_FILE"
+          if [ ! -f "$MODEL_FILE" ]; then
+            echo "❌ 没找到破界主程序：$MODEL_FILE"
+            echo "当前目录文件如下："
+            ls -la
+            exit 1
+          fi
+          echo "✅ 找到破界主程序：$MODEL_FILE"
+
+      - name: 尝试下载一号员工最新运行结果
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: stock_alert.yml
+          name: 一号员工选股结果
+          path: artifact_download
+          search_artifacts: true
+          if_no_artifact_found: warn
+
+      - name: 尝试从一号员工产物恢复K线
+        shell: bash
+        run: |
+          echo "开始检查一号员工产物..."
+          mkdir -p kline_cache
+
+          if [ -d artifact_download ]; then
+            echo "artifact_download 文件列表："
+            find artifact_download -maxdepth 4 -type f | head -80 || true
+
+            # 情况1：artifact 里本身已经解压出了 kline_cache
+            if [ -d "artifact_download/kline_cache" ]; then
+              echo "发现 artifact_download/kline_cache，复制到当前 kline_cache"
+              cp -r artifact_download/kline_cache/* kline_cache/ || true
+            fi
+
+            # 情况2：artifact 里有压缩包
+            ZIP_FILE=$(find artifact_download -name "*.zip" | head -n 1 || true)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "发现zip产物：$ZIP_FILE，开始解压"
+              rm -rf artifact_unzip
+              mkdir -p artifact_unzip
+              unzip -o "$ZIP_FILE" -d artifact_unzip || true
+
+              echo "解压后文件列表："
+              find artifact_unzip -maxdepth 5 -type f | head -100 || true
+
+              if [ -d "artifact_unzip/kline_cache" ]; then
+                echo "发现 artifact_unzip/kline_cache，复制到当前 kline_cache"
+                cp -r artifact_unzip/kline_cache/* kline_cache/ || true
+              fi
+
+              if [ -d "artifact_unzip/K线缓存" ]; then
+                echo "发现 artifact_unzip/K线缓存，复制到当前 kline_cache"
+                cp -r artifact_unzip/K线缓存/* kline_cache/ || true
+              fi
+            fi
+          else
+            echo "没有下载到一号员工产物，继续尝试 GitHub cache。"
+          fi
+
+          echo "产物恢复后 kline_cache CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+
       - name: 尝试恢复GitHub缓存里的K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'schedule' }}
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' || github.event_name == 'workflow_run' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
@@ -91,7 +164,8 @@ jobs:
         run: |
           echo "开始检查K线缓存状态..."
 
-          if [ "${{ github.event.inputs.run_mode || 'daily' }}" = "selfcheck" ] && [ "${{ github.event_name }}" != "schedule" ]; then
+          # selfcheck 不需要K线
+          if [ "${{ github.event.inputs.run_mode || 'daily' }}" = "selfcheck" ] && [ "${{ github.event_name }}" != "workflow_run" ]; then
             echo "当前是 selfcheck，自检模式不需要K线缓存。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
             exit 0
@@ -100,8 +174,8 @@ jobs:
           CSV_COUNT=0
 
           if [ -d "kline_cache" ]; then
-            echo "✅ 找到一号员工英文缓存目录：kline_cache"
-            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' | wc -l)"
+            echo "✅ 找到缓存目录：kline_cache"
+            echo "kline_cache 总CSV数量：$(find kline_cache -name '*.csv' 2>/dev/null | wc -l)"
             echo "kline_cache/base CSV数量：$(find kline_cache/base -name '*.csv' 2>/dev/null | wc -l)"
             echo "kline_cache/deep CSV数量：$(find kline_cache/deep -name '*.csv' 2>/dev/null | wc -l)"
             find kline_cache -name '*.csv' | head -20 || true
@@ -124,12 +198,11 @@ jobs:
 
           elif [ -d "K线缓存" ]; then
             echo "✅ 找到中文缓存目录：K线缓存"
-            CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
+            CSV_COUNT=$(find "K线缓存" -name "*.csv" 2>/dev/null | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
             find "K线缓存" -name "*.csv" | head -20 || true
             echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
             echo "CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
-
           else
             echo "⚠️ 没找到 kline_cache 或 K线缓存。"
           fi
@@ -137,24 +210,14 @@ jobs:
           echo "最终识别K线CSV数量：$CSV_COUNT"
 
           if [ "$CSV_COUNT" -ge 100 ]; then
-            echo "✅ K线缓存可用。"
+            echo "✅ K线缓存可用，允许运行破界。"
             echo "SHOULD_RUN_POJIE=1" >> "$GITHUB_ENV"
           else
             echo "❌ K线缓存不可用或数量过少：$CSV_COUNT"
+            echo "破界不再临时强拉全市场，避免公开源断流和GitHub超时。"
             echo "SHOULD_RUN_POJIE=0" >> "$GITHUB_ENV"
             exit 1
           fi
-
-      - name: 检查破界主程序
-        run: |
-          echo "检查破界主程序：$MODEL_FILE"
-          if [ ! -f "$MODEL_FILE" ]; then
-            echo "❌ 没找到破界主程序：$MODEL_FILE"
-            echo "当前目录文件如下："
-            ls -la
-            exit 1
-          fi
-          echo "✅ 找到破界主程序：$MODEL_FILE"
 
       - name: 安装Python环境
         uses: actions/setup-python@v5
@@ -168,7 +231,10 @@ jobs:
             echo "发现 requirements.txt，先安装仓库依赖。"
             pip install -r requirements.txt
           fi
+
+          echo "强制补装破界战法必需依赖，避免 requirements.txt 缺包。"
           pip install pandas numpy requests akshare baostock openpyxl
+
           python - <<'PY'
           import pandas, numpy, requests
           import akshare
@@ -192,9 +258,9 @@ jobs:
           echo "输出数量：$RESULT_LIMIT"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
 
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
             RUN_MODE="daily"
-            SEND_TG="true"
+            SEND_TG="false"
           else
             RUN_MODE="$RAW_MODE"
             SEND_TG="$RAW_SEND_TG"
