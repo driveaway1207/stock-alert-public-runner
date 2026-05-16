@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界V1.0｜核心线突破独立战法"
+MODEL_VERSION = "破界V1.1｜缓存优先+BaoStock补拉稳定版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -963,6 +963,26 @@ def read_local_kline_cache_for_pojie(bs_code: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def save_pojie_normalized_kline_cache(bs_code: str, df: pd.DataFrame) -> None:
+    """
+    缓存缺失后补拉成功时，额外写一份破界标准扁平缓存：kline_cache/600000.csv。
+    后续再跑时会直接命中这份缓存，不再联网。
+    """
+    try:
+        code = plain_code_from_any(bs_code)
+        if not code or df is None or getattr(df, "empty", True):
+            return
+        os.makedirs("kline_cache", exist_ok=True)
+        out = normalize_external_kline_df(df)
+        if out is None or out.empty:
+            return
+        keep = [c for c in ["date", "open", "high", "low", "close", "volume", "amount"] if c in out.columns]
+        out[keep].to_csv(os.path.join("kline_cache", f"{code}.csv"), index=False, encoding="utf-8")
+        print(f"破界K线：补拉成功后已写入标准缓存 file=kline_cache/{code}.csv rows={len(out)}")
+    except Exception as e:
+        print(f"破界K线：写入标准缓存失败 symbol={bs_code} error={str(e)[:120]}")
+
+
 def get_daily_kline_akshare_direct(bs_code: str, lookback_days: int = 2600) -> Optional[pd.DataFrame]:
     try:
         import akshare as ak
@@ -1033,6 +1053,7 @@ def get_daily_kline_safe(base, bs_code: str) -> Optional[pd.DataFrame]:
             out = normalize_external_kline_df(df)
             if out is not None and len(out) >= 120:
                 print(f"破界K线：BaoStock/一号员工入口补拉成功 symbol={bs_code} rows={len(out)}")
+                save_pojie_normalized_kline_cache(bs_code, out)
                 return out
     except Exception as e:
         print(f"破界K线：BaoStock/一号员工入口补拉失败 symbol={bs_code} error={str(e)[:180]}")
