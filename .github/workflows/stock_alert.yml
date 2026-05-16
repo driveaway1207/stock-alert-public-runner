@@ -1,7 +1,12 @@
-name: 一号员工选股模型 V25.3
+name: 一号员工选股模型 V25.5
 
 on:
+  # 每个交易日下午6点执行：GitHub cron 使用 UTC；北京时间18:00 = UTC 10:00
+  schedule:
+    - cron: '0 10 * * 1-5'
+
   # K线验收成功后，自动启动一号员工
+  # 注意：这里永远强制 daily，不再继承 pending 里的 backtest，避免再次跑满3小时。
   workflow_run:
     workflows:
       - A Stock Kline Cache Acceptance
@@ -12,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '运行模式：daily=每日选股；backtest=历史回测；selfcheck=自检'
+        description: '运行模式：daily=每日选股；backtest=压缩回测；selfcheck=自检'
         required: true
         default: 'daily'
         type: choice
@@ -32,17 +37,27 @@ on:
         default: '2023-04-08'
 
       max_dates:
-        description: '最多回测交易日数量，仅 backtest 使用，留空表示不限制'
+        description: '最多回测交易日数量，仅 backtest 使用；默认15，防止超时'
         required: false
-        default: ''
+        default: '15'
+
+      topn:
+        description: '每日回测最终推荐数量，仅 backtest 使用；默认3'
+        required: false
+        default: '3'
+
+      deep_limit:
+        description: '回测深度评分数量，仅 backtest 使用；默认3，压缩计算量'
+        required: false
+        default: '3'
 
       base_limit:
-        description: '回测基础层进入深度层数量，仅 backtest 使用，留空使用脚本默认'
+        description: '回测基础入深度数量，仅 backtest 使用；默认3，压缩计算量'
         required: false
-        default: ''
+        default: '3'
 
 concurrency:
-  group: 一号员工选股模型-v25-${{ github.ref }}
+  group: 一号员工选股模型-v25-5-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -51,20 +66,25 @@ permissions:
 
 jobs:
   run-stock-alert:
-    name: 运行一号员工选股
+    name: 运行一号员工选股 V25.5
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
-    # 自动触发时，只有 K线验收成功才运行；手动运行不拦截
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # 自动触发时，只有 K线验收成功才运行；定时和手动运行不拦截
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.workflow_run.conclusion == 'success' }}
 
     env:
       PYTHONUNBUFFERED: '1'
 
-      # 一号员工主程序
-      MODEL_FILE: 'stock_alert.py'
+      # 一号员工主程序：基于最新 V25.5 文件名
+      MODEL_FILE: 'stock_alert_v25_5.py'
+      MODEL_VERSION: 'V25.5'
 
-      # pending 请求文件：用于“没缓存时先缓存，缓存完成后继续跑原来的 daily/backtest”
+      # 关键保护：生产任务默认禁止自动回测
+      RUN_V25_BACKTEST: '0'
+
+      # pending 请求文件：只用于“没缓存时先缓存，缓存完成后继续跑 daily”。
+      # workflow_run 自动触发时不会继承 pending 的 backtest。
       PENDING_REQUEST_FILE: '.github/pending_stock_alert_request.json'
 
       # 生产模式：一号员工优先只读已经更新/验收过的K线缓存
@@ -96,11 +116,19 @@ jobs:
       # 最低样本要求
       MIN_VALID_KLINE: '1000'
 
-      # 正式推送数量
+      # 正式推送数量：每日只推 Top3
       TOP_PUSH_LIMIT: '3'
       RESULT_LIMIT: '3'
       FORCE_TOP_N: '3'
       MIN_PUSH_COUNT: '3'
+
+      # 压缩回测默认口径：只回测每天最终推荐Top3，只取15个交易日
+      V25_BACKTEST_TOP_N: '3'
+      V25_BACKTEST_DEEP_LIMIT: '3'
+      V25_1_BACKTEST_BASE_LIMIT: '3'
+      V25_BACKTEST_MAX_DATES: '15'
+      V25_BACKTEST_DATE_STEP: '1'
+      V25_BACKTEST_DISABLE_TELEGRAM: '1'
 
       # Telegram 推送
       ENABLE_TELEGRAM: '1'
@@ -121,16 +149,16 @@ jobs:
         shell: bash
         run: |
           echo "================ 一号员工生产口径 ================"
-          echo "模型版本：V25.3"
+          echo "模型版本：$MODEL_VERSION"
           echo "主程序文件：$MODEL_FILE"
+          echo "定时任务：北京时间18:00，固定 daily 选股"
+          echo "K线验收成功后：固定 daily，不继承 pending backtest"
           echo "手动 daily：先查缓存，有缓存就选股，没缓存就自动缓存"
-          echo "手动 backtest：先查缓存，有缓存就回测，没缓存就自动缓存"
+          echo "手动 backtest：压缩回测，默认15个交易日、Top3、Deep=3、Base=3"
           echo "selfcheck：只自检，不缓存"
-          echo "K线验收成功后：自动启动一号员工"
           echo "主数据源：BaoStock"
           echo "AkShare补拉：默认关闭"
           echo "基础层窗口：520天"
-          echo "深度评分数量：200只"
           echo "正式推送数量：Top3"
           echo "=================================================="
 
@@ -155,6 +183,8 @@ jobs:
           INPUT_START: ${{ github.event.inputs.start }}
           INPUT_END: ${{ github.event.inputs.end }}
           INPUT_MAX_DATES: ${{ github.event.inputs.max_dates }}
+          INPUT_TOPN: ${{ github.event.inputs.topn }}
+          INPUT_DEEP_LIMIT: ${{ github.event.inputs.deep_limit }}
           INPUT_BASE_LIMIT: ${{ github.event.inputs.base_limit }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -164,68 +194,49 @@ jobs:
             MODE="${INPUT_MODE:-daily}"
             START="${INPUT_START:-2022-04-08}"
             END="${INPUT_END:-2023-04-08}"
-            MAX_DATES="${INPUT_MAX_DATES:-}"
-            BASE_LIMIT="${INPUT_BASE_LIMIT:-}"
+            MAX_DATES="${INPUT_MAX_DATES:-15}"
+            TOPN="${INPUT_TOPN:-3}"
+            DEEP_LIMIT="${INPUT_DEEP_LIMIT:-3}"
+            BASE_LIMIT="${INPUT_BASE_LIMIT:-3}"
             PENDING_USED="0"
-
             echo "本次为手动运行。"
 
-          else
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
             echo "本次为 K线验收成功后自动触发。"
+            echo "安全规则：workflow_run 永远强制 daily，绝不继承 pending 的 backtest。"
+            MODE="daily"
+            START="2022-04-08"
+            END="2023-04-08"
+            MAX_DATES="15"
+            TOPN="3"
+            DEEP_LIMIT="3"
+            BASE_LIMIT="3"
+            PENDING_USED="0"
 
-            if [ -f "$PENDING_REQUEST_FILE" ]; then
-              echo "发现 pending 请求文件：$PENDING_REQUEST_FILE"
-              MODE=$(python - <<'PY'
-          import json
-          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
-              d=json.load(f)
-          print(d.get("mode","daily"))
-          PY
-          )
-              START=$(python - <<'PY'
-          import json
-          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
-              d=json.load(f)
-          print(d.get("start","2022-04-08"))
-          PY
-          )
-              END=$(python - <<'PY'
-          import json
-          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
-              d=json.load(f)
-          print(d.get("end","2023-04-08"))
-          PY
-          )
-              MAX_DATES=$(python - <<'PY'
-          import json
-          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
-              d=json.load(f)
-          print(d.get("max_dates",""))
-          PY
-          )
-              BASE_LIMIT=$(python - <<'PY'
-          import json
-          with open(".github/pending_stock_alert_request.json","r",encoding="utf-8") as f:
-              d=json.load(f)
-          print(d.get("base_limit",""))
-          PY
-          )
-              PENDING_USED="1"
-            else
-              echo "没有 pending 请求文件，默认执行 daily。"
-              MODE="daily"
-              START="2022-04-08"
-              END="2023-04-08"
-              MAX_DATES=""
-              BASE_LIMIT=""
-              PENDING_USED="0"
-            fi
+          else
+            echo "本次为定时运行。"
+            echo "安全规则：定时任务固定 daily，绝不跑 backtest。"
+            MODE="daily"
+            START="2022-04-08"
+            END="2023-04-08"
+            MAX_DATES="15"
+            TOPN="3"
+            DEEP_LIMIT="3"
+            BASE_LIMIT="3"
+            PENDING_USED="0"
+          fi
+
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$MODE" = "backtest" ]; then
+            echo "⚠️ 非手动触发不允许 backtest，已强制改为 daily。"
+            MODE="daily"
           fi
 
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
           echo "BT_START=$START" >> "$GITHUB_ENV"
           echo "BT_END=$END" >> "$GITHUB_ENV"
           echo "BT_MAX_DATES=$MAX_DATES" >> "$GITHUB_ENV"
+          echo "BT_TOPN=$TOPN" >> "$GITHUB_ENV"
+          echo "BT_DEEP_LIMIT=$DEEP_LIMIT" >> "$GITHUB_ENV"
           echo "BT_BASE_LIMIT=$BASE_LIMIT" >> "$GITHUB_ENV"
           echo "PENDING_FILE_USED=$PENDING_USED" >> "$GITHUB_ENV"
 
@@ -233,6 +244,8 @@ jobs:
           echo "回测开始：$START"
           echo "回测结束：$END"
           echo "最多交易日：$MAX_DATES"
+          echo "每日TopN：$TOPN"
+          echo "深度评分数量：$DEEP_LIMIT"
           echo "基础入深度数量：$BASE_LIMIT"
 
       - name: ⑤ 尝试下载K线验收产物
@@ -295,31 +308,38 @@ jobs:
             echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
             echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
 
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              echo "本次是手动 daily/backtest，缓存不足，准备保存 pending 请求并自动启动缓存任务。"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$RUN_MODE" = "daily" ]; then
+              echo "本次是手动 daily，缓存不足，准备保存 pending 请求并自动启动缓存任务。"
               echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
-            else
+            elif [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "本次是定时 daily，但缓存不足，停止；请先跑K线缓存任务。"
+              exit 1
+            elif [ "${{ github.event_name }}" = "workflow_run" ]; then
               echo "本次是验收后自动触发，但仍然没有拿到缓存，停止。"
+              exit 1
+            elif [ "$RUN_MODE" = "backtest" ]; then
+              echo "手动 backtest 缓存不足：为避免误触发超时回测，不自动保存 pending backtest。"
+              echo "请先手动运行K线缓存任务，缓存完成后再手动运行 backtest。"
+              exit 1
+            else
+              echo "缓存不足，停止。"
               exit 1
             fi
           fi
 
-      - name: ⑧ 没缓存时保存 pending 请求
-        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+      - name: ⑧ 没缓存时保存 pending daily 请求
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
         shell: bash
         run: |
-          echo "保存 pending 请求：$PENDING_REQUEST_FILE"
+          echo "保存 pending daily 请求：$PENDING_REQUEST_FILE"
           mkdir -p .github
 
           python - <<PY
           import json, os
           data = {
-              "mode": os.environ.get("RUN_MODE", "daily"),
-              "start": os.environ.get("BT_START", "2022-04-08"),
-              "end": os.environ.get("BT_END", "2023-04-08"),
-              "max_dates": os.environ.get("BT_MAX_DATES", ""),
-              "base_limit": os.environ.get("BT_BASE_LIMIT", ""),
-              "created_by": "stock_alert_workflow",
+              "mode": "daily",
+              "created_by": "stock_alert_workflow_v25_5",
+              "note": "workflow_run 会强制 daily，不会继承 backtest。",
           }
           with open(os.environ["PENDING_REQUEST_FILE"], "w", encoding="utf-8") as f:
               json.dump(data, f, ensure_ascii=False, indent=2)
@@ -331,28 +351,28 @@ jobs:
           git add "$PENDING_REQUEST_FILE"
 
           if git diff --cached --quiet; then
-            echo "pending 请求没有变化，不需要提交。"
+            echo "pending daily 请求没有变化，不需要提交。"
           else
-            git commit -m "保存一号员工待执行请求"
+            git commit -m "保存一号员工daily待执行请求"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push
           fi
 
       - name: ⑨ 没缓存时自动启动K线缓存任务
-        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
         shell: bash
         run: |
           echo "准备自动启动：A Stock Full Kline Cache Auto Backfill"
           gh workflow run "A Stock Full Kline Cache Auto Backfill" --ref "$GITHUB_REF_NAME"
           echo "✅ 已启动K线缓存任务。"
-          echo "本次一号员工先结束；缓存完成、验收成功后，会自动继续执行刚才的 $RUN_MODE。"
+          echo "本次一号员工先结束；缓存完成、验收成功后，会自动以 daily 模式继续执行。"
 
       - name: ⑩ 没缓存时结束当前运行
-        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'selfcheck' }}
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
         shell: bash
         run: |
           echo "当前没有可用K线缓存，已自动启动缓存任务。"
-          echo "等待缓存完成后，一号员工会被验收任务自动触发。"
+          echo "等待缓存完成后，一号员工会被验收任务自动触发，并强制 daily。"
           exit 0
 
       - name: ⑪ 显示最近的K线缓存文件
@@ -425,6 +445,7 @@ jobs:
           echo "股票池AkShare备用开关：$STOCK_LIST_FALLBACK_AKSHARE"
           echo "Telegram开关：$ENABLE_TELEGRAM"
           echo "pending文件是否使用：$PENDING_FILE_USED"
+          echo "压缩回测参数：max_dates=$BT_MAX_DATES topn=$BT_TOPN deep_limit=$BT_DEEP_LIMIT base_limit=$BT_BASE_LIMIT"
 
           if [ "$ENABLE_TELEGRAM" = "1" ] && [ -z "$TELEGRAM_TOKEN" ]; then
             echo "⚠️ Telegram Token 为空，模型可运行，但可能无法推送。"
@@ -444,34 +465,27 @@ jobs:
             python "$MODEL_FILE" --mode daily --self-check
 
           elif [ "$RUN_MODE" = "backtest" ]; then
-            CMD="python \"$MODEL_FILE\" --mode backtest --start ${BT_START:-2022-04-08} --end ${BT_END:-2023-04-08}"
-
-            if [ -n "$BT_MAX_DATES" ]; then
-              CMD="$CMD --max-dates $BT_MAX_DATES"
-            fi
-
-            if [ -n "$BT_BASE_LIMIT" ]; then
-              CMD="$CMD --base-limit $BT_BASE_LIMIT"
-            fi
-
+            echo "启动压缩回测：只回测最多${BT_MAX_DATES:-15}个交易日，每日最终Top${BT_TOPN:-3}。"
+            CMD="python \"$MODEL_FILE\" --mode backtest --start ${BT_START:-2022-04-08} --end ${BT_END:-2023-04-08} --max-dates ${BT_MAX_DATES:-15} --topn ${BT_TOPN:-3} --deep-limit ${BT_DEEP_LIMIT:-3} --base-limit ${BT_BASE_LIMIT:-3}"
             echo "$CMD"
             eval "$CMD"
 
           else
+            echo "启动每日选股：固定 daily，允许 Telegram 推送。"
             python "$MODEL_FILE" --mode daily
           fi
 
-      - name: ⑱ 清理已完成的 pending 请求
-        if: ${{ success() && env.PENDING_FILE_USED == '1' }}
+      - name: ⑱ 清理历史 pending 请求
+        if: ${{ success() && github.event_name == 'workflow_run' }}
         shell: bash
         run: |
-          echo "本次 pending 请求已经执行完成，准备清理：$PENDING_REQUEST_FILE"
+          echo "workflow_run 已强制 daily，本次运行完成后清理可能遗留的 pending 请求：$PENDING_REQUEST_FILE"
 
           if [ -f "$PENDING_REQUEST_FILE" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git rm "$PENDING_REQUEST_FILE"
-            git commit -m "清理一号员工待执行请求" || true
+            git commit -m "清理一号员工历史待执行请求" || true
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push || true
           else
