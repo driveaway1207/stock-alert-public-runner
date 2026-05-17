@@ -1,4 +1,4 @@
-name: 破界战法2.2.2年季候选池评分制
+name: 破界战法2.2.3年线最低有效上影线共振
 
 on:
   workflow_dispatch:
@@ -27,6 +27,10 @@ on:
         options:
           - "true"
           - "false"
+      expected_kline_date:
+        description: "期望K线最新日期 YYYY-MM-DD；留空则自动用缓存众数+北京时间工作日保护"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -75,6 +79,7 @@ jobs:
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '20' }}
+      POJIE_EXPECTED_KLINE_DATE: ${{ github.event.inputs.expected_kline_date || '' }}
 
     steps:
       - name: 下载仓库代码
@@ -271,6 +276,7 @@ jobs:
           echo "最低分：$破界_最低分"
           echo "最多股票数量：$MAX_STOCKS"
           echo "输出数量：$RESULT_LIMIT"
+          echo "期望K线最新日期：${POJIE_EXPECTED_KLINE_DATE:-自动识别}"
           echo "K线目录：$FULL_HISTORY_CACHE_DIR"
           echo "是否已恢复K线缓存：$HAS_KLINE_CACHE"
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
