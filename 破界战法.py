@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版"
+MODEL_VERSION = "破界战法2.2.3｜年线最低有效上影线共振-今日突破硬过滤版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -1996,7 +1996,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
 # ========================= V2.2.2 年季候选池评分制 + 今日触发硬过滤补丁 =========================
 # 说明：本段只覆盖“核心线候选池、评分、触发、报告字段”。不改缓存读取、股票池、并行框架、artifact保存。
 
-MODEL_VERSION = "破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版"
+MODEL_VERSION = "破界战法2.2.3｜年线最低有效上影线共振-今日突破硬过滤版"
 
 V22_ENTITY_NEAR_PCT = 0.03          # 年/季实体顶贴近阈值：3%
 V22_MAXVOL_SNAP_PCT = 0.003        # 最大量实体扫边/归边：0.3%
@@ -2203,11 +2203,14 @@ def _v222_line_quality_on_period(df: pd.DataFrame, line: float, period: str, anc
             else:
                 weak += 1
         if _v22_in_body(line, row):
+            # 年线核心压力线特殊口径：阴线/十字星实体被穿过不作为硬切割；
+            # 阳线实体仍然保护，尤其最大量阳K、前三大量阳K不能被切断。
+            kt_i = _v22_k_type(df, int(i), row)
+            allow_bear_or_doji_body = (period == 'Y' and kt_i in ['bear', 'doji', 'fake_bear_bull'])
             allow_anchor_bear_or_doji = False
             if anchor_idx is not None and i == anchor_idx:
-                kt = _v22_k_type(df, int(i), row)
-                allow_anchor_bear_or_doji = kt in ['bear', 'doji', 'fake_bear_bull']
-            if not allow_anchor_bear_or_doji:
+                allow_anchor_bear_or_doji = kt_i in ['bear', 'doji', 'fake_bear_bull']
+            if not (allow_bear_or_doji_body or allow_anchor_bear_or_doji):
                 cut_count += 1
                 cut_indices.append(int(i))
                 if i in top3:
@@ -2235,6 +2238,12 @@ def _v222_line_quality_on_period(df: pd.DataFrame, line: float, period: str, anc
 
 def _v222_anchor_point_score(period: str, rank_no: int, ktype: str, point_kind: str) -> float:
     is_year = period == 'Y'
+    # “最低有效上影线高点”是年线最大量K上影区里最关键的共振生成点：
+    # 它不是机械实顶，而是在不切断年线阳实体前提下，被最多上影线穿过/触碰的最低门槛。
+    if point_kind == 'lowest_effective_shadow_high':
+        return 28 if is_year else 20
+    if point_kind == 'external_high_in_anchor_zone':
+        return 20 if is_year else 14
     if ktype in ['bear', 'fake_bear_bull']:
         if point_kind == 'high':
             base = 30 if is_year else 22
@@ -2244,9 +2253,9 @@ def _v222_anchor_point_score(period: str, rank_no: int, ktype: str, point_kind: 
             return 24 if is_year else 17
         return 15 if is_year else 10
     if ktype == 'bull':
-        if point_kind in ['high', 'body_top']:
+        if point_kind == 'high':
             return 30 if is_year else 22
-        if point_kind == 'upper_mid':
+        if point_kind in ['body_top', 'upper_mid']:
             return 24 if is_year else 17
         return 14 if is_year else 10
     # 十字星/小实体：优先高点/上影，其次实顶。
@@ -2312,6 +2321,73 @@ def _v222_score_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
     return cand
 
 
+
+
+def _v223_cuts_year_bull_body(df: pd.DataFrame, line: float) -> bool:
+    """年线最低有效上影线候选：不能切断任何年线阳K实体；阴线/十字星实体例外。"""
+    if df is None or df.empty or line <= 0:
+        return True
+    for i, row in df.iterrows():
+        if not _v22_in_body(line, row):
+            continue
+        kt = _v22_k_type(df, int(i), row)
+        if kt == 'bull':
+            return True
+    return False
+
+
+def _v223_shadow_cross_count(df: pd.DataFrame, line: float) -> int:
+    if df is None or df.empty or line <= 0:
+        return 0
+    cnt = 0
+    for _, row in df.iterrows():
+        if _v22_in_upper_shadow(line, row):
+            cnt += 1
+    return int(cnt)
+
+
+def _v223_lowest_effective_shadow_high(df: pd.DataFrame, anchor_row: pd.Series, period: str) -> Tuple[Optional[float], Dict[str, Any]]:
+    """
+    在最大量/次大量K的上影区间内，寻找“最低有效上影线高点”：
+    1）候选价必须落在 anchor body_top ~ anchor high 之间；
+    2）年线候选不能切断任何阳K实体（阴K/十字星实体例外）；
+    3）统计每个候选价能穿过/触碰多少根上影线；
+    4）取共振数量最多的候选群；若并列，取最低的有效上影线高点。
+    """
+    diag = {'reason': '', 'best_shadow_count': 0, 'candidate_count': 0}
+    if df is None or df.empty:
+        diag['reason'] = 'empty_df'; return None, diag
+    body_top = _v22_body_top(anchor_row)
+    high = safe_float(anchor_row.get('high'))
+    if high <= body_top * 1.003 or body_top <= 0:
+        diag['reason'] = 'anchor_no_upper_shadow'; return None, diag
+    lowside = body_top
+    raw = []
+    # 只使用年/季K自身上影高点作为候选，不做粗暴价格簇。
+    for _, r in df.iterrows():
+        h = safe_float(r.get('high'))
+        if lowside < h <= high * 1.000001:
+            raw.append(h)
+    raw = sorted(set(round(float(x), 6) for x in raw if x > 0))
+    diag['candidate_count'] = len(raw)
+    scored = []
+    for p in raw:
+        if period == 'Y' and _v223_cuts_year_bull_body(df, p):
+            continue
+        # 季线也不鼓励切实体，交给后续评分/淘汰；这里不提前过滤。
+        cnt = _v223_shadow_cross_count(df, p)
+        if cnt <= 0:
+            continue
+        scored.append((cnt, p))
+    if not scored:
+        diag['reason'] = 'no_effective_shadow_high'; return None, diag
+    max_cnt = max(c for c, _ in scored)
+    # 关键：共振数量最多的一组里取最低有效上影线高点，例如 10.03/10.21/10.30 都有效时取10.03。
+    best = min(p for c, p in scored if c == max_cnt)
+    diag['best_shadow_count'] = int(max_cnt)
+    diag['reason'] = 'ok'
+    return float(best), diag
+
 def _v222_core_candidates_for_period(daily: pd.DataFrame, period: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pdf = _v22_period_df(daily, period, completed_only=True)
     diag = {'period': period, 'reason': '', 'candidates': [], 'anchors': []}
@@ -2328,18 +2404,20 @@ def _v222_core_candidates_for_period(daily: pd.DataFrame, period: str) -> Tuple[
         upper_mid = (body_top + high) / 2 if high > body_top else body_top
         diag['anchors'].append({'rank': rank_no, 'idx': int(idx), 'date': str(row.get('date')), 'type': kt, 'high': high, 'body_top': body_top, 'volume': safe_float(row.get('volume'))})
         raw_points = []
-        # 最大量/次大量K自身核心点：阴量K高点权重最高，上影二分之一和实顶第二。
+        # 最大量/次大量K自身核心点：高点、实顶、上影中位都入池，但不能机械只取实顶。
         raw_points.append((high, 'high'))
         raw_points.append((body_top, 'body_top'))
         if high > body_top * 1.003:
             raw_points.append((upper_mid, 'upper_mid'))
-            # 候选还要覆盖落在最大量K上影/实体供应区内的其他K高点，避免漏掉“最低有效上影线”。
-            if kt == 'bull':
-                lowside = body_top * 0.997
-            else:
-                lowside = body_bottom * 0.997
+            # 年线/季线最大量K上影供应区内的“最低有效上影线高点”。
+            # 这是 10.03 这类核心压力线的生成入口。
+            low_shadow, low_shadow_diag = _v223_lowest_effective_shadow_high(pdf, row, period)
+            if low_shadow and low_shadow > 0:
+                raw_points.append((low_shadow, 'lowest_effective_shadow_high'))
+            # 同时保留所有落在 anchor 上影区间内的年/季K高点，让评分体系比较。
+            lowside = body_top * 0.999
             for h in pdf['high'].astype(float).tolist():
-                if lowside <= h <= high * 1.003:
+                if lowside < h <= high * 1.000001:
                     raw_points.append((h, 'external_high_in_anchor_zone'))
         levels = []
         for lv, pk in raw_points:
@@ -2585,6 +2663,47 @@ def _v22_aux_trigger(d: pd.DataFrame, aux: Optional[Dict[str, Any]], symbol: str
     return {'effective': False, 'event': None, 'level': None, 'score': 0, 'reasons': ['辅助线不是最新日涨停级突破']}
 
 
+
+
+def _v223_previous_weekday_bj() -> str:
+    """不接交易日历时的保守目标日期：北京时间当前日的前一个工作日/当日工作日。
+    用于防止缓存众数落在明显旧日期还继续正式推荐；节假日可用 POJIE_EXPECTED_KLINE_DATE 覆盖。
+    """
+    try:
+        bj_now = datetime.utcnow() + timedelta(hours=8)
+        d = bj_now.date()
+        # 如果是周六/周日，回退到周五。
+        while d.weekday() >= 5:
+            d = d - timedelta(days=1)
+        return str(d)
+    except Exception:
+        return ''
+
+
+def _v223_resolve_effective_expected_date(stock_list: pd.DataFrame) -> str:
+    manual = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip()
+    if manual:
+        os.environ['POJIE_MARKET_LATEST_DATE'] = manual
+        return manual
+    market_latest = _v222_detect_market_latest_date_from_cache(stock_list)
+    calendar_latest = _v223_previous_weekday_bj()
+    chosen = market_latest
+    try:
+        if market_latest and calendar_latest and pd.to_datetime(market_latest) < pd.to_datetime(calendar_latest):
+            # 缓存明显滞后时，不再拿旧日期正式推荐；设置到日历目标日，让旧K线全部被硬过滤。
+            chosen = calendar_latest
+            print(f"破界：缓存众数日期={market_latest}，按北京时间工作日推断最新应为{calendar_latest}；缓存疑似未更新，本次正式候选必须等于{calendar_latest}。")
+        elif market_latest:
+            print(f"破界：全市场缓存最新交易日(众数)={market_latest}；正式候选必须等于该日。")
+        elif calendar_latest:
+            chosen = calendar_latest
+            print(f"破界：未识别缓存众数日期，按北京时间工作日推断最新应为{calendar_latest}；正式候选必须等于该日。")
+    except Exception:
+        chosen = market_latest or calendar_latest
+    if chosen:
+        os.environ['POJIE_MARKET_LATEST_DATE'] = chosen
+    return chosen or ''
+
 def _v222_detect_market_latest_date_from_cache(stock_list: pd.DataFrame, sample_limit: int = 2600) -> str:
     dates = []
     rows = stock_list.head(sample_limit).to_dict('records') if stock_list is not None else []
@@ -2682,7 +2801,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     lines = []
     valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
     not_selected = max(0, valid_scanned - len(results))
-    lines.append('【破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版】')
+    lines.append('【破界战法2.2.3｜年线最低有效上影线共振-今日突破硬过滤版】')
     lines.append(f'生成时间：{now_bj()}')
     expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip() or os.environ.get('POJIE_MARKET_LATEST_DATE', '').strip()
     if expected:
@@ -2690,7 +2809,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     else:
         lines.append('K线日期口径：未识别市场最新日期；建议检查缓存或设置 POJIE_EXPECTED_KLINE_DATE。')
     lines.append(f'扫描：{scanned}只，K线有效：{valid_scanned}只，入选：{len(results)}只，未入选：{not_selected}只，无K线/数据不足：{no_kline}只，异常失败：{failed}只')
-    lines.append('第一核心线口径：年线/季线同时生成候选并评分；年线权重大但低共振兜底线折扣；实体切割按规则扣分/淘汰；今日推荐只认最新日突破，不做历史突破回踩战法。')
+    lines.append('第一核心线口径：年线/季线同时生成候选并评分；年线最大量K上影区支持“最低有效上影线高点”候选；年线权重大但低共振兜底线折扣；今日推荐只认最新日突破，不做历史突破回踩战法。')
     lines.append('')
     if not results:
         lines.append('今日暂无破界候选。')
@@ -2765,8 +2884,7 @@ def main():
     print("破界战法2.0：K线模式=只读缓存；缓存命中不联网；缓存缺失直接跳过；BaoStock/AkShare默认禁用。")
     print(f"破界战法2.0：策略档位={POJIE_STRATEGY_PROFILE}，最低核心线分={POJIE_MIN_CORELINE_SCORE}，观察候选输出={POJIE_OUTPUT_OBSERVATION}")
     print(f"破界：POJIE_REMOTE_ON_CACHE_MISS={os.environ.get('POJIE_REMOTE_ON_CACHE_MISS', '1')}，POJIE_ALLOW_AKSHARE_KLINE={os.environ.get('POJIE_ALLOW_AKSHARE_KLINE', '0')}，KLINE_FALLBACK_AKSHARE={os.environ.get('KLINE_FALLBACK_AKSHARE', '0')}")
-    print(f"破界：最终扫描股票池数量={len(stock_list)}")
-    print(stock_list.head(20).to_string(index=False))
+    print(f"破界：最终扫描股票池数量={len(stock_list)}（GitHub日志不展示股票明细）")
 
     results = []
     scanned = 0
@@ -2778,13 +2896,10 @@ def main():
     last_progress_ts = start
 
     rows = stock_list.to_dict("records")
-    if not os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip():
-        market_latest = _v222_detect_market_latest_date_from_cache(stock_list)
-        if market_latest:
-            os.environ["POJIE_MARKET_LATEST_DATE"] = market_latest
-            print(f"破界：全市场缓存最新交易日(众数)={market_latest}；正式候选必须等于该日。")
-        else:
-            print("破界：未能识别全市场缓存最新交易日，本次只按个股缓存最后日扫描。")
+    # 最新K线日期硬过滤：手动 POJIE_EXPECTED_KLINE_DATE 优先；否则用缓存众数+北京时间工作日保护。
+    effective_expected = _v223_resolve_effective_expected_date(stock_list)
+    if not effective_expected:
+        print("破界：未能识别有效最新交易日，本次不会放宽日期过滤。")
     use_parallel = POJIE_WORKERS > 1 and len(rows) >= POJIE_PARALLEL_MIN_STOCKS
 
     if use_parallel:
