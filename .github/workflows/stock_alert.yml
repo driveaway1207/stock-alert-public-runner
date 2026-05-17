@@ -306,24 +306,136 @@ jobs:
           if [ -d "K线缓存" ]; then
             echo "✅ 找到中文K线缓存文件夹：K线缓存"
             echo "FULL_HISTORY_CACHE_DIR=K线缓存" >> "$GITHUB_ENV"
+            CACHE_DIR="K线缓存"
             CSV_COUNT=$(find "K线缓存" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           elif [ -d "kline_cache" ]; then
             echo "✅ 找到旧英文K线缓存文件夹：kline_cache"
             echo "FULL_HISTORY_CACHE_DIR=kline_cache" >> "$GITHUB_ENV"
+            CACHE_DIR="kline_cache"
             CSV_COUNT=$(find "kline_cache" -name "*.csv" | wc -l)
             echo "K线缓存CSV数量：$CSV_COUNT"
 
           else
             echo "⚠️ 没找到 K线缓存 或 kline_cache。"
+            CACHE_DIR=""
             CSV_COUNT=0
           fi
 
           if [ "$CSV_COUNT" -ge 1000 ]; then
-            echo "✅ K线缓存可用。"
-            echo "HAS_KLINE_CACHE=1" >> "$GITHUB_ENV"
-            echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
+            echo "开始检查K线缓存最新日期，不再只看CSV数量..."
+
+            CACHE_DATE_REPORT=$(CACHE_DIR="$CACHE_DIR" python - <<'PY'
+          import os, csv
+          from pathlib import Path
+          from collections import Counter
+          from datetime import datetime, timedelta, timezone
+
+          cache_dir = Path(os.environ.get("CACHE_DIR", ""))
+          dates = []
+          samples = []
+
+          def normalize_date(x):
+              s = str(x).strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+              return s[:10]
+
+          if cache_dir.exists():
+              for f in cache_dir.rglob("*.csv"):
+                  try:
+                      with open(f, "r", encoding="utf-8-sig", newline="") as fh:
+                          rows = list(csv.reader(fh))
+                      if len(rows) < 2:
+                          continue
+                      header = rows[0]
+                      idx = 0
+                      for name in ("date", "日期", "trade_date", "交易日期"):
+                          if name in header:
+                              idx = header.index(name)
+                              break
+                      last = None
+                      for row in reversed(rows[1:]):
+                          if row and len(row) > idx and str(row[idx]).strip():
+                              last = normalize_date(row[idx])
+                              break
+                      if last:
+                          dates.append(last)
+                          if len(samples) < 8:
+                              samples.append((f.name, last))
+                  except Exception:
+                      pass
+
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ""
+
+          manual = (
+              os.environ.get("TARGET_TRADE_DATE", "").strip()
+              or os.environ.get("EXPECTED_KLINE_DATE", "").strip()
+              or os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
+          )
+          if manual:
+              expected = normalize_date(manual)
+              source = "手动指定"
+          else:
+              # 只做普通工作日倒推；节假日以K线验收任务为准。
+              now = datetime.now(timezone(timedelta(hours=8))).date()
+              d = now
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              expected = d.isoformat()
+              source = "北京时间工作日推断"
+
+          print(f"CACHE_MAJORITY_DATE={majority}")
+          print(f"EXPECTED_TRADE_DATE={expected}")
+          print(f"EXPECTED_DATE_SOURCE={source}")
+          print("CACHE_DATE_TOP=" + "; ".join(f"{d}:{n}" for d, n in c.most_common(8)))
+          print("CACHE_DATE_SAMPLES=" + "; ".join(f"{name}:{d}" for name, d in samples))
+          PY
+            )
+
+            echo "$CACHE_DATE_REPORT"
+            CACHE_MAJORITY_DATE=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^CACHE_MAJORITY_DATE=/{print $2}')
+            EXPECTED_TRADE_DATE=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^EXPECTED_TRADE_DATE=/{print $2}')
+            CACHE_DATE_TOP=$(echo "$CACHE_DATE_REPORT" | sed -n 's/^CACHE_DATE_TOP=//p')
+
+            echo "CACHE_MAJORITY_DATE=$CACHE_MAJORITY_DATE" >> "$GITHUB_ENV"
+            echo "EXPECTED_TRADE_DATE=$EXPECTED_TRADE_DATE" >> "$GITHUB_ENV"
+            echo "缓存最后日期Top：$CACHE_DATE_TOP"
+            echo "缓存众数日期：$CACHE_MAJORITY_DATE"
+            echo "目标交易日：$EXPECTED_TRADE_DATE"
+
+            if [ -n "$EXPECTED_TRADE_DATE" ] && [ -n "$CACHE_MAJORITY_DATE" ] && [ "$CACHE_MAJORITY_DATE" != "$EXPECTED_TRADE_DATE" ]; then
+              echo "⚠️ K线缓存数量够，但日期不是目标交易日：缓存众数=$CACHE_MAJORITY_DATE，目标=$EXPECTED_TRADE_DATE。"
+              echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
+
+              if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$RUN_MODE" = "daily" ]; then
+                echo "本次是手动 daily，缓存过期，准备保存 pending 请求并自动启动缓存任务。"
+                echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
+              elif [ "${{ github.event_name }}" = "schedule" ]; then
+                echo "本次是定时 daily，缓存过期，准备自动启动缓存任务。"
+                echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
+              elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+                echo "本次是验收后自动触发，但缓存日期仍未达到目标，停止，避免使用旧K线。"
+                exit 1
+              elif [ "$RUN_MODE" = "backtest" ]; then
+                echo "手动 backtest 检测到缓存过期：为保证回测口径稳定，不自动补拉。"
+                echo "请先运行K线缓存任务并验收通过后，再手动运行 backtest。"
+                exit 1
+              else
+                echo "缓存过期，停止。"
+                exit 1
+              fi
+            else
+              echo "✅ K线缓存数量和日期均可用。"
+              echo "HAS_KLINE_CACHE=1" >> "$GITHUB_ENV"
+              echo "SHOULD_RUN_MODEL=1" >> "$GITHUB_ENV"
+            fi
           else
             echo "⚠️ K线缓存不可用或数量过少：$CSV_COUNT"
             echo "HAS_KLINE_CACHE=0" >> "$GITHUB_ENV"
@@ -332,8 +444,8 @@ jobs:
               echo "本次是手动 daily，缓存不足，准备保存 pending 请求并自动启动缓存任务。"
               echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
             elif [ "${{ github.event_name }}" = "schedule" ]; then
-              echo "本次是定时 daily，但缓存不足，停止；请先跑K线缓存任务。"
-              exit 1
+              echo "本次是定时 daily，缓存不足，准备自动启动缓存任务。"
+              echo "SHOULD_RUN_MODEL=0" >> "$GITHUB_ENV"
             elif [ "${{ github.event_name }}" = "workflow_run" ]; then
               echo "本次是验收后自动触发，但仍然没有拿到缓存，停止。"
               exit 1
@@ -379,7 +491,7 @@ jobs:
           fi
 
       - name: ⑨ 没缓存时自动启动K线缓存任务
-        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && env.RUN_MODE == 'daily' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
         shell: bash
         run: |
           echo "准备自动启动：A Stock Full Kline Cache Auto Backfill"
@@ -388,10 +500,10 @@ jobs:
           echo "本次一号员工先结束；缓存完成、验收成功后，会自动以 daily 模式继续执行。"
 
       - name: ⑩ 没缓存时结束当前运行
-        if: ${{ env.SHOULD_RUN_MODEL == '0' && github.event_name == 'workflow_dispatch' && env.RUN_MODE == 'daily' }}
+        if: ${{ env.SHOULD_RUN_MODEL == '0' && env.RUN_MODE == 'daily' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
         shell: bash
         run: |
-          echo "当前没有可用K线缓存，已自动启动缓存任务。"
+          echo "当前没有可用或最新的K线缓存，已自动启动缓存任务。"
           echo "等待缓存完成后，一号员工会被验收任务自动触发，并强制 daily。"
           exit 0
 
