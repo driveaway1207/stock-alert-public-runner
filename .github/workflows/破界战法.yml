@@ -214,6 +214,26 @@ jobs:
             pojie-kline-cache-${{ github.ref_name }}-
             pojie-kline-cache-
 
+      - name: 安装Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            echo "发现 requirements.txt，先安装仓库依赖。"
+            pip install -r requirements.txt
+          fi
+          echo "补装破界战法必需依赖。"
+          pip install pandas numpy requests baostock openpyxl
+          python - <<'PY'
+          import pandas, numpy, requests, baostock
+          print('依赖验证通过：pandas / numpy / requests / baostock')
+          PY
+
       - name: 检查K线缓存状态
         shell: bash
         run: |
@@ -302,26 +322,6 @@ jobs:
               print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失处理由POJIE_REMOTE_ON_CACHE_MISS控制。')
           else:
               print('⚠️ 当前没有发现K线缓存；是否补拉由POJIE_REMOTE_ON_CACHE_MISS控制。')
-          PY
-
-      - name: 安装Python环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: 安装依赖
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            echo "发现 requirements.txt，先安装仓库依赖。"
-            pip install -r requirements.txt
-          fi
-          echo "补装破界战法必需依赖。"
-          pip install pandas numpy requests baostock openpyxl
-          python - <<'PY'
-          import pandas, numpy, requests, baostock
-          print('依赖验证通过：pandas / numpy / requests / baostock')
           PY
 
       - name: 自动补拉并校验K线缓存日期
