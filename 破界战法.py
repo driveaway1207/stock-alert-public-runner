@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界战法2.2.1｜第一核心线季线主导精细化版-频率兼容修复"
+MODEL_VERSION = "破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -1992,16 +1992,18 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     return "\n".join(lines)
 
 
-# ========================= V2.2.1 第一核心压力线季线主导精细化补丁 =========================
-# 说明：本段只覆盖“找线、评线、触发、报告字段”。不改缓存、Workflow、股票池、并行扫描、Telegram发送框架。
+
+# ========================= V2.2.2 年季候选池评分制 + 今日触发硬过滤补丁 =========================
+# 说明：本段只覆盖“核心线候选池、评分、触发、报告字段”。不改缓存读取、股票池、并行框架、artifact保存。
+
+MODEL_VERSION = "破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版"
 
 V22_ENTITY_NEAR_PCT = 0.03          # 年/季实体顶贴近阈值：3%
 V22_MAXVOL_SNAP_PCT = 0.003        # 最大量实体扫边/归边：0.3%
 V22_NEAR_CLUSTER_PCT = 0.10        # 近价合并阈值：10%
 V22_AUX_FIRST_WINDOW = 200         # 辅助线200日内第一次涨停级突破
 V22_CORE_GAP_LOOKBACK = 500        # 第一核心线500日第一次跳空越线诊断
-V22_PULLBACK_MAX_DAYS = 8          # 涨停突破后8日内允许回踩确认
-V22_STRONG_HOLD_DAYS = 5           # 突破后1-5日强承接
+V22_SELECT_MARGIN = 8.0            # 年/季候选第一名与第二名分差阈值
 
 
 def _v22_body_top(row) -> float:
@@ -2033,7 +2035,7 @@ def _v22_body_ratio(row) -> float:
 def _v22_k_type(df: pd.DataFrame, idx: int, row) -> str:
     body_ratio = _v22_body_ratio(row)
     open_, close = safe_float(row.get('open')), safe_float(row.get('close'))
-    preclose = safe_float(df.iloc[idx-1].get('close')) if idx > 0 else open_
+    preclose = safe_float(df.iloc[idx-1].get('close')) if idx > 0 and len(df) > 1 else open_
     if body_ratio < 0.25:
         return 'doji'
     if close > open_:
@@ -2075,12 +2077,28 @@ def _v22_snap_to_entity(line: float, row) -> float:
 
 
 def _v22_resample_rule(period: str) -> str:
-    # pandas 2.2+ 已弃用/移除 Q、Y、M 的旧偏移别名；统一使用显式期末别名。
-    # Q -> QE：季度末；Y -> YE：年末；M -> ME：月末。
     return {'Q': 'QE', 'Y': 'YE', 'M': 'ME', 'W': 'W-FRI'}.get(str(period), 'D')
 
 
-def _v22_period_df(daily: pd.DataFrame, period: str) -> pd.DataFrame:
+def _v222_is_period_complete(last_date: Any, period: str) -> bool:
+    try:
+        dt = pd.to_datetime(last_date)
+    except Exception:
+        return False
+    today = pd.Timestamp(datetime.utcnow().date())
+    # 回测/历史缓存场景：如果最后日期明显早于当前自然周期，可认为完整；当前年/季/月/周则未完整。
+    if period == 'Y':
+        return dt.year < today.year
+    if period == 'Q':
+        return (dt.year, (dt.month - 1) // 3) < (today.year, (today.month - 1) // 3)
+    if period == 'M':
+        return (dt.year, dt.month) < (today.year, today.month)
+    if period == 'W':
+        return dt.normalize() < (today - pd.Timedelta(days=today.weekday())).normalize()
+    return True
+
+
+def _v22_period_df(daily: pd.DataFrame, period: str, completed_only: bool = False) -> pd.DataFrame:
     rule = _v22_resample_rule(period)
     if period == 'D':
         out = force_kline_schema(daily).copy()
@@ -2090,11 +2108,18 @@ def _v22_period_df(daily: pd.DataFrame, period: str) -> pd.DataFrame:
     if out is None or out.empty:
         return pd.DataFrame()
     out = out.copy().reset_index(drop=True)
+    if completed_only and period in ('Y', 'Q', 'M', 'W') and len(out) >= 2:
+        # 年线/季线最大量锚点不能用未完成K线；辅助线涉及最大量时也同样剔除未完成周期。
+        daily_last = pd.to_datetime(daily['date'].iloc[-1]) if 'date' in daily.columns else None
+        if not _v222_is_period_complete(daily_last, period):
+            out = out.iloc[:-1].copy()
+    if out is None or out.empty:
+        return pd.DataFrame()
     out['body_top'] = out[['open', 'close']].max(axis=1)
     out['body_bottom'] = out[['open', 'close']].min(axis=1)
     out['close_pos'] = ((out['close'] - out['low']) / (out['high'] - out['low']).replace(0, np.nan)).fillna(0.5)
     out['body_ratio'] = ((out['close'] - out['open']).abs() / (out['high'] - out['low']).replace(0, np.nan)).fillna(0.0)
-    return out
+    return out.reset_index(drop=True)
 
 
 def _v22_volume_rank_indices(df: pd.DataFrame, topn: int = 3) -> set:
@@ -2103,53 +2128,93 @@ def _v22_volume_rank_indices(df: pd.DataFrame, topn: int = 3) -> set:
     return set(df['volume'].fillna(0).sort_values(ascending=False).head(topn).index.tolist())
 
 
-def _v22_line_quality_on_period(df: pd.DataFrame, line: float, period: str, anchor_idx: Optional[int] = None, anchor_mode: str = 'quarter') -> Dict[str, Any]:
-    """对一条候选线做精度校验：共振、强共振、切实体、切前三大量实体。"""
+def _v222_hidden_intermediate_score(df: pd.DataFrame, line: float, period: str) -> Dict[str, Any]:
+    """隐形下跌/上涨中继简化识别：只用于候选线加分，不作为单独触发。"""
+    if df is None or len(df) < 8 or line <= 0:
+        return {'score': 0, 'count': 0, 'reasons': []}
+    max_platform = 5 if period in ('Y','Q') else 8
+    reasons = []
+    score = 0
+    count = 0
+    highs = df['high'].astype(float).values
+    lows = df['low'].astype(float).values
+    closes = df['close'].astype(float).values
+    opens = df['open'].astype(float).values
+    n = len(df)
+    for s in range(2, n - 3):
+        for e in range(s + 1, min(n - 2, s + max_platform)):
+            seg_high = float(max(highs[s:e+1]))
+            seg_low = float(min(lows[s:e+1]))
+            if seg_low <= 0:
+                continue
+            if seg_high / seg_low - 1 > 0.65:  # 不是“中继”，波动太散
+                continue
+            pre_high = float(max(highs[max(0, s-3):s]))
+            pre_low = float(min(lows[max(0, s-3):s]))
+            post_low = float(min(lows[e+1:min(n, e+4)]))
+            post_high = float(max(highs[e+1:min(n, e+4)]))
+            platform_top = max(float(max(np.maximum(opens[s:e+1], closes[s:e+1]))), float(max(closes[s:e+1])))
+            platform_bottom = min(float(min(np.minimum(opens[s:e+1], closes[s:e+1]))), float(min(closes[s:e+1])))
+            # 隐形下跌中继：之前有下跌、平台反抽失败、之后跌破平台低点。
+            pre_down = pre_high > 0 and seg_high < pre_high * 0.95 and pre_high / max(seg_low, 1e-9) - 1 >= 0.25
+            fail_down = post_low < seg_low * 0.90
+            line_hits_top = _v22_near(line, platform_top, V22_ENTITY_NEAR_PCT) or (platform_top < line <= seg_high * 1.0001)
+            if pre_down and fail_down and line_hits_top:
+                add = 10
+                if post_low < seg_low * 0.85:
+                    add += 3
+                if _v22_near(line, platform_top, 0.015):
+                    add += 2
+                score += min(15, add)
+                count += 1
+                reasons.append(f'{period}隐形下跌中继共振{s}-{e}')
+            # 隐形上涨中继：主要给辅助线/支撑确认，压力线只轻度加分。
+            pre_up = pre_low > 0 and seg_low > pre_low * 1.05 and seg_high / pre_low - 1 >= 0.25
+            success_up = post_high > seg_high * 1.10
+            line_hits_pause_top = _v22_near(line, platform_top, V22_ENTITY_NEAR_PCT)
+            if pre_up and success_up and line_hits_pause_top:
+                score += 5
+                count += 1
+                reasons.append(f'{period}隐形上涨中继停顿共振{s}-{e}')
+    return {'score': int(min(20, score)), 'count': int(count), 'reasons': reasons[:4]}
+
+
+def _v222_line_quality_on_period(df: pd.DataFrame, line: float, period: str, anchor_idx: Optional[int] = None, anchor_kind: str = '') -> Dict[str, Any]:
     if df is None or df.empty or line <= 0:
         return {'valid': False, 'reason': 'empty_period'}
     top3 = _v22_volume_rank_indices(df, 3)
-    total = 0
-    strong = 0
-    weak = 0
-    shadow = 0
-    body_near = 0
-    close_near = 0
-    cut_count = 0
-    cut_top3 = 0
+    total = strong = weak = shadow = body_near = close_near = 0
+    cut_count = cut_top3 = 0
     cut_anchor = False
-    details = []
+    cut_indices = []
     for i, row in df.iterrows():
-        # 同一根K最多贡献一个共振点；若多个条件同时满足，记为强共振但数量仍为1。
         is_shadow = _v22_in_upper_shadow(line, row)
         is_body_top_near = _v22_near(line, _v22_body_top(row), V22_ENTITY_NEAR_PCT)
         is_close_top_near = _v22_near(line, safe_float(row.get('close')), V22_ENTITY_NEAR_PCT) and _v22_close_pos(row) >= 0.60
         is_anchor_snap = anchor_idx is not None and i == anchor_idx and _v22_near(line, _v22_body_top(row), V22_MAXVOL_SNAP_PCT)
-        if is_shadow:
-            shadow += 1
-        if is_body_top_near:
-            body_near += 1
-        if is_close_top_near:
-            close_near += 1
-        if is_shadow or is_body_top_near or is_close_top_near or is_anchor_snap:
+        is_any = is_shadow or is_body_top_near or is_close_top_near or is_anchor_snap
+        if is_shadow: shadow += 1
+        if is_body_top_near: body_near += 1
+        if is_close_top_near: close_near += 1
+        if is_any:
             total += 1
             if is_shadow or is_body_top_near or is_close_top_near or is_anchor_snap:
                 strong += 1
             else:
                 weak += 1
-        # 切实体：年线一根实体都不能切；季线主要保护最大量阳K和前三大量K实体。
         if _v22_in_body(line, row):
-            # 最大量阴线/十字星允许穿过，但仍需其他上影线共振；阳线不允许。
             allow_anchor_bear_or_doji = False
             if anchor_idx is not None and i == anchor_idx:
                 kt = _v22_k_type(df, int(i), row)
                 allow_anchor_bear_or_doji = kt in ['bear', 'doji', 'fake_bear_bull']
             if not allow_anchor_bear_or_doji:
                 cut_count += 1
-                details.append(f"切实体{i}")
+                cut_indices.append(int(i))
                 if i in top3:
                     cut_top3 += 1
                 if anchor_idx is not None and i == anchor_idx:
                     cut_anchor = True
+    hidden = _v222_hidden_intermediate_score(df, line, period)
     return {
         'valid': True,
         'total_resonance': int(total),
@@ -2161,253 +2226,249 @@ def _v22_line_quality_on_period(df: pd.DataFrame, line: float, period: str, anch
         'cut_entity_count': int(cut_count),
         'cut_top3_entity': int(cut_top3),
         'cut_anchor_entity': bool(cut_anchor),
-        'details': details[:8],
+        'cut_indices': cut_indices[:8],
+        'hidden_intermediate_score': int(hidden.get('score', 0)),
+        'hidden_intermediate_count': int(hidden.get('count', 0)),
+        'hidden_intermediate_reasons': hidden.get('reasons', []),
     }
 
 
-def _v22_quarter_core_candidates(daily: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    qdf = _v22_period_df(daily, 'Q')
-    diag = {'period': 'Q', 'reason': '', 'anchor': None, 'candidates': []}
-    if qdf is None or len(qdf) < 8:
-        diag['reason'] = '季线样本不足'
-        return [], diag
-    max_idx = int(qdf['volume'].fillna(0).idxmax())
-    anchor = qdf.loc[max_idx]
-    anchor_type = _v22_k_type(qdf, max_idx, anchor)
-    diag['anchor'] = {'index': max_idx, 'date': str(anchor.get('date')), 'type': anchor_type, 'open': safe_float(anchor.get('open')), 'close': safe_float(anchor.get('close')), 'high': safe_float(anchor.get('high')), 'low': safe_float(anchor.get('low')), 'volume': safe_float(anchor.get('volume')), 'body_top': _v22_body_top(anchor)}
-    body_top = _v22_body_top(anchor)
-    high = safe_float(anchor.get('high'))
-    body_bottom = _v22_body_bottom(anchor)
-    raw_levels: List[float] = []
-    if anchor_type == 'bull':
-        # 阳线：必须围绕最大量K实顶/上影线；有上影线就在上影线里找，没上影线看实顶共振。
-        if high > body_top * 1.003:
-            raw_levels.extend([safe_float(x) for x in qdf['high'].tolist() if body_top * 0.997 <= safe_float(x) <= high * 1.003])
-            raw_levels.append(body_top)
-            raw_levels.append(high)
-        else:
-            raw_levels.append(body_top)
-    else:
-        # 阴线/十字星：允许在实体/上影范围内找，但必须跟其他上影线共振。
-        raw_levels.extend([safe_float(x) for x in qdf['high'].tolist() if body_bottom * 0.997 <= safe_float(x) <= high * 1.003])
-        raw_levels.extend([body_top, high])
-    # 去重，保留价格合理的候选。
-    levels = []
-    for lv in raw_levels:
-        if lv and lv > 0 and not any(_v22_near(lv, old, 0.002) for old in levels):
-            levels.append(lv)
-    out = []
-    for lv in levels:
-        lv = _v22_snap_to_entity(lv, anchor)
-        q = _v22_line_quality_on_period(qdf, lv, 'Q', anchor_idx=max_idx)
-        # 季线合格条件：有效共振>=3，强共振>=2；围绕最大量K；不能违规切关键实体。
-        if anchor_type == 'bull':
-            in_anchor_zone = (body_top * 0.997 <= lv <= max(high, body_top) * 1.003)
-            invalid_cut = q.get('cut_anchor_entity') or q.get('cut_top3_entity') > 0 or q.get('cut_entity_count') >= 2
-            enough = q.get('total_resonance', 0) >= 3 and q.get('strong_resonance', 0) >= 2
-        else:
-            in_anchor_zone = (body_bottom * 0.997 <= lv <= high * 1.003)
-            # 阴线/十字星允许穿过锚点实体，但其他上影线共振必须>2；其他前三大量实体仍保护。
-            invalid_cut = q.get('cut_top3_entity') > 0 and not _v22_in_body(lv, anchor)
-            enough = q.get('shadow_resonance', 0) >= 3 and q.get('strong_resonance', 0) >= 2
-        candidate = {
-            'center': float(lv), 'low': float(lv), 'high': float(lv), 'confirm_line': float(lv),
-            'level': 'S' if enough and not invalid_cut else 'B',
-            'score': 0.0,
-            'timeframes': ['Q'],
-            'role': 'first_coreline',
-            'source_kind': 'quarter_max_volume_anchor',
-            'sources': [f"季线最大量K{anchor_type}锚定：围绕实顶/上影线找第一核心线"],
-            'diagnostics': q,
-            'anchor_type': anchor_type,
-            'anchor_date': str(anchor.get('date')),
-            'valid_first_coreline': bool(in_anchor_zone and enough and not invalid_cut),
-            'why_rejected': []
-        }
-        if not in_anchor_zone:
-            candidate['why_rejected'].append('脱离季线最大量K实体/上影线范围')
-        if not enough:
-            candidate['why_rejected'].append('季线共振不足：需总共振>=3且强共振>=2')
-        if invalid_cut:
-            candidate['why_rejected'].append('违规切断季线关键实体/前三大量实体')
-        # 分数：共振为主，切实体重罚；同分时更靠近最大量K实顶优先。
-        dist_anchor_top = abs(lv / body_top - 1) if body_top > 0 else 9
-        score = 70 + q.get('total_resonance', 0) * 5 + q.get('strong_resonance', 0) * 4 + q.get('shadow_resonance', 0) * 2 - q.get('cut_entity_count', 0) * 18 - dist_anchor_top * 20
-        if candidate['valid_first_coreline']:
-            score += 10
-        candidate['score'] = float(max(0, min(100, score)))
-        out.append(candidate)
-    out = sorted(out, key=lambda c: (c.get('valid_first_coreline', False), c.get('diagnostics', {}).get('total_resonance', 0), c.get('diagnostics', {}).get('strong_resonance', 0), c.get('score', 0)), reverse=True)
-    diag['candidates'] = [{k: c.get(k) for k in ['center','score','valid_first_coreline','why_rejected','diagnostics','anchor_type']} for c in out[:10]]
-    return out, diag
+def _v222_anchor_point_score(period: str, rank_no: int, ktype: str, point_kind: str) -> float:
+    is_year = period == 'Y'
+    if ktype in ['bear', 'fake_bear_bull']:
+        if point_kind == 'high':
+            base = 30 if is_year else 22
+            extra = 10 if is_year else 6
+            return base + extra
+        if point_kind in ['upper_mid', 'body_top']:
+            return 24 if is_year else 17
+        return 15 if is_year else 10
+    if ktype == 'bull':
+        if point_kind in ['high', 'body_top']:
+            return 30 if is_year else 22
+        if point_kind == 'upper_mid':
+            return 24 if is_year else 17
+        return 14 if is_year else 10
+    # 十字星/小实体：优先高点/上影，其次实顶。
+    if point_kind == 'high':
+        return 28 if is_year else 20
+    if point_kind in ['upper_mid', 'body_top']:
+        return 24 if is_year else 17
+    return 14 if is_year else 10
 
 
-def _v22_year_fallback_candidates(daily: pd.DataFrame, current_price: float) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    ydf = _v22_period_df(daily, 'Y')
-    diag = {'period': 'Y', 'reason': '', 'candidates': []}
-    if ydf is None or len(ydf) < 2:
-        diag['reason'] = '年线样本不足'
+def _v222_score_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
+    period = cand.get('period')
+    q = cand.get('diagnostics', {}) or {}
+    is_year = period == 'Y'
+    period_base = 35 if is_year else 20
+    strong_w = 12 if is_year else 8
+    weak_w = 5 if is_year else 3
+    anchor_score = safe_float(cand.get('anchor_point_score'))
+    hidden = safe_float(q.get('hidden_intermediate_score'))
+    cut = int(q.get('cut_entity_count', 0) or 0)
+    cut_top3 = int(q.get('cut_top3_entity', 0) or 0)
+    cut_anchor = bool(q.get('cut_anchor_entity'))
+    anchor_type = cand.get('anchor_type', '')
+    hard_reject = False
+    reject_reasons = []
+    # 实体切割规则：切2根普通实体保留重扣，切3根/切前三大量/切最大量阳K直接淘汰。
+    if cut_top3 > 0:
+        hard_reject = True; reject_reasons.append('切断前三大量K实体')
+    if cut_anchor and anchor_type == 'bull':
+        hard_reject = True; reject_reasons.append('切断最大量阳K实体')
+    if cut >= 3:
+        hard_reject = True; reject_reasons.append('切断普通实体达到3根及以上')
+    if cut >= 2 and int(q.get('strong_resonance', 0)) < 2:
+        hard_reject = True; reject_reasons.append('切2根实体但强共振不足2')
+    cut_penalty = 0
+    if cut == 1:
+        cut_penalty = 8
+    elif cut == 2:
+        cut_penalty = 18
+    elif cut >= 3:
+        cut_penalty = 35
+    raw = period_base + strong_w * int(q.get('strong_resonance',0)) + weak_w * int(q.get('weak_resonance',0)) + anchor_score + hidden - cut_penalty
+    # 年线低共振兜底折扣：裸高点/裸实顶不能无脑压过高质量季线。
+    total_res = int(q.get('total_resonance', 0) or 0)
+    quality_coeff = 1.0
+    low_res = False
+    if is_year:
+        if total_res <= 0:
+            quality_coeff = 0.70; low_res = True
+        elif total_res == 1:
+            quality_coeff = 0.85; low_res = True
+        else:
+            quality_coeff = 1.0
+    final = raw * quality_coeff
+    if hard_reject:
+        final = min(final, 35)
+    cand['raw_score'] = round(float(raw), 2)
+    cand['score'] = round(float(max(0, min(160, final))), 2)
+    cand['quality_coeff'] = quality_coeff
+    cand['low_resonance_fallback'] = bool(low_res)
+    cand['valid_first_coreline'] = bool(not hard_reject and (period == 'Y' or (total_res >= 3 and int(q.get('strong_resonance',0)) >= 2)))
+    cand['why_rejected'] = reject_reasons + ([] if cand['valid_first_coreline'] else ['共振/实体切割未达第一核心线条件'])
+    return cand
+
+
+def _v222_core_candidates_for_period(daily: pd.DataFrame, period: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    pdf = _v22_period_df(daily, period, completed_only=True)
+    diag = {'period': period, 'reason': '', 'candidates': [], 'anchors': []}
+    if pdf is None or len(pdf) < (2 if period == 'Y' else 8):
+        diag['reason'] = f'{period}样本不足'
         return [], diag
-    ranks = ydf['volume'].fillna(0).sort_values(ascending=False).index.tolist()[:2]
+    topn = 2 if period == 'Y' else 3
+    ranks = pdf['volume'].fillna(0).sort_values(ascending=False).index.tolist()[:topn]
     out = []
     for rank_no, idx in enumerate(ranks, 1):
-        row = ydf.loc[idx]
-        kt = _v22_k_type(ydf, int(idx), row)
-        body_top = _v22_body_top(row)
-        high = safe_float(row.get('high'))
-        # 年线兜底：先看共振；没有共振也必须画历史最大量/第二大量实顶。
-        raw_levels = []
-        if kt == 'bull' and high > body_top * 1.003:
-            raw_levels.extend([safe_float(x) for x in ydf['high'].tolist() if body_top * 0.997 <= safe_float(x) <= high * 1.003])
-            raw_levels.append(body_top)
-        elif kt == 'bull':
-            raw_levels.append(body_top)
-        else:
-            raw_levels.append(body_top)
-            if high > body_top * 1.003:
-                raw_levels.append(high)
+        row = pdf.loc[idx]
+        kt = _v22_k_type(pdf, int(idx), row)
+        body_top, body_bottom, high = _v22_body_top(row), _v22_body_bottom(row), safe_float(row.get('high'))
+        upper_mid = (body_top + high) / 2 if high > body_top else body_top
+        diag['anchors'].append({'rank': rank_no, 'idx': int(idx), 'date': str(row.get('date')), 'type': kt, 'high': high, 'body_top': body_top, 'volume': safe_float(row.get('volume'))})
+        raw_points = []
+        # 最大量/次大量K自身核心点：阴量K高点权重最高，上影二分之一和实顶第二。
+        raw_points.append((high, 'high'))
+        raw_points.append((body_top, 'body_top'))
+        if high > body_top * 1.003:
+            raw_points.append((upper_mid, 'upper_mid'))
+            # 候选还要覆盖落在最大量K上影/实体供应区内的其他K高点，避免漏掉“最低有效上影线”。
+            if kt == 'bull':
+                lowside = body_top * 0.997
+            else:
+                lowside = body_bottom * 0.997
+            for h in pdf['high'].astype(float).tolist():
+                if lowside <= h <= high * 1.003:
+                    raw_points.append((h, 'external_high_in_anchor_zone'))
         levels = []
-        for lv in raw_levels:
-            if lv and lv > 0 and not any(_v22_near(lv, old, 0.002) for old in levels):
-                levels.append(lv)
-        best = None
-        for lv in levels:
+        for lv, pk in raw_points:
+            lv = safe_float(lv)
+            if lv <= 0:
+                continue
             lv = _v22_snap_to_entity(lv, row)
-            q = _v22_line_quality_on_period(ydf, lv, 'Y', anchor_idx=int(idx))
-            # 年线：原则上不切任何实体；但阴线/十字星兜底用实顶，不额外惩罚。
-            cuts_any = q.get('cut_entity_count', 0) > 0
-            if kt in ['bear', 'doji', 'fake_bear_bull'] and _v22_near(lv, body_top, V22_MAXVOL_SNAP_PCT):
-                cuts_any = False
-            resonance_ok = q.get('total_resonance', 0) >= 2 or rank_no == 1
-            fallback_low = q.get('total_resonance', 0) < 2
-            score = 62 + q.get('total_resonance', 0) * 6 + q.get('strong_resonance', 0) * 4 - (25 if cuts_any else 0) - (8 if fallback_low else 0) - (rank_no-1)*5
+            if not any(_v22_near(lv, old[0], 0.002) for old in levels):
+                levels.append((lv, pk))
+        for lv, pk in levels:
+            q = _v222_line_quality_on_period(pdf, lv, period, anchor_idx=int(idx), anchor_kind=pk)
             cand = {
                 'center': float(lv), 'low': float(lv), 'high': float(lv), 'confirm_line': float(lv),
-                'level': 'A' if not fallback_low else 'B',
-                'score': float(max(0, min(92, score))),
-                'timeframes': ['Y'],
-                'role': 'first_coreline',
-                'source_kind': 'year_fallback',
-                'sources': [f"年线兜底：历史第{rank_no}大量K{kt}实顶/上影供应线"],
+                'period': period, 'timeframes': [period], 'role': 'first_coreline',
+                'source_kind': 'year_quarter_candidate_pool',
+                'anchor_rank': rank_no, 'anchor_type': kt, 'anchor_date': str(row.get('date')),
+                'point_kind': pk,
+                'anchor_point_score': _v222_anchor_point_score(period, rank_no, kt, pk) - (rank_no - 1) * (5 if period == 'Y' else 3),
                 'diagnostics': q,
-                'year_fallback_low_resonance': bool(fallback_low),
-                'valid_first_coreline': bool(resonance_ok and not cuts_any),
-                'why_rejected': [] if not cuts_any else ['年线候选切断实体，降级']
+                'sources': [f"{('年线' if period=='Y' else '季线')}候选：第{rank_no}大量K{kt}的{pk}，参与年季候选池评分"],
             }
-            if best is None or (cand['diagnostics'].get('total_resonance',0), cand['score']) > (best['diagnostics'].get('total_resonance',0), best['score']):
-                best = cand
-        if best:
-            out.append(best)
-        # 如果最大量实顶已经被站上，继续看第二大量；否则不必强行再退。
-        if rank_no == 1 and current_price <= safe_float(best.get('center') if best else body_top) * 1.003:
-            break
-    out = sorted(out, key=lambda c: (c.get('valid_first_coreline', False), c.get('diagnostics', {}).get('total_resonance', 0), c.get('score', 0)), reverse=True)
-    diag['candidates'] = [{k: c.get(k) for k in ['center','score','valid_first_coreline','year_fallback_low_resonance','diagnostics','sources']} for c in out[:10]]
+            cand = _v222_score_candidate(cand)
+            cand['level'] = 'S' if cand['score'] >= 115 else ('A' if cand['score'] >= 90 else ('B' if cand['score'] >= 65 else 'C'))
+            out.append(cand)
+    out = sorted(out, key=lambda c: (c.get('valid_first_coreline', False), c.get('score', 0)), reverse=True)
+    diag['candidates'] = [{
+        'center': round(safe_float(c.get('center')), 3), 'period': c.get('period'), 'score': c.get('score'),
+        'raw_score': c.get('raw_score'), 'quality_coeff': c.get('quality_coeff'), 'valid_first_coreline': c.get('valid_first_coreline'),
+        'low_resonance_fallback': c.get('low_resonance_fallback'), 'why_rejected': c.get('why_rejected'),
+        'point_kind': c.get('point_kind'), 'anchor_rank': c.get('anchor_rank'), 'anchor_type': c.get('anchor_type'),
+        'diagnostics': c.get('diagnostics'), 'sources': c.get('sources')
+    } for c in out[:10]]
     return out, diag
+
+
+def _v222_select_first_coreline(y_cands: List[Dict[str, Any]], q_cands: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    all_cands = list(y_cands or []) + list(q_cands or [])
+    diag = {'selection_rule': '年线/季线同时生成候选并统一评分；年线权重大，但低共振兜底线折扣；分差<8时优先高质量年线。', 'selected': None}
+    if not all_cands:
+        return None, diag
+    valid = [c for c in all_cands if c.get('valid_first_coreline')]
+    if not valid:
+        # 没有合格线时仍保留最高分兜底，但报告必须标记低质量。
+        valid = sorted(all_cands, key=lambda c: c.get('score', 0), reverse=True)[:1]
+    ranked = sorted(valid, key=lambda c: c.get('score', 0), reverse=True)
+    top = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else None
+    selected = top
+    if second and abs(safe_float(top.get('score')) - safe_float(second.get('score'))) < V22_SELECT_MARGIN:
+        ys = [c for c in ranked[:5] if c.get('period') == 'Y' and not c.get('low_resonance_fallback')]
+        qs_strong = [c for c in ranked[:5] if c.get('period') == 'Q' and int((c.get('diagnostics') or {}).get('strong_resonance', 0)) >= 3]
+        if ys:
+            selected = ys[0]
+        elif top.get('period') == 'Y' and top.get('low_resonance_fallback') and qs_strong:
+            selected = qs_strong[0]
+    selected = dict(selected)
+    selected['role'] = 'first_coreline'
+    selected['first_coreline_type'] = '年线候选胜出' if selected.get('period') == 'Y' else '季线候选胜出'
+    if selected.get('period') == 'Y' and selected.get('low_resonance_fallback'):
+        selected['first_coreline_type'] = '年线兜底低共振'
+        selected['year_fallback_low_resonance'] = True
+    selected['sources'] = [selected['first_coreline_type']] + selected.get('sources', [])
+    diag['selected'] = {k: selected.get(k) for k in ['center','period','score','raw_score','quality_coeff','first_coreline_type','point_kind','anchor_type','diagnostics','sources']}
+    diag['top_candidates'] = [{
+        'center': round(safe_float(c.get('center')),3), 'period': c.get('period'), 'score': c.get('score'),
+        'quality_coeff': c.get('quality_coeff'), 'low_resonance_fallback': c.get('low_resonance_fallback'),
+        'valid_first_coreline': c.get('valid_first_coreline'), 'why_rejected': c.get('why_rejected'),
+        'diagnostics': c.get('diagnostics'), 'sources': c.get('sources')
+    } for c in sorted(all_cands, key=lambda c: c.get('score', 0), reverse=True)[:10]]
+    return selected, diag
 
 
 def _v22_collect_auxiliary_candidates(daily: pd.DataFrame, first_line: Optional[float]) -> List[Dict[str, Any]]:
     """只找一条辅助线。辅助线服务当前交易，不能替代第一核心线。"""
-    cur = safe_float(daily['close'].iloc[-1]) if daily is not None and len(daily) else 0
-    cands: List[Dict[str, Any]] = []
-    # 复用原有语义/共振候选，只作为辅助候选，不用于第一核心线。
-    for tf, rule, lookback in [('Q','QE',80), ('Y','YE',40), ('M','ME',120), ('W','W-FRI',180)]:
-        pdf = _v22_period_df(daily, tf).tail(lookback)
-        if pdf is None or len(pdf) < 10:
-            continue
+    d = force_kline_schema(daily)
+    cur = safe_float(d['close'].iloc[-1]) if d is not None and len(d) else 0
+    raw = []
+    for tf, win in [('Y', 80), ('Q', 80), ('M', 120), ('W', 180)]:
         try:
-            raw = []
+            pdf = _v22_period_df(d, tf, completed_only=tf in ('Y','Q','M','W'))
+            if pdf is None or pdf.empty:
+                continue
             raw.extend(detect_semantic_coreline_candidates(pdf, tf))
             raw.extend(detect_resonance_coreline_candidates(pdf, tf))
-            raw.extend(detect_gap_and_shadow_resonance_candidates(pdf, tf))
         except Exception:
-            raw = []
-        for r in raw[:80]:
-            line = safe_float(r.get('high', r.get('center')))
-            if line <= 0 or cur <= 0:
-                continue
-            if first_line and line > first_line * 1.003:
-                # 高于第一核心线的辅助候选不作为辅助线触发，避免逻辑倒挂。
-                continue
-            dist = abs(line / cur - 1)
-            # 辅助线服务当前交易，不取离当前过远的线。
-            if dist > 0.35:
-                continue
-            rr = dict(r)
-            rr.update({
-                'center': line, 'low': line, 'high': line, 'confirm_line': line,
-                'role': 'auxiliary_line',
-                'aux_rank_score': safe_float(r.get('score')) + (20 if dist <= 0.08 else 10 if dist <= 0.16 else 0) + ({'Y':8,'Q':7,'M':5,'W':3}.get(tf,0)),
-            })
-            cands.append(rr)
-    # 近价10%以内合并取高；超过10%时选择当前更有交易价值的低位辅助线。
-    if not cands:
-        return []
-    cands = sorted(cands, key=lambda x: safe_float(x.get('center')))
-    clusters = []
-    for c in cands:
-        added = False
-        for cl in clusters:
-            if _v22_near(c['center'], cl[0]['center'], V22_NEAR_CLUSTER_PCT):
-                cl.append(c); added=True; break
-        if not added:
-            clusters.append([c])
-    selected_clusters = []
-    for cl in clusters:
-        # 同簇取高线；分数取簇内最高解释。
-        high_line = max(cl, key=lambda x: safe_float(x.get('center')))
-        best_exp = max(cl, key=lambda x: safe_float(x.get('aux_rank_score')))
-        high_line['sources'] = list(dict.fromkeys((best_exp.get('sources') or []) + (high_line.get('sources') or [])))[:10]
-        high_line['aux_rank_score'] = max(safe_float(x.get('aux_rank_score')) for x in cl)
-        selected_clusters.append(high_line)
-    # 如果多个簇差距大，取当前更可触发的低位高质量辅助线。
-    selected_clusters = sorted(selected_clusters, key=lambda x: (abs(safe_float(x.get('center'))/cur-1) if cur>0 else 99, -safe_float(x.get('aux_rank_score'))))
-    return selected_clusters[:1]
+            continue
+    aux = []
+    for c in raw:
+        price = safe_float(c.get('price', c.get('center')))
+        if price <= 0 or cur <= 0:
+            continue
+        if first_line and price > first_line * 1.003:
+            continue
+        # 辅助线超过10%差距时取低位更有交易价值；接近第一核心线时可合并取高。
+        dist = abs(price / cur - 1)
+        if dist > 0.80:
+            continue
+        score = safe_float(c.get('weight', 0)) + (15 if c.get('timeframe') in ['Y','Q'] else 8) - dist * 10
+        aux.append({
+            'center': price, 'low': price, 'high': price, 'confirm_line': price,
+            'level': 'A' if score >= 24 else 'B', 'score': float(score), 'role': 'auxiliary_line',
+            'timeframes': [c.get('timeframe', '')], 'sources': [str(c.get('source', '辅助线候选'))],
+            'source_kind': 'auxiliary_candidate'
+        })
+    aux = sorted(aux, key=lambda x: x.get('score', 0), reverse=True)
+    return aux[:1]
 
 
 def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
-    d = normalize_external_kline_df(daily) if daily is not None else None
-    if d is None:
-        return []
-    d = force_kline_schema(d)
+    d = force_kline_schema(daily)
     if d is None or len(d) < 180:
         return []
-    cur = safe_float(d['close'].iloc[-1])
-    q_cands, q_diag = _v22_quarter_core_candidates(d)
-    first = None
-    selected_reason = ''
-    valid_q = [c for c in q_cands if c.get('valid_first_coreline')]
-    if valid_q:
-        # 共振数量优先；共振相同离最大量实体更近已在分数内体现。
-        first = sorted(valid_q, key=lambda c: (c['diagnostics'].get('total_resonance',0), c['diagnostics'].get('strong_resonance',0), c.get('score',0)), reverse=True)[0]
-        selected_reason = '季线主导第一核心线'
-    else:
-        y_cands, y_diag = _v22_year_fallback_candidates(d, cur)
-        first = y_cands[0] if y_cands else None
-        selected_reason = '季线无合格线，年线兜底'
-        if first:
-            first['diagnostics']['quarter_rejected'] = q_diag
+    y_cands, y_diag = _v222_core_candidates_for_period(d, 'Y')
+    q_cands, q_diag = _v222_core_candidates_for_period(d, 'Q')
+    first, sel_diag = _v222_select_first_coreline(y_cands, q_cands)
     zones = []
+    first_line = None
     if first:
-        first = dict(first)
-        first['sources'] = [selected_reason] + first.get('sources', [])
-        first['first_coreline_type'] = selected_reason
         zones.append(first)
         first_line = safe_float(first.get('confirm_line', first.get('center')))
-    else:
-        first_line = None
     aux = _v22_collect_auxiliary_candidates(d, first_line)
     if aux:
-        a = dict(aux[0])
-        a['role'] = 'auxiliary_line'
-        a['sources'] = ['辅助线：只保留当前最有交易价值的一条'] + a.get('sources', [])
+        a = dict(aux[0]); a['role'] = 'auxiliary_line'; a['sources'] = ['辅助线：只保留当前最有交易价值的一条'] + a.get('sources', [])
         zones.append(a)
-    # 诊断字段挂在第一条上，JSON可查看；Telegram只简述。
     if zones:
         zones[0]['v22_diagnostics'] = {
-            'quarter_candidates': q_diag.get('candidates', []),
-            'quarter_anchor': q_diag.get('anchor'),
-            'auxiliary_selected': aux[0] if aux else None,
+            'year_candidates': y_diag.get('candidates', []), 'quarter_candidates': q_diag.get('candidates', []),
+            'year_anchors': y_diag.get('anchors', []), 'quarter_anchors': q_diag.get('anchors', []),
+            'selection': sel_diag, 'auxiliary_selected': aux[0] if aux else None,
         }
     return zones
 
@@ -2471,129 +2532,78 @@ def _v22_prior_first_limit_break(d: pd.DataFrame, idx: int, line: float, symbol:
 
 def _v22_first_core_trigger(d: pd.DataFrame, zone: Dict[str, Any], symbol: str, name: str) -> Dict[str, Any]:
     idx = len(d) - 1
-    row = d.iloc[idx]
-    pre = d.iloc[idx-1] if idx >= 1 else row
+    if idx < 1:
+        return {'effective': False}
+    row, pre = d.iloc[idx], d.iloc[idx-1]
     line = safe_float(zone.get('confirm_line', zone.get('center')))
-    close = safe_float(row.get('close'))
-    preclose = safe_float(pre.get('close'))
+    close = safe_float(row.get('close')); preclose = safe_float(pre.get('close'))
     online_gain = close / line - 1 if line > 0 else -9
+    crossed_today = preclose <= line and close > line
     gap = safe_float(row.get('low')) > line and preclose <= line
     limitup = _v22_is_limit_up(row, pre, symbol, name)
     quality_ok = close > line and _v22_close_position_ok(row, 0.55)
     long_upper_bad = safe_float(row.get('upper_shadow_ratio', 0)) > 0.55 and _v22_close_pos(row) < 0.65
     vol_ok = _v22_volume_healthy(d, idx)
-    reasons = []
-    event = None
-    level = None
-    event_score = 0
+    reasons, event, level, event_score = [], None, None, 0
+    if not crossed_today and not gap:
+        return {'effective': False, 'event': None, 'level': None, 'score': 0, 'reasons': ['第一核心线不是最新交易日突破'], 'online_gain': online_gain}
     if gap and quality_ok and not long_upper_bad:
-        event = '第一核心线跳空突破'
-        level = 'S'
-        event_score = 96
-        reasons.append('当日最低价高于第一核心线，且前一日收盘未站上，构成跳空越线')
-        # 500日第一次跳空诊断
+        event = '第一核心线跳空突破'; level = 'S'; event_score = 96
+        reasons.append('当日最低价高于第一核心线，且前一日收盘未站上，构成最新日跳空越线')
         start = max(1, idx - V22_CORE_GAP_LOOKBACK)
         prior_gap = any(safe_float(d.iloc[j].get('low')) > line and safe_float(d.iloc[j-1].get('close')) <= line for j in range(start, idx))
         if not prior_gap:
             reasons.append('近500日首次完整跳空越过第一核心线')
-    elif limitup and close > line and online_gain >= 0.03 and quality_ok:
-        event = '第一核心线涨停突破'
-        level = 'S'
-        event_score = 94
-        reasons.append('涨停突破第一核心线，且线上涨幅不低于3%')
-    elif close > line and online_gain >= 0.05 and vol_ok and quality_ok:
-        event = '第一核心线高质量突破'
-        level = 'A'
-        event_score = 88
-        reasons.append('收盘站上第一核心线5%以上，量能健康，收盘质量合格')
-    # 突破后强承接：最新日必须是确认日。
-    carry = _v22_coreline_carry_confirm(d, line)
-    if event is None and carry.get('effective'):
-        event = carry.get('event')
-        level = 'A'
-        event_score = 84
-        reasons.extend(carry.get('reasons', []))
+    elif limitup and online_gain >= 0.03 and quality_ok:
+        event = '第一核心线涨停突破'; level = 'S'; event_score = 94
+        reasons.append('最新日涨停突破第一核心线，且线上涨幅不低于3%')
+    elif online_gain >= 0.05 and vol_ok and quality_ok:
+        event = '第一核心线高质量突破'; level = 'A'; event_score = 88
+        reasons.append('最新日收盘站上第一核心线5%以上，量能健康，收盘质量合格')
     if event and long_upper_bad:
-        level = 'A' if level == 'S' else 'B'
-        event_score = min(event_score, 78)
-        reasons.append('存在长上影回落，S级降级')
+        level = 'A' if level == 'S' else 'B'; event_score = min(event_score, 78); reasons.append('存在长上影回落，S级降级')
     return {'effective': bool(event), 'event': event, 'level': level, 'score': event_score, 'reasons': reasons, 'online_gain': online_gain}
-
-
-def _v22_coreline_carry_confirm(d: pd.DataFrame, line: float) -> Dict[str, Any]:
-    idx = len(d) - 1
-    if idx < 2:
-        return {'effective': False}
-    latest = d.iloc[idx]
-    # 找最近8日内第一核心线高质量突破K。
-    for j in range(max(1, idx - V22_PULLBACK_MAX_DAYS), idx):
-        row, pre = d.iloc[j], d.iloc[j-1]
-        close = safe_float(row.get('close'))
-        if close <= line:
-            continue
-        online_gain = close / line - 1 if line > 0 else 0
-        is_break = (safe_float(row.get('low')) > line and safe_float(pre.get('close')) <= line) or online_gain >= 0.05
-        if not is_break:
-            continue
-        body_mid = (_v22_body_top(row) + _v22_body_bottom(row)) / 2
-        latest_close = safe_float(latest.get('close'))
-        latest_vol = safe_float(latest.get('volume'))
-        break_vol = safe_float(row.get('volume'))
-        if idx - j <= V22_STRONG_HOLD_DAYS:
-            strict_flat = break_vol > 0 and abs(latest_vol / break_vol - 1) <= 0.05
-            loose_hold = break_vol > 0 and latest_vol >= break_vol * 0.70
-            if latest_close >= body_mid and (strict_flat or loose_hold) and safe_float(latest.get('upper_shadow_ratio', 0)) <= 0.55:
-                return {'effective': True, 'event': '第一核心线突破后强承接确认', 'reasons': ['最新日为突破后强承接：收盘守突破K实体中位，量能平稳/不弱']}
-        else:
-            # 6-8日内必须回踩关键位再转强，简化为守住实体中位且收盘突破回踩小平台高点。
-            seg = d.iloc[j+1:idx]
-            if len(seg) >= 2:
-                platform_high = max(seg['close'].max(), seg[['open','close']].max(axis=1).max())
-                if latest_close > platform_high and latest['low'] >= min(body_mid, line) * 0.995:
-                    return {'effective': True, 'event': '第一核心线回踩后再确认', 'reasons': ['突破后6-8日内回踩不破关键位，最新日重新站上回踩小平台高点']}
-    return {'effective': False}
 
 
 def _v22_aux_trigger(d: pd.DataFrame, aux: Optional[Dict[str, Any]], symbol: str, name: str) -> Dict[str, Any]:
     if not aux:
         return {'effective': False}
     idx = len(d) - 1
-    row = d.iloc[idx]
-    pre = d.iloc[idx-1] if idx >= 1 else row
+    if idx < 1:
+        return {'effective': False}
+    row, pre = d.iloc[idx], d.iloc[idx-1]
     line = safe_float(aux.get('confirm_line', aux.get('center')))
-    close = safe_float(row.get('close'))
+    close, preclose = safe_float(row.get('close')), safe_float(pre.get('close'))
     online_gain = close / line - 1 if line > 0 else -9
     limitup = _v22_is_limit_up(row, pre, symbol, name)
     reasons = []
     if _v22_has_extreme_recent_downlimit(d, idx, symbol, name):
         return {'effective': False, 'event': None, 'level': None, 'score': 0, 'reasons': ['近5日存在连续跌停/极端一字跌停反抽，辅助线触发过滤']}
-    if limitup and safe_float(pre.get('close')) <= line and online_gain >= 0.05 and not _v22_prior_first_limit_break(d, idx, line, symbol, name):
+    if limitup and preclose <= line and close > line and online_gain >= 0.05 and not _v22_prior_first_limit_break(d, idx, line, symbol, name):
         reasons.append('辅助线200日内第一次涨停级突破，且收盘在线上5%以上')
         return {'effective': True, 'event': '辅助线涨停突破', 'level': 'A', 'score': 82, 'reasons': reasons, 'online_gain': online_gain}
-    # 涨停后回踩确认：最新日必须是确认当日，仅采用“重新站上回踩小平台高点”。
-    for j in range(max(1, idx - V22_PULLBACK_MAX_DAYS), idx):
-        br, br_pre = d.iloc[j], d.iloc[j-1]
-        br_gain = safe_float(br.get('close')) / line - 1 if line > 0 else -9
-        if not (_v22_is_limit_up(br, br_pre, symbol, name) and safe_float(br_pre.get('close')) <= line and br_gain >= 0.05):
+    return {'effective': False, 'event': None, 'level': None, 'score': 0, 'reasons': ['辅助线不是最新日涨停级突破']}
+
+
+def _v222_detect_market_latest_date_from_cache(stock_list: pd.DataFrame, sample_limit: int = 2600) -> str:
+    dates = []
+    rows = stock_list.head(sample_limit).to_dict('records') if stock_list is not None else []
+    for row in rows:
+        try:
+            code = str(row.get('代码', row.get('code', ''))).zfill(6)
+            bs_code = str(row.get('bs_code', '')) or bs_code_from_plain(code)
+            if not bs_code or bs_code == 'nan':
+                continue
+            df = read_local_kline_cache_for_pojie(bs_code)
+            df = normalize_external_kline_df(df)
+            if df is not None and len(df) >= 2 and 'date' in df.columns:
+                dates.append(str(pd.to_datetime(df['date'].iloc[-1]).date()))
+        except Exception:
             continue
-        seg = d.iloc[j+1:idx]
-        if len(seg) < 2:
-            continue
-        br_top, br_bottom = _v22_body_top(br), _v22_body_bottom(br)
-        platform_high = max(seg['close'].max(), seg[['open','close']].max(axis=1).max())
-        # 承接：低点可刺破，但收盘不能有效跌破涨停实底；不破中位/实顶更强。
-        if safe_float(seg['close'].min()) < br_bottom * 0.995:
-            continue
-        if close > platform_high:
-            reasons.append('辅助线涨停突破后8日内回踩，最新日重新站上回踩小平台高点')
-            if safe_float(seg['low'].min()) >= br_top * 0.995:
-                reasons.append('回踩不破涨停实顶，承接最强')
-            elif safe_float(seg['low'].min()) >= ((br_top + br_bottom) / 2) * 0.995:
-                reasons.append('回踩不破涨停实体中位，承接较强')
-            else:
-                reasons.append('回踩不破涨停实底，基本承接成立')
-            return {'effective': True, 'event': '辅助线涨停后回踩确认', 'level': 'A', 'score': 80, 'reasons': reasons, 'online_gain': online_gain}
-    return {'effective': False}
+    if not dates:
+        return ''
+    vc = pd.Series(dates).value_counts()
+    return str(vc.index[0])
 
 
 def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -2602,9 +2612,8 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
         d = force_kline_schema(d)
     if d is None or len(d) < 180:
         return None
-    # 最新K线硬过滤：不改缓存；若设置环境变量则正式入选必须等于该日期。
-    expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip()
     last_date = str(pd.to_datetime(d['date'].iloc[-1]).date())
+    expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip() or os.environ.get('POJIE_MARKET_LATEST_DATE', '').strip()
     if expected and last_date != expected:
         return None
     zones = find_coreline_zones(d)
@@ -2619,83 +2628,52 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     aux_line = safe_float(aux.get('confirm_line', aux.get('center'))) if aux else 0
     first_trig = _v22_first_core_trigger(d, first, symbol, name)
     aux_trig = _v22_aux_trigger(d, aux, symbol, name)
-    # 最高级别事件优先：第一核心线 > 辅助线；同日两者突破为S。
     event = None; level = None; trigger_score = 0; reasons = []
     if first_trig.get('effective') and aux_trig.get('effective'):
-        event = '第一核心线与辅助线同日触发'
-        level = 'S'
-        trigger_score = 98
+        event = '第一核心线与辅助线同日触发'; level = 'S'; trigger_score = 98
         reasons = ['同日突破/触发第一核心线与辅助线，重点关注'] + first_trig.get('reasons', [])[:3] + aux_trig.get('reasons', [])[:2]
     elif first_trig.get('effective'):
-        event = first_trig.get('event')
-        level = first_trig.get('level') or 'A'
-        trigger_score = safe_float(first_trig.get('score'))
-        reasons = first_trig.get('reasons', [])
+        event = first_trig.get('event'); level = first_trig.get('level') or 'A'; trigger_score = safe_float(first_trig.get('score')); reasons = first_trig.get('reasons', [])
     elif aux_trig.get('effective'):
-        event = aux_trig.get('event')
-        level = 'A'  # 辅助线未破第一核心时最高A
-        trigger_score = min(82, safe_float(aux_trig.get('score')))
+        event = aux_trig.get('event'); level = 'A'; trigger_score = min(82, safe_float(aux_trig.get('score')))
         reasons = aux_trig.get('reasons', []) + [f"第一核心线{round(first_line,3)}尚未突破，不代表大级别破界完成"]
     else:
         return None
-    # 计算空间/RR时，用当前触发线作为防守参考，但保留原函数结构。
     rr_zone = first if first_trig.get('effective') else (aux or first)
     rr = calc_space_rr(d, rr_zone, zones)
     risk = risk_filter(d, {'名称': name})
     if risk.get('hard_exclude'):
         return None
-    # 年线兜底低共振或辅助触发要降权。
     core_quality_penalty = 0
-    if first.get('year_fallback_low_resonance'):
-        core_quality_penalty -= 6
-        reasons.append('第一核心线为年线兜底低共振，等级降权')
+    if first.get('year_fallback_low_resonance') or first.get('low_resonance_fallback'):
+        core_quality_penalty -= 6; reasons.append('第一核心线为年线兜底低共振，等级降权')
     if event and '辅助线' in event and not first_trig.get('effective'):
         core_quality_penalty -= 4
-    base_score = trigger_score + safe_float(rr.get('score')) * 0.25 + safe_float(first.get('score')) * 0.12 + core_quality_penalty + safe_float(risk.get('penalty'))
+    base_score = trigger_score + safe_float(rr.get('score')) * 0.25 + safe_float(first.get('score')) * 0.08 + core_quality_penalty + safe_float(risk.get('penalty'))
     total = max(0, min(100, base_score))
-    if level == 'S' and total < 90:
-        total = 90
-    elif level == 'A' and total < 80:
-        total = 80
-    # 辅助线未破第一核心，最高A。
-    if event and '辅助线' in event and not first_trig.get('effective') and level == 'S':
-        level = 'A'
+    if level == 'S' and total < 90: total = 90
+    elif level == 'A' and total < 80: total = 80
     result = {
-        'employee': '破界',
-        'version': MODEL_VERSION,
-        'symbol': symbol, 'name': name,
-        'date': last_date,
-        'close': round(close, 3),
-        'signal_level': level,
-        'score': round(float(total), 2),
+        'employee': '破界', 'version': MODEL_VERSION, 'symbol': symbol, 'name': name,
+        'date': last_date, 'close': round(close, 3), 'signal_level': level, 'score': round(float(total), 2),
         'recommendation_type': event,
-        'first_coreline': round(first_line, 3),
-        'first_coreline_source': first.get('first_coreline_type', first.get('source_kind', '')),
-        'first_coreline_status': '已触发' if first_trig.get('effective') else '未突破',
+        'first_coreline': round(first_line, 3), 'first_coreline_source': first.get('first_coreline_type', first.get('source_kind', '')),
+        'first_coreline_status': '今日触发' if first_trig.get('effective') else '未触发',
         'first_coreline_distance': round(first_line / close - 1, 4) if close > 0 else 0,
-        'first_coreline_sources': first.get('sources', [])[:10],
-        'first_coreline_diagnostics': first.get('v22_diagnostics', {}),
+        'first_coreline_sources': first.get('sources', [])[:10], 'first_coreline_diagnostics': first.get('v22_diagnostics', {}),
         'auxiliary_line': round(aux_line, 3) if aux_line else None,
         'auxiliary_status': aux_trig.get('event') if aux_trig.get('effective') else ('未触发' if aux_line else '无合格辅助线'),
         'auxiliary_sources': aux.get('sources', [])[:8] if aux else [],
-        # 兼容旧字段。
-        'coreline': round(first_line, 3),
-        'psychological_pressure_line': round(first_line, 3),
-        'coreline_zone': [round(first_line, 3), round(first_line, 3)],
-        'coreline_level': first.get('level', 'A'),
-        'coreline_score': round(safe_float(first.get('score')), 2),
-        'distance_to_pressure': round(first_line / close - 1, 4) if close > 0 else 0,
-        'coreline_sources': first.get('sources', [])[:14],
-        'coreline_timeframes': first.get('timeframes', []),
-        'trigger_reasons': reasons[:12],
-        'defense_price': round(safe_float(rr.get('defense')), 3),
-        'next_pressure': round(safe_float(rr.get('next_pressure')), 3),
-        'space': round(safe_float(rr.get('space')), 4),
-        'risk_distance': round(safe_float(rr.get('risk')), 4),
-        'rr': round(safe_float(rr.get('rr')), 2),
+        'coreline': round(first_line, 3), 'psychological_pressure_line': round(first_line, 3),
+        'coreline_zone': [round(first_line, 3), round(first_line, 3)], 'coreline_level': first.get('level', 'A'),
+        'coreline_score': round(safe_float(first.get('score')), 2), 'distance_to_pressure': round(first_line / close - 1, 4) if close > 0 else 0,
+        'coreline_sources': first.get('sources', [])[:14], 'coreline_timeframes': first.get('timeframes', []),
+        'trigger_reasons': reasons[:12], 'defense_price': round(safe_float(rr.get('defense')), 3),
+        'next_pressure': round(safe_float(rr.get('next_pressure')), 3), 'space': round(safe_float(rr.get('space')), 4),
+        'risk_distance': round(safe_float(rr.get('risk')), 4), 'rr': round(safe_float(rr.get('rr')), 2),
         'risk_reasons': risk.get('reasons', []),
-        'confirm_condition': '最新交易日必须完成第一核心线高级突破，或辅助线涨停突破/涨停后回踩确认。',
-        'giveup_condition': '第一核心线/辅助线触发后长上影回落、跌回关键线下方、或回踩跌破涨停实底，则破界失败。',
+        'confirm_condition': '必须是最新交易日完成第一核心线高级突破，或辅助线最新日涨停突破。',
+        'giveup_condition': '触发后长上影回落、跌回关键线下方、或跌破涨停实底，则破界失败。',
     }
     return result
 
@@ -2704,15 +2682,15 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     lines = []
     valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
     not_selected = max(0, valid_scanned - len(results))
-    lines.append('【破界战法2.2.1｜第一核心线季线主导精细化版-频率兼容修复】')
+    lines.append('【破界战法2.2.2｜年季候选池评分制-今日突破硬过滤版】')
     lines.append(f'生成时间：{now_bj()}')
-    expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip()
+    expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip() or os.environ.get('POJIE_MARKET_LATEST_DATE', '').strip()
     if expected:
-        lines.append(f'K线日期硬校验：{expected}，非该日期不进入正式候选。')
+        lines.append(f'K线日期硬过滤：{expected}；个股最后K线不等于该日，一律不入正式候选（停牌/缓存过期均剔除）。')
     else:
-        lines.append('K线日期口径：使用缓存最后一日；如需硬过滤，请设置 POJIE_EXPECTED_KLINE_DATE。')
+        lines.append('K线日期口径：未识别市场最新日期；建议检查缓存或设置 POJIE_EXPECTED_KLINE_DATE。')
     lines.append(f'扫描：{scanned}只，K线有效：{valid_scanned}只，入选：{len(results)}只，未入选：{not_selected}只，无K线/数据不足：{no_kline}只，异常失败：{failed}只')
-    lines.append('第一核心线口径：季线主导；季线围绕最大量K实顶/上影线找，季线不合格则年线兜底；月线/周线不参与第一核心线。辅助线只保留一条，辅助线触发必须涨停级突破或涨停后回踩确认。')
+    lines.append('第一核心线口径：年线/季线同时生成候选并评分；年线权重大但低共振兜底线折扣；实体切割按规则扣分/淘汰；今日推荐只认最新日突破，不做历史突破回踩战法。')
     lines.append('')
     if not results:
         lines.append('今日暂无破界候选。')
@@ -2737,7 +2715,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
         lines.append('')
     return '\n'.join(lines)
 
-# ========================= V2.2.1 第一核心压力线季线主导精细化补丁结束 =========================
+# ========================= V2.2.2 年季候选池评分制 + 今日触发硬过滤补丁结束 =========================
 
 def main():
     args = parse_args()
@@ -2800,6 +2778,13 @@ def main():
     last_progress_ts = start
 
     rows = stock_list.to_dict("records")
+    if not os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip():
+        market_latest = _v222_detect_market_latest_date_from_cache(stock_list)
+        if market_latest:
+            os.environ["POJIE_MARKET_LATEST_DATE"] = market_latest
+            print(f"破界：全市场缓存最新交易日(众数)={market_latest}；正式候选必须等于该日。")
+        else:
+            print("破界：未能识别全市场缓存最新交易日，本次只按个股缓存最后日扫描。")
     use_parallel = POJIE_WORKERS > 1 and len(rows) >= POJIE_PARALLEL_MIN_STOCKS
 
     if use_parallel:
@@ -2916,7 +2901,7 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "pojie_remote_fetch_count.txt"), "w", encoding="utf-8") as f:
         f.write(str(int(KLINE_STATS.get("remote_success", 0) or 0)))
 
-    print(report)
+    print(f"破界扫描完成：扫描={scanned}，入选={len(results)}，无K线/数据不足={no_kline}，异常失败={failed}。完整报告已写入artifact；推荐明细只推送Telegram。")
     print("破界K线汇总：" + json.dumps(KLINE_STATS, ensure_ascii=False))
     print(f"破界结果已保存：{json_path} / {txt_path}")
     print(f"破界异常/无K线清单已保存：{failed_path}")
