@@ -40,7 +40,7 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-      MODEL_FILE: "破界战法2.1第一核心压力线精细化版.py"
+      MODEL_FILE: "破界战法.py"
       BRANCH_NAME: ${{ github.ref_name }}
 
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
