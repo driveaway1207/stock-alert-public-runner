@@ -1,4 +1,4 @@
-name: 破界战法2.2.3年线最低有效上影线共振
+name: 破界战法2.2.4自动补拉缓存版
 
 on:
   workflow_dispatch:
@@ -28,9 +28,17 @@ on:
           - "true"
           - "false"
       expected_kline_date:
-        description: "期望K线最新日期 YYYY-MM-DD；留空则自动用缓存众数+北京时间工作日保护"
+        description: "期望K线最新日期 YYYY-MM-DD；留空则由PY自动判断"
         required: false
         default: ""
+      allow_remote_patch:
+        description: "缓存未更新/缺失时是否允许自动补拉；默认true=先补拉再扫描"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
@@ -47,7 +55,9 @@ jobs:
       MODEL_FILE: "破界战法.py"
       BRANCH_NAME: ${{ github.ref_name }}
 
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      # 你的仓库 Secrets 名称是 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。
+      # 同时导出 TELEGRAM_TOKEN 与 TELEGRAM_BOT_TOKEN，兼容 PY 里两种读取方式。
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
@@ -60,9 +70,15 @@ jobs:
       STOCK_LIST_FALLBACK_AKSHARE: "0"
       KLINE_FALLBACK_AKSHARE: "0"
       POJIE_ALLOW_AKSHARE_KLINE: "0"
-      POJIE_REMOTE_ON_CACHE_MISS: "0"
 
-      # 性能优化：默认6进程。实测小CSV I/O下4-6通常比10更稳；如需可改成10。
+      # 默认仍然保持只读缓存，不自作主张改缓存框架。
+      # 如果你手动运行时把 allow_remote_patch 设为 true，才允许 BaoStock 补拉。
+      POJIE_REMOTE_ON_CACHE_MISS: ${{ github.event.inputs.allow_remote_patch == 'true' && '1' || '0' }}
+      ENABLE_AUTO_BACKFILL: ${{ github.event.inputs.allow_remote_patch == 'true' && '1' || '0' }}
+      CACHE_ONLY: ${{ github.event.inputs.allow_remote_patch == 'true' && '0' || '1' }}
+      READ_CACHE_ONLY: ${{ github.event.inputs.allow_remote_patch == 'true' && '0' || '1' }}
+
+      # 性能优化：默认6进程。
       POJIE_WORKERS: "6"
       POJIE_PARALLEL_MIN_STOCKS: "300"
       POJIE_FAST_PREFILTER: "1"
@@ -76,6 +92,9 @@ jobs:
       POJIE_LOG_FIRST_N: "5"
       POJIE_PROGRESS_EVERY: "300"
       POJIE_PROGRESS_SECONDS: "30"
+
+      # GitHub日志只显示摘要；完整推荐只发Telegram并保存artifact。
+      POJIE_GITHUB_QUIET: "1"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '20' }}
@@ -94,17 +113,32 @@ jobs:
           ls -la
           echo "workflow 文件："
           ls -la .github/workflows || true
+          echo "运行模式：${{ github.event.inputs.run_mode }}"
+          echo "期望K线日期：${POJIE_EXPECTED_KLINE_DATE:-自动判断}"
+          echo "是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
+          echo "Telegram启用：$ENABLE_TELEGRAM"
+          if [ -n "$TELEGRAM_TOKEN" ]; then
+            echo "Telegram Token：已读取"
+          else
+            echo "Telegram Token：未读取"
+          fi
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram Chat ID：已读取"
+          else
+            echo "Telegram Chat ID：未读取"
+          fi
 
-      - name: 检查破界战法2.2.2主程序
+      - name: 检查破界战法2.2.3主程序
         shell: bash
         run: |
-          echo "检查破界战法2.2.2主程序：$MODEL_FILE"
+          echo "检查破界战法2.2.3主程序：$MODEL_FILE"
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             ls -la
             exit 1
           fi
-          echo "✅ 找到破界战法2.2.2主程序：$MODEL_FILE"
+          echo "✅ 找到破界战法2.2.3主程序：$MODEL_FILE"
+          ls -lh "$MODEL_FILE"
 
       - name: 尝试下载最近K线验收产物
         if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
@@ -196,6 +230,10 @@ jobs:
           python - <<'PY'
           import os
           from pathlib import Path
+          from collections import Counter
+          import pandas as pd
+
+          roots = [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]
           items = {
               'kline_cache_root': len(list(Path('kline_cache').glob('*.csv'))) if Path('kline_cache').exists() else 0,
               'kline_cache_base': len(list(Path('kline_cache/base').rglob('*.csv'))) if Path('kline_cache/base').exists() else 0,
@@ -210,9 +248,10 @@ jobs:
           print(f"K线缓存 CSV数量：{items['cn_cache']}")
           print(f"outputs CSV数量：{items['outputs']}")
           print(f"最终识别K线缓存CSV数量：{total}")
+
           print('展示前10个K线缓存文件：')
-          n=0
-          for root in [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]:
+          n = 0
+          for root in roots:
               if not root.exists():
                   continue
               for f in root.rglob('*.csv'):
@@ -222,6 +261,32 @@ jobs:
                       break
               if n >= 10:
                   break
+
+          dates = []
+          sample = 0
+          for root in roots:
+              if not root.exists():
+                  continue
+              for f in root.rglob('*.csv'):
+                  try:
+                      df = pd.read_csv(f, usecols=['date'])
+                      if len(df):
+                          dates.append(str(df['date'].iloc[-1])[:10])
+                          sample += 1
+                  except Exception:
+                      pass
+                  if sample >= 5000:
+                      break
+              if sample >= 5000:
+                  break
+
+          if dates:
+              print('缓存最后日期Top10：')
+              for d, c in Counter(dates).most_common(10):
+                  print(f'  {d}: {c}')
+          else:
+              print('缓存最后日期Top10：无可用日期')
+
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
               f.write('SHOULD_RUN_POJIE=1\n')
               f.write('FULL_HISTORY_CACHE_DIR=kline_cache\n')
@@ -230,12 +295,13 @@ jobs:
               f.write('STOCK_LIST_FALLBACK_AKSHARE=0\n')
               f.write('POJIE_ALLOW_AKSHARE_KLINE=0\n')
               f.write(f"HAS_KLINE_CACHE={1 if total >= 1000 else 0}\n")
+
           if total >= 1000:
-              print('✅ 已发现一号员工K线缓存；破界.py将按股票代码懒加载读取，缓存命中不联网。')
+              print('✅ 已发现一号员工K线缓存；破界.py将按股票代码懒加载读取。')
           elif total > 0:
-              print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失才BaoStock补拉。')
+              print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失处理由POJIE_REMOTE_ON_CACHE_MISS控制。')
           else:
-              print('⚠️ 当前没有发现K线缓存；破界.py会使用BaoStock主通道补拉，AkShare已关闭。')
+              print('⚠️ 当前没有发现K线缓存；是否补拉由POJIE_REMOTE_ON_CACHE_MISS控制。')
           PY
 
       - name: 安装Python环境
@@ -256,6 +322,118 @@ jobs:
           python - <<'PY'
           import pandas, numpy, requests, baostock
           print('依赖验证通过：pandas / numpy / requests / baostock')
+          PY
+
+      - name: 自动补拉并校验K线缓存日期
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
+        shell: bash
+        run: |
+          set -e
+          echo "自动补拉开关：$ENABLE_AUTO_BACKFILL"
+          echo "目标K线日期：${POJIE_EXPECTED_KLINE_DATE:-自动识别}"
+
+          echo "补拉前缓存日期分布："
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          from collections import Counter
+          roots = [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]
+          dates=[]
+          for root in roots:
+              if not root.exists():
+                  continue
+              for f in root.rglob('*.csv'):
+                  try:
+                      df = pd.read_csv(f, usecols=['date'])
+                      if len(df):
+                          dates.append(str(df['date'].iloc[-1])[:10])
+                  except Exception:
+                      pass
+          if dates:
+              for d,c in Counter(dates).most_common(10):
+                  print(f'  {d}: {c}')
+              print(f'缓存众数日期={Counter(dates).most_common(1)[0][0]}')
+              print(f'缓存最大日期={max(dates)}')
+          else:
+              print('  未发现可统计日期的K线缓存')
+          PY
+
+          if [ "$ENABLE_AUTO_BACKFILL" = "1" ]; then
+            echo "开始执行自动补拉脚本..."
+            SCRIPT=""
+            if [ -f "tools/update_kline_cache_daily.py" ]; then
+              SCRIPT="tools/update_kline_cache_daily.py"
+            elif [ -f "update_kline_cache_daily.py" ]; then
+              SCRIPT="update_kline_cache_daily.py"
+            elif [ -f "scripts/update_kline_cache_daily.py" ]; then
+              SCRIPT="scripts/update_kline_cache_daily.py"
+            fi
+
+            if [ -z "$SCRIPT" ]; then
+              echo "⚠️ 未找到 update_kline_cache_daily.py，无法自动补拉。"
+            else
+              echo "使用补拉脚本：$SCRIPT"
+              export TARGET_TRADE_DATE="$POJIE_EXPECTED_KLINE_DATE"
+              export EXPECTED_TRADE_DATE="$POJIE_EXPECTED_KLINE_DATE"
+              export POJIE_EXPECTED_KLINE_DATE="$POJIE_EXPECTED_KLINE_DATE"
+              export FULL_HISTORY_CACHE_DIR="kline_cache"
+              export CACHE_DIR="kline_cache"
+              python "$SCRIPT"
+              echo "AUTO_BACKFILL_RAN=1" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "自动补拉关闭，本次只读缓存。"
+          fi
+
+          echo "补拉后缓存日期分布与目标校验："
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          from collections import Counter
+
+          expected = (os.getenv('POJIE_EXPECTED_KLINE_DATE') or '').strip()
+          roots = [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]
+          dates=[]
+          total_csv=0
+          for root in roots:
+              if not root.exists():
+                  continue
+              for f in root.rglob('*.csv'):
+                  total_csv += 1
+                  try:
+                      df = pd.read_csv(f, usecols=['date'])
+                      if len(df):
+                          dates.append(str(df['date'].iloc[-1])[:10])
+                  except Exception:
+                      pass
+
+          print(f'K线CSV数量={total_csv}')
+          if dates:
+              cnt = Counter(dates)
+              print('缓存最后日期Top10：')
+              for d,c in cnt.most_common(10):
+                  print(f'  {d}: {c}')
+              mode_date, mode_count = cnt.most_common(1)[0]
+              print(f'缓存众数日期={mode_date}')
+              print(f'缓存最大日期={max(dates)}')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                  f.write(f'POJIE_CACHE_MODE_DATE={mode_date}\n')
+                  f.write(f'POJIE_CACHE_MODE_COUNT={mode_count}\n')
+
+              if expected:
+                  expected_count = cnt.get(expected, 0)
+                  print(f'目标日期={expected}；达到目标日期股票数={expected_count}')
+                  if mode_date != expected:
+                      print('❌ 缓存主体没有更新到目标日期，停止正式推荐。')
+                      print('处理办法：先运行自动补拉/全量缓存更新，或确认目标日期是否填错。')
+                      raise SystemExit(2)
+                  print('✅ 缓存主体已达到目标日期，可以继续破界扫描。')
+              else:
+                  print('未指定目标日期，后续由PY按缓存众数/工作日逻辑判断。')
+          else:
+              print('❌ 未发现可用K线日期，停止。')
+              raise SystemExit(2)
           PY
 
       - name: 语法检查
@@ -281,9 +459,8 @@ jobs:
           echo "是否已恢复K线缓存：$HAS_KLINE_CACHE"
           echo "AkShare K线兜底：$KLINE_FALLBACK_AKSHARE"
           echo "破界 AkShare K线兜底：$POJIE_ALLOW_AKSHARE_KLINE"
-          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
+          echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
           echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
-          echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
           echo "推送策略：完整推荐只发Telegram；GitHub日志只显示摘要。"
           if [ "$RAW_SEND_TG" = "true" ]; then export ENABLE_TELEGRAM=1; else export ENABLE_TELEGRAM=0; fi
 
@@ -336,14 +513,13 @@ jobs:
           print(f'运行结束后K线CSV数量：{total}')
           print(f'本次BaoStock补拉成功数量：{remote_success}')
 
-          # 优化原则：如果只是读取已有缓存、没有新增补拉，就不重复保存巨大cache，节省时间和GitHub存储。
-          should_save = (total >= 1000 and remote_success > 0)
+          should_save = (total >= 1000 and (remote_success > 0 or os.getenv('AUTO_BACKFILL_RAN') == '1'))
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
               f.write(f"SAVE_POJIE_CACHE={1 if should_save else 0}\n")
 
           if should_save:
-              print('✅ 本次有BaoStock补拉并且K线数量足够，保存破界专用缓存。')
+              print('✅ 本次有自动补拉或BaoStock补拉并且K线数量足够，保存破界专用缓存。')
           else:
               print('✅ 本次未新增补拉或K线数量不足，不重复保存缓存，避免浪费时间/存储。')
           PY
