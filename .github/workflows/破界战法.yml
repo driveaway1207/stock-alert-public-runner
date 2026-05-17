@@ -1,4 +1,4 @@
-name: 破界战法2.0专业核心压力线版
+name: 破界战法2.1第一核心压力线精细化版
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-      MODEL_FILE: "破界战法.py"
+      MODEL_FILE: "破界战法2.1第一核心压力线精细化版.py"
       BRANCH_NAME: ${{ github.ref_name }}
 
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -57,7 +57,7 @@ jobs:
       POJIE_ALLOW_AKSHARE_KLINE: "0"
       POJIE_REMOTE_ON_CACHE_MISS: "0"
 
-      # 性能优化：默认6进程。实测小CSV I/O下4-6通常比10更稳；如需可改成10。
+      # 性能优化：保持原缓存/并行框架，不改拉取逻辑。
       POJIE_WORKERS: "6"
       POJIE_PARALLEL_MIN_STOCKS: "300"
       POJIE_FAST_PREFILTER: "1"
@@ -65,6 +65,10 @@ jobs:
       POJIE_MIN_CORELINE_SCORE: "58"
       POJIE_OUTPUT_OBSERVATION: "1"
       破界_最低分: "58"
+
+      # K线新鲜度：不改变缓存恢复/只读框架，只在扫描层防止旧收盘价冒充最新价格。
+      POJIE_REQUIRE_LATEST_KLINE: "1"
+      POJIE_EXPECTED_KLINE_DATE: ""
 
       # 日志/进度优化：默认不逐只打印K线成功，避免Actions刷屏。
       POJIE_VERBOSE_KLINE: "0"
@@ -89,16 +93,16 @@ jobs:
           echo "workflow 文件："
           ls -la .github/workflows || true
 
-      - name: 检查破界战法2.0专业核心压力线版主程序
+      - name: 检查破界战法主程序
         shell: bash
         run: |
-          echo "检查破界战法2.0专业核心压力线版主程序：$MODEL_FILE"
+          echo "检查破界战法主程序：$MODEL_FILE"
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             ls -la
             exit 1
           fi
-          echo "✅ 找到破界战法2.0主程序：$MODEL_FILE"
+          echo "✅ 找到破界主程序：$MODEL_FILE"
 
       - name: 尝试下载最近K线验收产物
         if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
@@ -190,6 +194,9 @@ jobs:
           python - <<'PY'
           import os
           from pathlib import Path
+          from collections import Counter
+          import pandas as pd
+
           items = {
               'kline_cache_root': len(list(Path('kline_cache').glob('*.csv'))) if Path('kline_cache').exists() else 0,
               'kline_cache_base': len(list(Path('kline_cache/base').rglob('*.csv'))) if Path('kline_cache/base').exists() else 0,
@@ -204,6 +211,41 @@ jobs:
           print(f"K线缓存 CSV数量：{items['cn_cache']}")
           print(f"outputs CSV数量：{items['outputs']}")
           print(f"最终识别K线缓存CSV数量：{total}")
+
+          # 只做新鲜度识别，不改变缓存恢复/补拉框架。
+          files = []
+          for root in [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]:
+              if root.exists():
+                  files.extend(list(root.rglob('*.csv')))
+          counter = Counter()
+          for fp in files[:8000]:
+              try:
+                  head = pd.read_csv(fp, dtype=str, nrows=1)
+                  cols = [str(c).strip().replace('\ufeff','') for c in head.columns]
+                  date_col = None
+                  for c in cols:
+                      if c.lower() in ['date','trade_date','datetime','time'] or c in ['日期','交易日期']:
+                          date_col = c
+                          break
+                  if not date_col:
+                      continue
+                  tail = pd.read_csv(fp, dtype=str, usecols=[date_col]).dropna().tail(1)
+                  if tail.empty:
+                      continue
+                  dt = pd.to_datetime(tail.iloc[0, 0], errors='coerce')
+                  if pd.notna(dt):
+                      counter[str(dt.date())] += 1
+              except Exception:
+                  continue
+          expected_date = max(counter.keys()) if counter else ''
+          print('K线最后日期分布TOP10：')
+          for dt, cnt in counter.most_common(10):
+              print(f'  {dt}: {cnt}')
+          if expected_date:
+              print(f'✅ 本次破界只接受最新缓存日期：{expected_date}')
+          else:
+              print('⚠️ 无法识别K线最新日期；程序将只输出K线日期，不做日期硬过滤。')
+
           print('展示前10个K线缓存文件：')
           n=0
           for root in [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]:
@@ -216,6 +258,7 @@ jobs:
                       break
               if n >= 10:
                   break
+
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
               f.write('SHOULD_RUN_POJIE=1\n')
               f.write('FULL_HISTORY_CACHE_DIR=kline_cache\n')
@@ -223,13 +266,17 @@ jobs:
               f.write('KLINE_FALLBACK_AKSHARE=0\n')
               f.write('STOCK_LIST_FALLBACK_AKSHARE=0\n')
               f.write('POJIE_ALLOW_AKSHARE_KLINE=0\n')
+              f.write('POJIE_REQUIRE_LATEST_KLINE=1\n')
+              if expected_date:
+                  f.write(f'POJIE_EXPECTED_KLINE_DATE={expected_date}\n')
               f.write(f"HAS_KLINE_CACHE={1 if total >= 1000 else 0}\n")
+
           if total >= 1000:
               print('✅ 已发现一号员工K线缓存；破界.py将按股票代码懒加载读取，缓存命中不联网。')
           elif total > 0:
-              print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失才BaoStock补拉。')
+              print('⚠️ 发现少量K线缓存；破界.py会优先读，缺失直接跳过。')
           else:
-              print('⚠️ 当前没有发现K线缓存；破界.py会使用BaoStock主通道补拉，AkShare已关闭。')
+              print('⚠️ 当前没有发现K线缓存；破界只读缓存模式下将没有足够K线。')
           PY
 
       - name: 安装Python环境
@@ -277,7 +324,8 @@ jobs:
           echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
           echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
           echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
-          echo "推送策略：默认发送Telegram；即使候选为0，也推送总结报告。"
+          echo "K线日期硬过滤：$POJIE_REQUIRE_LATEST_KLINE；期望日期：$POJIE_EXPECTED_KLINE_DATE"
+          echo "推送策略：默认发送Telegram；GitHub日志只输出运行摘要，完整报告不在日志展开。"
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
@@ -328,7 +376,7 @@ jobs:
           print(f'运行结束后K线CSV数量：{total}')
           print(f'本次BaoStock补拉成功数量：{remote_success}')
 
-          # 优化原则：如果只是读取已有缓存、没有新增补拉，就不重复保存巨大cache，节省时间和GitHub存储。
+          # 保持原原则：只要本战法没有补拉，就不重复保存巨大cache。
           should_save = (total >= 1000 and remote_success > 0)
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
