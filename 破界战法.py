@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界战法2.0｜专业核心压力线版｜多周期核心线+宽严双层选股"
+MODEL_VERSION = "破界战法2.1｜第一核心压力线精细化版｜大级别第一核心线+Telegram正式推送"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -1991,6 +1991,667 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
         lines.append("")
     return "\n".join(lines)
 
+# ============================================================================
+# V2.1 增量补丁：大级别“第一核心压力线”精细化引擎 + Telegram/日志分离
+# 只覆盖破界战法的核心压力线寻找、扫描结果字段与报告输出，不改底层数据入口。
+# 核心原则：大级别优先；第一核心线不是最高点，也不是触碰最多的线，
+# 而是“共振足够、线成立后假突破受控、距离当前有交易价值、突破后有空间”的线。
+# ============================================================================
+
+_LEGACY_FIND_CORELINE_ZONES = find_coreline_zones
+_LEGACY_SCAN_ONE = scan_one
+_LEGACY_BUILD_REPORT = build_report
+
+POJIE_CORELINE_VERSION = "V2.1-第一核心压力线精细化"
+
+
+def _bj_now_compact() -> str:
+    try:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return now_bj()
+
+
+def _tf_rank(tf: str) -> int:
+    return {"Y": 5, "Q": 4, "M": 3, "W": 2, "D": 1}.get(str(tf), 0)
+
+
+def _tf_name(tf: str) -> str:
+    return {"Y": "年线", "Q": "季线", "M": "月线", "W": "周线", "D": "日线"}.get(str(tf), str(tf))
+
+
+def _core_tol(tf: str, atr_pct: float = 0.02) -> float:
+    # 大级别允许更宽容差，但不能粗到把平台实体切断。
+    base = {"Y": 0.028, "Q": 0.022, "M": 0.017, "W": 0.012, "D": 0.008}.get(str(tf), 0.012)
+    return max(base * 0.70, min(base * 1.35, max(base, safe_float(atr_pct, base) * 0.55)))
+
+
+def _big_body_down(row: pd.Series, tf: str) -> bool:
+    o, c, h, l = [safe_float(row.get(x)) for x in ["open", "close", "high", "low"]]
+    if o <= 0 or h <= l or c >= o:
+        return False
+    body_drop = (o - c) / o
+    body_ratio = abs(c - o) / max(1e-9, h - l)
+    th = {"Y": 0.12, "Q": 0.10, "M": 0.085, "W": 0.065, "D": 0.045}.get(str(tf), 0.07)
+    return body_drop >= th and body_ratio >= 0.45
+
+
+def _big_body_up(row: pd.Series, tf: str) -> bool:
+    o, c, h, l = [safe_float(row.get(x)) for x in ["open", "close", "high", "low"]]
+    if o <= 0 or h <= l or c <= o:
+        return False
+    body_up = (c - o) / o
+    body_ratio = abs(c - o) / max(1e-9, h - l)
+    th = {"Y": 0.12, "Q": 0.10, "M": 0.085, "W": 0.065, "D": 0.045}.get(str(tf), 0.07)
+    return body_up >= th and body_ratio >= 0.45
+
+
+def _body_top(row: pd.Series) -> float:
+    return max(safe_float(row.get("open")), safe_float(row.get("close")))
+
+
+def _body_bottom(row: pd.Series) -> float:
+    return min(safe_float(row.get("open")), safe_float(row.get("close")))
+
+
+def _add_candidate(out: List[Dict[str, Any]], price: float, tf: str, idx: int, source: str, ctype: str, weight: float, aux: Optional[Dict[str, Any]] = None) -> None:
+    price = safe_float(price)
+    if price <= 0:
+        return
+    item = {"price": price, "timeframe": tf, "idx": int(idx), "source": source, "core_type": ctype, "weight": float(weight)}
+    if aux:
+        item.update(aux)
+    out.append(item)
+
+
+def _collect_line_events(d: pd.DataFrame, price: float, tol: float) -> Dict[str, Any]:
+    """统计一条线在整段K线中的实体、收盘、影线、缺口共振。影线穿越在建线阶段算共振，不等同假突破。"""
+    d = force_kline_schema(d).reset_index(drop=True)
+    p = safe_float(price)
+    if p <= 0 or d.empty:
+        return {"entity": [], "close": [], "upper_shadow": [], "lower_shadow": [], "gap": [], "all_idx": []}
+    entity, close, upper, lower, gap = [], [], [], [], []
+    for i, row in d.iterrows():
+        o, h, l, c = [safe_float(row.get(x)) for x in ["open", "high", "low", "close"]]
+        bt, bb = max(o, c), min(o, c)
+        if bt > 0 and abs(p / bt - 1) <= tol:
+            entity.append(i)
+        if bb > 0 and abs(p / bb - 1) <= tol:
+            entity.append(i)
+        if c > 0 and abs(p / c - 1) <= tol:
+            close.append(i)
+        if bt < p <= h * (1 + tol * 0.20):
+            upper.append(i)
+        if l * (1 - tol * 0.20) <= p < bb:
+            lower.append(i)
+        if i >= 1:
+            pre = d.loc[i - 1]
+            pre_h, pre_l = safe_float(pre.get("high")), safe_float(pre.get("low"))
+            # 向上/向下缺口的边界或缺口内部被线穿过。
+            if l > pre_h * 1.003 and pre_h <= p <= l:
+                gap.append(i)
+            if h < pre_l * 0.997 and h <= p <= pre_l:
+                gap.append(i)
+    all_idx = sorted(set(entity + close + upper + lower + gap))
+    return {"entity": sorted(set(entity)), "close": sorted(set(close)), "upper_shadow": sorted(set(upper)), "lower_shadow": sorted(set(lower)), "gap": sorted(set(gap)), "all_idx": all_idx}
+
+
+def _formation_idx_from_events(events: Dict[str, Any], fallback_idx: int) -> int:
+    # 候选线成立点：优先使用第三个共振事件出现的位置；平台破位/大K实体边界用自身K线idx作为成立点。
+    all_idx = list(events.get("all_idx", []))
+    if len(all_idx) >= 3:
+        return int(sorted(all_idx)[2])
+    return int(fallback_idx)
+
+
+def _weighted_fake_breakouts(d: pd.DataFrame, price: float, tf: str, formation_idx: int, tol: float) -> Dict[str, Any]:
+    """线成立后才统计假突破；普通影线穿越中心线不算，明显越过确认边界又收不住才算。"""
+    d = force_kline_schema(d).reset_index(drop=True)
+    p = safe_float(price)
+    if p <= 0 or d.empty:
+        return {"weighted": 0.0, "count": 0, "details": []}
+    confirm = p * (1 + max(tol * 0.75, 0.006))
+    details, weighted = [], 0.0
+    start = max(0, int(formation_idx) + 1)
+    for i in range(start, len(d)):
+        row = d.loc[i]
+        h, l, c, o = [safe_float(row.get(x)) for x in ["high", "low", "close", "open"]]
+        if h <= confirm:
+            continue
+        bt, bb = max(o, c), min(o, c)
+        # 如果收盘也稳在确认线上方，这不是假突破。
+        if c > confirm and bt > confirm:
+            continue
+        over_pct = h / p - 1
+        upper_len = max(0.0, h - bt)
+        rng = max(1e-9, h - l)
+        upper_ratio = upper_len / rng
+        close_fail = c < p * (1 + tol * 0.15)
+        volr = 1.0
+        try:
+            ma = safe_float(d["volume"].rolling(8).mean().iloc[i], 0)
+            volr = safe_float(row.get("volume")) / ma if ma > 0 else 1.0
+        except Exception:
+            volr = 1.0
+        w = 0.5
+        if over_pct >= max(0.03, tol * 1.4) and close_fail:
+            w = 1.0
+        if over_pct >= max(0.07, tol * 2.5) and upper_ratio >= 0.35 and close_fail:
+            w = 1.5
+        if upper_ratio >= 0.50 and volr >= 1.30 and close_fail:
+            w = max(w, 1.5)
+        # 后续同周期1-2根继续在线下，失败权重更高。
+        try:
+            nxt = d.iloc[i + 1:min(len(d), i + 3)]
+            if not nxt.empty and safe_float(nxt["close"].max()) < p * (1 + tol * 0.25):
+                w += 0.35
+        except Exception:
+            pass
+        weighted += min(2.0, w)
+        date = str(pd.to_datetime(row.get("date")).date()) if pd.notna(pd.to_datetime(row.get("date"), errors="coerce")) else str(i)
+        details.append({"idx": int(i), "date": date, "high": round(h, 3), "close": round(c, 3), "weight": round(min(2.0, w), 2), "reason": "明显突破确认边界但收盘未站稳"})
+    return {"weighted": round(float(weighted), 2), "count": len(details), "details": details[:8]}
+
+
+def _detect_platform_break_lines(d: pd.DataFrame, tf: str) -> List[Dict[str, Any]]:
+    """先找平台上下沿，再取破位大阴线实顶/突破大阳线实底作为核心反向边界。"""
+    res: List[Dict[str, Any]] = []
+    d = force_kline_schema(d).reset_index(drop=True)
+    if len(d) < 14:
+        return res
+    tfw = _tf_base_weight(tf)
+    for i in range(8, len(d)):
+        # 大级别平台用前6-14根K的实体边界，要求实体顶/底离散不太大。
+        for n in (6, 8, 10, 12):
+            if i < n:
+                continue
+            seg = d.iloc[i - n:i].copy()
+            closes = pd.to_numeric(seg["close"], errors="coerce")
+            if closes.median() <= 0:
+                continue
+            body_tops = seg[["open", "close"]].max(axis=1)
+            body_bots = seg[["open", "close"]].min(axis=1)
+            # 平台要“横得住”：实体边界相对集中，不能宽到乱。
+            platform_width = (safe_float(body_tops.quantile(0.80)) / max(1e-9, safe_float(body_bots.quantile(0.20))) - 1)
+            if platform_width > {"Y":0.75,"Q":0.55,"M":0.42,"W":0.30,"D":0.22}.get(tf,0.35):
+                continue
+            lower = safe_float(body_bots.quantile(0.22))
+            upper = safe_float(body_tops.quantile(0.78))
+            row = d.loc[i]
+            if _big_body_down(row, tf) and safe_float(row["close"]) < lower * (1 - _core_tol(tf) * 0.45):
+                _add_candidate(
+                    res, _body_top(row), tf, i,
+                    f"{_tf_name(tf)}平台下沿被有级别大阴线跌破：取破位阴线实顶为第一核心压力线",
+                    "平台破位阴线实顶", tfw + 8.0,
+                    {"platform_lower": round(lower, 3), "platform_upper": round(upper, 3), "auxiliary_line": round(lower, 3), "formation_kind": "breakdown_body_top"}
+                )
+                break
+            # 反向规则：突破大阳线实底本是核心支撑；若后续失守/当前在其下方，可作为支撑转压力候选。
+            if _big_body_up(row, tf) and safe_float(row["close"]) > upper * (1 + _core_tol(tf) * 0.45):
+                price = _body_bottom(row)
+                current_close = safe_float(d["close"].iloc[-1])
+                if current_close < price * 0.995 or i >= len(d) - 4:
+                    _add_candidate(
+                        res, price, tf, i,
+                        f"{_tf_name(tf)}平台上沿被有级别大阳线突破：取突破阳线实底为核心支撑/失守后转压力",
+                        "平台突破阳线实底", tfw + 5.0,
+                        {"platform_lower": round(lower, 3), "platform_upper": round(upper, 3), "auxiliary_line": round(upper, 3), "formation_kind": "breakout_body_bottom"}
+                    )
+                break
+    return res
+
+
+def _detect_volume_anchor_lines(d: pd.DataFrame, tf: str) -> List[Dict[str, Any]]:
+    res: List[Dict[str, Any]] = []
+    d = force_kline_schema(d).reset_index(drop=True)
+    if len(d) < 10:
+        return res
+    tfw = _tf_base_weight(tf)
+    vols = pd.to_numeric(d["volume"], errors="coerce").fillna(0)
+    if vols.max() <= 0:
+        return res
+    for rank, i in enumerate(list(vols.sort_values(ascending=False).head(min(5, len(d))).index), 1):
+        row = d.loc[i]
+        o, c, h, l = [safe_float(row.get(x)) for x in ["open", "close", "high", "low"]]
+        body = abs(c - o)
+        shadows = max(0.0, h - max(o, c)) + max(0.0, min(o, c) - l)
+        is_eff_yang = c > o and body >= shadows * 0.50 and body / max(c, 1e-9) >= 0.018
+        if is_eff_yang:
+            _add_candidate(res, max(o, c), tf, i, f"{_tf_name(tf)}第{rank}大量有效阳K实顶", "大量阳K实顶", tfw + 6.0 - rank * 0.3, {"formation_kind": "volume_yang_body_top"})
+            _add_candidate(res, min(o, c), tf, i, f"{_tf_name(tf)}第{rank}大量有效阳K实底/支撑转压力备选", "大量阳K实底", tfw + 3.5 - rank * 0.25, {"formation_kind": "volume_yang_body_bottom"})
+        else:
+            _add_candidate(res, max(o, c), tf, i, f"{_tf_name(tf)}第{rank}大量K实体顶供应参考", "大量K实体顶供应", tfw + 2.0 - rank * 0.2, {"formation_kind": "volume_body_top_supply"})
+    return res
+
+
+def _detect_secondary_hidden_gap_headshoulder_lines(d: pd.DataFrame, tf: str) -> List[Dict[str, Any]]:
+    res: List[Dict[str, Any]] = []
+    d = force_kline_schema(d).reset_index(drop=True)
+    if len(d) < 18:
+        return res
+    tfw = _tf_base_weight(tf)
+    tol = _core_tol(tf)
+    # 明显次高点/隐形高点：下跌过程中的反抽失败高点。
+    for i in range(5, len(d) - 3):
+        pre = d.iloc[max(0, i - 5):i]
+        nxt = d.iloc[i + 1:min(len(d), i + 5)]
+        if pre.empty or nxt.empty:
+            continue
+        row = d.loc[i]
+        h = safe_float(row["high"])
+        if h <= safe_float(pre["high"].max()) * 1.01 and h >= safe_float(pre["high"].max()) * 0.96:
+            # 反抽失败：前面整体下跌，后面继续回落。
+            pre_drop = safe_float(pre["close"].iloc[-1]) < safe_float(pre["close"].iloc[0]) * 0.93
+            nxt_fail = safe_float(nxt["close"].min()) < safe_float(row["close"]) * 0.92
+            if pre_drop and nxt_fail:
+                _add_candidate(res, _body_top(row), tf, i, f"{_tf_name(tf)}下跌中唯一/明显反抽失败K实顶", "隐形反抽失败高点", tfw + 3.6, {"formation_kind": "hidden_rebound_fail_top"})
+                _add_candidate(res, h, tf, i, f"{_tf_name(tf)}下跌中反抽失败高点影线", "反抽失败影线高点", tfw + 2.0, {"formation_kind": "hidden_rebound_fail_high"})
+    # 缺口边界共振来源。
+    for i in range(1, len(d)):
+        row, pre = d.loc[i], d.loc[i - 1]
+        pre_h, pre_l = safe_float(pre["high"]), safe_float(pre["low"])
+        h, l = safe_float(row["high"]), safe_float(row["low"])
+        if l > pre_h * 1.003:
+            _add_candidate(res, pre_h, tf, i, f"{_tf_name(tf)}向上跳空缺口下沿/前高边界", "缺口边界", tfw + 1.8, {"formation_kind": "gap_up_lower"})
+            _add_candidate(res, l, tf, i, f"{_tf_name(tf)}向上跳空缺口上沿/当期低点", "缺口边界", tfw + 1.4, {"formation_kind": "gap_up_upper"})
+        if h < pre_l * 0.997:
+            _add_candidate(res, pre_l, tf, i, f"{_tf_name(tf)}向下跳空缺口上沿/前低边界", "缺口边界", tfw + 2.0, {"formation_kind": "gap_down_upper"})
+            _add_candidate(res, h, tf, i, f"{_tf_name(tf)}向下跳空缺口下沿/当期高点", "缺口边界", tfw + 1.6, {"formation_kind": "gap_down_lower"})
+    # 头肩顶/底肩部共振：左右肩实顶/实底接近；压力线取头肩顶双肩实顶。
+    highs = pd.to_numeric(d["high"], errors="coerce").values
+    lows = pd.to_numeric(d["low"], errors="coerce").values
+    local_highs = []
+    for i in range(2, len(d)-2):
+        if highs[i] >= max(highs[i-2:i]) and highs[i] >= max(highs[i+1:i+3]):
+            local_highs.append(i)
+    for a_i, li in enumerate(local_highs):
+        for ri in local_highs[a_i+1:a_i+8]:
+            if ri - li < 4:
+                continue
+            mid_seg = d.iloc[li+1:ri]
+            if mid_seg.empty:
+                continue
+            head_high = safe_float(mid_seg["high"].max())
+            left_top, right_top = _body_top(d.loc[li]), _body_top(d.loc[ri])
+            if head_high > max(left_top, right_top) * (1 + tol * 1.2) and abs(left_top / right_top - 1) <= tol * 1.25:
+                _add_candidate(res, (left_top + right_top) / 2, tf, ri, f"{_tf_name(tf)}疑似头肩顶左右肩实顶共振", "头肩顶双肩实顶", tfw + 5.0, {"formation_kind": "head_shoulders_shoulder_top"})
+    return res
+
+
+def _cluster_big_core_candidates(candidates: List[Dict[str, Any]], d_by_tf: Dict[str, pd.DataFrame], current_price: float, daily_atr: float) -> List[Dict[str, Any]]:
+    if not candidates or current_price <= 0:
+        return []
+    # 先按百分比聚类，不用固定金额。
+    tol_global = max(0.006, min(0.030, safe_float(daily_atr, 0.02) * 0.65))
+    cands = sorted(candidates, key=lambda x: safe_float(x.get("price")))
+    clusters: List[List[Dict[str, Any]]] = []
+    bucket: List[Dict[str, Any]] = []
+    for c in cands:
+        px = safe_float(c.get("price"))
+        if px <= 0:
+            continue
+        if not bucket:
+            bucket = [c]; continue
+        center = np.average([safe_float(x["price"]) for x in bucket], weights=[max(0.1, safe_float(x.get("weight", 1))) for x in bucket])
+        if abs(px / center - 1) <= tol_global:
+            bucket.append(c)
+        else:
+            clusters.append(bucket); bucket = [c]
+    if bucket:
+        clusters.append(bucket)
+
+    zones = []
+    for mem in clusters:
+        prices = [safe_float(x["price"]) for x in mem]
+        weights = [max(0.1, safe_float(x.get("weight", 1))) for x in mem]
+        center = float(np.average(prices, weights=weights))
+        tfs = sorted(set(str(x.get("timeframe")) for x in mem), key=lambda z: _tf_rank(z), reverse=True)
+        main_tf = tfs[0] if tfs else "D"
+        tf_df = d_by_tf.get(main_tf)
+        if tf_df is None or len(tf_df) < 8:
+            continue
+        tol = _core_tol(main_tf, daily_atr)
+        events = _collect_line_events(tf_df, center, tol)
+        fallback_idx = max([int(x.get("idx", 0)) for x in mem] or [0])
+        # 平台破位/突破大K边界是事件线，成立点取该K；普通共振线取第三个共振点。
+        event_like = [x for x in mem if str(x.get("formation_kind", "")).startswith(("breakdown", "breakout", "volume"))]
+        formation_idx = max(int(x.get("idx", 0)) for x in event_like) if event_like else _formation_idx_from_events(events, fallback_idx)
+        fake = _weighted_fake_breakouts(tf_df, center, main_tf, formation_idx, tol)
+        entity_n = len(events.get("entity", []))
+        close_n = len(events.get("close", []))
+        shadow_n = len(events.get("upper_shadow", [])) + len(events.get("lower_shadow", []))
+        gap_n = len(events.get("gap", []))
+        source_types = len(set(str(x.get("core_type")) for x in mem))
+        # 分数：大级别、结构来源、实体/收盘/影线/缺口共振、假突破受控、可交易性。
+        score = 0.0
+        score += _tf_rank(main_tf) * 9.0
+        score += min(18.0, sum(weights) * 0.85)
+        score += min(18.0, entity_n * 3.2 + close_n * 2.0)
+        score += min(12.0, shadow_n * 1.15)
+        score += min(8.0, gap_n * 1.8)
+        score += min(12.0, source_types * 3.0)
+        types = "；".join(str(x.get("core_type")) for x in mem)
+        if "平台破位阴线实顶" in types:
+            score += 14.0
+        if "平台突破阳线实底" in types:
+            score += 8.0
+        if "头肩顶双肩实顶" in types:
+            score += 9.0
+        if "大量阳K实顶" in types:
+            score += 7.0
+        # 假突破：>2不能当第一核心线，转为假突破记忆线。
+        fake_w = safe_float(fake.get("weighted"))
+        if fake_w <= 0.5:
+            score += 8.0
+        elif fake_w <= 2.0:
+            score += 4.0
+        elif fake_w > 2.0:
+            score -= min(24.0, (fake_w - 2.0) * 7.0 + 6.0)
+        # 可交易性：不能太高，也不能已经被明显甩在身后。
+        dist = center / current_price - 1
+        if -0.06 <= dist <= 0.32:
+            score += 12.0
+        elif 0.32 < dist <= 0.55:
+            score += 5.0
+        elif dist > 0.55:
+            score -= 10.0
+        elif dist < -0.12:
+            score -= 8.0
+        score = max(0.0, min(100.0, score))
+        if fake_w > 2.0:
+            role = "假突破记忆线"
+        elif dist > 0.55:
+            role = "远端主压力线"
+        else:
+            role = "第一核心压力线" if score >= 68 else "候选核心压力线"
+        if score >= 86 and role == "第一核心压力线":
+            level = "S"
+        elif score >= 74 and role == "第一核心压力线":
+            level = "A"
+        elif score >= 60:
+            level = "B"
+        else:
+            level = "C"
+        sources = []
+        seen = set()
+        for x in sorted(mem, key=lambda y: safe_float(y.get("weight")), reverse=True):
+            s = str(x.get("source"))
+            if s not in seen:
+                sources.append(s); seen.add(s)
+        zones.append({
+            "center": center,
+            "low": min(prices),
+            "high": max(prices),
+            "confirm_line": center,  # 第一核心线是单线，不再把平台下沿和破位阴线实顶混成区间。
+            "score": round(float(score), 2),
+            "level": level,
+            "role": role,
+            "coreline_role": role,
+            "members": mem,
+            "sources": sources[:16],
+            "timeframes": tfs,
+            "main_timeframe": main_tf,
+            "distance_to_current": dist,
+            "resonance_entity_count": entity_n,
+            "resonance_close_count": close_n,
+            "resonance_shadow_count": shadow_n,
+            "resonance_gap_count": gap_n,
+            "fake_breakout_weighted": fake_w,
+            "fake_breakout_count": int(fake.get("count", 0)),
+            "fake_breakout_details": fake.get("details", []),
+            "formation_idx": formation_idx,
+            "first_principle": "共振足够；线成立后假突破受控；距离当前有交易价值；突破后有空间",
+            "auxiliary_line": next((x.get("auxiliary_line") for x in mem if x.get("auxiliary_line")), None),
+        })
+    # 第一核心压力线优先，假突破记忆线/远端线保留用于报告和上方压力，但不优先触发。
+    zones = [z for z in zones if z["score"] >= 48]
+    zones.sort(key=lambda z: (z.get("role") == "第一核心压力线", z["score"], -abs(safe_float(z.get("distance_to_current")))), reverse=True)
+    return zones
+
+
+def find_coreline_zones(daily: pd.DataFrame) -> List[Dict[str, Any]]:
+    """覆盖原核心线函数：先找大级别第一核心压力线；若完全找不到，再回落旧逻辑。"""
+    daily = force_kline_schema(daily)
+    tfs = build_timeframes(daily)
+    cur = safe_float(daily["close"].iloc[-1]) if len(daily) else 0
+    atr = safe_float(daily["atr20_pct"].iloc[-1], 0.02) if len(daily) else 0.02
+    candidates: List[Dict[str, Any]] = []
+    # 第一阶段只优化大级别：年/季/月优先，周线辅助，不让日线抢第一核心线。
+    for tf in ["Y", "Q", "M", "W"]:
+        df = tfs.get(tf)
+        if df is None or len(df) < 8:
+            continue
+        x = force_kline_schema(df).tail(_cycle_lookback(tf)).reset_index(drop=True)
+        candidates.extend(_detect_platform_break_lines(x, tf))
+        candidates.extend(_detect_volume_anchor_lines(x, tf))
+        candidates.extend(_detect_secondary_hidden_gap_headshoulder_lines(x, tf))
+        # 保留原有大周期锚点/成交密集候选，但进入新评分体系，防止漏掉明显大级别线。
+        try:
+            candidates.extend(detect_major_cycle_anchor_candidates(x, tf))
+            candidates.extend(detect_volume_profile_resonance_candidates(x, tf))
+            candidates.extend(detect_gap_and_shadow_resonance_candidates(x, tf))
+        except Exception:
+            pass
+    zones = _cluster_big_core_candidates(candidates, tfs, cur, atr)
+    # 当前交易触发优先用第一核心压力线；假突破记忆线/远端线不用于主触发，除非没有可用第一核心线。
+    first = [z for z in zones if z.get("role") == "第一核心压力线" and z["level"] in ["S", "A", "B"]]
+    if first:
+        return first + [z for z in zones if z not in first][:6]
+    if zones:
+        return zones[:8]
+    return _LEGACY_FIND_CORELINE_ZONES(daily)
+
+
+def _expected_kline_date() -> str:
+    return os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
+
+
+def _kline_is_fresh(d: pd.DataFrame) -> Tuple[bool, str, str]:
+    last_date = ""
+    try:
+        last_date = str(pd.to_datetime(d["date"].iloc[-1]).date())
+    except Exception:
+        last_date = ""
+    expected = _expected_kline_date()
+    if expected:
+        return last_date == expected, last_date, expected
+    return True, last_date, expected
+
+
+def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    d = normalize_external_kline_df(df)
+    if d is not None:
+        d = force_kline_schema(d)
+    if d is None or len(d) < 180:
+        return None
+    fresh_ok, last_date, expected_date = _kline_is_fresh(d)
+    if os.environ.get("POJIE_REQUIRE_LATEST_KLINE", "1") == "1" and not fresh_ok:
+        return None
+    zones = find_coreline_zones(d)
+    if not zones:
+        return None
+    close = safe_float(d["close"].iloc[-1])
+    valid_zones = []
+    for z in zones[:10]:
+        line = safe_float(z.get("confirm_line", z.get("center", z.get("high"))))
+        if line <= 0 or close <= 0:
+            continue
+        dist = line / close - 1
+        # 第一核心线不能太远，但允许比旧模型更宽，避免年/季/月核心线被近价过滤误伤。
+        role = str(z.get("role", z.get("coreline_role", "")))
+        if role == "第一核心压力线" and -0.10 <= dist <= 0.55 and safe_float(z.get("score")) >= POJIE_MIN_CORELINE_SCORE:
+            valid_zones.append(z)
+        elif role in ["候选核心压力线"] and -0.08 <= dist <= 0.35 and safe_float(z.get("score")) >= max(55, POJIE_MIN_CORELINE_SCORE - 4):
+            valid_zones.append(z)
+    if not valid_zones:
+        return None
+    best_result = None
+    for z in valid_zones[:4]:
+        core_score = safe_float(z["score"])
+        buildup = score_left_buildup(d, z)
+        breakout = detect_breakout(d, z)
+        rr = calc_space_rr(d, z, zones)
+        risk = risk_filter(d, {"名称": name})
+        if risk["hard_exclude"]:
+            continue
+        line = safe_float(z.get("confirm_line", z.get("center")))
+        dist_to_line = line / close - 1 if close > 0 and line > 0 else 0
+        proximity_bonus = 0
+        proximity_reasons = []
+        if -0.015 <= dist_to_line <= 0.025:
+            proximity_bonus += 5; proximity_reasons.append("贴近第一核心压力线/临界状态")
+        elif 0.025 < dist_to_line <= 0.10:
+            proximity_bonus += 2; proximity_reasons.append("距离第一核心压力线不远，可观察")
+        if safe_float(buildup["score"]) >= 21 and 0 <= dist_to_line <= 0.14:
+            proximity_bonus += 3; proximity_reasons.append("线下蓄势较好，允许提前观察")
+        # 让第一核心线本身成为主权重，不再让低级别近端线抢分。
+        total = core_score * 0.40 + safe_float(buildup["score"]) * (22 / 35) + safe_float(breakout["score"]) * (24 / 30) + safe_float(rr["score"]) + proximity_bonus + safe_float(risk["penalty"])
+        if not breakout["effective"]:
+            total = min(total, 78)
+        total = max(0, min(100, total))
+        if total >= 88 and breakout["effective"] and z["level"] == "S" and rr["rr"] >= 2.0:
+            level = "S"
+        elif total >= 80 and breakout["effective"]:
+            level = "A"
+        elif total >= 68:
+            level = "B"
+        elif total >= 58:
+            level = "C"
+        else:
+            continue
+        result = {
+            "employee": "破界",
+            "version": MODEL_VERSION + "｜" + POJIE_CORELINE_VERSION,
+            "symbol": symbol, "name": name,
+            "date": last_date,
+            "kline_date": last_date,
+            "expected_kline_date": expected_date,
+            "kline_fresh": bool(fresh_ok),
+            "close": round(close, 3),
+            "close_label": f"K线收盘价({last_date})",
+            "signal_level": level,
+            "score": round(float(total), 2),
+            "coreline": round(safe_float(z["center"]), 3),
+            "first_core_pressure_line": round(line, 3),
+            "psychological_pressure_line": round(line, 3),
+            "coreline_zone": [round(safe_float(z.get("low", line)), 3), round(safe_float(z.get("high", line)), 3)],
+            "coreline_role": z.get("role", "第一核心压力线"),
+            "coreline_level": z["level"], "coreline_score": round(core_score, 2),
+            "coreline_main_timeframe": z.get("main_timeframe", ""),
+            "distance_to_pressure": round(dist_to_line, 4),
+            "coreline_sources": z["sources"][:14], "coreline_timeframes": z["timeframes"],
+            "resonance_entity_count": int(z.get("resonance_entity_count", 0)),
+            "resonance_close_count": int(z.get("resonance_close_count", 0)),
+            "resonance_shadow_count": int(z.get("resonance_shadow_count", 0)),
+            "resonance_gap_count": int(z.get("resonance_gap_count", 0)),
+            "fake_breakout_weighted": safe_float(z.get("fake_breakout_weighted", 0)),
+            "fake_breakout_count": int(z.get("fake_breakout_count", 0)),
+            "fake_breakout_details": z.get("fake_breakout_details", []),
+            "auxiliary_line": z.get("auxiliary_line"),
+            "strategy_profile": POJIE_STRATEGY_PROFILE,
+            "buildup_score": round(safe_float(buildup["score"]), 2), "buildup_level": buildup["level"], "buildup_reasons": buildup["reasons"],
+            "breakout_effective": bool(breakout["effective"]), "breakout_score": round(safe_float(breakout["score"]), 2), "breakout_reasons": breakout["reasons"],
+            "proximity_reasons": proximity_reasons,
+            "defense_price": round(safe_float(rr["defense"]), 3), "next_pressure": round(safe_float(rr["next_pressure"]), 3),
+            "space": round(safe_float(rr["space"]), 4), "risk_distance": round(safe_float(rr["risk"]), 4), "rr": round(safe_float(rr["rr"]), 2),
+            "space_reasons": rr["reasons"], "risk_reasons": risk["reasons"],
+            "long_pos_250": round(safe_float(risk["long_pos_250"]), 4), "bias20": round(safe_float(risk["bias20"]), 4),
+            "confirm_condition": "日线高级K实体站上第一核心压力线，收盘强、上影短、量能健康；或突破后回踩该线/突破K实体中位缩量止跌再转强。",
+            "giveup_condition": "放量长上影回落到第一核心压力线下方，或跌破突破K实底/交易防守位，破界失败。",
+        }
+        if best_result is None or result["score"] > best_result["score"]:
+            best_result = result
+    return best_result
+
+
+def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, no_kline: int = 0) -> str:
+    lines = []
+    valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
+    not_selected = max(0, valid_scanned - len(results))
+    lines.append("【破界战法2.1｜第一核心压力线精细化版】")
+    lines.append(f"生成时间：{now_bj()}")
+    exp = _expected_kline_date()
+    if exp:
+        lines.append(f"K线新鲜度口径：仅使用最新缓存日期 {exp} 的K线；报告价格均为该日期K线收盘价，不是盘中实时价。")
+    else:
+        lines.append("K线价格口径：报告价格为缓存K线最后一日收盘价；建议在workflow中写入 POJIE_EXPECTED_KLINE_DATE 做新鲜度硬校验。")
+    lines.append(f"扫描：{scanned}只，K线有效：{valid_scanned}只，入选：{len(results)}只，未入选：{not_selected}只，无K线/数据不足/过期：{no_kline}只，异常失败：{failed}只")
+    lines.append("第一核心线口径：大级别优先；共振足够；线成立后加权假突破≤2优先；不能是遥远孤立高点；平台破位取破位阴线实顶，平台突破取突破阳线实底。")
+    lines.append("")
+    if not results:
+        lines.append("今日暂无破界候选。")
+        return "\n".join(lines)
+    for i, r in enumerate(results, 1):
+        line = r.get("first_core_pressure_line", r.get("psychological_pressure_line", r.get("coreline")))
+        aux = r.get("auxiliary_line")
+        lines.append(f"{i}. {r['symbol']} {r['name']}｜{r['signal_level']}｜{r['score']}分｜{r.get('close_label','K线收盘价')} {r['close']}｜第一核心压力线 {line}｜距离{safe_float(r.get('distance_to_pressure')):.1%}")
+        lines.append(f"   核心线角色：{r.get('coreline_role','第一核心压力线')}｜主周期{r.get('coreline_main_timeframe','')}｜{r['coreline_level']}级｜{r['coreline_score']}分｜周期{','.join(r['coreline_timeframes'])}")
+        if aux:
+            lines.append(f"   辅助验证线：{aux}（例如原平台边界/第二确认线，不与第一核心线混同）")
+        lines.append(f"   共振统计：实体/开收={r.get('resonance_entity_count',0)}，收盘={r.get('resonance_close_count',0)}，影线穿越={r.get('resonance_shadow_count',0)}，缺口={r.get('resonance_gap_count',0)}")
+        lines.append(f"   假突破评估：加权{safe_float(r.get('fake_breakout_weighted',0))}次，原始{int(r.get('fake_breakout_count',0))}次（线成立后的明显突破确认边界失败才计入）")
+        lines.append(f"   线源：{'；'.join(r['coreline_sources'][:6])}")
+        lines.append(f"   蓄势：{r['buildup_level']} {r['buildup_score']}分｜{'；'.join(r['buildup_reasons'][:4])}")
+        br = '有效突破' if r['breakout_effective'] else '临界/观察'
+        extra = ('；' + '；'.join(r.get('proximity_reasons', [])[:2])) if r.get('proximity_reasons') else ''
+        lines.append(f"   突破状态：{br} {r['breakout_score']}分｜{'；'.join(r['breakout_reasons'][:4])}{extra}")
+        lines.append(f"   交易参数：防守{r['defense_price']}｜上方压力{r['next_pressure']}｜空间{r['space']:.1%}｜风险{r['risk_distance']:.1%}｜RR={r['rr']}")
+        if r['risk_reasons']:
+            lines.append(f"   风险：{'；'.join(r['risk_reasons'][:3])}")
+        lines.append(f"   确认：{r['confirm_condition']}")
+        lines.append(f"   放弃：{r['giveup_condition']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def send_telegram_direct(text: str) -> Tuple[bool, str]:
+    """优先独立推送，避免基础模型没有 send_telegram 时静默跳过；长报告自动分段。"""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TG_CHAT_ID") or os.environ.get("TELEGRAM_USER_ID")
+    if not token or not chat_id:
+        return False, "缺少 TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID/TG_CHAT_ID"
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        # Telegram文本上限约4096，留余量分段。
+        chunks = []
+        buf = ""
+        for line in text.splitlines():
+            if len(buf) + len(line) + 1 > 3600:
+                chunks.append(buf)
+                buf = line
+            else:
+                buf = (buf + "\n" + line) if buf else line
+        if buf:
+            chunks.append(buf)
+        ids = []
+        for idx, chunk in enumerate(chunks, 1):
+            prefix = f"【破界报告 {idx}/{len(chunks)}】\n" if len(chunks) > 1 else ""
+            resp = requests.post(url, json={"chat_id": chat_id, "text": prefix + chunk, "disable_web_page_preview": True}, timeout=20)
+            if resp.status_code != 200:
+                return False, f"Telegram HTTP {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            if not data.get("ok"):
+                return False, f"Telegram返回失败：{str(data)[:200]}"
+            try:
+                ids.append(str(data.get("result", {}).get("message_id")))
+            except Exception:
+                pass
+        return True, f"发送成功，分段{len(chunks)}，message_id={','.join([x for x in ids if x])}"
+    except Exception as e:
+        return False, f"Telegram异常：{str(e)[:220]}"
+
+
+def print_run_summary_only(results_count: int, scanned: int, failed: int, no_kline: int, json_path: str, txt_path: str, tg_status: str = "") -> None:
+    valid = max(0, int(scanned) - int(failed) - int(no_kline))
+    print("破界运行摘要：")
+    print(f"扫描={scanned} K线有效={valid} 入选={results_count} 无K线/过期={no_kline} 异常={failed}")
+    print(f"完整报告已保存：{txt_path}")
+    print(f"JSON结果已保存：{json_path}")
+    if tg_status:
+        print(f"Telegram状态：{tg_status}")
+
+
 def main():
     args = parse_args()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -2168,16 +2829,28 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "pojie_remote_fetch_count.txt"), "w", encoding="utf-8") as f:
         f.write(str(int(KLINE_STATS.get("remote_success", 0) or 0)))
 
-    print(report)
-    print("破界K线汇总：" + json.dumps(KLINE_STATS, ensure_ascii=False))
-    print(f"破界结果已保存：{json_path} / {txt_path}")
-    print(f"破界异常/无K线清单已保存：{failed_path}")
+    # 日志与正式报告分离：GitHub Actions 不再打印完整选股报告，完整内容只进 artifact 和 Telegram。
+    telegram_status = "未请求发送"
+    if args.发送Telegram and not args.不发送Telegram:
+        ok, msg = send_telegram_direct(report)
+        telegram_status = msg
+        if not ok and hasattr(base, "send_telegram"):
+            try:
+                base.send_telegram(report)
+                telegram_status = "基础模型send_telegram兜底发送成功"
+                ok = True
+            except Exception as e:
+                telegram_status = f"直接发送失败：{msg}；基础模型兜底也失败：{str(e)[:180]}"
+        if not ok:
+            print(f"❌ Telegram发送失败：{telegram_status}")
+        else:
+            print(f"✅ Telegram发送成功：{telegram_status}")
+    elif args.不发送Telegram:
+        telegram_status = "用户参数强制不发送"
 
-    if args.发送Telegram and not args.不发送Telegram and hasattr(base, "send_telegram"):
-        try:
-            base.send_telegram(report)
-        except Exception as e:
-            print(f"Telegram发送失败，但不影响本次运行：{e}")
+    print_run_summary_only(len(results), scanned, failed, no_kline, json_path, txt_path, telegram_status)
+    print("破界K线汇总：" + json.dumps(KLINE_STATS, ensure_ascii=False))
+    print(f"破界异常/无K线清单已保存：{failed_path}")
 
     # 尽量登出 BaoStock，但不强制。
     if hasattr(base, "baostock_logout"):
