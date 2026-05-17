@@ -1,4 +1,4 @@
-name: 破界战法2.2.5自动补拉断点续跑版
+name: 破界战法2.2.7日期模式优化版
 
 on:
   workflow_dispatch:
@@ -27,8 +27,18 @@ on:
         options:
           - "true"
           - "false"
+      date_mode:
+        description: "K线日期模式"
+        required: true
+        default: "自动识别最近完整交易日"
+        type: choice
+        options:
+          - 自动识别最近完整交易日
+          - 使用前一个交易日
+          - 使用当前缓存最新日期
+          - 手动填写日期
       expected_kline_date:
-        description: "期望K线最新日期 YYYY-MM-DD；留空则由PY自动判断"
+        description: "手动日期，仅选择“手动填写日期”时填写；支持 2026-05-15 / 2026-5-15 / 20260515 / 2026515"
         required: false
         default: ""
       allow_remote_patch:
@@ -99,6 +109,8 @@ jobs:
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
       RESULT_LIMIT: ${{ github.event.inputs.result_limit || '3' }}
       破界_输出数量: ${{ github.event.inputs.result_limit || '3' }}
+      POJIE_DATE_MODE: ${{ github.event.inputs.date_mode || 'auto' }}
+      POJIE_EXPECTED_KLINE_DATE_RAW: ${{ github.event.inputs.expected_kline_date || '' }}
       POJIE_EXPECTED_KLINE_DATE: ${{ github.event.inputs.expected_kline_date || '' }}
 
       # 自动补拉时间保护：给全市场5200只留足时间，避免补到一半反复从头开始。
@@ -114,6 +126,79 @@ jobs:
       - name: 下载仓库代码
         uses: actions/checkout@v4
 
+      - name: 归一化目标K线日期
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from datetime import datetime, date, timedelta
+          from zoneinfo import ZoneInfo
+
+          mode_raw = (os.getenv('POJIE_DATE_MODE') or '自动识别最近完整交易日').strip()
+          mode_map = {
+              '自动识别最近完整交易日': 'auto',
+              '使用前一个交易日': 'previous_trade_day',
+              '使用当前缓存最新日期': 'latest_cache',
+              '手动填写日期': 'manual',
+              # 兼容旧英文值，避免旧手动运行参数失效
+              'auto': 'auto',
+              'previous_trade_day': 'previous_trade_day',
+              'latest_cache': 'latest_cache',
+              'manual': 'manual',
+          }
+          mode = mode_map.get(mode_raw)
+          if not mode:
+              raise SystemExit(f'未知 K线日期模式：{mode_raw}')
+          raw = (os.getenv('POJIE_EXPECTED_KLINE_DATE_RAW') or '').strip()
+
+          def normalize_date(value: str) -> str:
+              value = (value or '').strip()
+              if not value:
+                  return ''
+              v = re.sub(r'[./_]', '-', value)
+              if re.fullmatch(r'\d{8}', v):
+                  y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
+              elif re.fullmatch(r'\d{7}', v):
+                  y, m, d = int(v[:4]), int(v[4:5]), int(v[5:7])
+              else:
+                  mobj = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', v)
+                  if not mobj:
+                      raise ValueError(f'无法识别日期格式：{value}。支持 2026-05-15 / 2026-5-15 / 20260515 / 2026515')
+                  y, m, d = map(int, mobj.groups())
+              return date(y, m, d).isoformat()
+
+          def previous_weekday(today: date) -> date:
+              d = today - timedelta(days=1)
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              return d
+
+          today_cn = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+          expected = ''
+          note = ''
+
+          if raw:
+              expected = normalize_date(raw)
+              note = f'手动输入日期已归一化：{raw} -> {expected}' if raw != expected else f'手动输入日期：{expected}'
+          elif mode == 'manual':
+              raise SystemExit('选择“手动填写日期”时必须填写“手动日期”')
+          elif mode == 'previous_trade_day':
+              expected = previous_weekday(today_cn).isoformat()
+              note = f'按前一普通交易日模式推断目标日期：{expected}'
+          elif mode in ('auto', 'latest_cache'):
+              expected = ''
+              note = f'K线日期模式={mode_raw}，未手动指定日期；后续由缓存/PY自动判断'
+          else:
+              raise SystemExit(f'未知 K线日期模式：{mode_raw}')
+
+          print(note)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+              f.write(f'POJIE_DATE_MODE={mode}\n')
+              f.write(f'POJIE_EXPECTED_KLINE_DATE={expected}\n')
+              f.write(f'POJIE_EXPECTED_KLINE_DATE_NORMALIZED={expected}\n')
+          PY
+
       - name: 显示当前运行环境
         shell: bash
         run: |
@@ -124,6 +209,8 @@ jobs:
           echo "workflow 文件："
           ls -la .github/workflows || true
           echo "运行模式：${{ github.event.inputs.run_mode }}"
+          echo "日期模式：$POJIE_DATE_MODE"
+          echo "原始日期输入：${POJIE_EXPECTED_KLINE_DATE_RAW:-空}"
           echo "期望K线日期：${POJIE_EXPECTED_KLINE_DATE:-自动判断}"
           echo "是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS"
           echo "Telegram启用：$ENABLE_TELEGRAM"
@@ -402,7 +489,36 @@ jobs:
           from pathlib import Path
           from collections import Counter
 
-          expected = (os.getenv('POJIE_EXPECTED_KLINE_DATE') or '').strip()
+          import re
+          from datetime import date
+          expected_raw = (os.getenv('POJIE_EXPECTED_KLINE_DATE') or '').strip()
+          expected = ''
+          def normalize_date(value):
+              value = (value or '').strip()
+              if not value:
+                  return ''
+              v = re.sub(r'[./_]', '-', value)
+              if re.fullmatch(r'\d{8}', v):
+                  y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
+              elif re.fullmatch(r'\d{7}', v):
+                  y, m, d = int(v[:4]), int(v[4:5]), int(v[5:7])
+              else:
+                  mobj = re.fullmatch(r'(\d{4})-(\d{1,2})-(\d{1,2})', v)
+                  if not mobj:
+                      raise ValueError(f'无法识别日期格式：{value}')
+                  y, m, d = map(int, mobj.groups())
+              return date(y, m, d).isoformat()
+          if expected_raw:
+              try:
+                  expected = normalize_date(expected_raw)
+                  if expected != expected_raw:
+                      print(f'目标日期格式归一化：{expected_raw} -> {expected}')
+              except Exception as e:
+                  print(f'❌ 目标日期无法归一化：{expected_raw}；原因：{e}')
+                  with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                      f.write('SHOULD_RUN_POJIE=0\n')
+                      f.write('POJIE_CACHE_NEEDS_MORE=0\n')
+                  raise SystemExit(1)
           roots = [Path('kline_cache/base'), Path('kline_cache/deep'), Path('kline_cache'), Path('K线缓存')]
           dates=[]
           total_csv=0
@@ -431,9 +547,16 @@ jobs:
                   f.write(f'POJIE_CACHE_MODE_DATE={mode_date}\n')
                   f.write(f'POJIE_CACHE_MODE_COUNT={mode_count}\n')
 
+              if not expected and (os.getenv('POJIE_DATE_MODE') or '').strip() == 'latest_cache':
+                  expected = mode_date
+                  print(f'K线日期模式=使用当前缓存最新日期，使用缓存众数日期作为目标日期：{expected}')
+                  with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                      f.write(f'POJIE_EXPECTED_KLINE_DATE={expected}\n')
               if expected:
                   expected_count = cnt.get(expected, 0)
                   print(f'目标日期={expected}；达到目标日期股票数={expected_count}')
+                  with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                      f.write(f'POJIE_EXPECTED_KLINE_DATE={expected}\n')
                   if mode_date != expected:
                       print('⚠️ 缓存主体还没有更新到目标日期，本次不运行破界正式推荐。')
                       print('✅ 已保留本轮补拉成果，后续保存到GitHub cache；请再次运行继续断点补拉。')
