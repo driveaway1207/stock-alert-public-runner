@@ -1,4 +1,4 @@
-name: 破界战法2.2.4自动补拉缓存版
+name: 破界战法2.2.5自动补拉断点续跑版
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ on:
       result_limit:
         description: "输出候选数量"
         required: true
-        default: "20"
+        default: "3"
       send_telegram:
         description: "是否发送Telegram"
         required: true
@@ -97,8 +97,18 @@ jobs:
       POJIE_GITHUB_QUIET: "1"
 
       MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
-      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '20' }}
+      RESULT_LIMIT: ${{ github.event.inputs.result_limit || '3' }}
+      破界_输出数量: ${{ github.event.inputs.result_limit || '3' }}
       POJIE_EXPECTED_KLINE_DATE: ${{ github.event.inputs.expected_kline_date || '' }}
+
+      # 自动补拉时间保护：给全市场5200只留足时间，避免补到一半反复从头开始。
+      KLINE_UPDATE_TIME_LIMIT_SECONDS: "6600"
+      MAX_UPDATE_SECONDS: "6600"
+      UPDATE_TIME_LIMIT_SECONDS: "6600"
+      MAX_RUNTIME_SECONDS: "6600"
+      BAOSTOCK_UPDATE_MAX_SECONDS: "6600"
+      DAILY_KLINE_UPDATE_MAX_SECONDS: "6600"
+      KLINE_BACKFILL_MAX_SECONDS: "6600"
 
     steps:
       - name: 下载仓库代码
@@ -199,19 +209,19 @@ jobs:
           echo "从artifact恢复后的K线CSV数量：${COUNT:-0}"
           echo "ARTIFACT_KLINE_COUNT=${COUNT:-0}" >> "$GITHUB_ENV"
 
-      - name: 如果artifact不足则恢复GitHub缓存里的K线
-        if: ${{ github.event.inputs.run_mode != 'selfcheck' && env.ARTIFACT_KLINE_COUNT < 1000 }}
+      - name: 恢复GitHub缓存里的K线断点续补结果
+        if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: |
             K线缓存
             kline_cache
-          key: a-kline-cache-${{ github.ref_name }}
+          key: pojie-kline-cache-${{ github.ref_name }}
           restore-keys: |
+            pojie-kline-cache-${{ github.ref_name }}-
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
-            pojie-kline-cache-${{ github.ref_name }}-
             pojie-kline-cache-
 
       - name: 安装Python环境
@@ -425,15 +435,27 @@ jobs:
                   expected_count = cnt.get(expected, 0)
                   print(f'目标日期={expected}；达到目标日期股票数={expected_count}')
                   if mode_date != expected:
-                      print('❌ 缓存主体没有更新到目标日期，停止正式推荐。')
-                      print('处理办法：先运行自动补拉/全量缓存更新，或确认目标日期是否填错。')
-                      raise SystemExit(2)
+                      print('⚠️ 缓存主体还没有更新到目标日期，本次不运行破界正式推荐。')
+                      print('✅ 已保留本轮补拉成果，后续保存到GitHub cache；请再次运行继续断点补拉。')
+                      with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                          f.write('SHOULD_RUN_POJIE=0\n')
+                          f.write('POJIE_CACHE_NEEDS_MORE=1\n')
+                      raise SystemExit(0)
                   print('✅ 缓存主体已达到目标日期，可以继续破界扫描。')
+                  with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                      f.write('SHOULD_RUN_POJIE=1\n')
+                      f.write('POJIE_CACHE_NEEDS_MORE=0\n')
               else:
                   print('未指定目标日期，后续由PY按缓存众数/工作日逻辑判断。')
+                  with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                      f.write('SHOULD_RUN_POJIE=1\n')
+                      f.write('POJIE_CACHE_NEEDS_MORE=0\n')
           else:
-              print('❌ 未发现可用K线日期，停止。')
-              raise SystemExit(2)
+              print('⚠️ 未发现可用K线日期，本次不运行破界正式推荐。')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                  f.write('SHOULD_RUN_POJIE=0\n')
+                  f.write('POJIE_CACHE_NEEDS_MORE=1\n')
+              raise SystemExit(0)
           PY
 
       - name: 语法检查
@@ -513,7 +535,7 @@ jobs:
           print(f'运行结束后K线CSV数量：{total}')
           print(f'本次BaoStock补拉成功数量：{remote_success}')
 
-          should_save = (total >= 1000 and (remote_success > 0 or os.getenv('AUTO_BACKFILL_RAN') == '1'))
+          should_save = (total >= 1000 and (remote_success > 0 or os.getenv('AUTO_BACKFILL_RAN') == '1' or os.getenv('POJIE_CACHE_NEEDS_MORE') == '1'))
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
               f.write(f"SAVE_POJIE_CACHE={1 if should_save else 0}\n")
