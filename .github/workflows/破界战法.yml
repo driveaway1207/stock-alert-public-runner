@@ -1,4 +1,4 @@
-name: 破界战法2.0专业核心压力线版
+name: 破界战法2.2.2年季候选池评分制
 
 on:
   workflow_dispatch:
@@ -48,6 +48,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      ENABLE_TELEGRAM: ${{ github.event.inputs.send_telegram == 'true' && '1' || '0' }}
 
       USE_FULL_HISTORY_CACHE: "1"
       FULL_HISTORY_CACHE_DIR: "kline_cache"
@@ -89,16 +90,16 @@ jobs:
           echo "workflow 文件："
           ls -la .github/workflows || true
 
-      - name: 检查破界战法2.0专业核心压力线版主程序
+      - name: 检查破界战法2.2.2主程序
         shell: bash
         run: |
-          echo "检查破界战法2.0专业核心压力线版主程序：$MODEL_FILE"
+          echo "检查破界战法2.2.2主程序：$MODEL_FILE"
           if [ ! -f "$MODEL_FILE" ]; then
             echo "❌ 没找到破界主程序：$MODEL_FILE"
             ls -la
             exit 1
           fi
-          echo "✅ 找到破界战法2.0主程序：$MODEL_FILE"
+          echo "✅ 找到破界战法2.2.2主程序：$MODEL_FILE"
 
       - name: 尝试下载最近K线验收产物
         if: ${{ github.event.inputs.run_mode != 'selfcheck' }}
@@ -277,7 +278,8 @@ jobs:
           echo "缓存未命中时是否允许BaoStock补拉：$POJIE_REMOTE_ON_CACHE_MISS（0=只读缓存，不补拉）"
           echo "逐只K线日志：$POJIE_VERBOSE_KLINE；并行workers：$POJIE_WORKERS；保守预筛：$POJIE_FAST_PREFILTER；进度间隔：每$POJIE_PROGRESS_EVERY只或$POJIE_PROGRESS_SECONDS秒"
           echo "数据源策略：只读缓存；缓存缺失直接跳过；BaoStock/AkShare均不在战法层补拉。"
-          echo "推送策略：默认发送Telegram；即使候选为0，也推送总结报告。"
+          echo "推送策略：完整推荐只发Telegram；GitHub日志只显示摘要。"
+          if [ "$RAW_SEND_TG" = "true" ]; then export ENABLE_TELEGRAM=1; else export ENABLE_TELEGRAM=0; fi
 
           if [ "$RAW_MODE" = "selfcheck" ]; then
             echo "执行破界自检，不发送Telegram。"
