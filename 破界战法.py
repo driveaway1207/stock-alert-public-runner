@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "破界战法2.2｜第一核心线季线主导精细化版"
+MODEL_VERSION = "破界战法2.2.1｜第一核心线季线主导精细化版-频率兼容修复"
 DEFAULT_BASE_MODEL_FILE = os.environ.get("破界_基础模型文件", os.environ.get("POJIE_BASE_MODEL_FILE", "stock_alert.py"))
 OUTPUT_DIR = os.environ.get("破界_输出目录", os.environ.get("POJIE_OUTPUT_DIR", "outputs/pojie"))
 
@@ -1992,7 +1992,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     return "\n".join(lines)
 
 
-# ========================= V2.2 第一核心压力线季线主导精细化补丁 =========================
+# ========================= V2.2.1 第一核心压力线季线主导精细化补丁 =========================
 # 说明：本段只覆盖“找线、评线、触发、报告字段”。不改缓存、Workflow、股票池、并行扫描、Telegram发送框架。
 
 V22_ENTITY_NEAR_PCT = 0.03          # 年/季实体顶贴近阈值：3%
@@ -2074,8 +2074,14 @@ def _v22_snap_to_entity(line: float, row) -> float:
     return float(line)
 
 
+def _v22_resample_rule(period: str) -> str:
+    # pandas 2.2+ 已弃用/移除 Q、Y、M 的旧偏移别名；统一使用显式期末别名。
+    # Q -> QE：季度末；Y -> YE：年末；M -> ME：月末。
+    return {'Q': 'QE', 'Y': 'YE', 'M': 'ME', 'W': 'W-FRI'}.get(str(period), 'D')
+
+
 def _v22_period_df(daily: pd.DataFrame, period: str) -> pd.DataFrame:
-    rule = {'Q': 'Q', 'Y': 'Y', 'M': 'M', 'W': 'W'}.get(period, 'D')
+    rule = _v22_resample_rule(period)
     if period == 'D':
         out = force_kline_schema(daily).copy()
     else:
@@ -2305,7 +2311,7 @@ def _v22_collect_auxiliary_candidates(daily: pd.DataFrame, first_line: Optional[
     cur = safe_float(daily['close'].iloc[-1]) if daily is not None and len(daily) else 0
     cands: List[Dict[str, Any]] = []
     # 复用原有语义/共振候选，只作为辅助候选，不用于第一核心线。
-    for tf, rule, lookback in [('Q','Q',80), ('Y','Y',40), ('M','M',120), ('W','W',180)]:
+    for tf, rule, lookback in [('Q','QE',80), ('Y','YE',40), ('M','ME',120), ('W','W-FRI',180)]:
         pdf = _v22_period_df(daily, tf).tail(lookback)
         if pdf is None or len(pdf) < 10:
             continue
@@ -2698,7 +2704,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     lines = []
     valid_scanned = max(0, int(scanned) - int(failed) - int(no_kline))
     not_selected = max(0, valid_scanned - len(results))
-    lines.append('【破界战法2.2｜第一核心线季线主导精细化版】')
+    lines.append('【破界战法2.2.1｜第一核心线季线主导精细化版-频率兼容修复】')
     lines.append(f'生成时间：{now_bj()}')
     expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip()
     if expected:
@@ -2731,7 +2737,7 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
         lines.append('')
     return '\n'.join(lines)
 
-# ========================= V2.2 第一核心压力线季线主导精细化补丁结束 =========================
+# ========================= V2.2.1 第一核心压力线季线主导精细化补丁结束 =========================
 
 def main():
     args = parse_args()
