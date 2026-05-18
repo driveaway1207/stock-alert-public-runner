@@ -90,6 +90,8 @@ jobs:
 
       - name: Check accepted cache before upload
         run: |
+          echo "开始执行上传前K线验收：数量 + 日期双重检查。"
+
           CSV_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "准备交给一号员工的K线CSV数量：$CSV_COUNT"
 
@@ -98,7 +100,132 @@ jobs:
             exit 1
           fi
 
-          echo "✅ K线缓存数量正常，可以交给一号员工。"
+          echo "开始检查K线缓存最新日期，不再只看CSV数量..."
+
+          CACHE_DATE_REPORT=$(python - <<'PY'
+          import os, csv, json
+          from pathlib import Path
+          from collections import Counter
+          from datetime import datetime, timedelta, timezone
+
+          cache_dir = Path("kline_cache")
+          dates = []
+          samples = []
+
+          def normalize_date(x):
+              s = str(x).strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+              return s[:10]
+
+          for f in cache_dir.rglob("*.csv"):
+              if f.name.startswith("_"):
+                  continue
+              try:
+                  with open(f, "r", encoding="utf-8-sig", newline="") as fh:
+                      rows = list(csv.reader(fh))
+
+                  if len(rows) < 2:
+                      continue
+
+                  header = rows[0]
+                  idx = 0
+                  for name in ("date", "日期", "trade_date", "交易日期"):
+                      if name in header:
+                          idx = header.index(name)
+                          break
+
+                  last = None
+                  for row in reversed(rows[1:]):
+                      if row and len(row) > idx and str(row[idx]).strip():
+                          last = normalize_date(row[idx])
+                          break
+
+                  if last:
+                      dates.append(last)
+                      if len(samples) < 12:
+                          samples.append((f.name, last))
+              except Exception:
+                  pass
+
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ""
+
+          manual = (
+              os.environ.get("TARGET_TRADE_DATE", "").strip()
+              or os.environ.get("EXPECTED_KLINE_DATE", "").strip()
+              or os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
+          )
+
+          if manual:
+              expected = normalize_date(manual)
+              source = "手动指定"
+          else:
+              # 普通交易日倒推：周末回到上一个工作日。
+              # 注意：节假日如需特殊处理，可手动设置 EXPECTED_KLINE_DATE。
+              now = datetime.now(timezone(timedelta(hours=8))).date()
+              d = now
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              expected = d.isoformat()
+              source = "北京时间工作日推断"
+
+          report = {
+              "csv_with_date_count": len(dates),
+              "cache_majority_date": majority,
+              "expected_trade_date": expected,
+              "expected_date_source": source,
+              "cache_date_top": c.most_common(10),
+              "cache_date_samples": samples,
+          }
+
+          Path("outputs").mkdir(exist_ok=True)
+          with open("outputs/cache_acceptance_date_report.json", "w", encoding="utf-8") as f:
+              json.dump(report, f, ensure_ascii=False, indent=2)
+
+          print(f"CSV_WITH_DATE_COUNT={len(dates)}")
+          print(f"CACHE_MAJORITY_DATE={majority}")
+          print(f"EXPECTED_TRADE_DATE={expected}")
+          print(f"EXPECTED_DATE_SOURCE={source}")
+          print("CACHE_DATE_TOP=" + "; ".join(f"{d}:{n}" for d, n in c.most_common(10)))
+          print("CACHE_DATE_SAMPLES=" + "; ".join(f"{name}:{d}" for name, d in samples))
+          PY
+          )
+
+          echo "$CACHE_DATE_REPORT"
+
+          CSV_WITH_DATE_COUNT=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^CSV_WITH_DATE_COUNT=/{print $2}')
+          CACHE_MAJORITY_DATE=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^CACHE_MAJORITY_DATE=/{print $2}')
+          EXPECTED_TRADE_DATE=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^EXPECTED_TRADE_DATE=/{print $2}')
+          EXPECTED_DATE_SOURCE=$(echo "$CACHE_DATE_REPORT" | awk -F= '/^EXPECTED_DATE_SOURCE=/{print $2}')
+
+          echo "可读日期CSV数量：$CSV_WITH_DATE_COUNT"
+          echo "缓存众数日期：$CACHE_MAJORITY_DATE"
+          echo "目标交易日：$EXPECTED_TRADE_DATE"
+          echo "目标日期来源：$EXPECTED_DATE_SOURCE"
+
+          if [ -z "$CACHE_MAJORITY_DATE" ]; then
+            echo "❌ 没有从K线CSV中读取到有效最新日期，不上传给一号员工。"
+            exit 1
+          fi
+
+          if [ "$CSV_WITH_DATE_COUNT" -lt 1000 ]; then
+            echo "❌ 可读日期的K线CSV数量过少，不上传给一号员工。"
+            exit 1
+          fi
+
+          if [ -n "$EXPECTED_TRADE_DATE" ] && [ "$CACHE_MAJORITY_DATE" != "$EXPECTED_TRADE_DATE" ]; then
+            echo "❌ K线缓存日期未达到目标交易日，不上传给一号员工。"
+            echo "缓存众数日期=$CACHE_MAJORITY_DATE，目标交易日=$EXPECTED_TRADE_DATE。"
+            echo "请先让 A Stock Full Kline Cache Auto Backfill 把大多数CSV更新到目标交易日。"
+            exit 1
+          fi
+
+          echo "✅ K线缓存数量和日期均正常，可以交给一号员工。"
 
       - name: Upload accepted kline cache and reports
         if: success()
