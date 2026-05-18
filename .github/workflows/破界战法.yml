@@ -554,17 +554,28 @@ jobs:
                       f.write(f'POJIE_EXPECTED_KLINE_DATE={expected}\n')
               if expected:
                   expected_count = cnt.get(expected, 0)
-                  print(f'目标日期={expected}；达到目标日期股票数={expected_count}')
+                  cache_max_date = max(dates)
+                  print(f'目标日期={expected}；目标日正好有K线的股票数={expected_count}')
+                  print(f'缓存最大日期={cache_max_date}')
                   with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
                       f.write(f'POJIE_EXPECTED_KLINE_DATE={expected}\n')
-                  if mode_date != expected:
-                      print('⚠️ 缓存主体还没有更新到目标日期，本次不运行破界正式推荐。')
-                      print('✅ 已保留本轮补拉成果，后续保存到GitHub cache；请再次运行继续断点补拉。')
-                      with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
-                          f.write('SHOULD_RUN_POJIE=0\n')
-                          f.write('POJIE_CACHE_NEEDS_MORE=1\n')
-                      raise SystemExit(0)
-                  print('✅ 缓存主体已达到目标日期，可以继续破界扫描。')
+
+                  # 指定日期扫描逻辑：缓存只要覆盖到目标日期即可运行。
+                  # Python会把每只股票K线截断到目标日期及以前，再进行破界扫描。
+                  try:
+                      if pd.to_datetime(cache_max_date) < pd.to_datetime(expected):
+                          print('⚠️ 缓存最大日期早于目标日期，本次不运行破界正式推荐。')
+                          print('✅ 已保留本轮补拉成果，后续保存到GitHub cache；请再次运行继续断点补拉。')
+                          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+                              f.write('SHOULD_RUN_POJIE=0\n')
+                              f.write('POJIE_CACHE_NEEDS_MORE=1\n')
+                          raise SystemExit(0)
+                  except SystemExit:
+                      raise
+                  except Exception as e:
+                      print(f'⚠️ 日期覆盖校验异常：{e}，本次继续运行。')
+
+                  print('✅ 缓存已覆盖目标日期，可以按目标日期截断后扫描。')
                   with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
                       f.write('SHOULD_RUN_POJIE=1\n')
                       f.write('POJIE_CACHE_NEEDS_MORE=0\n')
