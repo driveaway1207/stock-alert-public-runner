@@ -1491,6 +1491,45 @@ def parse_args():
 
 
 
+
+def cutoff_kline_to_expected_date(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    指定日期扫描模式：
+    - 如果填写 POJIE_EXPECTED_KLINE_DATE，就把K线截断到该日期及以前；
+    - 模型只看到目标日当时已经存在的数据；
+    - 后面的未来K线不参与选股。
+
+    例：填写 2023-06-15，则每只股票只用 <=2023-06-15 的K线扫描。
+    如果目标日不是交易日，会自动落到目标日前最近一个有K线的交易日。
+    """
+    expected = os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
+
+    if df is None or getattr(df, "empty", True):
+        return None
+
+    d = force_kline_schema(df)
+    if d is None or d.empty or "date" not in d.columns:
+        return None
+
+    if not expected:
+        return d
+
+    d = d.copy()
+    d["_dt"] = pd.to_datetime(d["date"], errors="coerce")
+    target = pd.to_datetime(expected, errors="coerce")
+
+    if pd.isna(target):
+        d = d.drop(columns=["_dt"], errors="ignore")
+        return force_kline_schema(d)
+
+    d = d[d["_dt"] <= target].copy()
+    d = d.drop(columns=["_dt"], errors="ignore")
+
+    if d.empty:
+        return None
+
+    return force_kline_schema(d)
+
 def quick_trigger_prefilter(df: pd.DataFrame) -> bool:
     """
     保守预筛：只过滤掉明显没有“破界触发K”的股票。
@@ -1500,6 +1539,7 @@ def quick_trigger_prefilter(df: pd.DataFrame) -> bool:
     if not POJIE_FAST_PREFILTER:
         return True
     d = normalize_external_kline_df(df)
+    d = cutoff_kline_to_expected_date(d)
     if d is None or len(d) < 120:
         return True
     last = d.iloc[-1]
@@ -2729,12 +2769,14 @@ def scan_one(symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     d = normalize_external_kline_df(df)
     if d is not None:
         d = force_kline_schema(d)
+
+    # 指定日期扫描：填哪天，就只用哪天及以前的K线。
+    # 这一步让缓存即使更新到今天，也能回到2023年某一天扫描当时能选出的股票。
+    d = cutoff_kline_to_expected_date(d)
+
     if d is None or len(d) < 180:
         return None
     last_date = str(pd.to_datetime(d['date'].iloc[-1]).date())
-    expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip() or os.environ.get('POJIE_MARKET_LATEST_DATE', '').strip()
-    if expected and last_date != expected:
-        return None
     zones = find_coreline_zones(d)
     if not zones:
         return None
@@ -2805,9 +2847,9 @@ def build_report(results: List[Dict[str, Any]], scanned: int, failed: int = 0, n
     lines.append(f'生成时间：{now_bj()}')
     expected = os.environ.get('POJIE_EXPECTED_KLINE_DATE', '').strip() or os.environ.get('POJIE_MARKET_LATEST_DATE', '').strip()
     if expected:
-        lines.append(f'K线日期硬过滤：{expected}；个股最后K线不等于该日，一律不入正式候选（停牌/缓存过期均剔除）。')
+        lines.append(f'指定扫描日期：{expected}；模型只使用该日期及以前K线，输出站在该日收盘后能选出的股票。')
     else:
-        lines.append('K线日期口径：未识别市场最新日期；建议检查缓存或设置 POJIE_EXPECTED_KLINE_DATE。')
+        lines.append('K线日期口径：未指定手动日期时，按缓存众数/工作日逻辑识别最新日期。')
     lines.append(f'扫描：{scanned}只，K线有效：{valid_scanned}只，入选：{len(results)}只，未入选：{not_selected}只，无K线/数据不足：{no_kline}只，异常失败：{failed}只')
     lines.append('第一核心线口径：年线/季线同时生成候选并评分；年线最大量K上影区支持“最低有效上影线高点”候选；年线权重大但低共振兜底线折扣；今日推荐只认最新日突破，不做历史突破回踩战法。')
     lines.append('')
@@ -2896,7 +2938,7 @@ def main():
     last_progress_ts = start
 
     rows = stock_list.to_dict("records")
-    # 最新K线日期硬过滤：手动 POJIE_EXPECTED_KLINE_DATE 优先；否则用缓存众数+北京时间工作日保护。
+    # 指定日期扫描：手动 POJIE_EXPECTED_KLINE_DATE 优先；否则用缓存众数+北京时间工作日保护。
     effective_expected = _v223_resolve_effective_expected_date(stock_list)
     if not effective_expected:
         print("破界：未能识别有效最新交易日，本次不会放宽日期过滤。")
