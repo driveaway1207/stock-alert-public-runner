@@ -105,6 +105,42 @@ def today_str():
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def normalize_date_str(x):
+    s = str(x).strip().replace("/", "-")
+    if not s:
+        return ""
+    if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+        return s[:10]
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s[:10]
+
+
+def expected_trade_date():
+    """
+    目标交易日：
+    1）优先读取手动/外部传入日期；
+    2）否则按北京时间普通工作日倒推；
+    3）这个日期用于判断缓存是否真的更新到目标日。
+    """
+    manual = (
+        os.getenv("TARGET_TRADE_DATE", "").strip()
+        or os.getenv("EXPECTED_KLINE_DATE", "").strip()
+        or os.getenv("POJIE_EXPECTED_KLINE_DATE", "").strip()
+    )
+    if manual:
+        return normalize_date_str(manual)
+
+    bj_now = datetime.utcnow() + timedelta(hours=8)
+    d = bj_now.date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
+TARGET_TRADE_DATE = expected_trade_date()
+
+
 def fmt_seconds(sec):
     sec = int(max(sec, 0))
     h = sec // 3600
@@ -386,12 +422,24 @@ def df_last_date(df):
 
 
 def cache_is_fresh(df):
+    """
+    V25.6.3 修复：
+    不能再用“距离今天<=5个自然日”判断缓存新鲜。
+    一号员工每日模型必须要求缓存最新日期达到目标交易日，
+    否则即使 meta 已确认全历史，也必须进入增量更新。
+    """
     if df is None or df.empty:
         return False
 
-    last_date = pd.to_datetime(df["date"].max()).date()
-    now_date = datetime.now().date()
-    return (now_date - last_date).days <= 5
+    try:
+        last_date = pd.to_datetime(df["date"].max()).strftime("%Y-%m-%d")
+    except Exception:
+        return False
+
+    if not TARGET_TRADE_DATE:
+        return False
+
+    return last_date >= TARGET_TRADE_DATE
 
 
 def likely_needs_backfill(df, meta_row=None):
@@ -1066,6 +1114,7 @@ def main():
         log(f"[配置] 每轮最多运行 {MAX_RUNTIME_MINUTES} 分钟，提前 {SOFT_STOP_BUFFER_MINUTES} 分钟收尾")
         log(f"[配置] FULL_REBUILD={FULL_REBUILD}, MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
         log(f"[缓存] 当前缓存CSV数量={existing_cache_count}")
+        log(f"[目标] 目标交易日={TARGET_TRADE_DATE}")
         log("[策略] 全历史回补优先 BaoStock；增量更新优先 EastMoney/AkShare")
         log("[保护] 三个数据源全部熔断时，本轮立刻安全收尾")
         log("==============================================")
