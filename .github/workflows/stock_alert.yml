@@ -1,4 +1,4 @@
-name: 一号员工选股模型 V25.6.3
+name: 一号员工选股模型 V25.8
 
 on:
   # 每个交易日下午6点执行：GitHub cron 使用 UTC；北京时间18:00 = UTC 10:00
@@ -57,7 +57,7 @@ on:
         default: '3'
 
 concurrency:
-  group: 一号员工选股模型-v25-6-3-${{ github.ref }}
+  group: 一号员工选股模型-v25-8-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -66,7 +66,7 @@ permissions:
 
 jobs:
   run-stock-alert:
-    name: 运行一号员工选股 V25.6.3
+    name: 运行一号员工选股 V25.8
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -79,15 +79,15 @@ jobs:
       # 当前仓库真实主程序文件名。日志显示仓库里存在 stock_alert.py，不存在 stock_alert_v25_6.py。
       # 所以这里必须指向 stock_alert.py；不要改成不存在的文件名。
       MODEL_FILE: 'stock_alert.py'
-      MODEL_VERSION: 'V25.6.3'
+      MODEL_VERSION: 'V25.8'
 
-      # V25.6.3 核心线/神经线精修参数：只影响压力/支撑线模块，不改变主流程
+      # V25.8 供需压力带参数：不启用核心线/神经线主轴，只保留多周期供需区与突破确认
       ENABLE_XHU_PRESSURE_BREAKOUT: '1'
       XHU_PRESSURE_DEFAULT_BUCKET_PCT: '0.005'
       XHU_PRESSURE_MAX_ZONES_PER_PERIOD: '5'
       XHU_PRESSURE_ENABLE_YEARLY: '1'
 
-      # V25.6.3 分层口径：正式A档不降级，新增A-观察层
+      # V25.8 分层口径：正式A档不降级，新增A-观察层
       V20_A_MIN_SCORE: '82'
       V20_A_MINUS_MIN_SCORE: '79'
       V20_BPLUS_MIN_SCORE: '75'
@@ -96,7 +96,7 @@ jobs:
       V20_TRADE_QUALITY_FLOOR_A_MINUS: '5'
       V20_TRADE_QUALITY_FLOOR_BPLUS: '3'
 
-      # V25.6.3 市场环境：默认中性，只影响突破确认强度，不影响股票池与主流程
+      # V25.8 市场环境：默认中性，只影响突破确认强度，不影响股票池与主流程
       V24_1_MARKET_REGIME: 'neutral'
 
       # 关键保护：生产任务默认禁止自动回测
@@ -399,22 +399,31 @@ jobs:
           c = Counter(dates)
           majority = c.most_common(1)[0][0] if c else ""
 
-          manual = (
-              os.environ.get("TARGET_TRADE_DATE", "").strip()
-              or os.environ.get("EXPECTED_KLINE_DATE", "").strip()
-              or os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
-          )
-          if manual:
-              expected = normalize_date(manual)
-              source = "手动指定"
-          else:
-              # 只做普通工作日倒推；节假日以K线验收任务为准。
-              now = datetime.now(timezone(timedelta(hours=8))).date()
-              d = now
+          # V25.6.4 硬锁目标日期：15:00前用前一工作日，15:00后用当天工作日。
+          # 默认不允许 EXPECTED_KLINE_DATE / POJIE_EXPECTED_KLINE_DATE 覆盖，避免其他战法串改一号员工；如需临时手动指定日期，必须设置 ALLOW_TARGET_DATE_OVERRIDE=允许。
+          def previous_workday(d):
+              d = d - timedelta(days=1)
               while d.weekday() >= 5:
                   d -= timedelta(days=1)
-              expected = d.isoformat()
-              source = "北京时间工作日推断"
+              return d
+
+          allow_override = os.environ.get("ALLOW_TARGET_DATE_OVERRIDE", "不允许").strip() == "允许"
+          manual = normalize_date(os.environ.get("TARGET_TRADE_DATE", "")) if allow_override else ""
+          if manual:
+              expected = manual
+              source = "手动指定-已授权"
+          else:
+              now = datetime.now(timezone(timedelta(hours=8)))
+              d = now.date()
+              if d.weekday() >= 5:
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  expected = d.isoformat()
+              elif now.hour < 15:
+                  expected = previous_workday(d).isoformat()
+              else:
+                  expected = d.isoformat()
+              source = "北京时间15点硬锁规则"
 
           print(f"CACHE_MAJORITY_DATE={majority}")
           print(f"EXPECTED_TRADE_DATE={expected}")
@@ -495,7 +504,7 @@ jobs:
           import json, os
           data = {
               "mode": "daily",
-              "created_by": "stock_alert_workflow_v25_6_3",
+              "created_by": "stock_alert_workflow_v25_8",
               "note": "workflow_run 会强制 daily，不会继承 backtest。",
           }
           with open(os.environ["PENDING_REQUEST_FILE"], "w", encoding="utf-8") as f:
