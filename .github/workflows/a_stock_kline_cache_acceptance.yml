@@ -91,6 +91,8 @@ jobs:
       - name: Check accepted cache before upload
         run: |
           echo "开始执行上传前K线验收：数量 + 日期双重检查。"
+          echo "V25.8硬锁规则：北京时间15:00前目标K线=前一工作日；15:00后目标K线=当天工作日。"
+          echo "默认不允许 EXPECTED_KLINE_DATE / POJIE_EXPECTED_KLINE_DATE 覆盖，避免其他战法串改一号员工；如需临时手动指定日期，必须设置 ALLOW_TARGET_DATE_OVERRIDE=允许。"
 
           CSV_COUNT=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
           echo "准备交给一号员工的K线CSV数量：$CSV_COUNT"
@@ -122,29 +124,47 @@ jobs:
                   return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
               return s[:10]
 
+          def previous_workday(d):
+              d = d - timedelta(days=1)
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              return d
+
+          def expected_trade_date():
+              allow_override = os.environ.get("ALLOW_TARGET_DATE_OVERRIDE", "不允许").strip() == "允许"
+              manual = normalize_date(os.environ.get("TARGET_TRADE_DATE", "")) if allow_override else ""
+              if manual:
+                  return manual, "手动指定-已授权"
+
+              now = datetime.now(timezone(timedelta(hours=8)))
+              d = now.date()
+              if d.weekday() >= 5:
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  return d.isoformat(), "北京时间15点硬锁规则-周末回退"
+              if now.hour < 15:
+                  return previous_workday(d).isoformat(), "北京时间15点硬锁规则-15点前用前一工作日"
+              return d.isoformat(), "北京时间15点硬锁规则-15点后用当天"
+
           for f in cache_dir.rglob("*.csv"):
               if f.name.startswith("_"):
                   continue
               try:
                   with open(f, "r", encoding="utf-8-sig", newline="") as fh:
                       rows = list(csv.reader(fh))
-
                   if len(rows) < 2:
                       continue
-
                   header = rows[0]
                   idx = 0
                   for name in ("date", "日期", "trade_date", "交易日期"):
                       if name in header:
                           idx = header.index(name)
                           break
-
                   last = None
                   for row in reversed(rows[1:]):
                       if row and len(row) > idx and str(row[idx]).strip():
                           last = normalize_date(row[idx])
                           break
-
                   if last:
                       dates.append(last)
                       if len(samples) < 12:
@@ -154,25 +174,7 @@ jobs:
 
           c = Counter(dates)
           majority = c.most_common(1)[0][0] if c else ""
-
-          manual = (
-              os.environ.get("TARGET_TRADE_DATE", "").strip()
-              or os.environ.get("EXPECTED_KLINE_DATE", "").strip()
-              or os.environ.get("POJIE_EXPECTED_KLINE_DATE", "").strip()
-          )
-
-          if manual:
-              expected = normalize_date(manual)
-              source = "手动指定"
-          else:
-              # 普通交易日倒推：周末回到上一个工作日。
-              # 注意：节假日如需特殊处理，可手动设置 EXPECTED_KLINE_DATE。
-              now = datetime.now(timezone(timedelta(hours=8))).date()
-              d = now
-              while d.weekday() >= 5:
-                  d -= timedelta(days=1)
-              expected = d.isoformat()
-              source = "北京时间工作日推断"
+          expected, source = expected_trade_date()
 
           report = {
               "csv_with_date_count": len(dates),
