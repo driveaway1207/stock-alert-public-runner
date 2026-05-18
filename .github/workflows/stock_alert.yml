@@ -276,10 +276,35 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
           name: kline-cache-accepted
-          path: .
+          path: downloaded_artifacts
+
+      - name: ⑤.1 整理K线验收产物
+        if: ${{ github.event_name == 'workflow_run' }}
+        shell: bash
+        run: |
+          echo "展示下载到的产物目录："
+          find downloaded_artifacts -maxdepth 4 -type d | sort | head -100 || true
+          find downloaded_artifacts -maxdepth 4 -type f | sort | head -100 || true
+
+          if find downloaded_artifacts -type d -name "K线缓存" | grep -q .; then
+            SRC=$(find downloaded_artifacts -type d -name "K线缓存" | head -1)
+            echo "发现中文K线缓存目录：$SRC"
+            rm -rf K线缓存 kline_cache
+            mv "$SRC" K线缓存
+            echo "ARTIFACT_KLINE_READY=1" >> "$GITHUB_ENV"
+          elif find downloaded_artifacts -type d -name "kline_cache" | grep -q .; then
+            SRC=$(find downloaded_artifacts -type d -name "kline_cache" | head -1)
+            echo "发现英文K线缓存目录：$SRC"
+            rm -rf K线缓存 kline_cache
+            mv "$SRC" kline_cache
+            echo "ARTIFACT_KLINE_READY=1" >> "$GITHUB_ENV"
+          else
+            echo "没有在验收产物里找到K线缓存目录"
+            echo "ARTIFACT_KLINE_READY=0" >> "$GITHUB_ENV"
+          fi
 
       - name: ⑥ 尝试恢复GitHub缓存里的K线
-        if: ${{ env.RUN_MODE != 'selfcheck' }}
+        if: ${{ env.RUN_MODE != 'selfcheck' && env.ARTIFACT_KLINE_READY != '1' }}
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
