@@ -40,7 +40,16 @@ os.makedirs(KLINE_CACHE_DIR, exist_ok=True)
 
 FULL_HISTORY_START = "1990-01-01"
 FULL_HISTORY_START_EM = "19900101"
-INCREMENTAL_DAYS = 90
+# ========================= V25.6.4 日更策略硬锁 =========================
+# 关键规则锁死：
+# 1）15:00前，目标K线日期=上一个工作日；15:00后，目标K线日期=当天工作日；
+# 2）日常只补最近10天；缓存落后较多才补30/90天；
+# 3）默认不读取外部环境变量覆盖这些核心规则，避免破界战法/其他 workflow 串改。
+LOCKED_TARGET_CUTOFF_HOUR_BJ = 15
+LOCKED_DAILY_INCREMENTAL_DAYS = 10
+LOCKED_MEDIUM_INCREMENTAL_DAYS = 30
+LOCKED_LONG_INCREMENTAL_DAYS = 90
+INCREMENTAL_DAYS = LOCKED_DAILY_INCREMENTAL_DAYS
 
 FULL_REBUILD = os.getenv("FULL_REBUILD", "0").strip() in ("1", "true", "True", "yes", "YES")
 MIN_CACHE_FILES_REQUIRED = int(os.getenv("MIN_CACHE_FILES_REQUIRED", "3000"))
@@ -101,8 +110,13 @@ def log(msg):
     print(msg, flush=True)
 
 
+def bj_now():
+    """北京时间。GitHub Actions 默认UTC，这里统一转北京时间。"""
+    return datetime.utcnow() + timedelta(hours=8)
+
+
 def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+    return bj_now().strftime("%Y-%m-%d")
 
 
 def normalize_date_str(x):
@@ -116,30 +130,70 @@ def normalize_date_str(x):
     return s[:10]
 
 
-def expected_trade_date():
-    """
-    目标交易日：
-    1）优先读取手动/外部传入日期；
-    2）否则按北京时间普通工作日倒推；
-    3）这个日期用于判断缓存是否真的更新到目标日。
-    """
-    manual = (
-        os.getenv("TARGET_TRADE_DATE", "").strip()
-        or os.getenv("EXPECTED_KLINE_DATE", "").strip()
-        or os.getenv("POJIE_EXPECTED_KLINE_DATE", "").strip()
-    )
-    if manual:
-        return normalize_date_str(manual)
-
-    bj_now = datetime.utcnow() + timedelta(hours=8)
-    d = bj_now.date()
+def previous_workday(d):
+    """简化版A股工作日兜底：周末回退；法定节假日后续可接交易日历，但不能用未来日期。"""
+    d = d - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
+    return d
+
+
+def expected_trade_date():
+    """
+    V25.6.4 硬锁目标K线日期：
+    - 北京时间15:00之前：今天日K还没收完，目标=上一个工作日；
+    - 北京时间15:00之后：目标=当天工作日；
+    - 周末：目标=上一个工作日。
+
+    默认不允许 TARGET_TRADE_DATE / EXPECTED_KLINE_DATE / POJIE_EXPECTED_KLINE_DATE 覆盖，
+    避免其他战法或 workflow 把一号员工缓存目标日期串改。
+    如遇极端节假日需要人工覆盖，必须同时设置：
+    ALLOW_TARGET_DATE_OVERRIDE=允许 且 TARGET_TRADE_DATE=YYYY-MM-DD。
+    """
+    allow_override = os.getenv("ALLOW_TARGET_DATE_OVERRIDE", "不允许").strip() == "允许"
+    manual = normalize_date_str(os.getenv("TARGET_TRADE_DATE", "")) if allow_override else ""
+    if manual:
+        return manual
+
+    now = bj_now()
+    d = now.date()
+
+    if d.weekday() >= 5:
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.isoformat()
+
+    if now.hour < LOCKED_TARGET_CUTOFF_HOUR_BJ:
+        return previous_workday(d).isoformat()
+
     return d.isoformat()
 
 
 TARGET_TRADE_DATE = expected_trade_date()
 
+
+def incremental_window_days(cache_df):
+    """
+    V25.6.4 自适应增量窗口：
+    - 缓存只落后几天：补10天，够覆盖最近缺口，速度快；
+    - 缓存落后10~30天：补30天；
+    - 缓存落后30天以上：补90天。
+    这样避免每天5200只股票都回补90天。
+    """
+    if cache_df is None or cache_df.empty:
+        return LOCKED_LONG_INCREMENTAL_DAYS
+    try:
+        last_date = pd.to_datetime(cache_df["date"].max()).date()
+        target_date = pd.to_datetime(TARGET_TRADE_DATE).date()
+        gap_days = max((target_date - last_date).days, 0)
+    except Exception:
+        return LOCKED_LONG_INCREMENTAL_DAYS
+
+    if gap_days <= 10:
+        return LOCKED_DAILY_INCREMENTAL_DAYS
+    if gap_days <= 30:
+        return LOCKED_MEDIUM_INCREMENTAL_DAYS
+    return LOCKED_LONG_INCREMENTAL_DAYS
 
 def fmt_seconds(sec):
     sec = int(max(sec, 0))
@@ -423,10 +477,9 @@ def df_last_date(df):
 
 def cache_is_fresh(df):
     """
-    V25.6.3 修复：
-    不能再用“距离今天<=5个自然日”判断缓存新鲜。
-    一号员工每日模型必须要求缓存最新日期达到目标交易日，
-    否则即使 meta 已确认全历史，也必须进入增量更新。
+    V25.6.4 硬锁新鲜度判断：
+    不能再用“距离今天<=5个自然日”判断新鲜。
+    必须达到目标K线日期；目标日期由15:00规则决定。
     """
     if df is None or df.empty:
         return False
@@ -742,13 +795,20 @@ def fetch_full_history(code, old_df=None):
 def fetch_incremental(code, cache_df):
     """
     增量更新阶段：
-    先试 EastMoney / AkShare，失败再 BaoStock。
+    V25.6.4 不再固定回补90天。
+    日常缺几天时只回补10天；落后较久才扩大到30/90天。
     """
     last_date = pd.to_datetime(cache_df["date"].max()).date()
-    start_date = last_date - timedelta(days=INCREMENTAL_DAYS)
+    days = incremental_window_days(cache_df)
+    start_date = last_date - timedelta(days=days)
     start_str = start_date.strftime("%Y-%m-%d")
     em_start = start_str.replace("-", "")
-    mode = "incremental"
+    mode = f"incremental_{days}d"
+
+    log(
+        f"[增量窗口] code={code} last={last_date.isoformat()} "
+        f"target={TARGET_TRADE_DATE} days={days} start={start_str}"
+    )
 
     for source in ["EastMoney", "AkShare", "BaoStock"]:
         df = fetch_from_source(code, source, mode, start_str, em_start)
@@ -1114,7 +1174,8 @@ def main():
         log(f"[配置] 每轮最多运行 {MAX_RUNTIME_MINUTES} 分钟，提前 {SOFT_STOP_BUFFER_MINUTES} 分钟收尾")
         log(f"[配置] FULL_REBUILD={FULL_REBUILD}, MIN_CACHE_FILES_REQUIRED={MIN_CACHE_FILES_REQUIRED}")
         log(f"[缓存] 当前缓存CSV数量={existing_cache_count}")
-        log(f"[目标] 目标交易日={TARGET_TRADE_DATE}")
+        log(f"[硬锁] 目标K线日期={TARGET_TRADE_DATE}，15:00前用前一工作日，15:00后用当天工作日")
+        log(f"[硬锁] 日常增量={LOCKED_DAILY_INCREMENTAL_DAYS}天，落后中等={LOCKED_MEDIUM_INCREMENTAL_DAYS}天，长期落后={LOCKED_LONG_INCREMENTAL_DAYS}天")
         log("[策略] 全历史回补优先 BaoStock；增量更新优先 EastMoney/AkShare")
         log("[保护] 三个数据源全部熔断时，本轮立刻安全收尾")
         log("==============================================")
