@@ -356,6 +356,8 @@ V26_MAX_NEAR_PRESSURE = float(os.environ.get("V26_MAX_NEAR_PRESSURE", "0.045"))
 V26_FAILURE_RISK_BLOCK = float(os.environ.get("V26_FAILURE_RISK_BLOCK", "7.0"))
 V26_SIGNAL_MAX_AGE_DAYS = int(os.environ.get("V26_SIGNAL_MAX_AGE_DAYS", "13"))
 V26_ENABLE_PORTFOLIO_DECORR = os.environ.get("V26_ENABLE_PORTFOLIO_DECORR", "1")
+# V26.2.1：只允许最终报告阶段发送Telegram；运行中诊断/空样本/异常分支只写日志和artifact，避免中途误推送。
+SUPPRESS_MIDRUN_TELEGRAM = os.environ.get("SUPPRESS_MIDRUN_TELEGRAM", "1")
 # ===========================================================================
 
 
@@ -10437,6 +10439,23 @@ def send_telegram(message):
     return ok
 
 
+def send_midrun_telegram(message, reason=""):
+    """
+    V26.2.1：中途推送保护。
+    日常生产只允许最终正式报告调用 send_telegram；运行中异常/诊断/空样本分支
+    只打印日志，不主动推送Telegram，避免未完成深度评分就误发报告。
+    如需临时恢复旧行为，可设置 SUPPRESS_MIDRUN_TELEGRAM=0。
+    """
+    if str(globals().get("SUPPRESS_MIDRUN_TELEGRAM", "1")) == "1":
+        print(f"[中途Telegram已抑制] reason={reason}")
+        try:
+            print(message)
+        except Exception:
+            pass
+        return False
+    return send_telegram(message)
+
+
 
 def v14_diagnostics_text(diags, limit=5):
     """V14/V19诊断文本兜底，避免最终报告阶段因旧函数缺失失败。"""
@@ -15413,7 +15432,7 @@ def main():
         if not baostock_login():
             msg = "BaoStock登录失败，无法获取数据。"
             print(msg)
-            send_telegram(build_error_message(msg))
+            send_midrun_telegram(build_error_message(msg), reason="baostock_login_failed")
             return
     else:
         try:
@@ -15430,7 +15449,7 @@ def main():
 
         if stock_list.empty:
             msg = build_message([], [], 0, 0, 0, 0)
-            send_telegram(msg)
+            send_midrun_telegram(msg, reason="early_empty_result")
             return
 
         print(f"共抓取 {len(stock_list)} 只股票")
@@ -15534,12 +15553,12 @@ def main():
                 f"{summarize_kline_source_stats()}"
             )
             print(warning)
-            send_telegram(build_error_message(warning))
+            send_midrun_telegram(build_error_message(warning), reason="runtime_warning")
             return
 
         if not base_rows:
             msg = build_message([], dates, len(stock_list), kline_success, kline_fail, 0)
-            send_telegram(msg)
+            send_midrun_telegram(msg, reason="early_empty_result")
             return
 
         base_rows = sorted(
@@ -15643,7 +15662,7 @@ def main():
                 "为避免误判，本次不推送正式选股结果。"
             )
             print(warning)
-            send_telegram(build_error_message(warning))
+            send_midrun_telegram(build_error_message(warning), reason="runtime_warning")
             return
 
         # V14最终三选：原主模型完整跑完后，只做后置审核/分层扣分/相对最优三选；不重写、不删主模型逻辑。
@@ -15721,7 +15740,7 @@ def main():
 
     except Exception as e:
         print(f"主流程失败：{e}")
-        send_telegram(build_error_message(e))
+        send_midrun_telegram(build_error_message(e), reason="main_exception")
 
     finally:
         baostock_logout()
