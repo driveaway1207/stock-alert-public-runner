@@ -1,4 +1,4 @@
-name: Employee1 V26 Daily Stock Alert
+name: Employee1 Daily Stock Alert
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
     - cron: '10 10 * * 1-5'
 
 jobs:
-  run-employee1-v26:
+  run-employee1:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -26,11 +26,18 @@ jobs:
       # END PROTECTED PAT AREA
       # ============================================================
 
+      # ============================================================
+      # PROTECTED TELEGRAM SECRET AREA - DO NOT MODIFY / RENAME
+      # Telegram密钥保护区：只读取 GitHub Secrets，不写明文，不改变量名。
+      # ============================================================
       # Telegram 推送
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       ENABLE_TELEGRAM: '1'
+      # ============================================================
+      # END PROTECTED TELEGRAM SECRET AREA
+      # ============================================================
 
       # 一号员工 V26：爆发前夜最终买入池
       TOP_PUSH_LIMIT: '5'
@@ -79,9 +86,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests baostock akshare openpyxl scipy
 
-      - name: Run Employee1 V26
+      - name: Run Employee1
         run: |
-          python stock_alert_V26_0_employee1_institutional_full.py
+          # PROTECTED ENTRYPOINT - DO NOT RENAME / DO NOT REPLACE
+          # 运行入口保护：保持你长期使用的原始 py 文件名，不擅自切换到新文件名。
+          python "stock_alert_V25_8_chan_institutional_full-1 copy.py"
 
       - name: Upload V26 artifacts
         if: always()
