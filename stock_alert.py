@@ -1,6 +1,15 @@
 # V20.3 BUILD - base screening multi-channel recall + dynamic risk library - py_compile passed
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
+
+# ============================================================
+# GLOBAL PERMANENT PROTECTION POLICY - DO NOT MODIFY PROTECTED AREAS
+# 全局永久保护规则：
+# 1）任何 PAT / GH_PAT / GITHUB_TOKEN / TOKEN / SECRET / KEY / TELEGRAM_* 相关变量和逻辑只读保护；
+# 2）任何 workflow 运行入口文件名、原始主流程入口、环境变量名不得擅自重命名；
+# 3）后续优化只能围绕评分、结构、报告与非密钥逻辑做外科式重构；
+# 4）如发现密钥相关区域需要调整，必须停止并人工确认，不允许自动修改。
+# ============================================================
 import json
 import time
 import html
@@ -159,16 +168,17 @@ warnings.filterwarnings("ignore")
 # ===========================================================================
 
 # ============================================================
-# PROTECTED CREDENTIAL / PAT AREA - DO NOT MODIFY / FORMAT / REPLACE
-# PAT字段与外部推送密钥保护区：禁止修改、清空、格式化、替换。
-# 说明：如workflow或环境变量中存在 GitHub PAT / Telegram Token，
-#      本代码只读取环境变量，绝不在重构中改写字段名或默认值。
+# PROTECTED CREDENTIAL / PAT-LIKE AREA - PERMANENT LOCK
+# 永久保护区：PAT / GH_PAT / GITHUB_TOKEN / TELEGRAM_TOKEN / TELEGRAM_BOT_TOKEN /
+# TELEGRAM_CHAT_ID / SECRET / TOKEN / KEY 等密钥、令牌、推送通道相关变量，
+# 以及 os.environ 读取逻辑，禁止在后续任何重构中修改、清空、替换、格式化或改名。
+# 规则：只允许读取 GitHub Secrets / 环境变量；禁止写入明文；禁止改变变量名与兜底链路。
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 # ============================================================
-# END PROTECTED CREDENTIAL / PAT AREA
+# END PROTECTED CREDENTIAL / PAT-LIKE AREA
 # ============================================================
 
 SIGNAL_FILE = "signals_history.json"
@@ -311,7 +321,7 @@ V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 # 从非硬雷区/非硬失败候选中按风险调整后综合排序固定输出Top3。
 # 压力带突破、倍量、回踩确认、空头钝化、时间窗口等均为评分项，不作为单独必要条件。
 V19_ENABLE_TOP3_FIXED = os.environ.get("V19_ENABLE_TOP3_FIXED", "1")
-V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "5"))))
+V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3"))))
 V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_4_score_cards.json")
 V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_4_daily_report.txt")
 V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_report.txt")
@@ -326,7 +336,7 @@ V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_
 # 5）保留固定Top3输出，但允许Top3里出现B/B+/C，并明确“观察/不交易”，避免固定输出被误解为每天必须买。
 V20_ENABLE_TIERED_OUTPUT = os.environ.get("V20_ENABLE_TIERED_OUTPUT", "1")
 V20_ENABLE_CONDITION_FEEDBACK = os.environ.get("V20_ENABLE_CONDITION_FEEDBACK", "1")
-V20_FIXED_TOP_N = int(os.environ.get("V20_FIXED_TOP_N", os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "5")))))
+V20_FIXED_TOP_N = int(os.environ.get("V20_FIXED_TOP_N", os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3")))))
 V20_SCORE_CARDS_FILE = os.environ.get("V20_SCORE_CARDS_FILE", "v20_3_1_score_cards.json")
 V20_DAILY_REPORT_FILE = os.environ.get("V20_DAILY_REPORT_FILE", "v20_3_1_daily_report.txt")
 V20_REVIEW_REPORT_FILE = os.environ.get("V20_REVIEW_REPORT_FILE", "v20_3_1_review_report.txt")
@@ -337,25 +347,6 @@ V20_SIGNAL_LIFECYCLE_FILE = os.environ.get("V20_SIGNAL_LIFECYCLE_FILE", "v20_3_1
 V20_ENABLE_SIGNAL_LIFECYCLE = os.environ.get("V20_ENABLE_SIGNAL_LIFECYCLE", "1")
 V20_LIFECYCLE_LOOKBACK_DAYS = int(os.environ.get("V20_LIFECYCLE_LOOKBACK_DAYS", "25"))
 V20_LIFECYCLE_MAX_ITEMS = int(os.environ.get("V20_LIFECYCLE_MAX_ITEMS", "60"))
-
-# ========================= V26.0：爆发前夜最终买入池 + 机构评分卡 =========================
-# 最高原则：不推翻旧底座；旧模型继续负责提取特征，V26负责最终评分出口、同源去重、定价、环境、仓位和复盘字段。
-# Top5是最终买入池，不是观察池；允许少于5只，宁缺毋滥。
-V26_ENABLE_INSTITUTIONAL_SCORECARD = os.environ.get("V26_ENABLE_INSTITUTIONAL_SCORECARD", "1")
-V26_MIN_BUY_SCORE = float(os.environ.get("V26_MIN_BUY_SCORE", "80"))
-V26_STRONG_CONFIRM_SCORE = float(os.environ.get("V26_STRONG_CONFIRM_SCORE", "82"))
-V26_STANDARD_POSITION_SCORE = float(os.environ.get("V26_STANDARD_POSITION_SCORE", "88"))
-V26_ALLOW_EMPTY_TOP5 = os.environ.get("V26_ALLOW_EMPTY_TOP5", "1")
-V26_MAX_INDUSTRY_EXPOSURE = float(os.environ.get("V26_MAX_INDUSTRY_EXPOSURE", "0.40"))
-V26_MAX_SAME_HYPOTHESIS_EXPOSURE = float(os.environ.get("V26_MAX_SAME_HYPOTHESIS_EXPOSURE", "0.60"))
-V26_MIN_RR = float(os.environ.get("V26_MIN_RR", "1.35"))
-V26_IDEAL_RR = float(os.environ.get("V26_IDEAL_RR", "2.00"))
-V26_MAX_DEFENSE_DIST = float(os.environ.get("V26_MAX_DEFENSE_DIST", "0.105"))
-V26_MAX_NEAR_PRESSURE = float(os.environ.get("V26_MAX_NEAR_PRESSURE", "0.045"))
-V26_FAILURE_RISK_BLOCK = float(os.environ.get("V26_FAILURE_RISK_BLOCK", "7.0"))
-V26_SIGNAL_MAX_AGE_DAYS = int(os.environ.get("V26_SIGNAL_MAX_AGE_DAYS", "13"))
-V26_ENABLE_PORTFOLIO_DECORR = os.environ.get("V26_ENABLE_PORTFOLIO_DECORR", "1")
-# ===========================================================================
 
 
 # ========================= V20.3 基础筛选重构 + 动态风险指标库 =========================
@@ -595,6 +586,11 @@ def split_message_by_lines(message, max_len=3500):
     return parts
 
 
+# ============================================================
+# PROTECTED TELEGRAM SEND LOGIC - DO NOT MODIFY
+# 推送逻辑保护区：依赖上方 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / ENABLE_TELEGRAM。
+# 后续重构不得改变量名、URL拼接、环境变量兜底或发送链路；如需改报告内容，只改 message 入参生成处。
+# ============================================================
 def send_telegram(message):
     if ENABLE_TELEGRAM != "1":
         print(f"[Telegram未发送: ENABLE_TELEGRAM={ENABLE_TELEGRAM}]")
@@ -12173,33 +12169,6 @@ def v26_scorecard_report_line(row):
     order = ["explosion_eve", "key_structure", "supply_absorption", "acceptance", "breakout_expansion", "pricing", "sector", "market", "execution"]
     return "｜".join([f"{k}:{safe_float(cards.get(k,0)):.1f}" for k in order])
 
-
-def v26_apply_to_row(row):
-    """兼容V20最终选择出口的V26包装器：调用原V26评分卡，并写入统一别名字段。"""
-    r = v26_institutional_scorecard(row)
-    cards = r.get("v26_scorecards", {}) if isinstance(r.get("v26_scorecards", {}), dict) else {}
-    block_reasons = r.get("v26_block_reasons", [])
-    if isinstance(block_reasons, list):
-        block_text = "；".join([str(x) for x in block_reasons if str(x).strip()])
-    else:
-        block_text = str(block_reasons or "")
-    r["v26_buy_eligible"] = bool(r.get("v26_formal_buy_ok", False))
-    r["v26_hard_gate_pass"] = bool(r.get("v26_formal_buy_ok", False))
-    r["v26_hard_gate_reasons"] = block_text
-    r["v26_explosion_eve_score"] = safe_float(cards.get("explosion_eve", 0))
-    r["v26_key_structure_score"] = safe_float(cards.get("key_structure", 0))
-    r["v26_supply_absorption_mother_score"] = safe_float(cards.get("supply_absorption", 0))
-    r["v26_support_defense_score"] = safe_float(cards.get("acceptance", 0))
-    r["v26_breakout_expansion_score"] = safe_float(cards.get("breakout_expansion", 0))
-    r["v26_pricing_rr_score"] = safe_float(cards.get("pricing", 0))
-    r["v26_sector_lifecycle_score"] = safe_float(cards.get("sector", 0))
-    r["v26_market_score"] = safe_float(cards.get("market", 0))
-    r["v26_execution_score"] = safe_float(cards.get("execution", 0))
-    r["v26_failure_similarity_risk"] = safe_float(r.get("v26_failure_similarity", 0))
-    r["v26_signal_age"] = r.get("v26_signal_age_days", "")
-    r["v26_same_source_dedup_note"] = r.get("v26_dedupe_note", "")
-    return r
-
 # ========================= V26 END =========================
 
 
@@ -12217,7 +12186,7 @@ V212_MIN_FORMAL_SCORE = float(os.environ.get("V22_MIN_FORMAL_SCORE", os.environ.
 V212_MAX_PREDICT_RISK = float(os.environ.get("V22_MAX_PREDICT_RISK", os.environ.get("V212_MAX_PREDICT_RISK", "0.075")))
 V212_MAX_CONFIRM_RISK = float(os.environ.get("V22_MAX_CONFIRM_RISK", os.environ.get("V212_MAX_CONFIRM_RISK", "0.085")))
 V212_MIN_RR_FORMAL = float(os.environ.get("V22_MIN_RR_FORMAL", os.environ.get("V212_MIN_RR_FORMAL", "1.70")))
-V212_TARGET_PUSH_LIMIT = int(os.environ.get("V22_TARGET_PUSH_LIMIT", os.environ.get("V212_TARGET_PUSH_LIMIT", os.environ.get("TOP_PUSH_LIMIT", "5") or "3")))
+V212_TARGET_PUSH_LIMIT = int(os.environ.get("V22_TARGET_PUSH_LIMIT", os.environ.get("V212_TARGET_PUSH_LIMIT", os.environ.get("TOP_PUSH_LIMIT", "3") or "3")))
 
 # V22 信号归属登记：解决“保留好逻辑但不重复打分”的核心机制。
 # owner_layer 只有一个；其他层只能引用 evidence/reference，不允许再拿满分。
@@ -13947,12 +13916,6 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             r = v2562_apply_trade_invalidation(r)
         except Exception:
             pass
-        # V26：在旧底座特征全部生成后，统一进入“爆发前夜最终买入池”机构评分卡。
-        try:
-            r = v26_apply_to_row(r)
-        except Exception as _e:
-            r["v26_error"] = str(_e)[:200]
-            r["v26_buy_eligible"] = False
         # 若V21.2/V22综合分生成失败，不再静默退回深度分参与最终正式排序；保留诊断。
         if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
             r["v22_score_valid"] = False
@@ -13987,8 +13950,6 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     candidates = sorted(
         candidates,
         key=lambda x: (
-            1 if bool(x.get("v26_buy_eligible", False)) else 0,
-            safe_float(x.get("v26_final_buy_score", 0)),
             1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
             tier_rank(x),
             safe_float(x.get("v22_composite_trade_score", 0)) if _valid_score_field(x, "v22_composite_trade_score") else -1.0,
@@ -14022,12 +13983,6 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = str(rr.get("v22_invalid_reason", "综合交易评分未独立生成"))
             diagnostics.append(rr)
             continue
-        if V26_ENABLE_INSTITUTIONAL_SCORECARD == "1" and not bool(r.get("v26_buy_eligible", False)):
-            rr = dict(r)
-            rr["v20_pool"] = "V26高质量观察/未入最终买入池"
-            rr["v20_skip_reason"] = str(rr.get("v26_hard_gate_reasons", "V26最终买入池硬条件未通过")) or f"V26分{safe_float(rr.get('v26_final_buy_score',0)):.2f}低于{V26_MIN_BUY_SCORE:.0f}"
-            diagnostics.append(rr)
-            continue
         key = f"{r.get('date','')}_{r.get('code','')}"
         if V14_IGNORE_HISTORY_FOR_RERUN != "1" and key in history:
             rr = dict(r)
@@ -14035,17 +13990,10 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = "signals_history已推送过"
             diagnostics.append(rr)
             continue
-        ok_portfolio, portfolio_reason = v26_portfolio_accept(r, final)
-        if not ok_portfolio:
-            rr = dict(r)
-            rr["v20_pool"] = "V26组合去相关降级"
-            rr["v20_skip_reason"] = portfolio_reason
-            diagnostics.append(rr)
-            continue
-        r["v20_pool"] = "V26最终买入池"
+        r["v20_pool"] = "V20.2最终Top3"
         r["v20_rank"] = len(final) + 1
         final.append(r)
-        if len(final) >= effective_limit:
+        if len(final) >= limit:
             break
 
     selected_codes = {str(r.get("code")) for r in final}
@@ -14053,7 +14001,7 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         if str(r.get("code")) not in selected_codes:
             rr = dict(r)
             rr["v20_pool"] = "后台跟踪"
-            rr["v20_skip_reason"] = "未进入V26最终买入池，进入跟踪池用于条件概率复盘"
+            rr["v20_skip_reason"] = "未进入V20.2最终Top3，进入跟踪池用于条件概率复盘"
             diagnostics.append(rr)
 
     return final, diagnostics[:80], audited
@@ -14116,23 +14064,6 @@ def _v20_compact_row(r, pool=""):
         "bottom_pattern_trigger_quality": safe_float(r.get("bottom_pattern_trigger_quality", 0)),
         "bottom_pattern_retest_quality": safe_float(r.get("bottom_pattern_retest_quality", 0)),
         "bottom_pattern_desc": r.get("bottom_pattern_desc", ""),
-        "v26_final_buy_score": safe_float(r.get("v26_final_buy_score", 0)),
-        "v26_buy_eligible": bool(r.get("v26_buy_eligible", False)),
-        "v26_position_tier": r.get("v26_position_tier", ""),
-        "v26_hard_gate_reasons": r.get("v26_hard_gate_reasons", ""),
-        "v26_explosion_eve_score": safe_float(r.get("v26_explosion_eve_score", 0)),
-        "v26_key_structure_score": safe_float(r.get("v26_key_structure_score", 0)),
-        "v26_supply_absorption_mother_score": safe_float(r.get("v26_supply_absorption_mother_score", 0)),
-        "v26_support_defense_score": safe_float(r.get("v26_support_defense_score", 0)),
-        "v26_breakout_expansion_score": safe_float(r.get("v26_breakout_expansion_score", 0)),
-        "v26_pricing_rr_score": safe_float(r.get("v26_pricing_rr_score", 0)),
-        "v26_sector_lifecycle_score": safe_float(r.get("v26_sector_lifecycle_score", 0)),
-        "v26_market_score": safe_float(r.get("v26_market_score", 0)),
-        "v26_execution_score": safe_float(r.get("v26_execution_score", 0)),
-        "v26_failure_similarity_risk": safe_float(r.get("v26_failure_similarity_risk", 0)),
-        "v26_signal_age": r.get("v26_signal_age", ""),
-        "v26_signal_freshness_score": safe_float(r.get("v26_signal_freshness_score", 0)),
-        "v26_same_source_dedup_note": r.get("v26_same_source_dedup_note", ""),
         "data_quality_tier": r.get("data_quality_tier", ""),
         "data_quality_reason": r.get("data_quality_reason", ""),
     })
@@ -14436,7 +14367,7 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
             else:
                 watch_rows.append(_v20_compact_row(r, "后台跟踪"))
 
-        final_cards = [_v20_compact_row(r, "V26最终买入池") for r in final_signals]
+        final_cards = [_v20_compact_row(r, "V20.2最终Top3") for r in final_signals]
         if lifecycle_tracking is None:
             lifecycle_tracking = build_v20_signal_lifecycle(history or {}, audited_rows or [], final_signals or [], current_dates=dates or [])
         tier_counts = {}
@@ -14490,16 +14421,14 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         lines.append("一号员工 V23.0 完整版日报｜V20生产底座 + V21.2交易机会层 + V23供应吸收量能级别切换")
         lines.append(f"生成时间：{bj_time_str()}")
         lines.append(f"日期：{', '.join(dates) if dates else '未知'}")
-        lines.append(f"最终买入池目标上限：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}（允许少于上限，宁缺毋滥）")
+        lines.append(f"固定输出目标：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}")
         lines.append(f"分层统计：{tier_counts}")
         lines.append("口径：V20.3.1负责候选质量与风险前置；V21.2负责交易机会与执行计划；V23新增“供应吸收/大阴修复/量能级别切换”确认层，同一信号只在归属层打分，其他层只引用，避免重复堆分。")
         lines.append("")
         if final_cards:
             lines.append("【今日V22正式Top3】")
             for i, row in enumerate(final_cards, 1):
-                lines.append(f"{i}. {row['name']}({row['code']}) | V26买入分 {safe_float(row.get('v26_final_buy_score',0)):.2f} | {row.get('v26_position_tier','')} | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
-                if safe_float(row.get('v26_final_buy_score',0)) > 0:
-                    lines.append(f"   V26母因子：爆发前夜{safe_float(row.get('v26_explosion_eve_score',0)):.1f}/20｜关键位{safe_float(row.get('v26_key_structure_score',0)):.1f}/15｜供应吸收{safe_float(row.get('v26_supply_absorption_mother_score',0)):.1f}/12｜承接{safe_float(row.get('v26_support_defense_score',0)):.1f}/12｜突破{safe_float(row.get('v26_breakout_expansion_score',0)):.1f}/12｜定价{safe_float(row.get('v26_pricing_rr_score',0)):.1f}/12")
+                lines.append(f"{i}. {row['name']}({row['code']}) | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | V20质量分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
                 if row.get("bottom_pattern_type"):
                     lines.append(f"   底部形态：{row.get('bottom_pattern_type')} 分{row.get('bottom_pattern_score',0):.1f} 颈线{row.get('bottom_pattern_neckline',0):.2f} {'已确认' if row.get('bottom_pattern_confirmed') else '观察中'}")
                 lines.append(f"   七层：结构{row['v201_structure_position']:.1f} 压力{row['v201_pressure_support']:.1f} 资金{row['v201_volume_behavior']:.1f} 触发{row['v201_trigger_confirmation']:.1f} 交易{row['v201_trade_quality']:.1f} 风险{row['v201_risk_filter']:.1f}")
@@ -15641,7 +15570,7 @@ def main():
         print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
         print(f"基础评分数量：{len(base_rows)} 条")
         print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
-        print(f"V26最终买入池数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
+        print(f"V20.3最终Top3数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
         print(f"V20.1后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON/条件概率跟踪底座）")
 
         save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_pool)
