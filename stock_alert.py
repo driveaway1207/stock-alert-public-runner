@@ -1,4 +1,5 @@
-# V26.0 — UPDATED 2026-05-19 09:04 CST — EMPLOYEE1 爆发前夜最终买入池 / PAT_LOCKED
+# Employee1 Stock Alert V26.1 | Updated: 2026-05-19
+# FIRST LINE FORMAT LOCKED: only version number and Updated date may change; do not rename entrypoint stock_alert.py
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
@@ -158,14 +159,23 @@ warnings.filterwarnings("ignore")
 #    涨停/大阳阶段标签修正、近端压力硬约束、极端放量/高乖离/过热组合封顶。
 # ===========================================================================
 
+# ============================================================
+# PROTECTED CREDENTIAL / PAT AREA - DO NOT MODIFY / FORMAT / REPLACE
+# PAT字段与外部推送密钥保护区：禁止修改、清空、格式化、替换。
+# 说明：如workflow或环境变量中存在 GitHub PAT / Telegram Token，
+#      本代码只读取环境变量，绝不在重构中改写字段名或默认值。
+# ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
+# ============================================================
+# END PROTECTED CREDENTIAL / PAT AREA
+# ============================================================
 
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V25.8一号员工选股模型｜去单线主轴+缠论级别递归+量价时空机构评分版"
+MODEL_VERSION = "V26.0一号员工选股模型｜爆发前夜最终买入池+机构评分卡+动态仓位自学习版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -175,7 +185,7 @@ CHECK_DAYS = int(os.environ.get("CHECK_DAYS", "1"))  # V11.1：默认只扫描�
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0"))
 RESULT_LIMIT_RAW = int(os.environ.get("RESULT_LIMIT", "20"))
 # V12：一号员工正式报告默认只推前5只；后台候选池/跟踪池仍保留更多记录。
-TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "3"))
+TOP_PUSH_LIMIT = int(os.environ.get("TOP_PUSH_LIMIT", "5"))
 RESULT_LIMIT = min(RESULT_LIMIT_RAW, TOP_PUSH_LIMIT) if TOP_PUSH_LIMIT > 0 else RESULT_LIMIT_RAW
 DEEP_SCORE_LIMIT_RAW = int(os.environ.get("DEEP_SCORE_LIMIT", "500"))
 # V19.2：深度评分硬上限默认200。V19最终Top3需要更宽候选池，但仍控制运行时间；如需扩大可设置 DEEP_SCORE_HARD_CAP=250/300。
@@ -302,7 +312,7 @@ V14_BLOCK_SEVERE_NO_DEFENSE = os.environ.get("V14_BLOCK_SEVERE_NO_DEFENSE", "0")
 # 从非硬雷区/非硬失败候选中按风险调整后综合排序固定输出Top3。
 # 压力带突破、倍量、回踩确认、空头钝化、时间窗口等均为评分项，不作为单独必要条件。
 V19_ENABLE_TOP3_FIXED = os.environ.get("V19_ENABLE_TOP3_FIXED", "1")
-V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3"))))
+V19_FIXED_TOP_N = int(os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "5"))))
 V19_SCORE_CARDS_FILE = os.environ.get("V19_SCORE_CARDS_FILE", "v19_4_score_cards.json")
 V19_DAILY_REPORT_FILE = os.environ.get("V19_DAILY_REPORT_FILE", "v19_4_daily_report.txt")
 V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_report.txt")
@@ -317,7 +327,7 @@ V19_REVIEW_REPORT_FILE = os.environ.get("V19_REVIEW_REPORT_FILE", "v19_4_review_
 # 5）保留固定Top3输出，但允许Top3里出现B/B+/C，并明确“观察/不交易”，避免固定输出被误解为每天必须买。
 V20_ENABLE_TIERED_OUTPUT = os.environ.get("V20_ENABLE_TIERED_OUTPUT", "1")
 V20_ENABLE_CONDITION_FEEDBACK = os.environ.get("V20_ENABLE_CONDITION_FEEDBACK", "1")
-V20_FIXED_TOP_N = int(os.environ.get("V20_FIXED_TOP_N", os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "3")))))
+V20_FIXED_TOP_N = int(os.environ.get("V20_FIXED_TOP_N", os.environ.get("FORCE_TOP_N", os.environ.get("MIN_PUSH_COUNT", os.environ.get("TOP_PUSH_LIMIT", "5")))))
 V20_SCORE_CARDS_FILE = os.environ.get("V20_SCORE_CARDS_FILE", "v20_3_1_score_cards.json")
 V20_DAILY_REPORT_FILE = os.environ.get("V20_DAILY_REPORT_FILE", "v20_3_1_daily_report.txt")
 V20_REVIEW_REPORT_FILE = os.environ.get("V20_REVIEW_REPORT_FILE", "v20_3_1_review_report.txt")
@@ -328,6 +338,25 @@ V20_SIGNAL_LIFECYCLE_FILE = os.environ.get("V20_SIGNAL_LIFECYCLE_FILE", "v20_3_1
 V20_ENABLE_SIGNAL_LIFECYCLE = os.environ.get("V20_ENABLE_SIGNAL_LIFECYCLE", "1")
 V20_LIFECYCLE_LOOKBACK_DAYS = int(os.environ.get("V20_LIFECYCLE_LOOKBACK_DAYS", "25"))
 V20_LIFECYCLE_MAX_ITEMS = int(os.environ.get("V20_LIFECYCLE_MAX_ITEMS", "60"))
+
+# ========================= V26.0：爆发前夜最终买入池 + 机构评分卡 =========================
+# 最高原则：不推翻旧底座；旧模型继续负责提取特征，V26负责最终评分出口、同源去重、定价、环境、仓位和复盘字段。
+# Top5是最终买入池，不是观察池；允许少于5只，宁缺毋滥。
+V26_ENABLE_INSTITUTIONAL_SCORECARD = os.environ.get("V26_ENABLE_INSTITUTIONAL_SCORECARD", "1")
+V26_MIN_BUY_SCORE = float(os.environ.get("V26_MIN_BUY_SCORE", "80"))
+V26_STRONG_CONFIRM_SCORE = float(os.environ.get("V26_STRONG_CONFIRM_SCORE", "82"))
+V26_STANDARD_POSITION_SCORE = float(os.environ.get("V26_STANDARD_POSITION_SCORE", "88"))
+V26_ALLOW_EMPTY_TOP5 = os.environ.get("V26_ALLOW_EMPTY_TOP5", "1")
+V26_MAX_INDUSTRY_EXPOSURE = float(os.environ.get("V26_MAX_INDUSTRY_EXPOSURE", "0.40"))
+V26_MAX_SAME_HYPOTHESIS_EXPOSURE = float(os.environ.get("V26_MAX_SAME_HYPOTHESIS_EXPOSURE", "0.60"))
+V26_MIN_RR = float(os.environ.get("V26_MIN_RR", "1.35"))
+V26_IDEAL_RR = float(os.environ.get("V26_IDEAL_RR", "2.00"))
+V26_MAX_DEFENSE_DIST = float(os.environ.get("V26_MAX_DEFENSE_DIST", "0.105"))
+V26_MAX_NEAR_PRESSURE = float(os.environ.get("V26_MAX_NEAR_PRESSURE", "0.045"))
+V26_FAILURE_RISK_BLOCK = float(os.environ.get("V26_FAILURE_RISK_BLOCK", "7.0"))
+V26_SIGNAL_MAX_AGE_DAYS = int(os.environ.get("V26_SIGNAL_MAX_AGE_DAYS", "13"))
+V26_ENABLE_PORTFOLIO_DECORR = os.environ.get("V26_ENABLE_PORTFOLIO_DECORR", "1")
+# ===========================================================================
 
 
 # ========================= V20.3 基础筛选重构 + 动态风险指标库 =========================
@@ -366,7 +395,7 @@ V25_BACKTEST_DATA_START = os.environ.get("V25_BACKTEST_DATA_START", "2016-01-01"
 V25_BACKTEST_START = os.environ.get("V25_BACKTEST_START", "2020-01-01")
 V25_BACKTEST_END = os.environ.get("V25_BACKTEST_END", "2025-12-31")
 V25_BACKTEST_WINDOWS = [int(x) for x in os.environ.get("V25_BACKTEST_WINDOWS", "1,3,5,8,13,20").split(",") if str(x).strip()]
-V25_BACKTEST_TOP_N = int(os.environ.get("V25_BACKTEST_TOP_N", "3"))
+V25_BACKTEST_TOP_N = int(os.environ.get("V25_BACKTEST_TOP_N", "5"))
 V25_BACKTEST_DEEP_LIMIT = int(os.environ.get("V25_BACKTEST_DEEP_LIMIT", str(DEEP_SCORE_LIMIT)))
 V25_BACKTEST_MAX_STOCKS = int(os.environ.get("V25_BACKTEST_MAX_STOCKS", "0"))
 V25_BACKTEST_MAX_DATES = int(os.environ.get("V25_BACKTEST_MAX_DATES", "0"))
@@ -11681,6 +11710,500 @@ def v201_simplified_layer_scores(row):
 
 
 
+
+
+# ========================= V26 爆发前夜最终买入池｜机构评分卡增量层 =========================
+# 本层只做“后置融合/分层约束/报告字段增强”，不删除、不改写 V12-V25 原始主模型。
+# 核心定位：爆发型、Top5最终买入池、高胜率偏好、部分黑箱、动态仓位、半自动自学习闭环。
+# 设计原则：
+# 1）母因子负责打分，子信号只负责解释，避免平量/缩量/小阴小阳/波动压缩等同源重复堆分；
+# 2）综合分>=80只是入池必要条件，仍必须通过RR、防守位、流动性、信号新鲜度、失败相似度、市场环境等硬条件；
+# 3）重大财务/监管/治理/退市/ST/流动性硬风险一票否决；
+# 4）正式Top5允许空缺，不凑数；仓位四档：观察仓、试仓、标准仓、重仓候选；
+# 5）自学习默认半自动：只写审计字段和调参建议，不自动大幅改权重。
+# ===========================================================================
+V26_ENABLED = os.environ.get("V26_ENABLED", "1")
+V26_MIN_BUY_SCORE = float(os.environ.get("V26_MIN_BUY_SCORE", "80"))
+V26_STRONG_CONFIRM_SCORE = float(os.environ.get("V26_STRONG_CONFIRM_SCORE", "82"))
+V26_STANDARD_SCORE = float(os.environ.get("V26_STANDARD_SCORE", "88"))
+V26_MIN_RR = float(os.environ.get("V26_MIN_RR", os.environ.get("V212_MIN_RR_FORMAL", "1.55")))
+V26_MIN_UPSIDE = float(os.environ.get("V26_MIN_UPSIDE", "0.10"))
+V26_MAX_DEFENSE_DIST = float(os.environ.get("V26_MAX_DEFENSE_DIST", "0.095"))
+V26_MAX_FAILURE_SIM = float(os.environ.get("V26_MAX_FAILURE_SIM", "68"))
+V26_MAX_SIGNAL_AGE_DAYS = int(os.environ.get("V26_MAX_SIGNAL_AGE_DAYS", "13"))
+V26_ALLOW_EMPTY_TOP5 = os.environ.get("V26_ALLOW_EMPTY_TOP5", "1")
+V26_ENABLE_PORTFOLIO_DECORRELATION = os.environ.get("V26_ENABLE_PORTFOLIO_DECORRELATION", "1")
+V26_MAX_SAME_SECTOR = int(os.environ.get("V26_MAX_SAME_SECTOR", "2"))
+V26_MAX_SAME_HYPOTHESIS = int(os.environ.get("V26_MAX_SAME_HYPOTHESIS", "2"))
+V26_AUTO_LEARN_MODE = os.environ.get("V26_AUTO_LEARN_MODE", "semi")  # off / semi / auto；默认半自动，只出建议不自动改权重
+V26_SCORECARD_FILE = os.environ.get("V26_SCORECARD_FILE", "v26_institutional_scorecards.json")
+V26_REVIEW_FILE = os.environ.get("V26_REVIEW_FILE", "v26_self_learning_review.json")
+
+
+def _v26_bool(x):
+    if isinstance(x, bool):
+        return x
+    return str(x).strip().lower() in ["1", "true", "yes", "y", "是", "真"]
+
+
+def _v26_text(row, *keys):
+    for k in keys:
+        v = row.get(k, "")
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    return ""
+
+
+def _v26_sector(row):
+    return _v26_text(row, "industry", "行业", "sector", "板块", "concept", "概念", "v26_sector") or "未知板块"
+
+
+def _v26_hypothesis(row):
+    return _v26_text(row, "v20_main_hypothesis", "main_hypothesis", "v16_main_signal", "v19_main_signal") or "综合结构机会"
+
+
+def _v26_clip(x, lo=0.0, hi=100.0):
+    try:
+        x = float(x)
+    except Exception:
+        x = lo
+    if x != x:
+        x = lo
+    return max(lo, min(hi, x))
+
+
+def _v26_last_date(row):
+    v = row.get("date", row.get("日期", ""))
+    try:
+        return pd.to_datetime(v, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def _v26_signal_age_days(row):
+    # 优先使用已有生命周期字段；没有则按date到北京时间自然日粗算，避免因交易日历缺失而误杀。
+    for k in ["signal_age", "v20_signal_age", "v212_signal_age", "v26_signal_age_days"]:
+        if k in row and str(row.get(k, "")).strip() != "":
+            return max(0, int(safe_float(row.get(k), 0)))
+    d = _v26_last_date(row)
+    if pd.isna(d):
+        return 0
+    try:
+        now = pd.to_datetime(datetime.now())
+        return max(0, int((now.normalize() - d.normalize()).days))
+    except Exception:
+        return 0
+
+
+def _v26_regime():
+    return str(globals().get("V24_1_MARKET_REGIME", os.environ.get("V24_1_MARKET_REGIME", "neutral")) or "neutral").lower().strip()
+
+
+def _v26_market_env_score():
+    regime = _v26_regime()
+    if regime in ["bull", "strong", "risk_on", "risk-on"]:
+        return 88.0, "Risk-on/强趋势环境，允许爆发型信号正常发挥"
+    if regime in ["range", "neutral", "normal", "", "震荡"]:
+        return 72.0, "中性/震荡环境，要求买点更舒服、RR更清楚"
+    if regime in ["weak", "bear", "risk_off", "risk-off"]:
+        return 42.0, "弱势/退潮环境，正式候选数量与仓位收缩"
+    if regime in ["panic", "crash", "系统性风险"]:
+        return 12.0, "恐慌/系统性风险环境，原则上空仓或仅保留观察"
+    return 60.0, f"未知市场状态{regime}，保守处理"
+
+
+def _v26_card_explosion_eve(row):
+    # 爆发前夜：压缩、平稳量、资金攻击记忆、关键位贴近、时间窗口共同刻画。
+    parts = []
+    s = 0.0
+    base_eve = max(
+        safe_float(row.get("base_explosion_eve_score", 0)),
+        safe_float(row.get("v23_explosion_eve_score", 0)),
+        safe_float(row.get("explosion_eve_score", 0)),
+        safe_float(row.get("v201_structure_position", 0)) * 1.2,
+    )
+    if base_eve > 0:
+        s += min(7.0, base_eve / 2.0)
+        parts.append("已有爆发前夜/结构位置种子")
+    vol_abs = max(safe_float(row.get("v23_supply_absorption_score", 0)), safe_float(row.get("supply_absorption_score", 0)))
+    if vol_abs >= 8:
+        s += 4.0; parts.append("供应吸收/平台压缩较明显")
+    elif vol_abs >= 4:
+        s += 2.0; parts.append("存在供应吸收迹象")
+    if safe_float(row.get("v20_target_dist", row.get("target_dist", 0))) >= 0.12:
+        s += 2.5; parts.append("上方空间支持爆发")
+    if safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) <= 0.07 and safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) > 0:
+        s += 2.5; parts.append("距离防守位较舒服")
+    if safe_float(row.get("time_window_score", row.get("v126_time_window_score", 0))) > 0:
+        s += 2.0; parts.append("存在时间窗口/蓄势成熟线索")
+    if safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0)))) >= 1.8:
+        s += 2.0; parts.append("赔率达到爆发前夜候选要求")
+    return _v26_clip(s, 0, 20), parts or ["爆发前夜证据不足，主要依赖旧模型结构分"]
+
+
+def _v26_card_key_structure(row):
+    parts = []
+    s = 0.0
+    pressure_grade = str(row.get("v212_pressure_grade", row.get("v15_model_grade", row.get("pressure_zone_grade", ""))))
+    if pressure_grade in ["S", "A"] or "S" in pressure_grade or "A" in pressure_grade:
+        s += 5.0; parts.append("核心压力带/关键结构位质量高")
+    elif pressure_grade:
+        s += 2.0; parts.append("有压力带/关键结构位记录")
+    if safe_float(row.get("v201_structure_position", 0)) >= 12:
+        s += 4.0; parts.append("结构位置评分高")
+    elif safe_float(row.get("v201_structure_position", 0)) >= 8:
+        s += 2.5; parts.append("结构位置尚可")
+    for k, label in [("v23_supply_absorption_score", "大级别供应吸收"), ("v231_shadow_acceptance_score", "长上影供应接受度"), ("notch_score", "凹口/平台"), ("monthly_repair_score", "大周期修复")]:
+        if safe_float(row.get(k, 0)) > 0:
+            s += 1.8; parts.append(label)
+    return _v26_clip(s, 0, 15), parts or ["关键结构位证据一般"]
+
+
+def _v26_card_supply_absorption(row):
+    parts = []
+    s = 0.0
+    supply = max(safe_float(row.get("v23_supply_absorption_score", 0)), safe_float(row.get("supply_absorption_score", 0)))
+    if supply >= 12:
+        s += 6.0; parts.append("供应吸收评分高")
+    elif supply >= 7:
+        s += 4.0; parts.append("供应吸收成立")
+    elif supply >= 3:
+        s += 2.0; parts.append("存在轻度吸收")
+    vb = safe_float(row.get("v201_volume_behavior", 0))
+    if vb >= 10:
+        s += 3.0; parts.append("量能行为较健康")
+    elif vb >= 6:
+        s += 1.5; parts.append("量能行为尚可")
+    for k, label in [("flat_volume_score", "平量稳定"), ("compression_score", "波动压缩"), ("platform_volume_lift_score", "平台均量抬升")]:
+        if safe_float(row.get(k, 0)) > 0:
+            s += 1.0; parts.append(label)
+    # 供应吸收内部同源封顶：最多12分。
+    return _v26_clip(s, 0, 12), parts or ["供应吸收/平量压缩证据不足"]
+
+
+def _v26_card_acceptance(row):
+    parts = []
+    s = 0.0
+    if safe_float(row.get("v212_acceptance_score", 0)) > 0:
+        s += min(4.0, safe_float(row.get("v212_acceptance_score", 0)) / 2.5); parts.append("V21.2承接确认")
+    if safe_float(row.get("v201_trade_quality", 0)) >= 12:
+        s += 3.5; parts.append("交易质量/承接质量高")
+    elif safe_float(row.get("v201_trade_quality", 0)) >= 8:
+        s += 2.0; parts.append("交易质量尚可")
+    if safe_float(row.get("v20_pullback", row.get("pullback_score", 0))) > 0:
+        s += 2.0; parts.append("回踩承接/二买线索")
+    if safe_float(row.get("volume_after_flat_acceptance_score", row.get("v212_flat_acceptance_score", 0))) > 0:
+        s += 2.0; parts.append("倍量后平量承接")
+    if safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) <= V26_MAX_DEFENSE_DIST and safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) > 0:
+        s += 1.2; parts.append("防守距离未过远")
+    return _v26_clip(s, 0, 12), parts or ["承接验证不足，需要次日确认"]
+
+
+def _v26_card_breakout_expansion(row):
+    parts = []
+    s = 0.0
+    action = str(row.get("v212_action", ""))
+    if action.startswith("V21.2正式"):
+        s += 4.0; parts.append("V21.2正式交易触发")
+    grade = str(row.get("v212_state", row.get("v15_day_grade", "")))
+    if "突破" in action or "break" in action.lower() or grade in ["S", "A"]:
+        s += 3.0; parts.append("突破扩张信号")
+    if safe_float(row.get("v201_volume_behavior", 0)) >= 10:
+        s += 2.0; parts.append("量能配合突破")
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.08:
+        s -= 2.5; parts.append("追高/乖离对突破扩张降权")
+    if _v26_bool(row.get("is_bad_stall", False)) or safe_float(row.get("stall_risk_score", 0)) > 0:
+        s -= 2.0; parts.append("存在放量滞涨风险")
+    return _v26_clip(s, 0, 12), parts or ["突破扩张不是主因，需靠承接/压缩取胜"]
+
+
+def _v26_card_pricing(row):
+    parts = []
+    rr = safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0))))
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    upside = safe_float(row.get("v20_target_dist", row.get("target_dist", row.get("v212_target_dist", 0))))
+    space_score = safe_float(row.get("v212_space_score", 0))
+    s = 0.0
+    if rr >= 2.5:
+        s += 4.5; parts.append("RR优秀")
+    elif rr >= V26_MIN_RR:
+        s += 3.2; parts.append("RR合格")
+    elif rr > 0:
+        s += 1.0; parts.append("RR偏低")
+    if 0 < defense <= 0.055:
+        s += 3.2; parts.append("防守距离舒服")
+    elif 0 < defense <= V26_MAX_DEFENSE_DIST:
+        s += 2.0; parts.append("防守距离可接受")
+    elif defense > V26_MAX_DEFENSE_DIST:
+        s -= 2.0; parts.append("离真实防守位偏远")
+    if upside >= 0.18:
+        s += 3.0; parts.append("上方空间较大")
+    elif upside >= V26_MIN_UPSIDE:
+        s += 2.0; parts.append("上方空间合格")
+    elif upside > 0:
+        s -= 1.0; parts.append("上方空间偏窄")
+    if space_score >= 65:
+        s += 1.3; parts.append("空间评分确认")
+    return _v26_clip(s, 0, 12), parts or ["定价/RR信息不足"]
+
+
+def _v26_card_sector(row):
+    parts = []
+    s = 0.0
+    # 可由workflow/上游写入：sector_lifecycle=start/main/climax/decline, sector_heat_score=0-100。
+    lifecycle = str(row.get("sector_lifecycle", row.get("v26_sector_lifecycle", ""))).lower().strip()
+    heat = safe_float(row.get("sector_heat_score", row.get("v26_sector_heat_score", 0)))
+    if lifecycle in ["start", "early", "启动", "启动初期"]:
+        s += 4.0; parts.append("板块生命周期处于启动初期")
+    elif lifecycle in ["main", "trend", "主升", "主升中段"]:
+        s += 3.0; parts.append("板块处于主升/趋势阶段")
+    elif lifecycle in ["climax", "late", "高潮", "高潮末端"]:
+        s += 0.5; parts.append("板块可能高潮，谨慎加分")
+    elif lifecycle in ["decline", "退潮", "down"]:
+        s -= 3.0; parts.append("板块退潮，降权")
+    if heat >= 80:
+        s += 2.0; parts.append("行业热点强")
+    elif heat >= 60:
+        s += 1.2; parts.append("行业热度尚可")
+    elif heat > 0 and heat < 35:
+        s -= 0.8; parts.append("行业热度偏弱")
+    # 没有行业数据时不扣太多，避免数据缺失误杀。
+    if not parts:
+        parts.append("行业热点数据缺失，按中性处理")
+        s += 2.5
+    return _v26_clip(s, 0, 6), parts
+
+
+def _v26_card_market(row):
+    m, txt = _v26_market_env_score()
+    return _v26_clip(m / 20.0, 0, 5), [txt]
+
+
+def _v26_card_execution(row):
+    parts = []
+    s = 0.0
+    liq_score = safe_float(row.get("v241_liquidity_score", 0))
+    if liq_score >= 90:
+        s += 1.4; parts.append("流动性舒适")
+    elif liq_score >= 70:
+        s += 1.0; parts.append("流动性合格")
+    elif liq_score > 0:
+        s -= 1.2; parts.append("流动性偏弱")
+    if _v26_bool(row.get("v241_formal_liquidity_ok", False)):
+        s += 0.8
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    if 0 < defense <= 0.07:
+        s += 0.8; parts.append("执行失败线清楚")
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.1:
+        s -= 1.0; parts.append("追买执行难度高")
+    return _v26_clip(s, 0, 3), parts or ["执行层中性"]
+
+
+def _v26_failure_similarity(row):
+    # 无真实失败样本库时，先用机构风险代理：追高、滞涨、压力近、RR差、信号过期、弱市。
+    pts = 0.0
+    reasons = []
+    rr = safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0))))
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    upside = safe_float(row.get("v20_target_dist", row.get("target_dist", 0)))
+    age = _v26_signal_age_days(row)
+    if rr > 0 and rr < V26_MIN_RR:
+        pts += 18; reasons.append("RR低于最终买入池要求")
+    if defense > V26_MAX_DEFENSE_DIST:
+        pts += 16; reasons.append("离防守位过远，类似追高失败样本")
+    if 0 < upside < V26_MIN_UPSIDE:
+        pts += 14; reasons.append("上方空间偏窄")
+    if age > V26_MAX_SIGNAL_AGE_DAYS:
+        pts += 14; reasons.append("信号生命周期偏老")
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.10:
+        pts += 14; reasons.append("追高风险高")
+    if _v26_regime() in ["bear", "weak", "panic", "crash"]:
+        pts += 10; reasons.append("市场环境弱，失败相似度上升")
+    if str(row.get("v212_state", "")).find("失败") >= 0 or str(row.get("v20_tier_reason", "")).find("失败") >= 0:
+        pts += 12; reasons.append("已有失败/假突破提示")
+    return _v26_clip(pts, 0, 100), reasons or ["未命中明显历史失败代理特征"]
+
+
+def _v26_freshness_score(row):
+    age = _v26_signal_age_days(row)
+    if age <= 3:
+        return 100.0, f"信号新鲜，约{age}天"
+    if age <= 8:
+        return 78.0, f"信号仍在主观察窗口，约{age}天"
+    if age <= V26_MAX_SIGNAL_AGE_DAYS:
+        return 58.0, f"信号进入后段窗口，约{age}天"
+    return 25.0, f"信号偏老/可能过期，约{age}天"
+
+
+def v26_institutional_scorecard(row):
+    """V26机构评分卡：输出100分最终买入池口径。只后置增强，不破坏原模型字段。"""
+    r = dict(row)
+    if V26_ENABLED != "1":
+        r["v26_enabled"] = False
+        return r
+    cards = {}
+    reasons = {}
+    for name, func in [
+        ("explosion_eve", _v26_card_explosion_eve),
+        ("key_structure", _v26_card_key_structure),
+        ("supply_absorption", _v26_card_supply_absorption),
+        ("acceptance", _v26_card_acceptance),
+        ("breakout_expansion", _v26_card_breakout_expansion),
+        ("pricing", _v26_card_pricing),
+        ("sector", _v26_card_sector),
+        ("market", _v26_card_market),
+        ("execution", _v26_card_execution),
+    ]:
+        try:
+            sc, rs = func(r)
+        except Exception as e:
+            sc, rs = 0.0, [f"{name}评分异常：{str(e)[:60]}"]
+        cards[name] = round(float(sc), 2)
+        reasons[name] = rs
+    fail_sim, fail_reasons = _v26_failure_similarity(r)
+    fresh_score, fresh_text = _v26_freshness_score(r)
+    freshness_points = _v26_clip(fresh_score / 100.0 * 3.0, 0, 3)
+    failure_points = _v26_clip((100.0 - fail_sim) / 100.0 * 5.0, 0, 5)
+    # 10个母因子满分100：20+15+12+12+12+12+6+5+3+8（失败相似度5+新鲜度3）
+    raw = sum(cards.values()) + freshness_points + failure_points
+    # 与旧融合分做轻度校准：旧模型是结构识别底座，V26是最终买入池口径。
+    legacy = safe_float(r.get("v22_composite_trade_score", r.get("v212_final_score", r.get("v20_final_score", 0))))
+    if legacy > 0:
+        final = raw * 0.72 + legacy * 0.28
+    else:
+        final = raw
+    # 环境硬调节：恐慌直接封顶，弱市封顶，避免好结构在坏环境里被误推重仓。
+    regime = _v26_regime()
+    if regime in ["panic", "crash"]:
+        final = min(final, 68.0)
+    elif regime in ["bear", "weak"]:
+        final = min(final, 84.0)
+    final = _v26_clip(final, 0, 100)
+
+    rr = safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))))
+    defense = safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)))
+    upside = safe_float(r.get("v20_target_dist", r.get("target_dist", 0)))
+    liq_ok = _v26_bool(r.get("v241_formal_liquidity_ok", True))
+    hard_risk = bool(r.get("v14_blocked", False)) or bool(r.get("exclude_from_final", False)) or str(r.get("v20_trade_tier", "")).startswith("硬风险")
+    invalid = bool(r.get("v20_trade_invalidated", False))
+    formal_ok = True
+    block_reasons = []
+    if hard_risk:
+        formal_ok = False; block_reasons.append("命中硬风险/综合分无效剔除")
+    if invalid:
+        formal_ok = False; block_reasons.append(str(r.get("v20_trade_invalid_reason", "交易假设失效")))
+    if final < V26_MIN_BUY_SCORE:
+        formal_ok = False; block_reasons.append(f"V26最终买入池分{final:.1f}< {V26_MIN_BUY_SCORE:.0f}")
+    if rr > 0 and rr < V26_MIN_RR:
+        formal_ok = False; block_reasons.append(f"RR={rr:.2f}低于{V26_MIN_RR:.2f}")
+    if defense > V26_MAX_DEFENSE_DIST:
+        formal_ok = False; block_reasons.append(f"防守距离{defense:.1%}偏远")
+    if 0 < upside < V26_MIN_UPSIDE:
+        formal_ok = False; block_reasons.append(f"上方空间{upside:.1%}不足")
+    if not liq_ok:
+        formal_ok = False; block_reasons.append(str(r.get("v241_liquidity_reason", "流动性未达正式门槛")))
+    if fail_sim > V26_MAX_FAILURE_SIM:
+        formal_ok = False; block_reasons.append(f"失败相似度{fail_sim:.0f}过高")
+    if _v26_signal_age_days(r) > V26_MAX_SIGNAL_AGE_DAYS:
+        formal_ok = False; block_reasons.append("信号生命周期过期")
+    if regime in ["panic", "crash"]:
+        formal_ok = False; block_reasons.append("系统性风险/恐慌环境，最终买入池关闭")
+
+    if not formal_ok:
+        position = "观察仓"
+        pos_pct = 0.0
+    elif final >= V26_STANDARD_SCORE and rr >= 2.2 and fail_sim <= 35 and regime not in ["bear", "weak"]:
+        position = "重仓候选"
+        pos_pct = 0.18
+    elif final >= V26_STRONG_CONFIRM_SCORE and rr >= 1.8:
+        position = "标准仓"
+        pos_pct = 0.10
+    else:
+        position = "试仓"
+        pos_pct = 0.05
+    # 继承V24.1市场乘数，但只作为仓位，不改变是否入池。
+    try:
+        mult, mult_text = v241_market_regime_multiplier()
+        pos_pct = round(max(0.0, min(0.20, pos_pct * float(mult))), 4)
+    except Exception:
+        mult_text = "仓位环境乘数未计算"
+
+    r.update({
+        "v26_enabled": True,
+        "v26_scorecards": cards,
+        "v26_reasons": reasons,
+        "v26_raw_score": round(raw, 2),
+        "v26_legacy_score": round(legacy, 2),
+        "v26_final_buy_score": round(final, 2),
+        "v26_formal_buy_ok": bool(formal_ok),
+        "v26_block_reasons": block_reasons,
+        "v26_failure_similarity": round(fail_sim, 2),
+        "v26_failure_similarity_reasons": fail_reasons,
+        "v26_signal_age_days": _v26_signal_age_days(r),
+        "v26_signal_freshness_score": round(fresh_score, 2),
+        "v26_signal_freshness_text": fresh_text,
+        "v26_sector": _v26_sector(r),
+        "v26_hypothesis": _v26_hypothesis(r),
+        "v26_position_tier": position,
+        "v26_position_pct": pos_pct,
+        "v26_position_reason": mult_text,
+        "v26_self_learning_mode": V26_AUTO_LEARN_MODE,
+        "v26_self_learning_note": "半自动自学习：记录T+1/T+3/T+5/T+8/T+13/T+20结果和调参建议，不自动大幅改权重。",
+        "v26_dedupe_note": "母因子打分、子信号解释；同源信号组内封顶，避免重复堆分。",
+    })
+    return r
+
+
+def v26_portfolio_accept(row, selected):
+    """Top5组合去相关：不让最终买入池全部变成同一板块/同一假设。"""
+    if V26_ENABLE_PORTFOLIO_DECORRELATION != "1":
+        return True, "组合去相关关闭"
+    sec = str(row.get("v26_sector", _v26_sector(row)))
+    hyp = str(row.get("v26_hypothesis", _v26_hypothesis(row)))
+    same_sec = sum(1 for x in selected if str(x.get("v26_sector", _v26_sector(x))) == sec)
+    same_hyp = sum(1 for x in selected if str(x.get("v26_hypothesis", _v26_hypothesis(x))) == hyp)
+    if same_sec >= V26_MAX_SAME_SECTOR:
+        return False, f"组合约束：{sec}已达到{V26_MAX_SAME_SECTOR}只"
+    if same_hyp >= V26_MAX_SAME_HYPOTHESIS:
+        return False, f"组合约束：{hyp}已达到{V26_MAX_SAME_HYPOTHESIS}只"
+    return True, "组合暴露可接受"
+
+
+def v26_scorecard_report_line(row):
+    cards = row.get("v26_scorecards", {}) if isinstance(row.get("v26_scorecards", {}), dict) else {}
+    order = ["explosion_eve", "key_structure", "supply_absorption", "acceptance", "breakout_expansion", "pricing", "sector", "market", "execution"]
+    return "｜".join([f"{k}:{safe_float(cards.get(k,0)):.1f}" for k in order])
+
+
+def v26_apply_to_row(row):
+    """兼容V20最终选择出口的V26包装器：调用原V26评分卡，并写入统一别名字段。"""
+    r = v26_institutional_scorecard(row)
+    cards = r.get("v26_scorecards", {}) if isinstance(r.get("v26_scorecards", {}), dict) else {}
+    block_reasons = r.get("v26_block_reasons", [])
+    if isinstance(block_reasons, list):
+        block_text = "；".join([str(x) for x in block_reasons if str(x).strip()])
+    else:
+        block_text = str(block_reasons or "")
+    r["v26_buy_eligible"] = bool(r.get("v26_formal_buy_ok", False))
+    r["v26_hard_gate_pass"] = bool(r.get("v26_formal_buy_ok", False))
+    r["v26_hard_gate_reasons"] = block_text
+    r["v26_explosion_eve_score"] = safe_float(cards.get("explosion_eve", 0))
+    r["v26_key_structure_score"] = safe_float(cards.get("key_structure", 0))
+    r["v26_supply_absorption_mother_score"] = safe_float(cards.get("supply_absorption", 0))
+    r["v26_support_defense_score"] = safe_float(cards.get("acceptance", 0))
+    r["v26_breakout_expansion_score"] = safe_float(cards.get("breakout_expansion", 0))
+    r["v26_pricing_rr_score"] = safe_float(cards.get("pricing", 0))
+    r["v26_sector_lifecycle_score"] = safe_float(cards.get("sector", 0))
+    r["v26_market_score"] = safe_float(cards.get("market", 0))
+    r["v26_execution_score"] = safe_float(cards.get("execution", 0))
+    r["v26_failure_similarity_risk"] = safe_float(r.get("v26_failure_similarity", 0))
+    r["v26_signal_age"] = r.get("v26_signal_age_days", "")
+    r["v26_same_source_dedup_note"] = r.get("v26_dedupe_note", "")
+    return r
+
+# ========================= V26 END =========================
+
+
 # ======================= V22.0 Signal Registry + V21.2 Unified Opportunity Engine START =======================
 # 设计原则：
 # 1）不删除V20.3.1旧颗粒口径；旧模型继续负责海选、深度评分、风险库、生命周期。
@@ -11695,7 +12218,7 @@ V212_MIN_FORMAL_SCORE = float(os.environ.get("V22_MIN_FORMAL_SCORE", os.environ.
 V212_MAX_PREDICT_RISK = float(os.environ.get("V22_MAX_PREDICT_RISK", os.environ.get("V212_MAX_PREDICT_RISK", "0.075")))
 V212_MAX_CONFIRM_RISK = float(os.environ.get("V22_MAX_CONFIRM_RISK", os.environ.get("V212_MAX_CONFIRM_RISK", "0.085")))
 V212_MIN_RR_FORMAL = float(os.environ.get("V22_MIN_RR_FORMAL", os.environ.get("V212_MIN_RR_FORMAL", "1.70")))
-V212_TARGET_PUSH_LIMIT = int(os.environ.get("V22_TARGET_PUSH_LIMIT", os.environ.get("V212_TARGET_PUSH_LIMIT", os.environ.get("TOP_PUSH_LIMIT", "3") or "3")))
+V212_TARGET_PUSH_LIMIT = int(os.environ.get("V22_TARGET_PUSH_LIMIT", os.environ.get("V212_TARGET_PUSH_LIMIT", os.environ.get("TOP_PUSH_LIMIT", "5") or "3")))
 
 # V22 信号归属登记：解决“保留好逻辑但不重复打分”的核心机制。
 # owner_layer 只有一个；其他层只能引用 evidence/reference，不允许再拿满分。
@@ -13425,6 +13948,12 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             r = v2562_apply_trade_invalidation(r)
         except Exception:
             pass
+        # V26：在旧底座特征全部生成后，统一进入“爆发前夜最终买入池”机构评分卡。
+        try:
+            r = v26_apply_to_row(r)
+        except Exception as _e:
+            r["v26_error"] = str(_e)[:200]
+            r["v26_buy_eligible"] = False
         # 若V21.2/V22综合分生成失败，不再静默退回深度分参与最终正式排序；保留诊断。
         if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
             r["v22_score_valid"] = False
@@ -13459,6 +13988,8 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     candidates = sorted(
         candidates,
         key=lambda x: (
+            1 if bool(x.get("v26_buy_eligible", False)) else 0,
+            safe_float(x.get("v26_final_buy_score", 0)),
             1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
             tier_rank(x),
             safe_float(x.get("v22_composite_trade_score", 0)) if _valid_score_field(x, "v22_composite_trade_score") else -1.0,
@@ -13492,6 +14023,12 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = str(rr.get("v22_invalid_reason", "综合交易评分未独立生成"))
             diagnostics.append(rr)
             continue
+        if V26_ENABLE_INSTITUTIONAL_SCORECARD == "1" and not bool(r.get("v26_buy_eligible", False)):
+            rr = dict(r)
+            rr["v20_pool"] = "V26高质量观察/未入最终买入池"
+            rr["v20_skip_reason"] = str(rr.get("v26_hard_gate_reasons", "V26最终买入池硬条件未通过")) or f"V26分{safe_float(rr.get('v26_final_buy_score',0)):.2f}低于{V26_MIN_BUY_SCORE:.0f}"
+            diagnostics.append(rr)
+            continue
         key = f"{r.get('date','')}_{r.get('code','')}"
         if V14_IGNORE_HISTORY_FOR_RERUN != "1" and key in history:
             rr = dict(r)
@@ -13499,10 +14036,17 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = "signals_history已推送过"
             diagnostics.append(rr)
             continue
-        r["v20_pool"] = "V20.2最终Top3"
+        ok_portfolio, portfolio_reason = v26_portfolio_accept(r, final)
+        if not ok_portfolio:
+            rr = dict(r)
+            rr["v20_pool"] = "V26组合去相关降级"
+            rr["v20_skip_reason"] = portfolio_reason
+            diagnostics.append(rr)
+            continue
+        r["v20_pool"] = "V26最终买入池"
         r["v20_rank"] = len(final) + 1
         final.append(r)
-        if len(final) >= limit:
+        if len(final) >= effective_limit:
             break
 
     selected_codes = {str(r.get("code")) for r in final}
@@ -13510,7 +14054,7 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         if str(r.get("code")) not in selected_codes:
             rr = dict(r)
             rr["v20_pool"] = "后台跟踪"
-            rr["v20_skip_reason"] = "未进入V20.2最终Top3，进入跟踪池用于条件概率复盘"
+            rr["v20_skip_reason"] = "未进入V26最终买入池，进入跟踪池用于条件概率复盘"
             diagnostics.append(rr)
 
     return final, diagnostics[:80], audited
@@ -13573,6 +14117,23 @@ def _v20_compact_row(r, pool=""):
         "bottom_pattern_trigger_quality": safe_float(r.get("bottom_pattern_trigger_quality", 0)),
         "bottom_pattern_retest_quality": safe_float(r.get("bottom_pattern_retest_quality", 0)),
         "bottom_pattern_desc": r.get("bottom_pattern_desc", ""),
+        "v26_final_buy_score": safe_float(r.get("v26_final_buy_score", 0)),
+        "v26_buy_eligible": bool(r.get("v26_buy_eligible", False)),
+        "v26_position_tier": r.get("v26_position_tier", ""),
+        "v26_hard_gate_reasons": r.get("v26_hard_gate_reasons", ""),
+        "v26_explosion_eve_score": safe_float(r.get("v26_explosion_eve_score", 0)),
+        "v26_key_structure_score": safe_float(r.get("v26_key_structure_score", 0)),
+        "v26_supply_absorption_mother_score": safe_float(r.get("v26_supply_absorption_mother_score", 0)),
+        "v26_support_defense_score": safe_float(r.get("v26_support_defense_score", 0)),
+        "v26_breakout_expansion_score": safe_float(r.get("v26_breakout_expansion_score", 0)),
+        "v26_pricing_rr_score": safe_float(r.get("v26_pricing_rr_score", 0)),
+        "v26_sector_lifecycle_score": safe_float(r.get("v26_sector_lifecycle_score", 0)),
+        "v26_market_score": safe_float(r.get("v26_market_score", 0)),
+        "v26_execution_score": safe_float(r.get("v26_execution_score", 0)),
+        "v26_failure_similarity_risk": safe_float(r.get("v26_failure_similarity_risk", 0)),
+        "v26_signal_age": r.get("v26_signal_age", ""),
+        "v26_signal_freshness_score": safe_float(r.get("v26_signal_freshness_score", 0)),
+        "v26_same_source_dedup_note": r.get("v26_same_source_dedup_note", ""),
         "data_quality_tier": r.get("data_quality_tier", ""),
         "data_quality_reason": r.get("data_quality_reason", ""),
     })
@@ -13876,7 +14437,7 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
             else:
                 watch_rows.append(_v20_compact_row(r, "后台跟踪"))
 
-        final_cards = [_v20_compact_row(r, "V20.2最终Top3") for r in final_signals]
+        final_cards = [_v20_compact_row(r, "V26最终买入池") for r in final_signals]
         if lifecycle_tracking is None:
             lifecycle_tracking = build_v20_signal_lifecycle(history or {}, audited_rows or [], final_signals or [], current_dates=dates or [])
         tier_counts = {}
@@ -13930,14 +14491,16 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         lines.append("一号员工 V23.0 完整版日报｜V20生产底座 + V21.2交易机会层 + V23供应吸收量能级别切换")
         lines.append(f"生成时间：{bj_time_str()}")
         lines.append(f"日期：{', '.join(dates) if dates else '未知'}")
-        lines.append(f"固定输出目标：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}")
+        lines.append(f"最终买入池目标上限：{V20_FIXED_TOP_N}；实际输出：{len(final_signals)}（允许少于上限，宁缺毋滥）")
         lines.append(f"分层统计：{tier_counts}")
         lines.append("口径：V20.3.1负责候选质量与风险前置；V21.2负责交易机会与执行计划；V23新增“供应吸收/大阴修复/量能级别切换”确认层，同一信号只在归属层打分，其他层只引用，避免重复堆分。")
         lines.append("")
         if final_cards:
             lines.append("【今日V22正式Top3】")
             for i, row in enumerate(final_cards, 1):
-                lines.append(f"{i}. {row['name']}({row['code']}) | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | V20质量分 {row['v20_final_score']:.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
+                lines.append(f"{i}. {row['name']}({row['code']}) | V26买入分 {safe_float(row.get('v26_final_buy_score',0)):.2f} | {row.get('v26_position_tier','')} | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
+                if safe_float(row.get('v26_final_buy_score',0)) > 0:
+                    lines.append(f"   V26母因子：爆发前夜{safe_float(row.get('v26_explosion_eve_score',0)):.1f}/20｜关键位{safe_float(row.get('v26_key_structure_score',0)):.1f}/15｜供应吸收{safe_float(row.get('v26_supply_absorption_mother_score',0)):.1f}/12｜承接{safe_float(row.get('v26_support_defense_score',0)):.1f}/12｜突破{safe_float(row.get('v26_breakout_expansion_score',0)):.1f}/12｜定价{safe_float(row.get('v26_pricing_rr_score',0)):.1f}/12")
                 if row.get("bottom_pattern_type"):
                     lines.append(f"   底部形态：{row.get('bottom_pattern_type')} 分{row.get('bottom_pattern_score',0):.1f} 颈线{row.get('bottom_pattern_neckline',0):.2f} {'已确认' if row.get('bottom_pattern_confirmed') else '观察中'}")
                 lines.append(f"   七层：结构{row['v201_structure_position']:.1f} 压力{row['v201_pressure_support']:.1f} 资金{row['v201_volume_behavior']:.1f} 触发{row['v201_trigger_confirmation']:.1f} 交易{row['v201_trade_quality']:.1f} 风险{row['v201_risk_filter']:.1f}")
@@ -15079,7 +15642,7 @@ def main():
         print(f"K线成功：{kline_success} 只 | K线失败：{kline_fail} 只")
         print(f"基础评分数量：{len(base_rows)} 条")
         print(f"深度评分数量：{len(deep_rows)} 条 | 输入：{len(deep_targets)} | 成功：{deep_success} | 失败：{deep_fail} | 跳过：{deep_skip} | 有效样本：{len(deep_rows)}")
-        print(f"V20.3最终Top3数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
+        print(f"V26最终买入池数量：{len(final_signals)} 只 | 诊断候选：{len(v14_diagnostics)} 只")
         print(f"V20.1后备观察池数量：{len(strong_watch_pool)} 只（默认不推送，只保存候选JSON/条件概率跟踪底座）")
 
         save_candidates_payload(base_rows, deep_rows, final_signals, strong_watch_pool)
