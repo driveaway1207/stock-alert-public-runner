@@ -1,3 +1,5 @@
+# Employee1 Workflow V26.1 | Updated: 2026-05-19
+# FIRST LINE FORMAT LOCKED: only version number and Updated date may change; entrypoint remains stock_alert.py
 name: Employee1 Daily Stock Alert
 
 on:
@@ -30,7 +32,6 @@ jobs:
       # PROTECTED TELEGRAM SECRET AREA - DO NOT MODIFY / RENAME
       # Telegram密钥保护区：只读取 GitHub Secrets，不写明文，不改变量名。
       # ============================================================
-      # Telegram 推送
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -39,7 +40,7 @@ jobs:
       # END PROTECTED TELEGRAM SECRET AREA
       # ============================================================
 
-      # 一号员工 V26：爆发前夜最终买入池
+      # 一号员工 V26.1：爆发前夜最终买入池
       TOP_PUSH_LIMIT: '5'
       V20_FIXED_TOP_N: '5'
       V26_ENABLED: '1'
@@ -89,14 +90,15 @@ jobs:
       - name: Run Employee1
         run: |
           # PROTECTED ENTRYPOINT - DO NOT RENAME / DO NOT REPLACE
-          # 运行入口保护：保持你长期使用的原始 py 文件名，不擅自切换到新文件名。
-          python "stock_alert_V25_8_chan_institutional_full-1 copy.py"
+          # 运行入口保护：保持仓库长期使用的入口文件 stock_alert.py，不擅自切换到新文件名。
+          test -f "stock_alert.py" || (echo "ERROR: protected entrypoint stock_alert.py not found" && ls -la && exit 2)
+          python "stock_alert.py"
 
-      - name: Upload V26 artifacts
+      - name: Upload Employee1 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: employee1-v26-artifacts
+          name: employee1-artifacts
           path: |
             stock_candidates.json
             v20_3_1_score_cards.json
