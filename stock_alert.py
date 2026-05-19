@@ -10157,6 +10157,9 @@ def select_final_signals_v14(deep_rows, history=None, limit=None):
     if history is None:
         history = {}
     limit = int(limit or V19_FIXED_TOP_N or V14_TARGET_PUSH_COUNT or RESULT_LIMIT or 3)
+    # V26.2 LOGIC-ONLY PATCH：V14旧出口仅作兼容/诊断时，避免 effective_limit 未定义导致生产运行异常。
+    # 不改变任何生产链路；正式出口仍由后续V26最终买入池控制。
+    effective_limit = limit
 
     audited = [v14_candidate_audit(r) for r in deep_rows]
 
@@ -11723,18 +11726,27 @@ def v201_simplified_layer_scores(row):
 # 5）自学习默认半自动：只写审计字段和调参建议，不自动大幅改权重。
 # ===========================================================================
 V26_ENABLED = os.environ.get("V26_ENABLED", "1")
-V26_MIN_BUY_SCORE = float(os.environ.get("V26_MIN_BUY_SCORE", "80"))
-V26_STRONG_CONFIRM_SCORE = float(os.environ.get("V26_STRONG_CONFIRM_SCORE", "82"))
-V26_STANDARD_SCORE = float(os.environ.get("V26_STANDARD_SCORE", "88"))
-V26_MIN_RR = float(os.environ.get("V26_MIN_RR", os.environ.get("V212_MIN_RR_FORMAL", "1.55")))
+# V26.2 LOGIC-ONLY PATCH：V26参数只在选股逻辑出口处统一口径；不触碰入口/workflow/cache/PAT/Telegram/BaoStock。
+# 这里优先继承文件前部已有V26配置，避免同名参数前后默认值不一致。
+V26_MIN_BUY_SCORE = float(os.environ.get("V26_MIN_BUY_SCORE", str(globals().get("V26_MIN_BUY_SCORE", 80))))
+V26_STRONG_CONFIRM_SCORE = float(os.environ.get("V26_STRONG_CONFIRM_SCORE", str(globals().get("V26_STRONG_CONFIRM_SCORE", 82))))
+V26_STANDARD_SCORE = float(os.environ.get("V26_STANDARD_SCORE", str(globals().get("V26_STANDARD_POSITION_SCORE", globals().get("V26_STANDARD_SCORE", 88)))))
+V26_MIN_RR = float(os.environ.get("V26_MIN_RR", str(globals().get("V26_MIN_RR", os.environ.get("V212_MIN_RR_FORMAL", "1.35")))))
 V26_MIN_UPSIDE = float(os.environ.get("V26_MIN_UPSIDE", "0.10"))
-V26_MAX_DEFENSE_DIST = float(os.environ.get("V26_MAX_DEFENSE_DIST", "0.095"))
+V26_MAX_DEFENSE_DIST = float(os.environ.get("V26_MAX_DEFENSE_DIST", str(globals().get("V26_MAX_DEFENSE_DIST", 0.105))))
 V26_MAX_FAILURE_SIM = float(os.environ.get("V26_MAX_FAILURE_SIM", "68"))
-V26_MAX_SIGNAL_AGE_DAYS = int(os.environ.get("V26_MAX_SIGNAL_AGE_DAYS", "13"))
-V26_ALLOW_EMPTY_TOP5 = os.environ.get("V26_ALLOW_EMPTY_TOP5", "1")
+V26_MAX_SIGNAL_AGE_DAYS = int(os.environ.get("V26_MAX_SIGNAL_AGE_DAYS", str(globals().get("V26_SIGNAL_MAX_AGE_DAYS", 13))))
+V26_ALLOW_EMPTY_TOP5 = os.environ.get("V26_ALLOW_EMPTY_TOP5", str(globals().get("V26_ALLOW_EMPTY_TOP5", "1")))
 V26_ENABLE_PORTFOLIO_DECORRELATION = os.environ.get("V26_ENABLE_PORTFOLIO_DECORRELATION", "1")
 V26_MAX_SAME_SECTOR = int(os.environ.get("V26_MAX_SAME_SECTOR", "2"))
 V26_MAX_SAME_HYPOTHESIS = int(os.environ.get("V26_MAX_SAME_HYPOTHESIS", "2"))
+# 旧模型只作为结构底座校准，不能反客为主把观察票推成买入票。
+V26_LEGACY_BLEND_WEIGHT = float(os.environ.get("V26_LEGACY_BLEND_WEIGHT", "0.15"))
+# 母因子硬门槛：防止只靠旧分/单一优点堆进最终买入池。
+V26_MIN_CORE_MOTHER_SCORE = float(os.environ.get("V26_MIN_CORE_MOTHER_SCORE", "40"))
+V26_MIN_PRICING_CARD = float(os.environ.get("V26_MIN_PRICING_CARD", "7"))
+V26_MIN_EXECUTION_CARD = float(os.environ.get("V26_MIN_EXECUTION_CARD", "5"))
+V26_MIN_ACCEPTANCE_OR_BREAKOUT_CARD = float(os.environ.get("V26_MIN_ACCEPTANCE_OR_BREAKOUT_CARD", "6"))
 V26_AUTO_LEARN_MODE = os.environ.get("V26_AUTO_LEARN_MODE", "semi")  # off / semi / auto；默认半自动，只出建议不自动改权重
 V26_SCORECARD_FILE = os.environ.get("V26_SCORECARD_FILE", "v26_institutional_scorecards.json")
 V26_REVIEW_FILE = os.environ.get("V26_REVIEW_FILE", "v26_self_learning_review.json")
@@ -12066,10 +12078,12 @@ def v26_institutional_scorecard(row):
     failure_points = _v26_clip((100.0 - fail_sim) / 100.0 * 5.0, 0, 5)
     # 10个母因子满分100：20+15+12+12+12+12+6+5+3+8（失败相似度5+新鲜度3）
     raw = sum(cards.values()) + freshness_points + failure_points
-    # 与旧融合分做轻度校准：旧模型是结构识别底座，V26是最终买入池口径。
+    # 与旧融合分做轻度校准：旧模型只作为结构识别底座，V26才是最终买入池口径。
+    # V26.2：旧分权重从隐性28%收敛为可配置小权重，避免旧模型堆分把观察票推成买入票。
     legacy = safe_float(r.get("v22_composite_trade_score", r.get("v212_final_score", r.get("v20_final_score", 0))))
-    if legacy > 0:
-        final = raw * 0.72 + legacy * 0.28
+    legacy_w = max(0.0, min(0.30, safe_float(globals().get("V26_LEGACY_BLEND_WEIGHT", 0.15), 0.15)))
+    if legacy > 0 and legacy_w > 0:
+        final = raw * (1.0 - legacy_w) + legacy * legacy_w
     else:
         final = raw
     # 环境硬调节：恐慌直接封顶，弱市封顶，避免好结构在坏环境里被误推重仓。
@@ -12088,10 +12102,29 @@ def v26_institutional_scorecard(row):
     invalid = bool(r.get("v20_trade_invalidated", False))
     formal_ok = True
     block_reasons = []
+    # V26.2母因子硬门槛：正式买入池不能只靠旧综合分或同源信号堆分。
+    core_mother_score = (
+        safe_float(cards.get("explosion_eve", 0))
+        + safe_float(cards.get("key_structure", 0))
+        + safe_float(cards.get("supply_absorption", 0))
+        + safe_float(cards.get("acceptance", 0))
+        + safe_float(cards.get("breakout_expansion", 0))
+        + safe_float(cards.get("pricing", 0))
+        + safe_float(cards.get("execution", 0))
+    )
+    acceptance_or_breakout = max(safe_float(cards.get("acceptance", 0)), safe_float(cards.get("breakout_expansion", 0)), safe_float(cards.get("key_structure", 0)))
     if hard_risk:
         formal_ok = False; block_reasons.append("命中硬风险/综合分无效剔除")
     if invalid:
         formal_ok = False; block_reasons.append(str(r.get("v20_trade_invalid_reason", "交易假设失效")))
+    if core_mother_score < V26_MIN_CORE_MOTHER_SCORE:
+        formal_ok = False; block_reasons.append(f"V26核心母因子{core_mother_score:.1f}低于{V26_MIN_CORE_MOTHER_SCORE:.0f}，仅作观察")
+    if safe_float(cards.get("pricing", 0)) < V26_MIN_PRICING_CARD:
+        formal_ok = False; block_reasons.append("定价/RR母因子不足，不能进入最终买入池")
+    if safe_float(cards.get("execution", 0)) < V26_MIN_EXECUTION_CARD:
+        formal_ok = False; block_reasons.append("执行/买点母因子不足，不能进入最终买入池")
+    if acceptance_or_breakout < V26_MIN_ACCEPTANCE_OR_BREAKOUT_CARD:
+        formal_ok = False; block_reasons.append("承接/突破/核心结构至少一项确认不足")
     if final < V26_MIN_BUY_SCORE:
         formal_ok = False; block_reasons.append(f"V26最终买入池分{final:.1f}< {V26_MIN_BUY_SCORE:.0f}")
     if rr > 0 and rr < V26_MIN_RR:
@@ -12134,8 +12167,12 @@ def v26_institutional_scorecard(row):
         "v26_reasons": reasons,
         "v26_raw_score": round(raw, 2),
         "v26_legacy_score": round(legacy, 2),
+        "v26_legacy_blend_weight": round(legacy_w, 4),
+        "v26_core_mother_score": round(core_mother_score, 2),
+        "v26_acceptance_or_breakout_score": round(acceptance_or_breakout, 2),
         "v26_final_buy_score": round(final, 2),
         "v26_formal_buy_ok": bool(formal_ok),
+        "v26_pool_classification": "最终买入池" if formal_ok else "高质量观察/未入买入池",
         "v26_block_reasons": block_reasons,
         "v26_failure_similarity": round(fail_sim, 2),
         "v26_failure_similarity_reasons": fail_reasons,
