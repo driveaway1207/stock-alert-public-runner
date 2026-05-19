@@ -9284,6 +9284,8 @@ def select_deep_targets_v10(base_rows, limit):
         dedup.append(r)
 
     enriched = [v203_enrich_base_row(r, recent_codes) for r in dedup]
+    if V27_ENABLE_CORE_ENGINE == "1" and V27_ENABLE_BASE_RECALL_OVERLAY == "1":
+        enriched = [v27_base_recall_overlay(r) for r in enriched]
 
     # 风险前置过滤：R4硬剔除；R3默认风险观察，不进正式深评，除非近期推荐跟踪或用户设置允许少量诊断。
     gated, gated_out, r3_watch = [], [], []
@@ -9324,7 +9326,7 @@ def select_deep_targets_v10(base_rows, limit):
     for channel, _ratio in plan:
         rows = [r for r in gated if channel in list(r.get("base_entry_channels", [])) and str(r.get("code", "")) not in selected_codes]
         # R2风险允许入池但排序降权，R3诊断靠后。
-        rows = sorted(rows, key=lambda x: (safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
+        rows = sorted(rows, key=lambda x: (safe_float(x.get("v27_base_deep_priority_score", x.get("base_recall_score", 0))), safe_float(x.get("v27_base_current_trigger_factor", 0)), safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
         take = rows[:quotas.get(channel, 0)]
         for r in take:
             code = str(r.get("code", ""))
@@ -9335,7 +9337,7 @@ def select_deep_targets_v10(base_rows, limit):
     # 不足则全局补齐：按召回分，避免某通道不足导致池子缩水。
     if len(selected) < limit:
         leftovers = [r for r in gated if str(r.get("code", "")) not in selected_codes]
-        leftovers = sorted(leftovers, key=lambda x: (safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
+        leftovers = sorted(leftovers, key=lambda x: (safe_float(x.get("v27_base_deep_priority_score", x.get("base_recall_score", 0))), safe_float(x.get("v27_base_current_trigger_factor", 0)), safe_float(x.get("base_recall_score", 0)), safe_float(x.get("base_total_score", 0))), reverse=True)
         for r in leftovers:
             code = str(r.get("code", ""))
             if code in selected_codes:
@@ -9348,6 +9350,8 @@ def select_deep_targets_v10(base_rows, limit):
         selected,
         key=lambda x: (
             bool(x.get("base_seed_pool_flag", False)),
+            safe_float(x.get("v27_base_deep_priority_score", x.get("base_recall_score", 0))),
+            safe_float(x.get("v27_base_current_trigger_factor", 0)),
             safe_float(x.get("base_recall_score", 0)),
             safe_float(x.get("base_total_score", x.get("base_score", 0))),
             safe_float(x.get("score", 0)),
@@ -12257,6 +12261,475 @@ def v26_apply_to_row(row):
     r["v26_same_source_dedup_note"] = r.get("v26_dedupe_note", "")
     return r
 
+
+
+# ========================= V27.0 选股逻辑主引擎重构：A股海选 + 华尔街深度定价 START =========================
+# 生产层锁死说明：本段只新增选股评分/排序/分流逻辑，不触碰入口、workflow、缓存、数据门控、BaoStock、Telegram、PAT、artifact。
+# 架构原则：基础层只有召回权；深度层拥有定价权和否决权；最终买入池只接受正期望交易。
+V27_ENABLE_CORE_ENGINE = os.environ.get("V27_ENABLE_CORE_ENGINE", "1")
+V27_ENABLE_BASE_RECALL_OVERLAY = os.environ.get("V27_ENABLE_BASE_RECALL_OVERLAY", "1")
+V27_ENABLE_FINAL_GATE = os.environ.get("V27_ENABLE_FINAL_GATE", "1")
+V27_MIN_BUY_SCORE = float(os.environ.get("V27_MIN_BUY_SCORE", os.environ.get("V26_MIN_BUY_SCORE", "80")))
+V27_BASE_TRIGGER_MIN_FOR_DEEP = float(os.environ.get("V27_BASE_TRIGGER_MIN_FOR_DEEP", "5.5"))
+V27_DEEP_TRIGGER_MIN = float(os.environ.get("V27_DEEP_TRIGGER_MIN", "7.0"))
+V27_DEEP_STRUCTURE_MIN = float(os.environ.get("V27_DEEP_STRUCTURE_MIN", "7.0"))
+V27_DEEP_FUND_MIN = float(os.environ.get("V27_DEEP_FUND_MIN", "7.0"))
+V27_CHASE_HARD_BLOCK_PCT5 = float(os.environ.get("V27_CHASE_HARD_BLOCK_PCT5", "0.18"))
+V27_CHASE_HARD_BLOCK_BIAS20 = float(os.environ.get("V27_CHASE_HARD_BLOCK_BIAS20", "0.18"))
+V27_MAX_DEFENSE_DIST = float(os.environ.get("V27_MAX_DEFENSE_DIST", os.environ.get("V26_MAX_DEFENSE_DIST", "0.095")))
+V27_MAX_SOFT_DEFENSE_DIST = float(os.environ.get("V27_MAX_SOFT_DEFENSE_DIST", "0.08"))
+V27_MIN_UPSIDE = float(os.environ.get("V27_MIN_UPSIDE", os.environ.get("V26_MIN_UPSIDE", "0.08")))
+V27_MIN_RR = float(os.environ.get("V27_MIN_RR", os.environ.get("V26_MIN_RR", "1.35")))
+V27_NEAR_PRESSURE_BLOCK = float(os.environ.get("V27_NEAR_PRESSURE_BLOCK", os.environ.get("V26_MAX_NEAR_PRESSURE", "0.05")))
+V27_BASE_SCORE_FILE = os.environ.get("V27_BASE_SCORE_FILE", "v27_base_recall_overlay.json")
+
+
+def _v27_clip(x, lo=0.0, hi=100.0):
+    try:
+        x = float(x)
+    except Exception:
+        x = lo
+    if x != x:
+        x = lo
+    return max(lo, min(hi, x))
+
+
+def _v27_norm(x, src_hi, dst_hi):
+    src_hi = float(src_hi) if src_hi else 1.0
+    return _v27_clip(safe_float(x, 0) / src_hi * float(dst_hi), 0, float(dst_hi))
+
+
+def _v27_any_text(row, keys):
+    vals = []
+    for k in keys:
+        v = row.get(k, "")
+        if isinstance(v, (list, tuple)):
+            vals.extend([str(x) for x in v if str(x).strip()])
+        elif str(v).strip():
+            vals.append(str(v))
+    return "；".join(vals)
+
+
+def _v27_base_factor_funds(row):
+    """资金因子：资金攻击、承接、持续、效率、失败反证；海选层只做召回，不做买入结论。"""
+    reasons = []
+    attack = 0.0
+    carry = 0.0
+    sustain = 0.0
+    eff = 0.0
+    fail = 0.0
+    # 攻击：不能让单日强攻无限加分。
+    if safe_float(row.get("base_attack_quality_score", 0)) >= 22:
+        attack += 2.5; reasons.append("资金攻击K质量强")
+    elif safe_float(row.get("base_attack_quality_score", 0)) >= 14:
+        attack += 1.5; reasons.append("资金攻击K质量尚可")
+    if safe_float(row.get("base_big_bull7_count_100", 0)) >= 4:
+        attack += 1.5; reasons.append("近100日多次7%大阳攻击记忆")
+    elif safe_float(row.get("base_big_bull7_count_100", 0)) >= 2:
+        attack += 0.8; reasons.append("近100日存在7%大阳攻击记忆")
+    if safe_float(row.get("base_gap_count_100", 0)) >= 2:
+        attack += 0.6; reasons.append("存在跳空攻击记忆")
+    if safe_float(row.get("base_fibo_second_confirm_score", 0)) >= 6:
+        attack += 1.0; reasons.append("首倍高点二次确认入口")
+
+    # 承接：资金因子第一优先，不奖励一日游。
+    carry += _v27_norm(row.get("base_volume_carry_score", 0), 15, 4.0)
+    if safe_float(row.get("flat_volume_count_60_base", 0)) >= 1:
+        carry += 1.6; reasons.append("倍量后平量/平量承接记忆")
+    if safe_float(row.get("base_limitup_hold_score", row.get("base_limitup_hold_3d", 0))) > 0:
+        carry += 1.2; reasons.append("涨停后三日实体承接线索")
+    if safe_float(row.get("base_observe_k_repair_score", 0)) >= 4:
+        carry += 1.0; reasons.append("K线修复/承接记忆")
+
+    # 持续性/效率。
+    sustain += min(3.0, safe_float(row.get("base_observe_fund_event_score", 0)) * 0.35)
+    if safe_float(row.get("beiliang_count_60_base", 0)) >= 2:
+        sustain += 1.0; reasons.append("分散健康倍量记忆")
+    if safe_float(row.get("base_up_down_vol_ratio_60", 0)) >= 1.05:
+        eff += 1.2; reasons.append("阳量强于阴量")
+    if safe_float(row.get("base_up_down_vol_ratio_40", 0)) >= 1.10:
+        eff += 0.8
+    if safe_float(row.get("base_observe_price_attack_score", 0)) >= 5:
+        eff += 0.8; reasons.append("价格攻击效率较好")
+
+    # 失败反证：多次假突破/放量滞涨/长上影供给。
+    risk_active = safe_float(row.get("base_observe_risk_active_penalty", 0))
+    risk_penalty = safe_float(row.get("base_risk_penalty", 0))
+    if risk_active < 0:
+        fail += abs(risk_active) * 0.75; reasons.append("放量长上影/滞涨等失败记忆扣分")
+    if risk_penalty < -8:
+        fail += min(4.0, abs(risk_penalty) * 0.25); reasons.append("基础追高/量价风险扣分")
+    if safe_float(row.get("base_big_yin_count_100", 0)) >= safe_float(row.get("base_big_yang_count_100", 0)) + 2:
+        fail += 2.0; reasons.append("大阴攻击多于大阳攻击")
+
+    score = _v27_clip(attack + carry + sustain + eff - fail, 0, 25)
+    return score, reasons or ["资金因子中性：未发现强攻击/承接记忆"]
+
+
+def _v27_base_factor_structure(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("base_structure_potential_score", 0), 22, 7.0)
+    s += _v27_norm(row.get("base_long_cycle_potential_score", 0), 10, 3.0)
+    s += _v27_norm(row.get("base_supply_pressure_clarity_score", 0), 10, 3.0)
+    if safe_float(row.get("base_supply_dist_to_upper", 999)) <= 0.06 and safe_float(row.get("base_supply_core_upper", 0)) > 0:
+        s += 2.0; reasons.append("接近供需/核心压力上沿")
+    if bool(row.get("base_supply_absorption_valid", False)):
+        s += 2.0; reasons.append("供应吸收结构有效")
+    if bool(row.get("base_explosion_eve_valid", False)):
+        s += 1.5; reasons.append("爆发前夜结构有效")
+    if safe_float(row.get("base_fibo_second_confirm_score", 0)) >= 6:
+        s += 1.0; reasons.append("黄金倍量/首倍结构入口")
+    if not reasons and safe_float(row.get("base_structure_potential_score", 0)) > 0:
+        reasons.append("平台/凹口/结构潜力存在")
+    return _v27_clip(s, 0, 20), reasons or ["核心结构证据一般"]
+
+
+def _v27_base_factor_explosion(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("base_channel_explosion_eve_score", 0), 30, 8.0)
+    s += _v27_norm(row.get("base_channel_supply_absorption_score", 0), 30, 5.0)
+    s += _v27_norm(row.get("base_supply_absorb_context_score", 0), 9, 2.0)
+    s += _v27_norm(row.get("base_supply_volume_platform_score", 0), 7, 2.0)
+    if safe_float(row.get("base_observation_subscore", 0)) >= 7:
+        s += 1.0; reasons.append("观察值显示资金/结构/修复记忆较好")
+    if bool(row.get("base_explosion_eve_valid", False)):
+        s += 1.5; reasons.append("爆发前夜有效召回")
+    if safe_float(row.get("base_explosion_eve_penalty", 0)) < 0:
+        s += max(-2.0, safe_float(row.get("base_explosion_eve_penalty", 0)) * 0.4)
+        reasons.append("爆发前夜存在追高/滞涨反证")
+    return _v27_clip(s, 0, 20), reasons or ["爆发前夜证据不足"]
+
+
+def _v27_base_factor_trigger(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("base_supply_compression_trigger_score", 0), 6, 3.0)
+    if safe_float(row.get("break_rate", 0)) >= 0.005 and safe_float(row.get("break_rate", 0)) <= 0.035:
+        s += 3.0; reasons.append("当前处于健康突破/临界触发")
+    elif safe_float(row.get("break_rate", 0)) > 0.06:
+        s -= 2.0; reasons.append("突破过远，触发降权")
+    if bool(row.get("platform20_break_base", False)) or bool(row.get("platform40_break_base", False)):
+        s += 2.0; reasons.append("平台上沿触发")
+    if safe_float(row.get("base_trade_quality_score", 0)) >= 8:
+        s += 2.0; reasons.append("基础买点质量较好")
+    if 0 < safe_float(row.get("base_defense_dist", 0)) <= 0.07:
+        s += 1.5; reasons.append("离基础防守位不远")
+    if 0 < safe_float(row.get("near_pressure_dist", 0)) < 0.05:
+        s -= 2.0; reasons.append("近端压力贴脸，触发降权")
+    if safe_float(row.get("bias20", 0)) > 0.15:
+        s -= 1.5; reasons.append("20日乖离偏高，防追涨")
+    return _v27_clip(s, 0, 15), reasons or ["当前触发窗口不明显"]
+
+
+def _v27_base_factor_market(row):
+    reasons = []
+    s = 0.0
+    # 无板块实时数据时，使用相对强弱/市场环境代理；缺失中性，不误杀。
+    if safe_float(row.get("base_activity_memory_score", 0)) >= 4:
+        s += 2.0; reasons.append("股性活跃度适合A股短线生态")
+    elif safe_float(row.get("base_activity_memory_score", 0)) <= -3:
+        s -= 1.5; reasons.append("股性偏黏/活跃度不足")
+    if safe_float(row.get("base_long_cycle_potential_score", 0)) > 0 and safe_float(row.get("long_pos_250", 0)) <= 0.65:
+        s += 1.5; reasons.append("相对位置适合中低位修复")
+    if _v26_regime() in ["bear", "weak", "panic", "crash"]:
+        s -= 2.0; reasons.append("市场环境偏弱，海选降权")
+    else:
+        s += 2.0; reasons.append("市场环境中性/可交易")
+    return _v27_clip(s + 4.0, 0, 10), reasons
+
+
+def _v27_base_factor_risk_trade(row):
+    reasons = []
+    s = 10.0
+    if safe_float(row.get("base_risk_penalty", 0)) < 0:
+        s += safe_float(row.get("base_risk_penalty", 0)) * 0.45; reasons.append("基础风险扣分")
+    if safe_float(row.get("base_observe_risk_active_penalty", 0)) < 0:
+        s += safe_float(row.get("base_observe_risk_active_penalty", 0)) * 0.55; reasons.append("失败记忆/滞涨风险扣分")
+    if safe_float(row.get("base_defense_dist", 0)) > 0.10:
+        s -= 2.0; reasons.append("距离基础防守位过远")
+    if 0 < safe_float(row.get("base_target_dist", 0)) < 0.06:
+        s -= 2.0; reasons.append("上方第一空间偏窄")
+    if safe_float(row.get("base_rsi", 50)) > 82 or safe_float(row.get("base_cci", 0)) > 260:
+        s -= 1.5; reasons.append("短线过热")
+    return _v27_clip(s, 0, 10), reasons or ["基础可交易风险中性"]
+
+
+def v27_base_recall_overlay(row):
+    """V27基础层：六大一级因子，只负责深度召回，不输出买入结论。"""
+    if V27_ENABLE_CORE_ENGINE != "1" or V27_ENABLE_BASE_RECALL_OVERLAY != "1":
+        return row
+    r = dict(row)
+    f1, r1 = _v27_base_factor_funds(r)
+    f2, r2 = _v27_base_factor_structure(r)
+    f3, r3 = _v27_base_factor_explosion(r)
+    f4, r4 = _v27_base_factor_trigger(r)
+    f5, r5 = _v27_base_factor_market(r)
+    f6, r6 = _v27_base_factor_risk_trade(r)
+    # 100分海选召回口径：资金25、结构20、爆发前夜20、当前触发15、市场10、可交易10。
+    total = f1 + f2 + f3 + f4 + f5 + f6
+    # 当前触发不足但历史记忆好：进入种子池，不抢深度前排。
+    if f4 < V27_BASE_TRIGGER_MIN_FOR_DEEP and total >= 60:
+        priority = total * 0.72
+        tier = "V27种子池：历史记忆好但当前触发不足"
+    else:
+        priority = total
+        tier = "V27深度池候选" if total >= 55 and f4 >= V27_BASE_TRIGGER_MIN_FOR_DEEP else "V27普通观察"
+    r.update({
+        "v27_base_fund_factor": round(f1, 2),
+        "v27_base_structure_factor": round(f2, 2),
+        "v27_base_explosion_factor": round(f3, 2),
+        "v27_base_current_trigger_factor": round(f4, 2),
+        "v27_base_market_factor": round(f5, 2),
+        "v27_base_risk_trade_factor": round(f6, 2),
+        "v27_base_recall_score": round(total, 2),
+        "v27_base_deep_priority_score": round(priority, 2),
+        "v27_base_tier": tier,
+        "v27_base_reason": "｜".join((r1[:2] + r2[:2] + r3[:2] + r4[:2] + r6[:2])[:8]),
+        "v27_base_dedup_note": "21个海选维度合并为6个一级因子；K线组合归入资金事件簇；同源组内封顶，基础层只召回不买入。",
+    })
+    return r
+
+
+def _v27_deep_factor_funds(row):
+    reasons = []
+    s = 0.0
+    # 资金因子：攻击、承接、持续、效率、失败反证。
+    s += _v27_norm(row.get("v201_volume_behavior", 0), 15, 5.0)
+    if safe_float(row.get("v212_acceptance_score", 0)) > 0:
+        s += min(4.0, safe_float(row.get("v212_acceptance_score", 0)) * 0.35); reasons.append("V21.2承接确认")
+    if safe_float(row.get("v26_support_defense_score", 0)) > 0:
+        s += min(3.5, safe_float(row.get("v26_support_defense_score", 0)) * 0.35); reasons.append("V26承接/防守确认")
+    for k, label, w in [
+        ("flat_volume_score", "平量承接", 0.6),
+        ("volume_after_flat_acceptance_score", "倍量后平量承接", 0.8),
+        ("score_double_yang_sandwich", "双阳夹阴/多方炮", 0.7),
+        ("base_fibo_second_confirm_score", "首倍二次确认", 0.25),
+        ("v23_supply_absorption_score", "供应吸收资金", 0.22),
+    ]:
+        val = safe_float(row.get(k, 0))
+        if val > 0:
+            s += min(2.5, val * w); reasons.append(label)
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.10:
+        s -= 3.0; reasons.append("资金强但追涨风险高，资金效率降权")
+    if _v26_bool(row.get("is_bad_stall", False)) or safe_float(row.get("stall_risk_score", 0)) > 0:
+        s -= 3.5; reasons.append("放量滞涨/供应压制")
+    return _v27_clip(s, 0, 25), reasons or ["深度资金因子中性"]
+
+
+def _v27_deep_factor_structure(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("v201_structure_position", 0), 15, 6.0)
+    s += _v27_norm(row.get("v201_pressure_support", 0), 15, 4.0)
+    s += _v27_norm(row.get("v26_key_structure_score", 0), 15, 4.0)
+    for k, label, w in [
+        ("xhu_coreline_core_score", "核心压力/支撑线", 0.20),
+        ("v201_v256_core_score", "V25.6核心线", 0.18),
+        ("monthly_repair_score", "大周期修复", 0.25),
+        ("notch_score", "凹口/平台", 0.30),
+        ("v23_supply_absorption_score", "大级别供应吸收", 0.16),
+    ]:
+        val = safe_float(row.get(k, 0))
+        if val > 0:
+            s += min(2.5, val * w); reasons.append(label)
+    return _v27_clip(s, 0, 20), reasons or ["结构因子一般"]
+
+
+def _v27_deep_factor_explosion(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("v26_explosion_eve_score", 0), 20, 6.0)
+    s += _v27_norm(row.get("v26_supply_absorption_mother_score", 0), 12, 4.0)
+    s += _v27_norm(row.get("v23_supply_absorption_score", 0), 20, 4.0)
+    for k, label, w in [
+        ("compression_score", "量价压缩", 0.50),
+        ("platform_volume_lift_score", "平台量能均值抬升", 0.45),
+        ("flat_volume_score", "平量稳定", 0.35),
+        ("v231_shadow_acceptance_score", "上影供应接受", 0.25),
+    ]:
+        val = safe_float(row.get(k, 0))
+        if val > 0:
+            s += min(2.5, val * w); reasons.append(label)
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.10:
+        s -= 2.5; reasons.append("已远离爆发前夜，防追涨降权")
+    return _v27_clip(s, 0, 20), reasons or ["爆发前夜深度证据不足"]
+
+
+def _v27_deep_factor_trigger(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("v201_trigger_confirmation", 0), 15, 4.0)
+    action = str(row.get("v212_action", ""))
+    if action.startswith("V21.2正式"):
+        s += 3.0; reasons.append("V21.2正式触发")
+    if safe_float(row.get("v26_breakout_expansion_score", 0)) >= 5:
+        s += 2.0; reasons.append("突破扩张信号")
+    if safe_float(row.get("v26_support_defense_score", 0)) >= 5:
+        s += 2.0; reasons.append("回踩/承接确认")
+    if _v26_bool(row.get("v201_precise_trigger_valid", False)):
+        s += 1.5; reasons.append("低量精准触发线有效")
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    if 0 < defense <= 0.06:
+        s += 1.0; reasons.append("触发后仍接近防守位")
+    if safe_float(row.get("v20_chase_risk", row.get("chase_risk", 0))) > 0.10:
+        s -= 3.0; reasons.append("触发已远离，追涨降权")
+    return _v27_clip(s, 0, 15), reasons or ["当前触发不足"]
+
+
+def _v27_deep_factor_market(row):
+    reasons = []
+    s = 0.0
+    s += _v27_norm(row.get("v26_sector_lifecycle_score", 0), 6, 3.0)
+    s += _v27_norm(row.get("v26_market_score", 0), 5, 2.5)
+    if safe_float(row.get("sector_heat_score", 0)) >= 60:
+        s += 1.5; reasons.append("板块热度配合")
+    if safe_float(row.get("relative_strength_score", 0)) > 0:
+        s += min(2.0, safe_float(row.get("relative_strength_score", 0)) * 0.25); reasons.append("相对强弱配合")
+    if _v26_regime() in ["bear", "weak", "panic", "crash"]:
+        s -= 2.0; reasons.append("市场环境弱，降低成功率假设")
+    return _v27_clip(s + 2.0, 0, 10), reasons or ["市场/板块按中性处理"]
+
+
+def _v27_deep_factor_risk_trade(row):
+    reasons = []
+    s = 10.0
+    rr = safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0))))
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    upside = safe_float(row.get("v20_target_dist", row.get("target_dist", 0)))
+    nearp = safe_float(row.get("v20_near_pressure", row.get("near_pressure_dist", 0)))
+    if rr >= 2.0:
+        s += 2.0; reasons.append("RR优秀")
+    elif rr >= V27_MIN_RR:
+        s += 0.8; reasons.append("RR合格")
+    elif rr > 0:
+        s -= 3.0; reasons.append("RR不合格")
+    if 0 < defense <= 0.055:
+        s += 1.5; reasons.append("防守位舒服")
+    elif defense > V27_MAX_DEFENSE_DIST:
+        s -= 4.0; reasons.append("防守位过远")
+    if upside >= 0.15:
+        s += 1.2; reasons.append("上方空间较好")
+    elif 0 < upside < V27_MIN_UPSIDE:
+        s -= 3.0; reasons.append("上方空间不足")
+    if 0 < nearp < V27_NEAR_PRESSURE_BLOCK:
+        s -= 3.0; reasons.append("近端压力贴脸")
+    if safe_float(row.get("v26_failure_similarity_risk", row.get("v26_failure_similarity", 0))) >= 45:
+        s -= 2.5; reasons.append("失败相似度偏高")
+    if safe_float(row.get("v241_liquidity_score", 70)) < 50:
+        s -= 3.0; reasons.append("流动性/成交额不足")
+    return _v27_clip(s, 0, 10), reasons or ["可交易风险中性"]
+
+
+def v27_wallstreet_decision_engine(row):
+    """V27深度层：华尔街定价器。旧模型只做特征库，V27负责买入池/观察池/剔除池分流。"""
+    if V27_ENABLE_CORE_ENGINE != "1":
+        return row
+    r = dict(row)
+    f1, r1 = _v27_deep_factor_funds(r)
+    f2, r2 = _v27_deep_factor_structure(r)
+    f3, r3 = _v27_deep_factor_explosion(r)
+    f4, r4 = _v27_deep_factor_trigger(r)
+    f5, r5 = _v27_deep_factor_market(r)
+    f6, r6 = _v27_deep_factor_risk_trade(r)
+    score = _v27_clip(f1 + f2 + f3 + f4 + f5 + f6, 0, 100)
+
+    rr = safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))))
+    defense = safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)))
+    upside = safe_float(r.get("v20_target_dist", r.get("target_dist", 0)))
+    nearp = safe_float(r.get("v20_near_pressure", r.get("near_pressure_dist", 0)))
+    chase = safe_float(r.get("v20_chase_risk", r.get("chase_risk", 0)))
+    bias20 = safe_float(r.get("bias20", r.get("base_bias20", 0)))
+    pct_chg = safe_float(r.get("pct_chg", 0))
+    block = []
+    observe = []
+
+    if bool(r.get("v14_blocked", False)) or bool(r.get("risk_hard_exclude", False)):
+        block.append("硬雷区/重大风险剔除")
+    if bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
+        block.append(str(r.get("v20_trade_invalid_reason", r.get("v22_invalid_reason", "交易假设已失效"))))
+    if rr > 0 and rr < V27_MIN_RR:
+        block.append(f"RR {rr:.2f} 低于V27最低{V27_MIN_RR:.2f}")
+    if defense > V27_MAX_DEFENSE_DIST:
+        block.append(f"防守距离{defense:.1%}过远，追涨风险")
+    elif defense > V27_MAX_SOFT_DEFENSE_DIST:
+        observe.append(f"防守距离{defense:.1%}偏远，观察降级")
+    if 0 < upside < V27_MIN_UPSIDE:
+        block.append(f"上方空间{upside:.1%}不足")
+    if 0 < nearp < V27_NEAR_PRESSURE_BLOCK:
+        block.append(f"近端压力{nearp:.1%}贴脸")
+    if chase > 0.12:
+        block.append(f"追高风险{chase:.1%}过高")
+    elif chase > 0.09:
+        observe.append("追高风险偏高，需回踩确认")
+    if bias20 > V27_CHASE_HARD_BLOCK_BIAS20 and defense > 0.06:
+        block.append("20日乖离偏高且防守位偏远")
+    if pct_chg >= 7.0 and defense > 0.075 and f4 < 10:
+        block.append("当日强攻但防守位远、触发质量不足")
+    if f4 < V27_DEEP_TRIGGER_MIN:
+        observe.append("当前触发不足：基础好但买点未成熟")
+    if f2 < V27_DEEP_STRUCTURE_MIN:
+        observe.append("核心结构质量不足，不能作为正式买入主因")
+    if f1 < V27_DEEP_FUND_MIN:
+        observe.append("资金有效性/承接不足")
+
+    formal_ok = (score >= V27_MIN_BUY_SCORE) and not block and f4 >= V27_DEEP_TRIGGER_MIN and f2 >= V27_DEEP_STRUCTURE_MIN and f1 >= V27_DEEP_FUND_MIN
+    if formal_ok:
+        pool = "V27最终买入池"
+    elif block:
+        pool = "V27剔除/禁止买入"
+    else:
+        pool = "V27观察池"
+
+    # 交易假设分类：先分类，再定价。
+    if f3 >= 13 and f4 >= 7:
+        hypo = "爆发前夜临界触发"
+    elif f2 >= 13 and f4 >= 9:
+        hypo = "核心结构位突破/回踩确认"
+    elif f1 >= 15 and f4 >= 8:
+        hypo = "资金承接后转强"
+    elif f3 >= 12 and f4 < 7:
+        hypo = "爆发前夜种子，等待触发"
+    elif chase > 0.10 or defense > V27_MAX_SOFT_DEFENSE_DIST:
+        hypo = "强攻后追涨风险观察"
+    else:
+        hypo = "综合结构观察"
+
+    r.update({
+        "v27_enabled": True,
+        "v27_fund_factor": round(f1, 2),
+        "v27_structure_factor": round(f2, 2),
+        "v27_explosion_eve_factor": round(f3, 2),
+        "v27_current_trigger_factor": round(f4, 2),
+        "v27_market_factor": round(f5, 2),
+        "v27_risk_trade_factor": round(f6, 2),
+        "v27_final_score": round(score, 2),
+        "v27_buy_eligible": bool(formal_ok),
+        "v27_pool": pool,
+        "v27_trade_hypothesis": hypo,
+        "v27_block_reasons": block,
+        "v27_observe_reasons": observe,
+        "v27_reason_summary": "｜".join((r1[:2] + r2[:2] + r3[:2] + r4[:2] + r6[:2])[:10]),
+        "v27_dedup_note": "旧模型=特征库；V27=交易定价器。资金/结构/爆发/触发/市场/风险六大因子组内封顶，防止阳包阴、分手线、跳空等K线事件重复加分。",
+        "v27_failure_path_note": "正式买入池必须满足RR、防守位、第一压力空间、当前触发、资金有效性；不满足则观察或剔除。",
+    })
+    return r
+
+
+def v27_apply_to_row(row):
+    """统一入口：深度层V27华尔街决策器。"""
+    try:
+        return v27_wallstreet_decision_engine(row)
+    except Exception as e:
+        r = dict(row)
+        r["v27_error"] = str(e)[:200]
+        r["v27_buy_eligible"] = False
+        r["v27_pool"] = "V27评分异常观察"
+        return r
+
+# ========================= V27.0 选股逻辑主引擎重构：A股海选 + 华尔街深度定价 END =========================
+
 # ========================= V26 END =========================
 
 
@@ -14010,6 +14483,12 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         except Exception as _e:
             r["v26_error"] = str(_e)[:200]
             r["v26_buy_eligible"] = False
+        # V27：最终选股逻辑主引擎。旧模型/V26只做特征与审计，V27负责正式买入池/观察池/剔除池分流。
+        try:
+            r = v27_apply_to_row(r)
+        except Exception as _e:
+            r["v27_error"] = str(_e)[:200]
+            r["v27_buy_eligible"] = False
         # 若V21.2/V22综合分生成失败，不再静默退回深度分参与最终正式排序；保留诊断。
         if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
             r["v22_score_valid"] = False
@@ -14044,6 +14523,8 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
     candidates = sorted(
         candidates,
         key=lambda x: (
+            1 if bool(x.get("v27_buy_eligible", False)) else 0,
+            safe_float(x.get("v27_final_score", 0)),
             1 if bool(x.get("v26_buy_eligible", False)) else 0,
             safe_float(x.get("v26_final_buy_score", 0)),
             1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
@@ -14079,7 +14560,16 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = str(rr.get("v22_invalid_reason", "综合交易评分未独立生成"))
             diagnostics.append(rr)
             continue
-        if V26_ENABLE_INSTITUTIONAL_SCORECARD == "1" and not bool(r.get("v26_buy_eligible", False)):
+        if V27_ENABLE_CORE_ENGINE == "1" and V27_ENABLE_FINAL_GATE == "1" and not bool(r.get("v27_buy_eligible", False)):
+            rr = dict(r)
+            rr["v20_pool"] = str(rr.get("v27_pool", "V27观察池/未入最终买入池"))
+            reasons = rr.get("v27_block_reasons", []) or rr.get("v27_observe_reasons", [])
+            if isinstance(reasons, list):
+                reasons = "；".join([str(x) for x in reasons if str(x).strip()])
+            rr["v20_skip_reason"] = reasons or f"V27分{safe_float(rr.get('v27_final_score',0)):.2f}低于{V27_MIN_BUY_SCORE:.0f}或当前触发/RR/防守位未通过"
+            diagnostics.append(rr)
+            continue
+        if V27_ENABLE_CORE_ENGINE != "1" and V26_ENABLE_INSTITUTIONAL_SCORECARD == "1" and not bool(r.get("v26_buy_eligible", False)):
             rr = dict(r)
             rr["v20_pool"] = "V26高质量观察/未入最终买入池"
             rr["v20_skip_reason"] = str(rr.get("v26_hard_gate_reasons", "V26最终买入池硬条件未通过")) or f"V26分{safe_float(rr.get('v26_final_buy_score',0)):.2f}低于{V26_MIN_BUY_SCORE:.0f}"
@@ -14099,7 +14589,7 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
             rr["v20_skip_reason"] = portfolio_reason
             diagnostics.append(rr)
             continue
-        r["v20_pool"] = "V26最终买入池"
+        r["v20_pool"] = "V27最终买入池" if V27_ENABLE_CORE_ENGINE == "1" else "V26最终买入池"
         r["v20_rank"] = len(final) + 1
         final.append(r)
         if len(final) >= effective_limit:
