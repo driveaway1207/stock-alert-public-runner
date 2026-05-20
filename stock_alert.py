@@ -1,10 +1,11 @@
-# Employee1 Stock Alert V27.9 | Updated: 2026-05-20
+# Employee1 Stock Alert V28.5.1 | Updated: 2026-05-21
 # FIRST LINE FORMAT LOCKED: only version number and Updated date may change; do not rename entrypoint stock_alert.py
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
 import json
 import time
 import html
+import hashlib
 import warnings
 import signal
 import io
@@ -175,7 +176,8 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V28一号员工选股模型｜市场状态前置+分情景WalkForward定价+动态雷区版"
+MODEL_VERSION = "V28.5.1一号员工选股模型｜风险分层防误杀+市场状态前置+生命周期归因+同源去重审计版"
+CURRENT_MODEL_VERSION_TAG = "V28.5.1"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -11660,7 +11662,7 @@ def build_message(final_signals, dates, stock_count=0, kline_success=0, kline_fa
     lines.append("━━━━━━━━━━━━━━")
 
     if not final_signals:
-        lines.append("⚠️ 今日没有可用Top3股票。通常代表深度评分为空或全部命中硬雷区/硬约束。")
+        lines.append("⚠️ 今日没有可用Top3股票。通常代表严格买入池与分层候选池均为空。")
         diag = v14_diagnostics_text(v14_diagnostics or [], 10)
         if diag:
             lines.append(html.escape(diag))
@@ -11848,7 +11850,7 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
                 if row.get("v16_cap_reason"):
                     lines.append(f"   风险/封顶：{row['v16_cap_reason']}")
         else:
-            lines.append("今日没有可用Top3：深度评分为空或全部命中硬雷区/硬约束。")
+            lines.append("今日没有可用Top3：严格买入池与分层候选池均为空，通常代表深度评分为空、硬雷区/硬约束过多，或候选分数低于V28兜底阈值。")
         lines.append("")
         lines.append("【后台跟踪前10】")
         for i, row in enumerate(watch_rows[:10], 1):
@@ -11863,10 +11865,14 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
         # V27.1：复盘归因不再写“占位”。优先读取条件概率表/回测交易记录，输出当前可用的T+窗口统计；
         # 若暂无历史交易记录，则明确标记pending，不伪装成已完成复盘。
         condition_table = build_v20_condition_probability_placeholder(payload)
+        _ls = condition_table.get("lifecycle_summary", {}) if isinstance(condition_table, dict) else {}
         review_lines = [
             "一号员工 V19.3/V27 复盘归因报告",
             f"生成时间：{bj_time_str()} 北京时间",
             f"条件概率来源：{condition_table.get('source','unknown')}",
+            f"闭环状态：{condition_table.get('lifecycle_status','UNKNOWN')}；是否参与评分校准：{'是' if condition_table.get('score_calibration_enabled') else '否'}",
+            f"生命周期统计：信号{_ls.get('total_signal_count', condition_table.get('signal_count',0))}；已实现窗口{_ls.get('realized_window_count', condition_table.get('realized_window_count', condition_table.get('realized_window_rows',0)))}；待跟踪窗口{_ls.get('pending_window_count', condition_table.get('pending_window_count', condition_table.get('pending_rows',0)))}；数据缺失{_ls.get('data_missing_signal_count', condition_table.get('data_missing_signal_count',0))}；失败{_ls.get('failed_signal_count', condition_table.get('failed_signal_count',0))}",
+            f"样本可信度：full={_ls.get('full_sample_context_count',0)}；semi={_ls.get('semi_sample_context_count',0)}；weak={_ls.get('weak_sample_context_count',0)}；small={_ls.get('small_sample_context_count',0)}",
             f"复盘窗口：{','.join([str(x) for x in V20_REVIEW_WINDOWS])}",
             "",
             "【按交易假设统计】",
@@ -13286,6 +13292,18 @@ V27_CALIBRATION_FILE = os.environ.get("V27_CALIBRATION_FILE", os.path.join("outp
 V27_REQUIRE_CALIBRATION_FOR_FORMAL = os.environ.get("V27_REQUIRE_CALIBRATION_FOR_FORMAL", "0")
 V27_UNCALIBRATED_SCORE_HAIRCUT = float(os.environ.get("V27_UNCALIBRATED_SCORE_HAIRCUT", "0.92"))
 V27_MIN_CALIBRATION_SAMPLE = int(os.environ.get("V27_MIN_CALIBRATION_SAMPLE", "80"))
+
+# ========================= V28.2：Top3 分层兜底输出 =========================
+# 只优化最终选股逻辑，不触碰生产链路。
+# 目的：严格买入池可以宁缺毋滥，但当严格Top3为空时，不再把高分候选全部隐藏，
+# 而是输出“分层候选/观察TopN”，明确标注为等待确认，不包装成正式S/A买入。
+V28_ENABLE_TIERED_FALLBACK_TOP = os.environ.get("V28_ENABLE_TIERED_FALLBACK_TOP", "1")
+V28_FILL_UNDER_LIMIT_WITH_FALLBACK = os.environ.get("V28_FILL_UNDER_LIMIT_WITH_FALLBACK", "1")
+V28_FALLBACK_MIN_SCORE = float(os.environ.get("V28_FALLBACK_MIN_SCORE", "72"))
+V28_FALLBACK_MIN_V27_SCORE = float(os.environ.get("V28_FALLBACK_MIN_V27_SCORE", "70"))
+V28_FALLBACK_ALLOW_C_TIER = os.environ.get("V28_FALLBACK_ALLOW_C_TIER", "0")
+V28_FALLBACK_POOL_NAME = os.environ.get("V28_FALLBACK_POOL_NAME", "V28分层候选池/等待确认")
+# ===========================================================================
 
 
 def _v27_clip(x, lo=0.0, hi=100.0):
@@ -15965,27 +15983,35 @@ def classify_v20_trade_tier(row):
 
 
 def v20_condition_probability_hint(row):
-    """读取已有条件概率表，给当前主假设一个轻量参考。样本不足时只提示不调权。"""
+    """读取条件概率表，给当前主假设一个轻量参考；只有full/semi样本允许调权。"""
     hypo = str(row.get("v20_main_hypothesis", "") or detect_v20_main_hypothesis(row))
     try:
         if not os.path.exists(V20_CONDITION_TABLE_FILE):
             return {"sample_count": 0, "score_adj": 0.0, "text": "条件概率样本不足，暂不调权"}
         with open(V20_CONDITION_TABLE_FILE, "r", encoding="utf-8") as f:
             table = json.load(f)
+        if isinstance(table, dict) and table.get("lifecycle_status") in ["FAILED", "FALLBACK_LEGACY"]:
+            return {
+                "sample_count": 0,
+                "score_adj": 0.0,
+                "text": f"条件概率闭环{table.get('lifecycle_status')}，本次只展示不调权"
+            }
         stats = table.get("by_hypothesis", {}).get(hypo, {}) if isinstance(table, dict) else {}
         n = int(stats.get("sample_count", 0) or 0)
-        if n < 20:
-            return {"sample_count": n, "score_adj": 0.0, "text": f"条件概率样本{n}，只观察不调权"}
+        q = str(stats.get("sample_quality", "small_sample_no_score"))
+        if q not in ["full_sample", "semi_sample"]:
+            return {"sample_count": n, "score_adj": 0.0, "text": f"条件概率样本{n}({q})，只观察不调权"}
         win = stats.get("T+5", {}) or stats.get("T+8", {}) or {}
         win_rate = safe_float(win.get("win_rate", 0))
         med_ret = safe_float(win.get("median_return", 0))
         med_dd = safe_float(win.get("median_max_drawdown", 0))
         adj = 0.0
+        weight = V285_SCORE_CALIBRATION_FULL_WEIGHT if q == "full_sample" else V285_SCORE_CALIBRATION_SEMI_WEIGHT
         if win_rate >= 0.62 and med_ret > 0.025 and med_dd > -0.055:
-            adj = 3.0 if n >= 50 else 1.5
+            adj = (3.0 if n >= 50 else 1.5) * weight
         elif win_rate <= 0.45 and med_ret < 0 and med_dd < -0.06:
-            adj = -3.0 if n >= 50 else -1.5
-        text = f"{hypo}历史样本{n}，T+5胜率{win_rate:.1%}，中位收益{med_ret:.1%}，中位回撤{med_dd:.1%}"
+            adj = (-3.0 if n >= 50 else -1.5) * weight
+        text = f"{hypo}历史样本{n}({q})，T+5胜率{win_rate:.1%}，中位收益{med_ret:.1%}，中位回撤{med_dd:.1%}，轻量校准{adj:+.1f}"
         return {"sample_count": n, "score_adj": float(adj), "text": text}
     except Exception as e:
         return {"sample_count": 0, "score_adj": 0.0, "text": f"条件概率读取失败：{str(e)[:80]}"}
@@ -16151,6 +16177,63 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         final.append(r)
         if len(final) >= effective_limit:
             break
+
+    # V28.2：严格买入池为空/不足时，补充分层候选，避免报告显示“无Top3”却只在下面列基础高分票。
+    # 注意：这里只从已经通过硬风险、综合分有效、交易假设未失效的 candidates 中选择；
+    # 不放松硬雷、数据无效、signals_history、组合去相关等硬约束。
+    if V28_ENABLE_TIERED_FALLBACK_TOP == "1" and effective_limit > 0:
+        need_fill = (len(final) == 0) or (V28_FILL_UNDER_LIMIT_WITH_FALLBACK == "1" and len(final) < effective_limit)
+        if need_fill:
+            used_codes = {str(x.get("code")) for x in final}
+            fallback_pool = []
+            for r in candidates:
+                code_key = str(r.get("code"))
+                if code_key in used_codes:
+                    continue
+                if bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
+                    continue
+                if r.get("v14_blocked") or str(r.get("v20_trade_tier", "")).startswith("硬风险"):
+                    continue
+                if not _valid_score_field(r, "v22_composite_trade_score") and not _valid_score_field(r, "v212_final_score"):
+                    continue
+                tier_text = str(r.get("v20_trade_tier", ""))
+                if V28_FALLBACK_ALLOW_C_TIER != "1" and tier_text.startswith("C档"):
+                    continue
+                v27_score = safe_float(r.get("v27_final_score", 0))
+                comp_score = safe_float(r.get("v22_composite_trade_score", r.get("v212_final_score", r.get("v20_final_score", r.get("score", 0)))))
+                # 兼容旧字段：有些日志里展示的是 score/score_final，而不是 v27_final_score。
+                legacy_score = max(
+                    comp_score,
+                    safe_float(r.get("score_final", 0)),
+                    safe_float(r.get("final_score", 0)),
+                    safe_float(r.get("score", 0)),
+                )
+                if v27_score < V28_FALLBACK_MIN_V27_SCORE and legacy_score < V28_FALLBACK_MIN_SCORE:
+                    continue
+                rr = dict(r)
+                rr["v20_pool"] = V28_FALLBACK_POOL_NAME
+                rr["v28_fallback_top"] = True
+                rr["v28_fallback_is_formal_buy"] = False
+                reasons = rr.get("v27_block_reasons", []) or rr.get("v27_observe_reasons", [])
+                if isinstance(reasons, list):
+                    reasons = "；".join([str(x) for x in reasons if str(x).strip()])
+                rr["v20_skip_reason"] = (
+                    "严格买入池未满，作为当前最优分层候选输出；"
+                    "不是无条件买入，需等待次日确认/回踩承接/压力突破。"
+                    + (f" 未入严格池原因：{reasons}" if reasons else "")
+                )
+                rr["v20_rank"] = len(final) + len(fallback_pool) + 1
+                # 报告侧可直接读取这些字段，避免把观察票误解为正式A。
+                rr["execution_action"] = rr.get("execution_action") or "观察/等待确认，不追高"
+                rr["trade_action"] = rr.get("trade_action") or "观察/等待确认，不追高"
+                rr["position_suggestion"] = rr.get("position_suggestion") or "未触发前0仓；触发后轻仓试错"
+                fallback_pool.append(rr)
+                used_codes.add(code_key)
+                if len(final) + len(fallback_pool) >= effective_limit:
+                    break
+            if fallback_pool:
+                print(f"V28.2分层兜底输出：严格买入池{len(final)}只，补充分层候选{len(fallback_pool)}只。")
+                final.extend(fallback_pool)
 
     selected_codes = {str(r.get("code")) for r in final}
     for r in candidates:
@@ -16850,15 +16933,22 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         except Exception as _e:
             print(f"V23完整融合日报保存失败：{_e}")
 
+        try:
+            _ct = _v285_read_json(V20_CONDITION_TABLE_FILE, default={}) if 'V285_MODEL_VERSION' in globals() else {}
+            _ls = _ct.get("lifecycle_summary", {}) if isinstance(_ct, dict) else {}
+        except Exception:
+            _ct, _ls = {}, {}
         review_lines = [
-            "一号员工 V20.1 复盘归因报告底座",
+            "一号员工 V20.1/V28.5.1 复盘归因报告",
             f"生成时间：{bj_time_str()}",
             "复盘窗口：T+1/T+3/T+5/T+8/T+13/T+20",
             f"评分卡：{V20_SCORE_CARDS_FILE}",
             f"条件概率表：{V20_CONDITION_TABLE_FILE}",
             f"信号反馈CSV：{V20_SIGNAL_FEEDBACK_CSV}",
             f"推荐生命周期：{V20_SIGNAL_LIFECYCLE_FILE}",
-            "说明：当前已加入推荐后生命周期跟踪；后续继续补充forward return、max drawdown、是否破防守位、是否触及目标位。",
+            f"闭环状态：{_ct.get('lifecycle_status','UNKNOWN') if isinstance(_ct,dict) else 'UNKNOWN'}；是否参与评分校准：{'是' if isinstance(_ct,dict) and _ct.get('score_calibration_enabled') else '否'}",
+            f"生命周期统计：信号{_ls.get('total_signal_count',0)}；已实现窗口{_ls.get('realized_window_count',0)}；待跟踪窗口{_ls.get('pending_window_count',0)}；数据缺失{_ls.get('data_missing_signal_count',0)}；失败{_ls.get('failed_signal_count',0)}",
+            "说明：当前已加入确定性生命周期状态机；只有full/semi样本参与轻量校准，weak/small只展示不调权。",
         ]
         with open(V20_REVIEW_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(review_lines))
@@ -18132,46 +18222,157 @@ def _risk_data_unavailable_result(reason):
 
 
 def evaluate_regulatory_risk(code, name=""):
-    """V27.8：硬过滤框架升级为多源风险过滤。动态源未配置时可惩罚/可失败关闭。"""
+    """V28.1：监管/财务雷区分层防误杀。
+
+    核心原则：
+    1）硬雷才 hard_exclude：立案调查、行政处罚/重大违法、财务造假、非标/无法表示/否定/保留意见、
+       退市/ST、资金占用、违规担保、债务违约、破产重整、控股权司法拍卖/大额冻结等。
+    2）普通问询函、关注函、一般监管措施、一般质押/冻结、一般诉讼/仲裁，只做 MEDIUM_RISK 降权，继续K线深算。
+    3）行业周期、业绩波动、价格波动等只做 SOFT_RISK 提示或轻扣，不阻断模型。
+    4）避免“监管问询/质押冻结/诉讼等中度风险”这类聚合标签触发 medium_hits>=3 后被误判硬剔除。
+    """
     global _RISK_FLAGS_CACHE
     if _RISK_FLAGS_CACHE is None:
         _RISK_FLAGS_CACHE = load_risk_flags()
-    meta = _RISK_FLAGS_CACHE.get("__meta__", {}) if isinstance(_RISK_FLAGS_CACHE, dict) else {}
-    if meta and meta.get('status') not in ['ok','ok_with_dynamic_only']:
-        return _risk_data_unavailable_result(str(meta.get('reason','雷区源不可用')))
-    key=str(code).strip(); zkey=_v278_normalize_code(key)
-    raw=_RISK_FLAGS_CACHE.get(key, _RISK_FLAGS_CACHE.get(zkey, None)) if isinstance(_RISK_FLAGS_CACHE, dict) else None
-    if not raw:
-        if V278_RISK_REQUIRE_DYNAMIC_SOURCE=='1' and meta.get('dynamic_status')!='ok':
-            return _risk_data_unavailable_result('动态监管/财报源不可用，不能证明无雷')
-        return {"penalty":0.0,"hard_exclude":False,"flags":[],"note":"","risk_data_status":"ok","risk_action":"pass","risk_source_status":meta.get('dynamic_status','')}
-    if isinstance(raw,dict):
-        flags=raw.get('flags',[]); note=str(raw.get('note',''))
-    elif isinstance(raw,list):
-        flags=raw; note=''
-    else:
-        flags=[str(raw)]; note=''
-    flags=[str(x) for x in flags if str(x).strip()]
-    joined='；'.join(flags)+('；'+note if note else '')
-    major_keywords=['立案','证监会','调查','信披违规','资金占用','违规担保','重大处罚','行政处罚','非标','无法表示','保留意见','否定意见','退市','ST','债务违约','暂停上市','终止上市','欺诈','财务造假','被实施退市风险警示']
-    medium_keywords=['监管措施','警示函','问询函','关注函','高质押','质押','冻结','司法拍卖','诉讼','仲裁','高管处罚','股权分散','会计师事务所变动','频繁更名','延期披露','更正公告']
-    financial_keywords=['亏损','连续亏损','扣非亏损','经营现金流','现金流为负','应收','坏账','减值','高商誉','商誉','负债率','客户集中','供应商集中','毛利率下滑','营收下滑']
-    major_hits=sum(1 for k in major_keywords if k in joined)
-    medium_hits=sum(1 for k in medium_keywords if k in joined)
-    financial_hits=sum(1 for k in financial_keywords if k in joined)
-    if major_hits>0:
-        penalty=-45.0-min(30.0,6.0*max(0,major_hits-1)+3.0*medium_hits+2.0*financial_hits)
-        return {"penalty":penalty,"hard_exclude":True,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"hard_exclude","risk_source_status":meta.get('dynamic_status','')}
-    if medium_hits>0:
-        penalty=-22.0-min(28.0,5.0*max(0,medium_hits-1)+2.0*financial_hits)
-        hard=medium_hits>=3 or (medium_hits>=2 and financial_hits>=1)
-        if hard: penalty=min(penalty,-40.0)
-        return {"penalty":penalty,"hard_exclude":hard,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"hard_exclude" if hard else "downgrade","risk_source_status":meta.get('dynamic_status','')}
-    if financial_hits>0:
-        penalty=-12.0-min(20.0,4.0*financial_hits)
-        return {"penalty":penalty,"hard_exclude":False,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"financial_penalty","risk_source_status":meta.get('dynamic_status','')}
-    return {"penalty":-5.0 if flags else 0.0,"hard_exclude":False,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"minor_flag","risk_source_status":meta.get('dynamic_status','')}
 
+    meta = _RISK_FLAGS_CACHE.get("__meta__", {}) if isinstance(_RISK_FLAGS_CACHE, dict) else {}
+    if meta and meta.get('status') not in ['ok', 'ok_with_dynamic_only']:
+        return _risk_data_unavailable_result(str(meta.get('reason', '雷区源不可用')))
+
+    key = str(code).strip()
+    zkey = _v278_normalize_code(key)
+    raw = _RISK_FLAGS_CACHE.get(key, _RISK_FLAGS_CACHE.get(zkey, None)) if isinstance(_RISK_FLAGS_CACHE, dict) else None
+    if not raw:
+        if V278_RISK_REQUIRE_DYNAMIC_SOURCE == '1' and meta.get('dynamic_status') != 'ok':
+            return _risk_data_unavailable_result('动态监管/财报源不可用，不能证明无雷')
+        return {
+            "penalty": 0.0, "hard_exclude": False, "flags": [], "note": "",
+            "risk_data_status": "ok", "risk_action": "pass", "risk_level": "NORMAL",
+            "skip_deep_calc": False, "risk_source_status": meta.get('dynamic_status', '')
+        }
+
+    if isinstance(raw, dict):
+        flags = raw.get('flags', [])
+        note = str(raw.get('note', ''))
+    elif isinstance(raw, list):
+        flags = raw
+        note = ''
+    else:
+        flags = [str(raw)]
+        note = ''
+
+    flags = [str(x) for x in flags if str(x).strip()]
+    joined = '；'.join(flags) + ('；' + note if note else '')
+    text = joined.replace(' ', '')
+
+    aggregated_medium_labels = [
+        '监管问询/质押冻结/诉讼等中度风险',
+        '监管问询、质押冻结、诉讼等中度风险',
+        '问询/质押/诉讼',
+        '问询、质押、诉讼',
+    ]
+    has_aggregated_medium = any(k in text for k in aggregated_medium_labels)
+
+    hard_keywords = [
+        '证监会立案', '被立案调查', '立案调查', '调查通知书', '涉嫌信息披露违法违规',
+        '涉嫌信披违法违规', '涉嫌违法违规', '重大违法', '欺诈发行', '财务造假', '虚假记载',
+        '行政处罚事先告知书', '行政处罚决定书', '重大行政处罚', '被行政处罚',
+        '资金占用', '非经营性资金占用', '违规担保', '对外担保违规',
+        '非标审计', '非标准审计', '无法表示意见', '否定意见', '保留意见',
+        '审计报告保留意见', '审计报告否定意见', '审计报告无法表示意见',
+        '退市风险警示', '被实施退市风险警示', '*ST', ' ST', '暂停上市', '终止上市', '强制退市',
+        '债务违约', '债务逾期', '破产重整', '资不抵债', '净资产为负',
+        '控股股东所持股份被司法拍卖', '实际控制人所持股份被司法拍卖',
+        '控股股东全部股份被冻结', '实际控制人全部股份被冻结', '控股股东爆仓', '质押平仓风险',
+    ]
+    medium_keywords = [
+        '监管措施', '行政监管措施', '责令改正', '警示函', '监管函', '问询函', '关注函',
+        '年报问询', '半年报问询', '延期披露', '更正公告', '会计差错', '前期会计差错',
+        '质押', '股份冻结', '司法冻结', '冻结', '司法拍卖', '诉讼', '仲裁',
+        '高管处罚', '股权分散', '会计师事务所变动', '频繁更名', '公开谴责', '通报批评',
+    ]
+    financial_keywords = [
+        '业绩预亏', '续亏', '亏损', '连续亏损', '扣非亏损', '经营活动现金流量净额为负',
+        '经营现金流为负', '现金流为负', '商誉减值', '资产减值', '信用减值', '高商誉', '商誉',
+        '负债率', '偿债风险', '流动性风险', '应收账款', '坏账', '客户集中', '供应商集中',
+        '毛利率下滑', '营收下滑', '业绩波动',
+    ]
+    soft_keywords = [
+        '行业周期', '价格波动', '原材料波动', '汇率波动', '政策扰动', '景气度波动',
+        '锂矿周期', '猪周期', '鸡周期', '禽流感', '周期风险',
+    ]
+
+    hard_hits = [k for k in hard_keywords if k in text]
+    medium_hits = [k for k in medium_keywords if k in text]
+    financial_hits = [k for k in financial_keywords if k in text]
+    soft_hits = [k for k in soft_keywords if k in text]
+
+    severe_qualifiers = [
+        '重大', '巨额', '大额', '全部', '控股股东', '实际控制人', '实控人', '主营业务停滞',
+        '持续经营能力存在重大不确定性', '可能导致控制权变更', '可能被强制执行',
+        '平仓风险', '爆仓', '逾期', '无法偿还', '净资产为负', '退市', 'ST', '*ST'
+    ]
+    severe_context = any(k in text for k in severe_qualifiers)
+
+    if hard_hits:
+        penalty = -42.0 - min(28.0, 6.0 * max(0, len(hard_hits) - 1) + 2.0 * len(financial_hits))
+        return {
+            "penalty": float(penalty), "hard_exclude": True, "flags": flags, "note": note,
+            "risk_data_status": "ok", "risk_action": "hard_exclude", "risk_level": "HARD_BLOCK",
+            "skip_deep_calc": True, "risk_reason": "重大硬雷：" + '、'.join(hard_hits[:6]),
+            "risk_source_status": meta.get('dynamic_status', '')
+        }
+
+    severe_financial_terms = [
+        '净资产为负', '资不抵债', '持续经营能力存在重大不确定性', '债务逾期', '债务违约',
+        '无法偿还', '连续亏损', '扣非连续亏损', '经营活动现金流量净额为负', '流动性风险', '偿债风险'
+    ]
+    financial_unique = set(financial_hits)
+    financial_severe = (
+        any(k in text for k in ['净资产为负', '资不抵债', '持续经营能力存在重大不确定性']) or
+        (severe_context and len(financial_unique) >= 2 and any(k in text for k in severe_financial_terms)) or
+        (len(financial_unique) >= 4 and any(k in text for k in ['连续亏损', '流动性风险', '偿债风险', '经营活动现金流量净额为负']))
+    )
+    if financial_severe:
+        penalty = -40.0 - min(15.0, 4.0 * max(0, len(financial_hits) - 3))
+        return {
+            "penalty": float(penalty), "hard_exclude": True, "flags": flags, "note": note,
+            "risk_data_status": "ok", "risk_action": "hard_exclude", "risk_level": "HARD_BLOCK",
+            "skip_deep_calc": True, "risk_reason": "严重财务风险：" + '、'.join(financial_hits[:6]),
+            "risk_source_status": meta.get('dynamic_status', '')
+        }
+
+    if medium_hits or financial_hits or has_aggregated_medium:
+        penalty = -5.0
+        if not has_aggregated_medium:
+            penalty -= min(7.0, 1.5 * max(0, len(set(medium_hits)) - 1))
+            penalty -= min(5.0, 1.2 * len(set(financial_hits)))
+        if severe_context and len(set(medium_hits)) >= 2:
+            penalty -= 3.0
+        penalty = max(-15.0, penalty)
+        hit_text = '、'.join(list(dict.fromkeys((medium_hits + financial_hits)))[:8])
+        return {
+            "penalty": float(penalty), "hard_exclude": False, "flags": flags, "note": note,
+            "risk_data_status": "ok", "risk_action": "downgrade_continue_deep", "risk_level": "MEDIUM_RISK",
+            "skip_deep_calc": False, "risk_reason": "中度风险降权继续深算：" + (hit_text or '聚合中度风险标签'),
+            "risk_source_status": meta.get('dynamic_status', '')
+        }
+
+    if soft_hits:
+        return {
+            "penalty": -1.0, "hard_exclude": False, "flags": flags, "note": note,
+            "risk_data_status": "ok", "risk_action": "soft_notice", "risk_level": "SOFT_RISK",
+            "skip_deep_calc": False, "risk_reason": "软风险提示：" + '、'.join(soft_hits[:6]),
+            "risk_source_status": meta.get('dynamic_status', '')
+        }
+
+    return {
+        "penalty": -2.0 if flags else 0.0, "hard_exclude": False, "flags": flags, "note": note,
+        "risk_data_status": "ok", "risk_action": "minor_flag_continue_deep" if flags else "pass",
+        "risk_level": "MINOR_FLAG" if flags else "NORMAL", "skip_deep_calc": False,
+        "risk_reason": "未知轻微风险标签，继续深算" if flags else "",
+        "risk_source_status": meta.get('dynamic_status', '')
+    }
 
 def _v278_candidate_trade_files():
     paths=[]
@@ -21238,6 +21439,1234 @@ def v27_wallstreet_decision_engine(row):
     except Exception:
         pass
     return r
+
+
+# ============================================================================
+# V28.5 增量补丁：本地市场环境缓存 + 条件概率生命周期闭环
+# ============================================================================
+# 最高原则：不触碰 stock_alert.py 入口、workflow、PAT/凭证、Telegram、BaoStock、
+# kline_cache 生产闭环、15:00 数据门控和原中文报告主结构。
+# 本层只补两件事：
+#   1）market_context_cache.json 缺失时，从本地K线缓存轻量生成市场环境缓存，避免长期 field_infer；
+#   2）把每日信号写入 lifecycle，并用本地K线补齐 T+1/T+3/T+5/T+8/T+13/T+20，
+#      再生成条件概率表。样本不足只提示，不硬扣，不误杀。
+# ============================================================================
+V285_MODEL_VERSION = "V28.5本地市场缓存+条件概率生命周期闭环"
+V285_ENABLE_LOCAL_MARKET_CACHE_FALLBACK = os.environ.get("V285_ENABLE_LOCAL_MARKET_CACHE_FALLBACK", "1")
+V285_LOCAL_MARKET_CACHE_MAX_SCAN = int(os.environ.get("V285_LOCAL_MARKET_CACHE_MAX_SCAN", "1600"))
+V285_LOCAL_MARKET_CACHE_MIN_SAMPLE = int(os.environ.get("V285_LOCAL_MARKET_CACHE_MIN_SAMPLE", "120"))
+V285_ENABLE_SIGNAL_LIFECYCLE_REALIZE = os.environ.get("V285_ENABLE_SIGNAL_LIFECYCLE_REALIZE", "1")
+V285_LIFECYCLE_MAX_REALIZE_PER_RUN = int(os.environ.get("V285_LIFECYCLE_MAX_REALIZE_PER_RUN", "260"))
+V285_LIFECYCLE_MAX_RECORDS = int(os.environ.get("V285_LIFECYCLE_MAX_RECORDS", "3000"))
+V285_CONDITION_FULL_SAMPLE = int(os.environ.get("V285_CONDITION_FULL_SAMPLE", "80"))
+V285_CONDITION_SEMI_SAMPLE = int(os.environ.get("V285_CONDITION_SEMI_SAMPLE", "35"))
+V285_CONDITION_WEAK_SAMPLE = int(os.environ.get("V285_CONDITION_WEAK_SAMPLE", "15"))
+V285_CONDITION_MAIN_WINDOW = int(os.environ.get("V285_CONDITION_MAIN_WINDOW", "5"))
+V285_CONDITION_MAX_SCORE_ADJ = float(os.environ.get("V285_CONDITION_MAX_SCORE_ADJ", "6"))
+V285_MARKET_CACHE_LOCAL_SOURCE_TAG = "local_kline_cache_lightweight_v28_5"
+V285_STATUS_NEW = "NEW"
+V285_STATUS_REALIZED_FULL = "REALIZED_FULL"
+V285_STATUS_REALIZED_PARTIAL = "REALIZED_PARTIAL"
+V285_STATUS_EXPIRED = "EXPIRED"
+V285_STATUS_DATA_MISSING = "DATA_MISSING"
+V285_STATUS_FAILED = "FAILED"
+V285_STATUS_PENDING_PREFIX = "PENDING_T"
+V285_SCORE_CALIBRATION_FULL_WEIGHT = float(os.environ.get("V285_SCORE_CALIBRATION_FULL_WEIGHT", "1.0"))
+V285_SCORE_CALIBRATION_SEMI_WEIGHT = float(os.environ.get("V285_SCORE_CALIBRATION_SEMI_WEIGHT", "0.35"))
+V285_LIFECYCLE_EXPIRE_BARS = int(os.environ.get("V285_LIFECYCLE_EXPIRE_BARS", str(max(V20_REVIEW_WINDOWS) + 5 if V20_REVIEW_WINDOWS else 25)))
+
+
+
+def _v285_json_default(obj):
+    try:
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (pd.Timestamp, datetime)):
+            return obj.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return str(obj)
+
+
+def _v285_write_json(path, data):
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=_v285_json_default)
+        return True
+    except Exception as e:
+        print(f"V28.5 JSON写入失败：file={path} error={str(e)[:160]}")
+        return False
+
+
+def _v285_read_json(path, default=None):
+    try:
+        if not path or not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _v285_iter_flat_cache_codes(max_scan=None):
+    """从全历史扁平缓存/模型池取样代码。只读，不联网。"""
+    max_scan = int(max_scan or V285_LOCAL_MARKET_CACHE_MAX_SCAN)
+    codes = []
+    try:
+        uni = _load_model_universe_file() if 'MODEL_UNIVERSE_FILE' in globals() else pd.DataFrame()
+        if uni is not None and not uni.empty and "代码" in uni.columns:
+            codes = [str(x).zfill(6) for x in uni["代码"].dropna().astype(str).tolist() if str(x).strip()]
+    except Exception:
+        codes = []
+    if not codes:
+        try:
+            d = FULL_HISTORY_CACHE_DIR if 'FULL_HISTORY_CACHE_DIR' in globals() else CACHE_DIR
+            if os.path.exists(d):
+                codes = sorted({f[:6] for f in os.listdir(d) if f.lower().endswith('.csv') and f[:6].isdigit() and not f.startswith('_')})
+        except Exception:
+            codes = []
+    codes = [c for c in codes if c and c not in EXCLUDE_MODEL_CODES]
+    if max_scan > 0 and len(codes) > max_scan:
+        # 等距抽样比按代码头部截断更稳，避免只抽到某个市场/板块。
+        idx = np.linspace(0, len(codes) - 1, max_scan).round().astype(int).tolist()
+        codes = [codes[i] for i in idx]
+    return codes
+
+
+def _v285_read_tail_flat_kline_by_code(code, tail_rows=80):
+    """轻量读取单票最后若干根K线，避免调用联网通道。"""
+    try:
+        code = str(code).zfill(6)
+        path = os.path.join(FULL_HISTORY_CACHE_DIR, f"{code}.csv")
+        if not os.path.exists(path):
+            # 兼容旧分层缓存，但不主动联网。
+            bs_code = _bs_code_from_plain_code(code)
+            alt = cache_path(bs_code, cache_scope="base") if bs_code else ""
+            path = alt if alt and os.path.exists(alt) else path
+        if not os.path.exists(path):
+            return None
+        try:
+            # pandas没有稳定tail行读取；全量读单个CSV通常可接受，外层有max_scan限制。
+            df = pd.read_csv(path, dtype={"date": str})
+        except Exception:
+            return None
+        df = normalize_full_history_cache_df(df) if 'normalize_full_history_cache_df' in globals() else normalize_kline_df(df)
+        if df is None or df.empty or len(df) < 3:
+            return None
+        return df.tail(tail_rows).reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def build_market_context_from_local_kline_cache(universe_df=None, max_scan=None, output_file=None):
+    """
+    V28.5 本地市场环境缓存生成器。
+    数据来源只限本地K线缓存，不联网；用于 market_context_cache.json 缺失时兜底。
+    输出只做市场环境/仓位/顺逆风校准，不作为硬剔除。
+    """
+    if V285_ENABLE_LOCAL_MARKET_CACHE_FALLBACK != "1":
+        return {"status": "disabled", "generator": V285_MARKET_CACHE_LOCAL_SOURCE_TAG}
+    codes = []
+    if universe_df is not None and isinstance(universe_df, pd.DataFrame) and "代码" in universe_df.columns:
+        try:
+            codes = [str(x).zfill(6) for x in universe_df["代码"].dropna().astype(str).tolist()]
+        except Exception:
+            codes = []
+    if not codes:
+        codes = _v285_iter_flat_cache_codes(max_scan=max_scan)
+    if not codes:
+        return {"status": "no_codes", "generator": V285_MARKET_CACHE_LOCAL_SOURCE_TAG}
+
+    rows = []
+    for code in codes:
+        df = _v285_read_tail_flat_kline_by_code(code, tail_rows=80)
+        if df is None or df.empty or len(df) < 20:
+            continue
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            close = safe_float(last.get("close"), 0.0)
+            open_ = safe_float(last.get("open"), 0.0)
+            high = safe_float(last.get("high"), 0.0)
+            low = safe_float(last.get("low"), 0.0)
+            preclose = safe_float(prev.get("close"), 0.0)
+            volume = safe_float(last.get("volume"), 0.0)
+            amount = safe_float(last.get("amount"), 0.0)
+            if close <= 0 or preclose <= 0 or high <= 0 or low <= 0:
+                continue
+            pct = close / preclose - 1.0
+            rng = max(high - low, 1e-9)
+            close_pos = (close - low) / rng
+            body_pct = (close - open_) / preclose if preclose > 0 else 0.0
+            vol_ma20 = safe_float(pd.to_numeric(df["volume"], errors="coerce").rolling(20, min_periods=5).mean().iloc[-1], 0.0)
+            amt_ma20 = safe_float(pd.to_numeric(df["amount"], errors="coerce").rolling(20, min_periods=5).mean().iloc[-1], 0.0) if "amount" in df.columns else 0.0
+            limit_thr = get_limit_threshold(code) / 100.0 if 'get_limit_threshold' in globals() else (0.193 if str(code).startswith(("300", "301", "688")) else 0.093)
+            rows.append({
+                "code": str(code).zfill(6),
+                "date": str(last.get("date", "")),
+                "pct": float(pct),
+                "body_pct": float(body_pct),
+                "close_pos": float(close_pos),
+                "up": bool(pct > 0),
+                "down": bool(pct < 0),
+                "limit_up": bool(pct >= limit_thr * 0.985),
+                "limit_down": bool(pct <= -limit_thr * 0.985),
+                "strong_bull": bool(pct >= 0.03 and close > open_ and close_pos >= 0.70),
+                "volume_up": bool(pct > 0 and vol_ma20 > 0 and volume >= vol_ma20 * 1.08),
+                "amount_chg": float(amount / amt_ma20 - 1.0) if amt_ma20 > 0 else 0.0,
+            })
+        except Exception:
+            continue
+
+    n = len(rows)
+    if n < V285_LOCAL_MARKET_CACHE_MIN_SAMPLE:
+        return {"status": "insufficient_sample", "sample_count": n, "min_sample": V285_LOCAL_MARKET_CACHE_MIN_SAMPLE, "generator": V285_MARKET_CACHE_LOCAL_SOURCE_TAG}
+
+    rdf = pd.DataFrame(rows)
+    latest_date = str(rdf["date"].dropna().astype(str).max()) if "date" in rdf.columns else ""
+    up_ratio = float(rdf["up"].mean())
+    down_ratio = float(rdf["down"].mean())
+    limit_up_count = int(rdf["limit_up"].sum())
+    limit_down_count = int(rdf["limit_down"].sum())
+    strong_bull_count = int(rdf["strong_bull"].sum())
+    volume_up_ratio = float(rdf["volume_up"].mean())
+    median_pct = float(pd.to_numeric(rdf["pct"], errors="coerce").median())
+    amount_chg_median = float(pd.to_numeric(rdf["amount_chg"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().median()) if "amount_chg" in rdf.columns else 0.0
+
+    if up_ratio >= 0.62 and limit_up_count >= 60 and limit_down_count <= 10:
+        market_regime = "bull"
+        regime_cn = "强势市场"
+    elif up_ratio >= 0.52 and limit_up_count >= 35 and limit_down_count <= 18:
+        market_regime = "range_strong"
+        regime_cn = "震荡偏强"
+    elif up_ratio <= 0.38 or limit_down_count >= 25:
+        market_regime = "bear"
+        regime_cn = "弱势/防守市场"
+    else:
+        market_regime = "range"
+        regime_cn = "震荡市场"
+
+    risk_appetite_score = (
+        up_ratio * 45.0
+        + min(limit_up_count / 80.0, 1.0) * 25.0
+        + min(strong_bull_count / max(n * 0.18, 1.0), 1.0) * 15.0
+        + max(0.0, 1.0 - limit_down_count / 30.0) * 15.0
+    )
+    risk_appetite_score = float(max(0.0, min(100.0, risk_appetite_score)))
+
+    cache = {
+        "model_version": MODEL_VERSION,
+        "v285_model_version": V285_MODEL_VERSION,
+        "generated_at_bj": bj_time_str(),
+        "trade_date": latest_date or DATA_GATE_TARGET_DATE or LAST_TRADE_DAY,
+        "generator": V285_MARKET_CACHE_LOCAL_SOURCE_TAG,
+        "status": "ok",
+        "sample_count": int(n),
+        "sample_method": "evenly_sampled_local_flat_cache",
+        "breadth": {
+            "up_ratio": round(up_ratio, 6),
+            "down_ratio": round(down_ratio, 6),
+            "limit_up_count": int(limit_up_count),
+            "limit_down_count": int(limit_down_count),
+            "median_pct": round(median_pct, 6),
+            "strong_bull_count": int(strong_bull_count),
+            "volume_up_ratio": round(volume_up_ratio, 6),
+            "amount_chg_median": round(amount_chg_median, 6),
+        },
+        "style": {
+            "market_regime": market_regime,
+            "market_regime_cn": regime_cn,
+            "risk_appetite_score": round(risk_appetite_score, 2),
+            "confidence": "local_cache_breadth",
+        },
+        "indices": {},
+        "sectors": [],
+        "note": "V28.5从本地K线缓存轻量生成市场环境；只用于顺逆风/仓位/小幅校准，不作为硬剔除。",
+    }
+    out = output_file or V281_MARKET_CONTEXT_CACHE_FILE
+    _v285_write_json(out, cache)
+    print(f"V28.5本地市场环境缓存生成：file={out} sample={n} regime={market_regime} up={up_ratio:.1%} limit_up={limit_up_count} limit_down={limit_down_count}")
+    return cache
+
+
+# 覆盖市场缓存读取：原逻辑优先；原逻辑无缓存时，本地K线兜底生成。
+_v281_read_market_context_cache_before_v285 = _v281_read_market_context_cache
+
+
+def _v281_read_market_context_cache():
+    cache = None
+    try:
+        cache = _v281_read_market_context_cache_before_v285()
+    except Exception:
+        cache = None
+    if cache:
+        return cache
+    if V285_ENABLE_LOCAL_MARKET_CACHE_FALLBACK == "1":
+        try:
+            built = build_market_context_from_local_kline_cache(max_scan=V285_LOCAL_MARKET_CACHE_MAX_SCAN, output_file=V281_MARKET_CONTEXT_CACHE_FILE)
+            if isinstance(built, dict) and built.get("status") == "ok":
+                return built
+        except Exception as e:
+            print(f"V28.5本地市场环境缓存兜底失败：{str(e)[:160]}")
+    return cache
+
+
+def _v285_signal_trade_date(row=None):
+    row = row or {}
+    for k in ["date", "trade_date", "signal_date", "交易日期"]:
+        v = str(row.get(k, "")).strip() if isinstance(row, dict) else ""
+        if v:
+            try:
+                return pd.to_datetime(v).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+    for v in [DATA_GATE_TARGET_DATE, LAST_TRADE_DAY]:
+        v = str(v or "").strip()
+        if v:
+            try:
+                return pd.to_datetime(v).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def _v285_signal_rows_from_payload(payload):
+    rows = []
+    if not isinstance(payload, dict):
+        return rows
+    sections = ["final_top3", "final_top5", "buy_pool", "final_signals", "watch_pool", "deep_top"]
+    seen = set()
+    for section in sections:
+        items = payload.get(section, []) or []
+        if not isinstance(items, list):
+            continue
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            code = str(r.get("code") or r.get("代码") or "").strip()
+            digits = "".join(ch for ch in code if ch.isdigit())
+            if len(digits) >= 6:
+                code = digits[-6:].zfill(6)
+            if not code or not code.isdigit() or len(code) != 6:
+                continue
+            signal_date = _v285_signal_trade_date(r)
+            hypothesis = str(r.get("v27_trade_hypothesis") or r.get("v20_main_hypothesis") or r.get("main_hypothesis") or r.get("v27_today_buy_reason") or "综合结构机会")[:80]
+            pool = str(r.get("pool") or section)
+            entry_price = safe_float(r.get("entry_price", r.get("close", r.get("收盘", r.get("latest_close", 0)))), 0.0)
+            # V28.5.1：signal_id 必须跨进程稳定，不能使用 Python 内置 hash()（每次运行会随机化）。
+            sid_seed = f"{signal_date}|{code}|{pool}|{hypothesis}|{entry_price:.3f}"
+            sid_hash = hashlib.sha1(sid_seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            sid = f"{signal_date}_{code}_{pool}_{sid_hash}"
+            if sid in seen:
+                continue
+            seen.add(sid)
+            rows.append({
+                "signal_id": sid,
+                "code": code,
+                "name": str(r.get("name") or r.get("名称") or "")[:40],
+                "signal_date": signal_date,
+                "entry_price": float(entry_price),
+                "pool": pool,
+                "hypothesis": hypothesis,
+                "tier": str(r.get("v20_trade_tier") or r.get("tier") or r.get("v27_pool") or "unknown")[:40],
+                "industry": str(r.get("industry") or r.get("板块") or r.get("sector") or "unknown")[:60],
+                "market_env": str(r.get("market_env") or r.get("v24_market_env") or r.get("market_regime") or "unknown")[:40],
+                "buy_point_type": str(r.get("buy_point_type") or r.get("v27_trade_hypothesis") or r.get("v20_main_hypothesis") or "unknown")[:80],
+                "rr": safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))), 0.0),
+                "defense_dist": safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)), 0.0),
+                "near_pressure": safe_float(r.get("v20_near_pressure", r.get("near_pressure_dist", r.get("near_pressure", 0))), 0.0),
+                "v20_final_score": safe_float(r.get("v20_final_score", 0), 0.0),
+                "v27_final_score": safe_float(r.get("v27_final_score", 0), 0.0),
+                "status": V285_STATUS_NEW,
+                "lifecycle_state": V285_STATUS_NEW,
+                "created_at_bj": bj_time_str(),
+                "windows": list(V20_REVIEW_WINDOWS),
+            })
+    return rows
+
+
+def _v285_load_lifecycle_records():
+    obj = _v285_read_json(V20_SIGNAL_LIFECYCLE_FILE, default=[])
+    if isinstance(obj, dict):
+        if isinstance(obj.get("records"), list):
+            return obj.get("records")
+        if isinstance(obj.get("signals"), list):
+            return obj.get("signals")
+    if isinstance(obj, list):
+        return obj
+    return []
+
+
+def _v285_save_lifecycle_records(records):
+    if not isinstance(records, list):
+        records = []
+    # 保留最近若干条，避免文件无限膨胀；不删除同一signal_id的最新状态。
+    records = records[-max(100, V285_LIFECYCLE_MAX_RECORDS):]
+    payload = {
+        "model_version": MODEL_VERSION,
+        "v285_model_version": V285_MODEL_VERSION,
+        "generated_at_bj": bj_time_str(),
+        "review_windows": list(V20_REVIEW_WINDOWS),
+        "records": records,
+    }
+    return _v285_write_json(V20_SIGNAL_LIFECYCLE_FILE, payload)
+
+
+def _v285_pending_status_for_available_bars(available_forward):
+    """按已拥有的未来K线数量，给出明确 PENDING_Tx 状态。"""
+    try:
+        available_forward = int(max(0, available_forward))
+    except Exception:
+        available_forward = 0
+    windows = sorted(int(x) for x in (V20_REVIEW_WINDOWS or []) if int(x) > 0)
+    for w in windows:
+        if available_forward < w:
+            return f"{V285_STATUS_PENDING_PREFIX}{w}"
+    return V285_STATUS_REALIZED_FULL
+
+
+def _v285_is_terminal_lifecycle_status(status):
+    s = str(status or "").upper()
+    return s in {V285_STATUS_REALIZED_FULL, V285_STATUS_EXPIRED, V285_STATUS_FAILED}
+
+
+def _v285_is_pending_lifecycle_status(status):
+    s = str(status or "").upper()
+    return s == V285_STATUS_NEW or s.startswith(V285_STATUS_PENDING_PREFIX)
+
+
+def _v285_realized_windows_for_record(rec):
+    out = []
+    if not isinstance(rec, dict):
+        return out
+    for w in V20_REVIEW_WINDOWS:
+        try:
+            w = int(w)
+        except Exception:
+            continue
+        if rec.get(f"t{w}_return") is not None:
+            out.append(w)
+    return out
+
+
+def _v285_refresh_record_lifecycle_state(rec):
+    """统一状态机出口：NEW/PENDING_Tx/REALIZED_PARTIAL/REALIZED_FULL/DATA_MISSING/FAILED。"""
+    if not isinstance(rec, dict):
+        return rec
+    status = str(rec.get("status") or rec.get("lifecycle_state") or V285_STATUS_NEW)
+    if status in [V285_STATUS_FAILED, V285_STATUS_DATA_MISSING, V285_STATUS_EXPIRED, V285_STATUS_REALIZED_FULL]:
+        rec["lifecycle_state"] = status
+        rec["status"] = status
+        return rec
+
+    realized_windows = _v285_realized_windows_for_record(rec)
+    total_windows = len(V20_REVIEW_WINDOWS or [])
+    available_forward = int(safe_float(rec.get("available_forward_bars", 0), 0))
+    if total_windows > 0 and len(realized_windows) >= total_windows:
+        state = V285_STATUS_REALIZED_FULL
+    elif realized_windows:
+        next_pending = _v285_pending_status_for_available_bars(available_forward)
+        if next_pending == V285_STATUS_REALIZED_FULL:
+            state = V285_STATUS_REALIZED_PARTIAL
+        else:
+            state = V285_STATUS_REALIZED_PARTIAL + "|" + next_pending
+    else:
+        state = _v285_pending_status_for_available_bars(available_forward)
+        if state == V285_STATUS_REALIZED_FULL:
+            state = V285_STATUS_NEW
+    rec["realized_windows"] = realized_windows
+    rec["pending_windows"] = [int(w) for w in (V20_REVIEW_WINDOWS or []) if int(w) not in set(realized_windows)]
+    rec["lifecycle_state"] = state
+    rec["status"] = state
+    return rec
+
+
+def append_today_signals_to_lifecycle(payload):
+    """将当前输出信号写入生命周期表；同一 signal_id 幂等更新，不重复膨胀。"""
+    rows = _v285_signal_rows_from_payload(payload)
+    if not rows:
+        return {"status": "no_signal_rows", "added": 0, "updated": 0, "total": len(_v285_load_lifecycle_records()), "lifecycle_state": "NO_SIGNAL"}
+    records = _v285_load_lifecycle_records()
+    index = {str(r.get("signal_id")): i for i, r in enumerate(records) if isinstance(r, dict) and r.get("signal_id")}
+    added = 0
+    updated = 0
+    for row in rows:
+        sid = row.get("signal_id")
+        if sid in index:
+            old = dict(records[index[sid]])
+            # 不覆盖已经实现的收益字段，只补充当日静态字段。
+            for k, v in row.items():
+                if k not in old or old.get(k) in [None, "", 0, 0.0]:
+                    old[k] = v
+            old["last_seen_at_bj"] = bj_time_str()
+            records[index[sid]] = _v285_refresh_record_lifecycle_state(old)
+            updated += 1
+        else:
+            records.append(_v285_refresh_record_lifecycle_state(row))
+            index[sid] = len(records) - 1
+            added += 1
+    _v285_save_lifecycle_records(records)
+    return {"status": "ok", "added": int(added), "updated": int(updated), "total": int(len(records))}
+
+
+def _v285_get_signal_kline(code):
+    df = _v285_read_tail_flat_kline_by_code(code, tail_rows=5000)
+    if df is not None and not df.empty:
+        return df
+    try:
+        bs_code = _bs_code_from_plain_code(code)
+        if bs_code:
+            # 只读旧缓存兜底；不主动联网。
+            for scope in ["deep", "base"]:
+                path = cache_path(bs_code, cache_scope=scope)
+                if os.path.exists(path):
+                    d = pd.read_csv(path, dtype={"date": str})
+                    d = normalize_kline_df(d)
+                    if d is not None and not d.empty:
+                        return d
+    except Exception:
+        pass
+    return None
+
+
+def _v285_find_signal_index(df, signal_date):
+    try:
+        d = df.copy()
+        d["_dt"] = pd.to_datetime(d["date"], errors="coerce")
+        target = pd.to_datetime(signal_date, errors="coerce")
+        if pd.isna(target):
+            return None
+        valid = d[d["_dt"].notna()].reset_index(drop=False)
+        if valid.empty:
+            return None
+        exact = valid[valid["_dt"] == target]
+        if not exact.empty:
+            return int(exact.iloc[-1]["index"])
+        # 若信号日在非交易日，取之后第一根；用于补偿节假日/数据口径差。
+        after = valid[valid["_dt"] > target]
+        if not after.empty:
+            return int(after.iloc[0]["index"])
+        return None
+    except Exception:
+        return None
+
+
+def _v285_realize_one_signal(rec):
+    if not isinstance(rec, dict):
+        return rec, False
+    code = str(rec.get("code", "")).zfill(6)
+    signal_date = str(rec.get("signal_date") or rec.get("date") or "")
+    if not code or not signal_date or code == "000000":
+        rec["status"] = V285_STATUS_FAILED
+        rec["lifecycle_state"] = V285_STATUS_FAILED
+        rec["lifecycle_error"] = "invalid_signal"
+        return rec, False
+
+    df = _v285_get_signal_kline(code)
+    if df is None or df.empty or len(df) < 3:
+        rec["status"] = V285_STATUS_DATA_MISSING
+        rec["lifecycle_state"] = V285_STATUS_DATA_MISSING
+        rec["lifecycle_error"] = "no_local_kline"
+        rec["last_checked_at_bj"] = bj_time_str()
+        return rec, False
+
+    df = df.sort_values("date").reset_index(drop=True)
+    idx = _v285_find_signal_index(df, signal_date)
+    if idx is None or idx >= len(df):
+        rec["status"] = V285_STATUS_DATA_MISSING
+        rec["lifecycle_state"] = V285_STATUS_DATA_MISSING
+        rec["lifecycle_error"] = "signal_date_not_found"
+        rec["last_checked_at_bj"] = bj_time_str()
+        return rec, False
+
+    entry_price = safe_float(rec.get("entry_price"), 0.0)
+    if entry_price <= 0:
+        entry_price = safe_float(df.loc[idx, "close"], 0.0)
+        rec["entry_price"] = float(entry_price)
+    if entry_price <= 0:
+        rec["status"] = V285_STATUS_FAILED
+        rec["lifecycle_state"] = V285_STATUS_FAILED
+        rec["lifecycle_error"] = "invalid_entry_price"
+        rec["last_checked_at_bj"] = bj_time_str()
+        return rec, False
+
+    available_forward = len(df) - idx - 1
+    rec["available_forward_bars"] = int(max(0, available_forward))
+    rec["entry_kline_date"] = str(df.loc[idx, "date"])
+    rec["last_kline_date"] = str(df["date"].iloc[-1])
+    rec["last_checked_at_bj"] = bj_time_str()
+
+    any_new = False
+    realized_before = set(_v285_realized_windows_for_record(rec))
+    for w in V20_REVIEW_WINDOWS:
+        w = int(w)
+        prefix = f"t{w}"
+        if available_forward < w:
+            continue
+        target = df.iloc[idx + w]
+        seg = df.iloc[idx + 1:idx + w + 1]
+        close_w = safe_float(target.get("close"), 0.0)
+        high_max = safe_float(pd.to_numeric(seg["high"], errors="coerce").max(), 0.0) if not seg.empty else 0.0
+        low_min = safe_float(pd.to_numeric(seg["low"], errors="coerce").min(), 0.0) if not seg.empty else 0.0
+        ret = close_w / entry_price - 1.0 if entry_price > 0 and close_w > 0 else 0.0
+        runup = high_max / entry_price - 1.0 if entry_price > 0 and high_max > 0 else 0.0
+        drawdown = low_min / entry_price - 1.0 if entry_price > 0 and low_min > 0 else 0.0
+        rec[f"{prefix}_return"] = float(ret)
+        rec[f"{prefix}_max_runup"] = float(runup)
+        rec[f"{prefix}_max_drawdown"] = float(drawdown)
+        rec[f"{prefix}_win"] = bool(ret > 0)
+        rec[f"{prefix}_stop_hit"] = bool(drawdown <= -abs(safe_float(V25_BACKTEST_STOP_LOSS, 0.055))) if 'V25_BACKTEST_STOP_LOSS' in globals() else bool(drawdown <= -0.055)
+        rec[f"{prefix}_take_profit_hit"] = bool(runup >= abs(safe_float(V25_BACKTEST_TAKE_PROFIT, 0.12))) if 'V25_BACKTEST_TAKE_PROFIT' in globals() else bool(runup >= 0.12)
+        if w not in realized_before:
+            any_new = True
+
+    rec["realized_at_bj"] = bj_time_str()
+    rec = _v285_refresh_record_lifecycle_state(rec)
+
+    # 如果长期没有足够未来K线，明确过期；避免永久 pending 造成误判。
+    try:
+        if available_forward >= V285_LIFECYCLE_EXPIRE_BARS and rec.get("pending_windows"):
+            rec["status"] = V285_STATUS_EXPIRED
+            rec["lifecycle_state"] = V285_STATUS_EXPIRED
+            rec["lifecycle_error"] = "expired_before_all_windows_realized"
+    except Exception:
+        pass
+    return rec, any_new
+
+
+def realize_pending_signal_lifecycle(max_items=None):
+    """用本地K线把 pending 生命周期信号补齐 T+窗口；只读本地缓存，不联网。"""
+    if V285_ENABLE_SIGNAL_LIFECYCLE_REALIZE != "1":
+        return {"status": "disabled", "checked": 0, "realized_or_updated": 0}
+    max_items = int(max_items or V285_LIFECYCLE_MAX_REALIZE_PER_RUN)
+    records = _v285_load_lifecycle_records()
+    if not records:
+        return {"status": "empty_lifecycle", "checked": 0, "realized_or_updated": 0}
+    realized = 0
+    checked = 0
+    data_missing = 0
+    failed = 0
+    out = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rec = _v285_refresh_record_lifecycle_state(dict(rec))
+        need = not _v285_is_terminal_lifecycle_status(rec.get("status"))
+        if need and checked < max_items:
+            checked += 1
+            new_rec, changed = _v285_realize_one_signal(dict(rec))
+            if changed:
+                realized += 1
+            if str(new_rec.get("status")) == V285_STATUS_DATA_MISSING:
+                data_missing += 1
+            if str(new_rec.get("status")) == V285_STATUS_FAILED:
+                failed += 1
+            out.append(new_rec)
+        else:
+            out.append(rec)
+    _v285_save_lifecycle_records(out)
+    return {
+        "status": "ok",
+        "checked": int(checked),
+        "realized_or_updated": int(realized),
+        "data_missing": int(data_missing),
+        "failed": int(failed),
+        "total": int(len(out)),
+    }
+
+
+def _v285_lifecycle_to_dataframe(records):
+    flat = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        base = {
+            "signal_id": rec.get("signal_id"),
+            "code": rec.get("code"),
+            "name": rec.get("name"),
+            "signal_date": rec.get("signal_date"),
+            "entry_kline_date": rec.get("entry_kline_date"),
+            "entry_price": rec.get("entry_price"),
+            "hypothesis": rec.get("hypothesis", "综合结构机会"),
+            "tier": rec.get("tier", "unknown"),
+            "pool": rec.get("pool", "unknown"),
+            "industry": rec.get("industry", "unknown"),
+            "market_env": rec.get("market_env", "unknown"),
+            "buy_point_type": rec.get("buy_point_type", "unknown"),
+            "rr": rec.get("rr", 0),
+            "defense_dist": rec.get("defense_dist", 0),
+            "near_pressure": rec.get("near_pressure", 0),
+            "v20_final_score": rec.get("v20_final_score", 0),
+            "v27_final_score": rec.get("v27_final_score", 0),
+            "status": rec.get("status", V285_STATUS_NEW),
+            "lifecycle_state": rec.get("lifecycle_state", rec.get("status", V285_STATUS_NEW)),
+        }
+        for w in V20_REVIEW_WINDOWS:
+            w = int(w)
+            item = dict(base)
+            item["window"] = w
+            item["return"] = rec.get(f"t{w}_return")
+            item["max_runup"] = rec.get(f"t{w}_max_runup")
+            item["max_drawdown"] = rec.get(f"t{w}_max_drawdown")
+            item["win"] = rec.get(f"t{w}_win")
+            item["stop_hit"] = rec.get(f"t{w}_stop_hit")
+            item["take_profit_hit"] = rec.get(f"t{w}_take_profit_hit")
+            item["is_realized_window"] = pd.notna(item["return"])
+            item["is_pending_window"] = not bool(item["is_realized_window"])
+            flat.append(item)
+    if not flat:
+        return pd.DataFrame()
+    return pd.DataFrame(flat)
+
+
+def _v285_sample_quality(n):
+    n = int(n or 0)
+    if n >= V285_CONDITION_FULL_SAMPLE:
+        return "full_sample"
+    if n >= V285_CONDITION_SEMI_SAMPLE:
+        return "semi_sample"
+    if n >= V285_CONDITION_WEAK_SAMPLE:
+        return "weak_sample"
+    return "small_sample_no_score"
+
+
+def _v285_condition_stat(g, window=None):
+    if g is None or len(g) == 0:
+        return {
+            "sample_count": 0, "signal_count": 0, "window_row_count": 0, "unique_code_count": 0,
+            "sample_quality": "small_sample_no_score", "score_calibration_enabled": False
+        }
+    if window is not None and "window" in g.columns:
+        g = g[pd.to_numeric(g["window"], errors="coerce") == int(window)].copy()
+    if g is None or g.empty:
+        return {
+            "sample_count": 0, "signal_count": 0, "window_row_count": 0, "unique_code_count": 0,
+            "sample_quality": "small_sample_no_score", "score_calibration_enabled": False
+        }
+
+    ret_all = pd.to_numeric(g.get("return"), errors="coerce")
+    ret = ret_all.dropna()
+    dd = pd.to_numeric(g.get("max_drawdown"), errors="coerce").dropna()
+    run = pd.to_numeric(g.get("max_runup"), errors="coerce").dropna()
+    n = int(len(ret))
+    signal_count = int(g["signal_id"].nunique()) if "signal_id" in g.columns else int(len(g))
+    unique_code_count = int(g["code"].nunique()) if "code" in g.columns else 0
+    window_row_count = int(len(g))
+    q = _v285_sample_quality(n)
+    score_enabled = q in ["full_sample", "semi_sample"]
+    out = {
+        "sample_count": n,
+        "signal_count": signal_count,
+        "window_row_count": window_row_count,
+        "unique_code_count": unique_code_count,
+        "pending_count": int(max(0, window_row_count - n)),
+        "sample_quality": q,
+        "score_calibration_enabled": bool(score_enabled),
+        "calibration_weight": float(V285_SCORE_CALIBRATION_FULL_WEIGHT if q == "full_sample" else (V285_SCORE_CALIBRATION_SEMI_WEIGHT if q == "semi_sample" else 0.0)),
+    }
+    if n <= 0:
+        return out
+    win_rate = float((ret > 0).mean())
+    mean_return = float(ret.mean())
+    median_return = float(ret.median())
+    mean_dd = float(dd.mean()) if len(dd) else 0.0
+    mean_run = float(run.mean()) if len(run) else 0.0
+    wr = safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get("return_weight"), V281_UTILITY_RETURN_WEIGHT) if isinstance(globals().get("V282_CALIBRATED_UTILITY_WEIGHTS"), dict) else V281_UTILITY_RETURN_WEIGHT
+    ww = safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get("win_weight"), V281_UTILITY_WIN_WEIGHT) if isinstance(globals().get("V282_CALIBRATED_UTILITY_WEIGHTS"), dict) else V281_UTILITY_WIN_WEIGHT
+    wd = safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get("drawdown_weight"), V281_UTILITY_DRAWDOWN_WEIGHT) if isinstance(globals().get("V282_CALIBRATED_UTILITY_WEIGHTS"), dict) else V281_UTILITY_DRAWDOWN_WEIGHT
+    utility = mean_return * wr + (win_rate - 0.5) * ww + mean_dd * wd
+    # 小样本只展示，不参与最终分数校准；full/semi 才给可用 edge。
+    raw_edge = max(-V285_CONDITION_MAX_SCORE_ADJ, min(V285_CONDITION_MAX_SCORE_ADJ, utility * 100.0))
+    score_edge = raw_edge * out["calibration_weight"] if score_enabled else 0.0
+    out.update({
+        "win_rate": win_rate,
+        "mean_return": mean_return,
+        "median_return": median_return,
+        "median_max_drawdown": float(dd.median()) if len(dd) else 0.0,
+        "mean_max_drawdown": mean_dd,
+        "mean_max_runup": mean_run,
+        "utility": float(utility),
+        "raw_score_edge": float(raw_edge),
+        "score_edge": float(score_edge),
+    })
+    return out
+
+
+def _v285_lifecycle_summary(records, df=None, realized=None, calibration_seed=None):
+    records = [r for r in (records or []) if isinstance(r, dict)]
+    total_signals = len(records)
+    status_counts = {}
+    for r in records:
+        st = str(r.get("lifecycle_state") or r.get("status") or V285_STATUS_NEW)
+        status_counts[st] = status_counts.get(st, 0) + 1
+
+    if df is None:
+        df = _v285_lifecycle_to_dataframe(records)
+    if df is None or df.empty:
+        window_row_count = 0
+        realized_window_count = 0
+        pending_window_count = 0
+        unrealized_window_count = 0
+    else:
+        window_row_count = int(len(df))
+        realized_window_count = int((df.get("is_realized_window", False) == True).sum())
+        unrealized_window_count = max(0, window_row_count - realized_window_count)
+        pending_mask = df.get("lifecycle_state", df.get("status", "")).astype(str).apply(
+            lambda x: _v285_is_pending_lifecycle_status(x) or x.startswith(V285_STATUS_REALIZED_PARTIAL)
+        )
+        pending_window_count = int(((df.get("is_realized_window", False) != True) & pending_mask).sum())
+    data_missing_count = sum(1 for r in records if str(r.get("status")) == V285_STATUS_DATA_MISSING)
+    failed_count = sum(1 for r in records if str(r.get("status")) == V285_STATUS_FAILED)
+    full = semi = weak = small = 0
+    if isinstance(calibration_seed, dict):
+        for item in calibration_seed.values():
+            if not isinstance(item, dict):
+                continue
+            q = item.get("sample_quality")
+            if q == "full_sample":
+                full += 1
+            elif q == "semi_sample":
+                semi += 1
+            elif q == "weak_sample":
+                weak += 1
+            elif q == "small_sample_no_score":
+                small += 1
+    calibration_enabled = bool(full or semi)
+    return {
+        "lifecycle_status": "OK",
+        "total_signal_count": int(total_signals),
+        "status_counts": status_counts,
+        "window_row_count": int(window_row_count),
+        "realized_window_count": int(realized_window_count),
+        "pending_window_count": int(pending_window_count),
+        "unrealized_window_count": int(unrealized_window_count),
+        "pending_signal_count": int(sum(1 for s, c in status_counts.items() if (_v285_is_pending_lifecycle_status(s) or str(s).startswith(V285_STATUS_REALIZED_PARTIAL)) for _ in range(c))),
+        "data_missing_signal_count": int(data_missing_count),
+        "failed_signal_count": int(failed_count),
+        "full_sample_context_count": int(full),
+        "semi_sample_context_count": int(semi),
+        "weak_sample_context_count": int(weak),
+        "small_sample_context_count": int(small),
+        "score_calibration_enabled": bool(calibration_enabled),
+        "score_calibration_note": "仅full/semi样本参与轻量校准；weak/small只展示不调分。",
+    }
+
+
+def _v285_bucket_series(df, col, cuts, labels, default="unknown"):
+    try:
+        if col not in df.columns:
+            return pd.Series([default] * len(df), index=df.index)
+        return pd.cut(pd.to_numeric(df[col], errors="coerce"), bins=cuts, labels=labels, include_lowest=True).astype(str).fillna(default)
+    except Exception:
+        return pd.Series([default] * len(df), index=df.index)
+
+
+def rebuild_condition_probability_table_from_lifecycle(payload=None):
+    records = _v285_load_lifecycle_records()
+    df = _v285_lifecycle_to_dataframe(records)
+    realized = df[df.get("is_realized_window", False) == True].copy() if df is not None and not df.empty else pd.DataFrame()
+    by_hypothesis = {}
+    by_context = {}
+    calibration_seed = {}
+    pending_count = int(sum(1 for r in records if isinstance(r, dict) and _v285_is_pending_lifecycle_status(r.get("status", r.get("lifecycle_state", "")))))
+
+    if realized is not None and not realized.empty:
+        main_window = V285_CONDITION_MAIN_WINDOW
+        main_df = realized[pd.to_numeric(realized["window"], errors="coerce") == int(main_window)].copy()
+        if main_df.empty:
+            main_df = realized.copy()
+        try:
+            for hypo, g in realized.groupby("hypothesis", dropna=False):
+                item = {"sample_count": int(g["signal_id"].nunique()) if "signal_id" in g.columns else int(len(g)), "pending_count": 0, "windows": list(V20_REVIEW_WINDOWS)}
+                for w in V20_REVIEW_WINDOWS:
+                    item[f"T+{int(w)}"] = _v285_condition_stat(g, window=int(w))
+                item.update(_v285_condition_stat(g, window=main_window))
+                by_hypothesis[str(hypo or "综合结构机会")] = item
+        except Exception:
+            pass
+        try:
+            main_df["_rr_bucket"] = _v285_bucket_series(main_df, "rr", [0, 1.0, 1.35, 2.0, 99], ["RR<1", "RR1-1.35", "RR1.35-2", "RR>2"])
+            main_df["_defense_bucket"] = _v285_bucket_series(main_df, "defense_dist", [0, 0.04, 0.08, 0.12, 99], ["def<=4%", "def4-8%", "def8-12%", "def>12%"])
+            main_df["_pressure_bucket"] = _v285_bucket_series(main_df, "near_pressure", [0, 0.03, 0.05, 0.10, 99], ["press<=3%", "press3-5%", "press5-10%", "press>10%"])
+            context_specs = {
+                "hypothesis|market_env|tier": ["hypothesis", "market_env", "tier"],
+                "hypothesis|industry|buy_point": ["hypothesis", "industry", "buy_point_type"],
+                "hypothesis|rr|defense|pressure": ["hypothesis", "_rr_bucket", "_defense_bucket", "_pressure_bucket"],
+                "hypothesis|pool|market_env": ["hypothesis", "pool", "market_env"],
+            }
+            for spec_name, cols in context_specs.items():
+                bucket = {}
+                for key, g in main_df.groupby(cols, dropna=False):
+                    if not isinstance(key, tuple):
+                        key = (key,)
+                    k = "|".join(str(x) for x in key)
+                    stat = _v285_condition_stat(g, window=None)
+                    stat["slice"] = spec_name
+                    bucket[k] = stat
+                    if stat.get("sample_quality") in ["full_sample", "semi_sample"]:
+                        calibration_seed[k] = stat
+                by_context[spec_name] = bucket
+        except Exception:
+            pass
+
+    # pending信号也计入假设pending_count，绝不伪装胜率。
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("status", "")).startswith("pending"):
+            hypo = str(rec.get("hypothesis") or "综合结构机会")
+            item = by_hypothesis.setdefault(hypo, {"sample_count": 0, "pending_count": 0, "windows": list(V20_REVIEW_WINDOWS)})
+            item["pending_count"] = int(item.get("pending_count", 0)) + 1
+
+    lifecycle_summary = _v285_lifecycle_summary(records, df=df, realized=realized, calibration_seed=calibration_seed)
+
+    table = {
+        "model_version": MODEL_VERSION,
+        "v285_model_version": V285_MODEL_VERSION,
+        "generated_at_bj": bj_time_str(),
+        "source": "v285_lifecycle_realized_from_local_kline",
+        "lifecycle_status": lifecycle_summary.get("lifecycle_status", "OK"),
+        "score_calibration_enabled": bool(lifecycle_summary.get("score_calibration_enabled", False)),
+        "score_calibration_note": lifecycle_summary.get("score_calibration_note", ""),
+        "note": "V28.5.1已把每日信号写入生命周期状态机，并用本地K线补齐T+窗口；full/semi样本才参与轻量校准，weak/small只展示不硬扣分。",
+        "review_windows": list(V20_REVIEW_WINDOWS),
+        "main_window": int(V285_CONDITION_MAIN_WINDOW),
+        "sample_thresholds": {
+            "full_sample": V285_CONDITION_FULL_SAMPLE,
+            "semi_sample": V285_CONDITION_SEMI_SAMPLE,
+            "weak_sample": V285_CONDITION_WEAK_SAMPLE,
+        },
+        "lifecycle_file": V20_SIGNAL_LIFECYCLE_FILE,
+        "lifecycle_summary": lifecycle_summary,
+        "signal_count": int(lifecycle_summary.get("total_signal_count", 0)),
+        "window_row_count": int(lifecycle_summary.get("window_row_count", 0)),
+        "realized_window_rows": int(len(realized)) if realized is not None else 0,
+        "realized_window_count": int(lifecycle_summary.get("realized_window_count", 0)),
+        "pending_rows": int(pending_count),
+        "pending_window_count": int(lifecycle_summary.get("pending_window_count", 0)),
+        "data_missing_signal_count": int(lifecycle_summary.get("data_missing_signal_count", 0)),
+        "failed_signal_count": int(lifecycle_summary.get("failed_signal_count", 0)),
+        "by_hypothesis": by_hypothesis,
+        "by_context": by_context,
+        "calibration_seed_context_probability": calibration_seed,
+    }
+    _v285_write_json(V20_CONDITION_TABLE_FILE, table)
+
+    try:
+        if realized is not None and not realized.empty:
+            realized.to_csv(V20_SIGNAL_FEEDBACK_CSV, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        print(f"V28.5反馈CSV写入失败：{str(e)[:160]}")
+
+    try:
+        if calibration_seed:
+            parent = os.path.dirname(V27_CALIBRATION_FILE)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(V27_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "generated_at_bj": bj_time_str(),
+                    "model_version": MODEL_VERSION,
+                    "v285_model_version": V285_MODEL_VERSION,
+                    "sample_count": int(sum(safe_float(v.get("sample_count"), 0) for v in calibration_seed.values())),
+                    "context_probability": calibration_seed,
+                    "utility_note": "V28.5生命周期实算样本生成；仅full/semi样本进入校准种子，小样本不硬加减分。",
+                }, f, ensure_ascii=False, indent=2, default=_v285_json_default)
+    except Exception:
+        pass
+    return table
+
+
+# V28.5.1：显式包装旧placeholder。新生命周期闭环失败时保留legacy回退，但必须显性标记状态。
+_build_v20_condition_probability_placeholder_before_v285 = build_v20_condition_probability_placeholder
+
+
+def build_v285_condition_probability_lifecycle(payload):
+    append_info = append_today_signals_to_lifecycle(payload)
+    realize_info = realize_pending_signal_lifecycle(max_items=V285_LIFECYCLE_MAX_REALIZE_PER_RUN)
+    table = rebuild_condition_probability_table_from_lifecycle(payload=payload)
+    table["lifecycle_append_info"] = append_info
+    table["lifecycle_realize_info"] = realize_info
+    table["lifecycle_status"] = "OK"
+    table["lifecycle_error"] = ""
+    table["fallback_legacy_used"] = False
+    _v285_write_json(V20_CONDITION_TABLE_FILE, table)
+    print(
+        "V28.5.1条件概率生命周期闭环："
+        f"status=OK added={append_info.get('added', 0)} updated={append_info.get('updated', 0)} "
+        f"realized={realize_info.get('realized_or_updated', 0)} "
+        f"pending_signals={table.get('pending_rows', 0)} "
+        f"pending_windows={table.get('pending_window_count', 0)} "
+        f"realized_windows={table.get('realized_window_count', table.get('realized_window_rows', 0))} "
+        f"calibration={'on' if table.get('score_calibration_enabled') else 'off'}"
+    )
+    return table
+
+
+def build_v20_condition_probability_placeholder(payload):
+    try:
+        return build_v285_condition_probability_lifecycle(payload)
+    except Exception as e:
+        lifecycle_error = str(e)[:300]
+        print(f"V28.5.1生命周期闭环失败，显性回退旧条件概率逻辑：{lifecycle_error}")
+        try:
+            legacy = _build_v20_condition_probability_placeholder_before_v285(payload)
+            if not isinstance(legacy, dict):
+                legacy = {}
+            legacy["lifecycle_status"] = "FALLBACK_LEGACY"
+            legacy["lifecycle_error"] = lifecycle_error
+            legacy["fallback_legacy_used"] = True
+            legacy["score_calibration_enabled"] = False
+            legacy["score_calibration_note"] = "生命周期闭环失败，本次旧逻辑仅供展示，不参与评分校准。"
+            legacy.setdefault("source", "legacy_condition_probability_fallback")
+            _v285_write_json(V20_CONDITION_TABLE_FILE, legacy)
+            return legacy
+        except Exception as legacy_e:
+            failed = {
+                "model_version": MODEL_VERSION,
+                "v285_model_version": V285_MODEL_VERSION,
+                "generated_at_bj": bj_time_str(),
+                "source": "v285_failed_and_legacy_failed",
+                "lifecycle_status": "FAILED",
+                "lifecycle_error": lifecycle_error,
+                "legacy_error": str(legacy_e)[:300],
+                "fallback_legacy_used": False,
+                "score_calibration_enabled": False,
+                "score_calibration_note": "生命周期闭环和旧逻辑均失败，本次不参与评分校准。",
+                "by_hypothesis": {},
+                "by_context": {},
+                "pending_rows": 0,
+                "pending_window_count": 0,
+                "realized_window_count": 0,
+            }
+            _v285_write_json(V20_CONDITION_TABLE_FILE, failed)
+            return failed
+
+
+# =============================================================================
+# V28.5.1 SAFE PATCH：版本口径统一 + 评分归因审计 + 同源去重旁路
+# 说明：本补丁只覆盖选股评分出口层，不触碰 workflow / stock_alert.py 入口 / PAT / Telegram / BaoStock / 缓存闭环。
+# 安全原则：
+#   1）所有原始模型照常运行，原始分数保留；
+#   2）同源去重默认只旁路输出，不默认接管排序；
+#   3）如需让去重分参与排序，显式设置 V2851_ENABLE_DEDUP_SCORE_FOR_SORT=1；
+#   4）任何硬雷区、生产链路、数据门控逻辑均不在此处改写。
+# =============================================================================
+V2851_SAFE_PATCH_VERSION = "v28_5_1_dedup_attribution_safe_patch"
+V2851_ENABLE_ATTRIBUTION_AUDIT = os.environ.get("V2851_ENABLE_ATTRIBUTION_AUDIT", "1")
+V2851_ENABLE_DEDUP_SCORE_FOR_SORT = os.environ.get("V2851_ENABLE_DEDUP_SCORE_FOR_SORT", "0")
+V2851_MAX_SAME_SOURCE_PENALTY = float(os.environ.get("V2851_MAX_SAME_SOURCE_PENALTY", "7.0"))
+V2851_WRITE_DEDUP_AUDIT_FILE = os.environ.get("V2851_WRITE_DEDUP_AUDIT_FILE", "0")
+V2851_DEDUP_AUDIT_FILE = os.environ.get("V2851_DEDUP_AUDIT_FILE", "v28_5_1_dedup_attribution_audit.json")
+
+
+def _v2851_clip(x, lo=0.0, hi=100.0):
+    try:
+        return max(float(lo), min(float(hi), float(x)))
+    except Exception:
+        return float(lo)
+
+
+def _v2851_list_len(value):
+    if value is None:
+        return 0
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, str):
+        return 1 if value.strip() else 0
+    return 1
+
+
+def _v2851_text_has_any(text, keywords):
+    t = str(text or "")
+    return any(k in t for k in keywords)
+
+
+def _v2851_primary_score(row):
+    """保留原始模型出口分，不在此处重算生产逻辑。"""
+    for k in [
+        "v27_final_score", "v27_score", "v27_final_price_score", "v26_final_buy_score",
+        "v22_composite_trade_score", "v212_final_score", "v20_final_score", "v16_final_score",
+        "v14_final_score", "total_score", "score_final", "score"
+    ]:
+        if k in row:
+            val = safe_float(row.get(k), None)
+            if val is not None and val > 0:
+                return float(val), k
+    return 0.0, "missing"
+
+
+def _v2851_group_raw_scores(row):
+    """
+    将当前已存在的V27/V26/V22字段归并到少数独立信息组。
+    注意：这里只做归因与同源审计，不改变原模型内部计算。
+    """
+    return {
+        "资金行为": max(
+            safe_float(row.get("v27_fund_factor", 0)),
+            safe_float(row.get("v26_card_acceptance", 0)),
+            safe_float(row.get("v212_volume_score", 0)),
+            safe_float(row.get("v212_acceptance_score", 0)),
+        ),
+        "结构位置": max(
+            safe_float(row.get("v27_structure_factor", 0)),
+            safe_float(row.get("v26_key_structure_score", 0)),
+            safe_float(row.get("v26_card_key_structure", 0)),
+            safe_float(row.get("v212_price_score", 0)),
+            safe_float(row.get("v212_core_supply_confidence", 0)),
+        ),
+        "爆发前夜": max(
+            safe_float(row.get("v27_explosion_eve_factor", 0)),
+            safe_float(row.get("v26_explosion_eve_score", 0)),
+            safe_float(row.get("v26_card_explosion_eve", 0)),
+            safe_float(row.get("v23_supply_absorption_score", 0)),
+        ),
+        "当前触发": max(
+            safe_float(row.get("v27_current_trigger_factor", 0)),
+            safe_float(row.get("v26_breakout_expansion_score", 0)),
+            safe_float(row.get("v26_card_breakout_expansion", 0)),
+            safe_float(row.get("v212_time_score", 0)),
+        ),
+        "交易质量": max(
+            safe_float(row.get("v27_risk_trade_factor", 0)),
+            safe_float(row.get("v26_execution_score", 0)),
+            safe_float(row.get("v26_card_execution", 0)),
+            safe_float(row.get("v212_space_score", 0)),
+        ),
+        "市场环境": max(
+            safe_float(row.get("v27_market_factor", 0)),
+            safe_float(row.get("v26_market_env_score", 0)),
+            safe_float(row.get("v26_market_score", 0)),
+            safe_float(row.get("v26_sector_heat_score", 0)),
+        ),
+    }
+
+
+def _v2851_same_source_penalty(row, groups):
+    """识别明显同源堆分，只扣水分，不删除任何战法。"""
+    notes = []
+    penalty = 0.0
+    structure = safe_float(groups.get("结构位置", 0))
+    explosion = safe_float(groups.get("爆发前夜", 0))
+    trigger = safe_float(groups.get("当前触发", 0))
+    funds = safe_float(groups.get("资金行为", 0))
+    trade = safe_float(groups.get("交易质量", 0))
+
+    # 结构 + 爆发前夜常来自同一段平台/压缩/大周期吸收，不能无限叠加。
+    if structure >= 13 and explosion >= 12:
+        p = min(2.5, 0.18 * ((structure - 12) + (explosion - 11)))
+        penalty += p
+        notes.append(f"结构位置与爆发前夜高度同源，压缩水分{p:.1f}")
+
+    # 爆发前夜 + 当前触发既可共振，但同一根日K同时贡献过多时要轻压。
+    if explosion >= 13 and trigger >= 10:
+        p = min(2.0, 0.16 * ((explosion - 12) + (trigger - 9)))
+        penalty += p
+        notes.append(f"爆发前夜与当前触发同源共振，保留主逻辑但轻度封顶{p:.1f}")
+
+    # 资金行为 + 触发如果均来自同一根放量阳K，避免倍量、突破、强收盘重复吹分。
+    factor_text = json.dumps(row.get("v27_factor_reasons", {}), ensure_ascii=False, default=str)
+    if funds >= 15 and trigger >= 10 and _v2851_text_has_any(factor_text, ["倍量", "放量", "强阳", "突破"]):
+        p = min(1.8, 0.12 * ((funds - 14) + (trigger - 9)))
+        penalty += p
+        notes.append(f"资金放量与触发K线可能同源，重复定价扣水{p:.1f}")
+
+    # 交易质量不足不应被前面形态分完全抵消；这里只做归因提示型扣水。
+    rr = safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0))))
+    defense = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    nearp = safe_float(row.get("v20_near_pressure", row.get("near_pressure_dist", 0)))
+    if rr > 0 and rr < 1.35:
+        p = 1.5
+        penalty += p
+        notes.append("RR低于1.35，归因层轻扣1.5")
+    if defense > 0.105:
+        p = 2.0
+        penalty += p
+        notes.append("防守距离超过10.5%，归因层轻扣2.0")
+    if 0 < nearp <= 0.045 and trigger < 10:
+        p = 1.5
+        penalty += p
+        notes.append("近端压力偏近且触发不强，归因层轻扣1.5")
+
+    # 硬风险仍尊重原模型，归因层只解释，不额外重罚到误杀。
+    block_count = _v2851_list_len(row.get("v27_block_reasons")) + _v2851_list_len(row.get("v26_block_reasons"))
+    if block_count > 0:
+        notes.append(f"原模型已有硬阻断/剔除原因{block_count}项，归因层不重复叠加硬罚")
+
+    penalty = min(float(V2851_MAX_SAME_SOURCE_PENALTY), max(0.0, float(penalty)))
+    if penalty <= 0 and not notes:
+        notes.append("未发现明显同源重复吹分，保留原始评分")
+    return penalty, notes
+
+
+def attach_v2851_dedup_attribution(row):
+    """给单只股票附加归因/去重字段。默认不改变原始分数与排序。"""
+    if V2851_ENABLE_ATTRIBUTION_AUDIT != "1":
+        return row
+    try:
+        r = dict(row)
+        raw_score, raw_field = _v2851_primary_score(r)
+        groups = _v2851_group_raw_scores(r)
+        penalty, notes = _v2851_same_source_penalty(r, groups)
+        dedup_score = _v2851_clip(raw_score - penalty, 0, 100)
+        factor_reasons = r.get("v27_factor_reasons", {}) if isinstance(r.get("v27_factor_reasons"), dict) else {}
+        attribution = {
+            "version": V2851_SAFE_PATCH_VERSION,
+            "raw_score": round(float(raw_score), 2),
+            "raw_score_field": raw_field,
+            "dedup_score": round(float(dedup_score), 2),
+            "same_source_penalty": round(float(penalty), 2),
+            "score_delta": round(float(dedup_score - raw_score), 2),
+            "groups": {k: round(float(v), 2) for k, v in groups.items()},
+            "reason_counts": {str(k): _v2851_list_len(v) for k, v in factor_reasons.items()},
+            "dedup_notes": notes,
+            "dedup_sort_enabled": V2851_ENABLE_DEDUP_SCORE_FOR_SORT == "1",
+            "safety_scope": "score_output_only_no_workflow_no_pat_no_cache_no_telegram_chain_change",
+        }
+        r["v2851_score_attribution"] = attribution
+        r["v2851_raw_score"] = round(float(raw_score), 2)
+        r["v2851_dedup_score"] = round(float(dedup_score), 2)
+        r["v2851_same_source_penalty"] = round(float(penalty), 2)
+        r["v2851_dedup_notes"] = notes
+        r["v2851_score_for_sort"] = round(float(dedup_score if V2851_ENABLE_DEDUP_SCORE_FOR_SORT == "1" else raw_score), 2)
+
+        # 默认不接管排序。显式打开时才只替换分数字段，不重写买入资格/池子/生产链路。
+        if V2851_ENABLE_DEDUP_SCORE_FOR_SORT == "1" and raw_score > 0:
+            for k in ["v27_final_score", "v27_score", "v27_final_price_score"]:
+                if k in r:
+                    r[k] = round(float(dedup_score), 2)
+            r["v2851_dedup_score_applied"] = True
+        else:
+            r["v2851_dedup_score_applied"] = False
+        return r
+    except Exception as e:
+        try:
+            rr = dict(row)
+            rr["v2851_score_attribution_error"] = str(e)[:200]
+            return rr
+        except Exception:
+            return row
+
+
+# 最终包裹V28.5.1当前生效决策器：仅附加字段，不删除/替换核心模型。
+_v2851_decision_engine_before_dedup_attribution = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    r = _v2851_decision_engine_before_dedup_attribution(row)
+    return attach_v2851_dedup_attribution(r)
+
+
+
 
 
 if __name__ == "__main__":
