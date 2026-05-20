@@ -1,4 +1,4 @@
-# Employee1 Stock Alert V26.1 | Updated: 2026-05-19
+# Employee1 Stock Alert V27.9 | Updated: 2026-05-20
 # FIRST LINE FORMAT LOCKED: only version number and Updated date may change; do not rename entrypoint stock_alert.py
 # V19.3.3 AUDITED HOTFIX - base observation subscores + deep score 200 + static audit passed
 import os
@@ -175,7 +175,7 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "0")
 SIGNAL_FILE = "signals_history.json"
 CANDIDATE_FILE = "stock_candidates.json"
 CACHE_DIR = "kline_cache"
-MODEL_VERSION = "V26.0一号员工选股模型｜爆发前夜最终买入池+机构评分卡+动态仓位自学习版"
+MODEL_VERSION = "V28一号员工选股模型｜市场状态前置+分情景WalkForward定价+动态雷区版"
 SEED_POOL_FILE = os.environ.get("SEED_POOL_FILE", "stock_seed_pool.json")
 
 
@@ -475,6 +475,10 @@ VR1_MAX = 2.5
 
 FAILED_KLINE_FILE = "failed_kline_symbols.json"
 RISK_FLAGS_FILE = os.environ.get("RISK_FLAGS_FILE", "risk_flags.json")
+# V27.7：雷区筛查失败关闭。不能因为 risk_flags.json 缺失/损坏就默认为零风险。
+RISK_FLAGS_STRICT_REQUIRED = os.environ.get("RISK_FLAGS_STRICT_REQUIRED", "1")
+RISK_FLAGS_MISSING_PENALTY = float(os.environ.get("RISK_FLAGS_MISSING_PENALTY", "-35"))
+RISK_FLAGS_MISSING_HARD_EXCLUDE = os.environ.get("RISK_FLAGS_MISSING_HARD_EXCLUDE", "1")
 
 VALID_STOCK_PREFIXES = (
     "sh.600", "sh.601", "sh.603", "sh.605", "sh.688",
@@ -496,7 +500,8 @@ KLINE_SOURCE_STATS = {
 }
 
 class StockDataTimeout(Exception):
-    pass
+    """单只股票取数超时异常；由 stock_query_timeout 抛出并被上层数据源保护捕获。"""
+
 
 
 @contextmanager
@@ -1315,25 +1320,50 @@ def save_json_file(path, data):
 def load_risk_flags(path=RISK_FLAGS_FILE):
     """
     重大基本面/监管雷区由外部JSON提供，避免联网抓公告导致不稳定。
+    V27.7 修正：雷区库缺失/损坏不再等同零风险，而是返回带状态的空库，
+    由 evaluate_regulatory_risk() 按失败关闭规则处理。
     支持格式：
     {
       "000567": ["立案调查", "控股股东高质押", "审计报告带强调事项段"],
       "300001": {"flags": ["行政监管措施"], "note": "..."}
     }
-    命中重大雷区至少扣40分，并从普通80分候选池中降级。
     """
+    meta = {"__meta__": {"path": path, "status": "ok", "reason": ""}}
     if not os.path.exists(path):
-        return {}
+        meta["__meta__"]["status"] = "missing"
+        meta["__meta__"]["reason"] = f"雷区库不存在:{path}"
+        print(f"V27.7雷区库缺失：{path}。按失败关闭规则处理，正式买入池不再默认为零风险。")
+        return meta
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            data.setdefault("__meta__", meta["__meta__"])
+            return data
+        meta["__meta__"]["status"] = "invalid_format"
+        meta["__meta__"]["reason"] = "雷区库不是dict格式"
+        return meta
     except Exception as e:
+        meta["__meta__"]["status"] = "read_failed"
+        meta["__meta__"]["reason"] = f"读取雷区文件失败:{str(e)[:120]}"
         print(f"读取雷区文件失败 {path}: {e}")
-        return {}
+        return meta
 
 
 _RISK_FLAGS_CACHE = None
+
+
+def _risk_data_unavailable_result(reason):
+    hard = (RISK_FLAGS_STRICT_REQUIRED == "1" and RISK_FLAGS_MISSING_HARD_EXCLUDE == "1")
+    penalty = RISK_FLAGS_MISSING_PENALTY if RISK_FLAGS_STRICT_REQUIRED == "1" else 0.0
+    return {
+        "penalty": float(penalty),
+        "hard_exclude": bool(hard),
+        "flags": ["雷区库缺失/不可用，监管财务硬过滤未完成"],
+        "note": reason or "risk_flags_unavailable",
+        "risk_data_status": "unavailable",
+        "risk_action": "fail_closed" if hard else "penalty_only",
+    }
 
 
 def evaluate_regulatory_risk(code, name=""):
@@ -1341,9 +1371,15 @@ def evaluate_regulatory_risk(code, name=""):
     if _RISK_FLAGS_CACHE is None:
         _RISK_FLAGS_CACHE = load_risk_flags()
 
-    raw = _RISK_FLAGS_CACHE.get(str(code), _RISK_FLAGS_CACHE.get(str(code).zfill(6), None))
+    meta = _RISK_FLAGS_CACHE.get("__meta__", {}) if isinstance(_RISK_FLAGS_CACHE, dict) else {}
+    if meta and meta.get("status") != "ok":
+        return _risk_data_unavailable_result(str(meta.get("reason", "雷区库不可用")))
+
+    key = str(code).strip()
+    zkey = "".join(ch for ch in key if ch.isdigit())[-6:].zfill(6) if any(ch.isdigit() for ch in key) else key
+    raw = _RISK_FLAGS_CACHE.get(key, _RISK_FLAGS_CACHE.get(zkey, None)) if isinstance(_RISK_FLAGS_CACHE, dict) else None
     if not raw:
-        return {"penalty": 0.0, "hard_exclude": False, "flags": [], "note": ""}
+        return {"penalty": 0.0, "hard_exclude": False, "flags": [], "note": "", "risk_data_status": "ok", "risk_action": "pass"}
 
     if isinstance(raw, dict):
         flags = raw.get("flags", [])
@@ -1380,26 +1416,24 @@ def evaluate_regulatory_risk(code, name=""):
     financial_hits = sum(1 for k in financial_keywords if k in joined)
 
     if major_hits > 0:
-        penalty = -40.0 - min(20.0, 5.0 * max(0, major_hits - 1) + 3.0 * medium_hits)
-        return {"penalty": penalty, "hard_exclude": True, "flags": flags, "note": note}
+        penalty = -40.0 - min(25.0, 5.0 * max(0, major_hits - 1) + 3.0 * medium_hits + 2.0 * financial_hits)
+        return {"penalty": penalty, "hard_exclude": True, "flags": flags, "note": note, "risk_data_status": "ok", "risk_action": "hard_exclude"}
     if medium_hits > 0:
-        # 用户强调重大雷区至少-40；单纯中等风险先扣20~35，若多项中等风险合并也硬降级。
-        penalty = -20.0 - min(20.0, 5.0 * max(0, medium_hits - 1))
-        hard = medium_hits >= 3
+        penalty = -20.0 - min(25.0, 5.0 * max(0, medium_hits - 1) + 2.0 * financial_hits)
+        hard = medium_hits >= 3 or (medium_hits >= 2 and financial_hits >= 1)
         if hard:
             penalty = min(penalty, -40.0)
-        return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note}
+        return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note, "risk_data_status": "ok", "risk_action": "hard_exclude" if hard else "penalty"}
 
     if financial_hits > 0:
-        # V11.1：财报/治理/集中度/商誉等雷区必须在一号员工阶段严格处理。
-        # 单项财务风险明显压分；多项财务风险或财务+治理风险叠加，直接降级/剔除优先池。
         penalty = -15.0 - min(35.0, 7.0 * max(0, financial_hits - 1) + 4.0 * medium_hits)
         hard = (financial_hits >= 3) or (financial_hits >= 2 and medium_hits >= 1)
         if hard:
             penalty = min(penalty, -40.0)
-        return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note}
+        return {"penalty": penalty, "hard_exclude": hard, "flags": flags, "note": note, "risk_data_status": "ok", "risk_action": "hard_exclude" if hard else "penalty"}
 
-    return {"penalty": -10.0, "hard_exclude": False, "flags": flags, "note": note}
+    return {"penalty": -10.0, "hard_exclude": False, "flags": flags, "note": note, "risk_data_status": "ok", "risk_action": "unknown_flag_penalty"}
+
 
 
 def build_monthly_df(df):
@@ -1450,6 +1484,713 @@ def build_monthly_df(df):
     monthly["big_down"] = monthly["is_down"] & (monthly["body_pct"] <= -0.08)
     monthly["big_down_vol"] = monthly["big_down"] & (monthly["volume"] >= monthly["vol_ma5"] * 1.15)
     return monthly
+
+
+def build_period_ohlcv_df(df, freq):
+    """
+    从日线构造指定周期OHLCV。freq 取值：D/W/M/Q/Y。
+    只做数据聚合，不读取任何生产链路、凭证、推送或缓存配置。
+    """
+    if df is None or len(df) < 30 or "date" not in df.columns:
+        return pd.DataFrame()
+    data = df.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data = data.dropna(subset=["date"]).sort_values("date")
+    if data.empty:
+        return pd.DataFrame()
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in data.columns:
+            return pd.DataFrame()
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    if "amount" not in data.columns:
+        data["amount"] = 0.0
+    else:
+        data["amount"] = pd.to_numeric(data["amount"], errors="coerce").fillna(0.0)
+
+    data = data.dropna(subset=["open", "high", "low", "close", "volume"])
+    if data.empty:
+        return pd.DataFrame()
+
+    f = str(freq).upper()
+    if f == "D":
+        out = data[["date", "open", "high", "low", "close", "volume", "amount"]].copy()
+        out = out.reset_index(drop=True)
+    else:
+        rule_map = {"W": "W-FRI", "M": "ME", "Q": "QE", "Y": "YE"}
+        if f not in rule_map:
+            return pd.DataFrame()
+        data = data.set_index("date")
+        out = pd.DataFrame()
+        out["open"] = data["open"].resample(rule_map[f]).first()
+        out["high"] = data["high"].resample(rule_map[f]).max()
+        out["low"] = data["low"].resample(rule_map[f]).min()
+        out["close"] = data["close"].resample(rule_map[f]).last()
+        out["volume"] = data["volume"].resample(rule_map[f]).sum()
+        out["amount"] = data["amount"].resample(rule_map[f]).sum()
+        out = out.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index()
+
+    if out.empty:
+        return out
+    out["range"] = (out["high"] - out["low"]).replace(0, np.nan)
+    out["body"] = out["close"] - out["open"]
+    out["body_abs"] = out["body"].abs()
+    out["body_pct"] = out["body"] / out["open"].replace(0, np.nan)
+    out["body_ratio"] = out["body_abs"] / out["range"]
+    out["close_pos"] = (out["close"] - out["low"]) / out["range"]
+    out["entity_top"] = out[["open", "close"]].max(axis=1)
+    out["entity_bottom"] = out[["open", "close"]].min(axis=1)
+    out["entity_mid"] = (out["entity_top"] + out["entity_bottom"]) / 2.0
+    out["is_bull"] = (out["close"] > out["open"]) & (out["close"] > out["close"].shift(1).fillna(0))
+    out["vol_med_5"] = out["volume"].rolling(5, min_periods=2).median()
+    out["vol_ma_5"] = out["volume"].rolling(5, min_periods=2).mean()
+    return out
+
+
+def detect_anchored_big_bull_midline_defense(df):
+    """
+    V27.3 锚定超级阳线中位防守模型。
+
+    目标：把“年/季/月/周/日超级大阳线或历史巨量阳线的实体中位，
+    在后续长期回调中收盘不有效跌破”量化为固定机构成本锚。
+
+    评分拆成四个互不重复的子分：
+    - structure_score：锚定K线自身质量和周期级别，只进入结构种子块；
+    - hold_score：后续收盘防守质量，只进入承接确认块；
+    - trigger_score：当前日线相对锚定线的触发状态，只进入突破/买点触发；
+    - risk_penalty：当前或历史已有效失守的降级分，只进入风险块。
+    """
+    empty = {
+        "score": 0.0, "structure_score": 0.0, "hold_score": 0.0, "trigger_score": 0.0,
+        "risk_penalty": 0.0, "grade": "", "flag": "", "detail": "大阳中位样本不足",
+        "cycle": "", "anchor_date": "", "anchor_mid": 0.0, "anchor_top": 0.0, "anchor_bottom": 0.0,
+        "defense_periods": 0, "breach_count": 0, "max_consecutive_breach": 0, "min_close_to_mid": 0.0,
+        "current_dist_to_mid": 0.0, "daily_trigger": False
+    }
+    if df is None or len(df) < 120:
+        return dict(empty)
+
+    d = df.copy()
+    if "date" not in d.columns:
+        return dict(empty)
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if len(d) < 120:
+        return dict(empty)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in d.columns:
+            return dict(empty)
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 120:
+        return dict(empty)
+
+    cur_close = safe_float(d["close"].iloc[-1])
+    cur_high = safe_float(d["high"].iloc[-1])
+    cur_low = safe_float(d["low"].iloc[-1])
+    cur_open = safe_float(d["open"].iloc[-1])
+    cur_range = max(cur_high - cur_low, 1e-9)
+    cur_pos = (cur_close - cur_low) / cur_range if cur_range > 0 else 0.0
+    cur_body_pct = (cur_close - cur_open) / cur_open if cur_open > 0 else 0.0
+    ma20 = pd.to_numeric(d["close"], errors="coerce").rolling(20, min_periods=5).mean().iloc[-1]
+    ma60 = pd.to_numeric(d["close"], errors="coerce").rolling(60, min_periods=10).mean().iloc[-1]
+    bias20 = cur_close / ma20 - 1 if safe_float(ma20) > 0 else 0.0
+    bias60 = cur_close / ma60 - 1 if safe_float(ma60) > 0 else 0.0
+
+    # 周期权重明确区分：年线最稀缺，季线/月线次之，周线/日线只做辅助锚。
+    cfgs = [
+        {"cycle": "Y", "name": "年线", "min_bars": 3, "lookback": 30, "body_pct": 0.25, "body_ratio": 0.38, "close_pos": 0.62, "vol_pct": 0.55, "vol_mult": 0.95, "tol": 0.010, "cycle_cap": 16.0, "base": 4.8, "period_unit": "年"},
+        {"cycle": "Q", "name": "季线", "min_bars": 8, "lookback": 80, "body_pct": 0.18, "body_ratio": 0.42, "close_pos": 0.65, "vol_pct": 0.60, "vol_mult": 1.00, "tol": 0.015, "cycle_cap": 13.0, "base": 3.8, "period_unit": "季"},
+        {"cycle": "M", "name": "月线", "min_bars": 18, "lookback": 120, "body_pct": 0.12, "body_ratio": 0.45, "close_pos": 0.68, "vol_pct": 0.65, "vol_mult": 1.05, "tol": 0.020, "cycle_cap": 11.0, "base": 3.0, "period_unit": "月"},
+        {"cycle": "W", "name": "周线", "min_bars": 45, "lookback": 180, "body_pct": 0.08, "body_ratio": 0.48, "close_pos": 0.70, "vol_pct": 0.70, "vol_mult": 1.10, "tol": 0.025, "cycle_cap": 8.0, "base": 2.2, "period_unit": "周"},
+        {"cycle": "D", "name": "日线", "min_bars": 120, "lookback": 260, "body_pct": 0.05, "body_ratio": 0.52, "close_pos": 0.72, "vol_pct": 0.72, "vol_mult": 1.15, "tol": 0.030, "cycle_cap": 5.0, "base": 1.4, "period_unit": "日"},
+    ]
+
+    candidates = []
+    for cfg in cfgs:
+        p = build_period_ohlcv_df(d, cfg["cycle"])
+        if p is None or len(p) < cfg["min_bars"]:
+            continue
+        p = p.tail(cfg["lookback"]).reset_index(drop=True)
+        if len(p) < cfg["min_bars"]:
+            continue
+        vol_rank = p["volume"].rank(pct=True).fillna(0.0)
+        p["vol_pct_rank"] = vol_rank
+        p["vol_ratio_med5"] = p["volume"] / p["vol_med_5"].replace(0, np.nan)
+
+        # 最后一根未完成周期不作为锚定K线；它只能作为当前触发判断。
+        scan_end = max(1, len(p) - 1)
+        for i in range(0, scan_end):
+            row = p.iloc[i]
+            if not bool(row.get("is_bull", False)):
+                continue
+            body_pct = safe_float(row.get("body_pct", 0.0))
+            body_ratio = safe_float(row.get("body_ratio", 0.0))
+            close_pos = safe_float(row.get("close_pos", 0.0))
+            vol_pct_rank = safe_float(row.get("vol_pct_rank", 0.0))
+            vol_ratio_med5 = safe_float(row.get("vol_ratio_med5", 0.0))
+            entity_mid = safe_float(row.get("entity_mid", 0.0))
+            entity_top = safe_float(row.get("entity_top", 0.0))
+            entity_bottom = safe_float(row.get("entity_bottom", 0.0))
+            high = safe_float(row.get("high", 0.0))
+            if entity_mid <= 0 or entity_top <= entity_bottom:
+                continue
+            if body_pct < cfg["body_pct"] or body_ratio < cfg["body_ratio"] or close_pos < cfg["close_pos"]:
+                continue
+            if (vol_pct_rank < cfg["vol_pct"]) and (vol_ratio_med5 < cfg["vol_mult"]):
+                continue
+
+            after = p.iloc[i + 1:].copy()
+            if after.empty:
+                continue
+            close_after = pd.to_numeric(after["close"], errors="coerce").dropna()
+            if close_after.empty:
+                continue
+            defense_periods = int(len(close_after))
+            tol = cfg["tol"]
+            breach = close_after < entity_mid * (1.0 - tol)
+            breach_count = int(breach.sum())
+            breach_ratio = breach_count / max(1, defense_periods)
+            max_consecutive_breach = 0
+            cur_streak = 0
+            for bv in breach.astype(bool).tolist():
+                if bv:
+                    cur_streak += 1
+                    max_consecutive_breach = max(max_consecutive_breach, cur_streak)
+                else:
+                    cur_streak = 0
+            min_close_to_mid = safe_float(close_after.min() / entity_mid) if entity_mid > 0 else 0.0
+            current_above_mid = cur_close >= entity_mid * (1.0 - tol)
+
+            # 锚定K线质量分：周期基础 + 实体/收盘/量能，封顶由周期决定。
+            structure_score = cfg["base"]
+            if body_pct >= cfg["body_pct"] * 1.50:
+                structure_score += 1.0
+            if body_pct >= cfg["body_pct"] * 2.00:
+                structure_score += 0.8
+            if body_ratio >= 0.60:
+                structure_score += 0.8
+            if close_pos >= 0.80:
+                structure_score += 0.7
+            if vol_pct_rank >= 0.85:
+                structure_score += 1.0
+            elif vol_pct_rank >= 0.75:
+                structure_score += 0.6
+            if vol_ratio_med5 >= 1.30:
+                structure_score += 0.7
+            structure_score = min(structure_score, cfg["cycle_cap"] * 0.45)
+
+            # 后续防守质量分：不奖励“只是触碰”，只奖励后续周期收盘长期守中位。
+            hold_score = 0.0
+            if breach_count == 0:
+                hold_score += 4.0
+            elif breach_ratio <= 0.08 and max_consecutive_breach <= 1:
+                hold_score += 2.6
+            elif breach_ratio <= 0.15 and max_consecutive_breach <= 2:
+                hold_score += 1.2
+            else:
+                hold_score -= 1.5
+
+            if defense_periods >= 3:
+                hold_score += 0.8
+            if defense_periods >= 6:
+                hold_score += 0.8
+            if defense_periods >= 12:
+                hold_score += 0.7
+            if cfg["cycle"] in ["Y", "Q"] and defense_periods >= 4:
+                hold_score += 0.7
+            if cfg["cycle"] == "Y" and defense_periods >= 3 and breach_count == 0:
+                hold_score += 1.2
+            if min_close_to_mid >= 1.05:
+                hold_score += 0.8
+            elif min_close_to_mid >= 0.995:
+                hold_score += 0.4
+            hold_score = max(-2.0, min(8.0, hold_score))
+
+            # 当前日线触发：年/月/季锚定线负责定方向，日线必须给出靠近/站回/突破确认。
+            current_dist_to_mid = cur_close / entity_mid - 1.0 if entity_mid > 0 else 0.0
+            current_dist_to_top = cur_close / entity_top - 1.0 if entity_top > 0 else 0.0
+            last20 = d.tail(20).copy()
+            recent_min_close = safe_float(pd.to_numeric(last20["close"], errors="coerce").min()) if not last20.empty else cur_close
+            recent_hold_daily = recent_min_close >= entity_mid * (1.0 - max(0.025, tol))
+            daily_reclaim_mid = (cur_close >= entity_mid * 1.003) and (safe_float(d["close"].iloc[-2]) < entity_mid * 1.003 if len(d) >= 2 else False)
+            daily_break_top = cur_close >= entity_top * 1.003 or (cur_close >= high * 1.003 if high > 0 else False)
+            trigger_score = 0.0
+            if current_above_mid and 0.0 <= current_dist_to_mid <= 0.12:
+                trigger_score += 1.2
+            if current_above_mid and recent_hold_daily:
+                trigger_score += 1.0
+            if daily_reclaim_mid:
+                trigger_score += 1.4
+            if daily_break_top:
+                trigger_score += 1.8
+            if cur_body_pct >= 0.025 and cur_pos >= 0.70:
+                trigger_score += 0.6
+            if bias20 > 0.18 or bias60 > 0.25:
+                trigger_score -= 1.2
+            if current_dist_to_mid > 0.60 and not daily_break_top:
+                trigger_score -= 0.8
+            trigger_score = max(0.0, min(5.0, trigger_score))
+
+            risk_penalty = 0.0
+            if not current_above_mid:
+                risk_penalty -= 4.0 if cfg["cycle"] in ["Y", "Q", "M"] else 2.0
+            if breach_ratio > 0.20 or max_consecutive_breach >= 3:
+                risk_penalty -= 3.0 if cfg["cycle"] in ["Y", "Q", "M"] else 1.5
+            if current_above_mid and breach_count > 0 and breach_ratio <= 0.12 and max_consecutive_breach <= 2:
+                # 曾短暂失守但重新站回，只保留轻微历史瑕疵，不重复打重罚。
+                risk_penalty = max(risk_penalty, -1.0)
+            risk_penalty = max(-8.0, min(0.0, risk_penalty))
+
+            raw_score = structure_score + max(0.0, hold_score) + trigger_score + risk_penalty
+            cycle_score = max(0.0, min(cfg["cycle_cap"], raw_score))
+            if cycle_score <= 0:
+                continue
+
+            anchor_date = row.get("date", "")
+            try:
+                anchor_date_text = pd.to_datetime(anchor_date).strftime("%Y-%m-%d")
+            except Exception:
+                anchor_date_text = str(anchor_date)
+            grade = "C"
+            if cycle_score >= cfg["cycle_cap"] * 0.82 and hold_score >= 5.0 and risk_penalty >= -1.0:
+                grade = "S" if cfg["cycle"] in ["Y", "Q", "M"] else "A"
+            elif cycle_score >= cfg["cycle_cap"] * 0.66 and hold_score >= 3.0:
+                grade = "A"
+            elif cycle_score >= cfg["cycle_cap"] * 0.48:
+                grade = "B"
+
+            candidates.append({
+                "cycle": cfg["cycle"], "cycle_name": cfg["name"], "period_unit": cfg["period_unit"],
+                "score": float(cycle_score), "structure_score": float(structure_score),
+                "hold_score": float(max(0.0, hold_score)), "trigger_score": float(trigger_score),
+                "risk_penalty": float(risk_penalty), "grade": grade, "anchor_date": anchor_date_text,
+                "anchor_mid": float(entity_mid), "anchor_top": float(entity_top), "anchor_bottom": float(entity_bottom),
+                "anchor_high": float(high), "body_pct": float(body_pct), "body_ratio": float(body_ratio),
+                "close_pos": float(close_pos), "vol_pct_rank": float(vol_pct_rank), "vol_ratio_med5": float(vol_ratio_med5),
+                "defense_periods": defense_periods, "breach_count": breach_count,
+                "max_consecutive_breach": max_consecutive_breach, "min_close_to_mid": float(min_close_to_mid),
+                "current_dist_to_mid": float(current_dist_to_mid), "current_dist_to_top": float(current_dist_to_top),
+                "daily_trigger": bool(daily_reclaim_mid or daily_break_top or (current_above_mid and recent_hold_daily and 0.0 <= current_dist_to_mid <= 0.12)),
+            })
+
+    if not candidates:
+        out = dict(empty)
+        out["detail"] = "未找到满足实体、量能、收盘质量和后续防守条件的超级阳线中位锚"
+        return out
+
+    # 同一类机构成本锚不允许线性堆分：取最强周期为主，其他周期只给共振小分。
+    candidates = sorted(candidates, key=lambda x: (x["score"], {"Y": 5, "Q": 4, "M": 3, "W": 2, "D": 1}.get(x["cycle"], 0)), reverse=True)
+    best = candidates[0]
+    strong_resonance = [c for c in candidates[1:] if c["grade"] in ["S", "A"] and c["risk_penalty"] >= -1.0]
+    resonance_score = min(3.0, len(strong_resonance) * 1.0)
+
+    structure_score = min(10.0, best["structure_score"] + resonance_score * 0.40)
+    hold_score = min(8.0, best["hold_score"] + resonance_score * 0.35)
+    trigger_score = min(5.0, best["trigger_score"] + resonance_score * 0.20)
+    risk_penalty = min(0.0, best["risk_penalty"] + sum(c["risk_penalty"] for c in strong_resonance) * 0.25)
+    total = max(0.0, min(22.0, structure_score + hold_score + trigger_score + risk_penalty))
+
+    if total >= 18 and best["grade"] in ["S", "A"] and risk_penalty >= -1.0:
+        grade = "S"
+    elif total >= 14 and risk_penalty >= -2.0:
+        grade = "A"
+    elif total >= 9:
+        grade = "B"
+    else:
+        grade = "C"
+
+    flag = f"{best['cycle_name']}超级阳线中位防守{grade}级"
+    if strong_resonance:
+        flag += f"+{len(strong_resonance)}周期共振"
+
+    detail = (
+        f"{best['cycle_name']}锚定K({best['anchor_date']})：中位{best['anchor_mid']:.2f}，"
+        f"实体底/顶{best['anchor_bottom']:.2f}/{best['anchor_top']:.2f}；"
+        f"后续{best['defense_periods']}{best['period_unit']}收盘有效失守{best['breach_count']}次，"
+        f"最长连续失守{best['max_consecutive_breach']}期，最低收盘/中位{best['min_close_to_mid']:.2f}；"
+        f"当前距中位{best['current_dist_to_mid']:.1%}；"
+        f"拆分：结构{structure_score:.1f}/10，防守{hold_score:.1f}/8，日线触发{trigger_score:.1f}/5，风险{risk_penalty:.1f}"
+    )
+
+    return {
+        "score": float(total),
+        "structure_score": float(structure_score),
+        "hold_score": float(hold_score),
+        "trigger_score": float(trigger_score),
+        "risk_penalty": float(risk_penalty),
+        "grade": grade,
+        "flag": flag,
+        "detail": detail,
+        "cycle": best["cycle"],
+        "anchor_date": best["anchor_date"],
+        "anchor_mid": float(best["anchor_mid"]),
+        "anchor_top": float(best["anchor_top"]),
+        "anchor_bottom": float(best["anchor_bottom"]),
+        "defense_periods": int(best["defense_periods"]),
+        "breach_count": int(best["breach_count"]),
+        "max_consecutive_breach": int(best["max_consecutive_breach"]),
+        "min_close_to_mid": float(best["min_close_to_mid"]),
+        "current_dist_to_mid": float(best["current_dist_to_mid"]),
+        "daily_trigger": bool(best["daily_trigger"]),
+        "resonance_count": int(len(strong_resonance)),
+    }
+
+
+
+def detect_institutional_cooling_behavior(df, anchor_midline_ctx=None):
+    """
+    V27.5 机构级主动冷却 / 再换手 / 大冲突行为引擎。
+
+    设计原则：
+    1）主动冷却不是缩量。必须先通过 institution_markup_gate：大周期机构级扩张、突破、放量、收盘接受。
+    2）缩量、波动收缩、中位防守、低点抬高只作为同一个行为标签的组成因子，不再独立重复大加分。
+    3）放量阴线只是事件，必须结合 Context 与 Aftermath 分类为派发、再换手、洗盘或冲突区。
+    4）年/季/月/周/日周期权重分离：年线/季线行为稀缺，日线行为只做短触发辅助。
+    """
+    empty = {
+        "score": 0.0, "cooling_score": 0.0, "conflict_score": 0.0, "reaccumulation_score": 0.0,
+        "risk_penalty": 0.0, "markup_score": 0.0, "grade": "", "dominant_behavior": "",
+        "flag": "", "detail": "主动冷却样本不足", "cycle": "", "anchor_date": "",
+        "anchor_mid": 0.0, "anchor_top": 0.0, "anchor_volume": 0.0,
+        "volume_contraction_ratio": 0.0, "range_contraction_ratio": 0.0,
+        "close_above_mid_ratio": 0.0, "higher_low_score": 0.0,
+        "bear_event_type": "", "bear_event_count": 0, "daily_reexpansion_trigger": False,
+    }
+    if df is None or len(df) < 160:
+        return dict(empty)
+    d = df.copy()
+    if "date" not in d.columns:
+        return dict(empty)
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in d.columns:
+            return dict(empty)
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    if "amount" not in d.columns:
+        d["amount"] = 0.0
+    else:
+        d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(0.0)
+    d = d.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    if len(d) < 160:
+        return dict(empty)
+
+    cur_close = safe_float(d["close"].iloc[-1])
+    cur_open = safe_float(d["open"].iloc[-1])
+    cur_high = safe_float(d["high"].iloc[-1])
+    cur_low = safe_float(d["low"].iloc[-1])
+    cur_vol = safe_float(d["volume"].iloc[-1])
+    cur_range = max(cur_high - cur_low, 1e-9)
+    cur_pos = (cur_close - cur_low) / cur_range
+    cur_body_pct = (cur_close - cur_open) / cur_open if cur_open > 0 else 0.0
+    vol_ma20_d = safe_float(d["volume"].rolling(20, min_periods=5).mean().iloc[-1])
+    vol_ma60_d = safe_float(d["volume"].rolling(60, min_periods=10).mean().iloc[-1])
+    vol_ma240_d = safe_float(d["volume"].rolling(240, min_periods=40).median().iloc[-1]) if len(d) >= 80 else vol_ma60_d
+    amount_ma60 = safe_float(d["amount"].rolling(60, min_periods=10).mean().iloc[-1]) if "amount" in d.columns else 0.0
+    recent_daily_liquidity_ok = True
+    if vol_ma240_d > 0:
+        recent_daily_liquidity_ok = vol_ma60_d >= vol_ma240_d * 0.35
+    if amount_ma60 > 0:
+        recent_daily_liquidity_ok = recent_daily_liquidity_ok and amount_ma60 >= safe_float(d["amount"].rolling(240, min_periods=40).median().iloc[-1]) * 0.25
+
+    cfgs = [
+        {"cycle": "Y", "name": "年线", "min_bars": 4, "lookback": 35, "pre": 4, "body_pct": 0.24, "body_ratio": 0.36, "close_pos": 0.62, "vol_rank": 0.58, "vol_mult": 0.95, "mid_tol": 0.010, "cap": 11.0, "weight": 1.00, "unit": "年", "cool_min": 1, "cool_max": 3},
+        {"cycle": "Q", "name": "季线", "min_bars": 9, "lookback": 90, "pre": 6, "body_pct": 0.16, "body_ratio": 0.40, "close_pos": 0.64, "vol_rank": 0.62, "vol_mult": 1.00, "mid_tol": 0.015, "cap": 9.0, "weight": 0.82, "unit": "季", "cool_min": 1, "cool_max": 4},
+        {"cycle": "M", "name": "月线", "min_bars": 20, "lookback": 140, "pre": 8, "body_pct": 0.10, "body_ratio": 0.43, "close_pos": 0.66, "vol_rank": 0.66, "vol_mult": 1.05, "mid_tol": 0.020, "cap": 7.0, "weight": 0.62, "unit": "月", "cool_min": 1, "cool_max": 6},
+        {"cycle": "W", "name": "周线", "min_bars": 55, "lookback": 220, "pre": 12, "body_pct": 0.065, "body_ratio": 0.46, "close_pos": 0.68, "vol_rank": 0.70, "vol_mult": 1.10, "mid_tol": 0.025, "cap": 4.2, "weight": 0.34, "unit": "周", "cool_min": 2, "cool_max": 8},
+        {"cycle": "D", "name": "日线", "min_bars": 150, "lookback": 320, "pre": 20, "body_pct": 0.040, "body_ratio": 0.50, "close_pos": 0.70, "vol_rank": 0.75, "vol_mult": 1.15, "mid_tol": 0.030, "cap": 2.2, "weight": 0.16, "unit": "日", "cool_min": 3, "cool_max": 20},
+    ]
+
+    candidates = []
+    for cfg in cfgs:
+        p = build_period_ohlcv_df(d, cfg["cycle"])
+        if p is None or len(p) < cfg["min_bars"]:
+            continue
+        p = p.tail(cfg["lookback"]).reset_index(drop=True)
+        if len(p) < cfg["min_bars"]:
+            continue
+        p["range_pct"] = (p["high"] - p["low"]) / p["open"].replace(0, np.nan)
+        p["vol_pct_rank"] = p["volume"].rank(pct=True).fillna(0.0)
+        p["vol_ratio_med5"] = p["volume"] / p["vol_med_5"].replace(0, np.nan)
+        scan_end = max(1, len(p) - 1)
+        for i in range(1, scan_end):
+            row = p.iloc[i]
+            if not bool(row.get("is_bull", False)):
+                continue
+            body_pct = safe_float(row.get("body_pct", 0.0))
+            body_ratio = safe_float(row.get("body_ratio", 0.0))
+            close_pos = safe_float(row.get("close_pos", 0.0))
+            vol_rank = safe_float(row.get("vol_pct_rank", 0.0))
+            vol_mult = safe_float(row.get("vol_ratio_med5", 0.0))
+            anchor_mid = safe_float(row.get("entity_mid", 0.0))
+            anchor_top = safe_float(row.get("entity_top", 0.0))
+            anchor_bottom = safe_float(row.get("entity_bottom", 0.0))
+            anchor_vol = safe_float(row.get("volume", 0.0))
+            anchor_range_pct = safe_float(row.get("range_pct", 0.0))
+            if anchor_mid <= 0 or anchor_top <= anchor_bottom or anchor_vol <= 0:
+                continue
+            if body_pct < cfg["body_pct"] or body_ratio < cfg["body_ratio"] or close_pos < cfg["close_pos"]:
+                continue
+            if (vol_rank < cfg["vol_rank"]) and (vol_mult < cfg["vol_mult"]):
+                continue
+
+            pre = p.iloc[max(0, i - cfg["pre"]):i].copy()
+            if pre.empty:
+                continue
+            pre_high = safe_float(pre["high"].max())
+            pre_close_max = safe_float(pre["close"].max())
+            pre_close_med = safe_float(pre["close"].median())
+            pre_vol_med = safe_float(pre["volume"].median())
+            structure_breakout = (pre_high > 0 and safe_float(row.get("close", 0.0)) >= pre_high * 0.995) or (pre_close_max > 0 and safe_float(row.get("close", 0.0)) >= pre_close_max * 1.015)
+            repricing = pre_close_med > 0 and safe_float(row.get("close", 0.0)) >= pre_close_med * (1.0 + max(0.10, cfg["body_pct"] * 0.55))
+            volume_acceptance = (vol_rank >= max(cfg["vol_rank"], 0.72)) or (pre_vol_med > 0 and anchor_vol >= pre_vol_med * 1.25)
+            markup_score = 0.0
+            if structure_breakout:
+                markup_score += 2.2
+            if repricing:
+                markup_score += 1.4
+            if volume_acceptance:
+                markup_score += 1.4
+            if body_ratio >= 0.58:
+                markup_score += 0.8
+            if close_pos >= 0.78:
+                markup_score += 0.8
+            if body_pct >= cfg["body_pct"] * 1.60:
+                markup_score += 0.8
+            # 结构背景门控：没有突破/重新定价/量能接受，后面的缩量一律不定义为主动冷却。
+            if markup_score < 4.4 or not (structure_breakout or (repricing and volume_acceptance)):
+                continue
+
+            # V27.5 主动冷却只评价“当前正在发生的冷却窗口”，不能把锚定K之后所有周期都平均进去。
+            # 长期守中位属于锚定中位防守模型；主动冷却属于短中期 Expansion -> Stabilization 阶段。
+            after_full = p.iloc[i + 1:].copy().reset_index(drop=True)
+            min_w = int(cfg.get("cool_min", 2))
+            max_w = int(cfg.get("cool_max", 8))
+            if len(after_full) < min_w:
+                continue
+            if len(after_full) > max_w:
+                # 锚定K已经超出主动冷却有效窗口，不能继续按 cooling 加分。
+                continue
+            after = after_full.copy()
+            close_after = pd.to_numeric(after["close"], errors="coerce").dropna()
+            if close_after.empty or len(close_after) < min_w:
+                continue
+            tol = cfg["mid_tol"]
+            above_mid = close_after >= anchor_mid * (1.0 - tol)
+            close_above_mid_ratio = float(above_mid.mean())
+            breach_count = int((~above_mid).sum())
+            max_breach_streak = 0
+            cur_streak = 0
+            for ok in above_mid.tolist():
+                if not ok:
+                    cur_streak += 1
+                    max_breach_streak = max(max_breach_streak, cur_streak)
+                else:
+                    cur_streak = 0
+            mean_vol_after = safe_float(after["volume"].mean())
+            volume_contraction_ratio = mean_vol_after / anchor_vol if anchor_vol > 0 else 0.0
+            if len(after) >= 4:
+                first_half = after.iloc[:max(1, len(after)//2)]
+                last_half = after.iloc[max(1, len(after)//2):]
+                vol_stability = safe_float(last_half["volume"].mean()) / safe_float(first_half["volume"].mean()) if safe_float(first_half["volume"].mean()) > 0 else 1.0
+                range_contraction_ratio = safe_float(last_half["range_pct"].mean()) / max(anchor_range_pct, 1e-9)
+                range_decay = safe_float(last_half["range_pct"].mean()) <= safe_float(first_half["range_pct"].mean()) * 0.92 if safe_float(first_half["range_pct"].mean()) > 0 else False
+            else:
+                vol_stability = volume_contraction_ratio
+                range_contraction_ratio = safe_float(after["range_pct"].mean()) / max(anchor_range_pct, 1e-9)
+                range_decay = range_contraction_ratio <= 0.75
+
+            lows = pd.to_numeric(after["low"], errors="coerce").dropna().reset_index(drop=True)
+            higher_low_score = 0.0
+            if len(lows) >= 3:
+                first_low = safe_float(lows.iloc[:max(1, len(lows)//2)].min())
+                last_low = safe_float(lows.iloc[max(1, len(lows)//2):].min())
+                if first_low > 0 and last_low >= first_low * 0.98:
+                    higher_low_score += 1.0
+                if first_low > 0 and last_low >= first_low * 1.05:
+                    higher_low_score += 0.8
+                x = np.arange(len(lows), dtype=float)
+                try:
+                    slope = float(np.polyfit(x, lows.values.astype(float), 1)[0])
+                    if safe_float(lows.mean()) > 0 and slope / safe_float(lows.mean()) > 0.005 / max(1, len(lows)):
+                        higher_low_score += 0.7
+                except Exception:
+                    pass
+            higher_low_score = min(2.5, higher_low_score)
+
+            # 放量阴线分类：同一行为只给一个主标签，避免“放量阴线+缩量+修复”重复打分。
+            after2 = after.copy()
+            after2["is_big_bear"] = (after2["close"] < after2["open"]) & (((after2["open"] - after2["close"]) / after2["open"].replace(0, np.nan)) >= cfg["body_pct"] * 0.55) & (after2["volume"] >= anchor_vol * 0.55)
+            bear_count = int(after2["is_big_bear"].sum())
+            bear_event_type = "none"
+            bear_risk = 0.0
+            reaccumulation_score = 0.0
+            conflict_score = 0.0
+            if bear_count > 0:
+                bear_rows = after2[after2["is_big_bear"]].copy()
+                worst_bear = bear_rows.iloc[int(np.argmax(pd.to_numeric(bear_rows["volume"], errors="coerce").fillna(0).values))]
+                bear_close = safe_float(worst_bear.get("close", 0.0))
+                bear_low = safe_float(worst_bear.get("low", 0.0))
+                bear_vol = safe_float(worst_bear.get("volume", 0.0))
+                bear_range = max(safe_float(worst_bear.get("high", 0.0)) - safe_float(worst_bear.get("low", 0.0)), 1e-9)
+                bear_close_pos = (bear_close - bear_low) / bear_range
+                post_bear = after2.iloc[int(worst_bear.name) + 1:].copy() if str(worst_bear.name).isdigit() else pd.DataFrame()
+                repaired = False
+                post_stable = False
+                if not post_bear.empty:
+                    repaired = safe_float(post_bear["close"].max()) >= max(anchor_mid, bear_close) * 1.02
+                    post_stable = safe_float(post_bear["close"].min()) >= anchor_mid * (1.0 - tol * 1.5)
+                if bear_close < anchor_mid * (1.0 - tol) and bear_vol >= anchor_vol * 0.85 and (not repaired) and bear_close_pos <= 0.35:
+                    bear_event_type = "distribution"
+                    bear_risk -= 3.5
+                elif post_stable and repaired and bear_vol <= anchor_vol * 1.15:
+                    bear_event_type = "reaccumulation"
+                    reaccumulation_score += 2.2
+                elif close_above_mid_ratio >= 0.75 and bear_vol <= anchor_vol * 1.05:
+                    bear_event_type = "conflict_absorbed"
+                    conflict_score += 1.2
+                else:
+                    bear_event_type = "conflict_unconfirmed"
+                    conflict_score += 0.3
+                    if close_above_mid_ratio < 0.60:
+                        bear_risk -= 1.8
+
+            cooling_components = 0.0
+            if volume_contraction_ratio <= 0.72:
+                cooling_components += 1.4
+            elif volume_contraction_ratio <= 0.90:
+                cooling_components += 0.8
+            if vol_stability <= 1.05:
+                cooling_components += 0.8
+            if range_contraction_ratio <= 0.65 or range_decay:
+                cooling_components += 1.2
+            elif range_contraction_ratio <= 0.85:
+                cooling_components += 0.6
+            if close_above_mid_ratio >= 0.92 and max_breach_streak == 0:
+                cooling_components += 2.0
+            elif close_above_mid_ratio >= 0.80 and max_breach_streak <= 1:
+                cooling_components += 1.2
+            elif close_above_mid_ratio >= 0.65 and max_breach_streak <= 2:
+                cooling_components += 0.5
+            cooling_components += higher_low_score
+            if recent_daily_liquidity_ok:
+                cooling_components += 0.6
+            else:
+                cooling_components -= 1.2
+
+            # 没有价格稳定/中位防守的缩量，不允许得到主动冷却标签。
+            cooling_valid = (cooling_components >= 4.0 and close_above_mid_ratio >= 0.70 and max_breach_streak <= 2 and recent_daily_liquidity_ok)
+            cooling_score = 0.0
+            if cooling_valid:
+                cooling_score = min(cfg["cap"], (cooling_components + markup_score * 0.35) * cfg["weight"])
+            else:
+                cooling_score = max(0.0, min(cfg["cap"] * 0.30, (cooling_components - 1.5) * cfg["weight"]))
+
+            risk_penalty = bear_risk
+            if close_above_mid_ratio < 0.60 or max_breach_streak >= 3:
+                risk_penalty -= 3.0 if cfg["cycle"] in ["Y", "Q", "M"] else 1.5
+            if volume_contraction_ratio > 1.20 and range_contraction_ratio > 0.95 and close_above_mid_ratio < 0.75:
+                risk_penalty -= 1.5
+            risk_penalty = max(-8.0, min(0.0, risk_penalty))
+
+            daily_reexpansion_trigger = False
+            if cur_close > anchor_mid * (1.0 + tol) and cur_body_pct >= 0.025 and cur_pos >= 0.70 and cur_vol >= max(vol_ma20_d, 1.0) * 1.15:
+                daily_reexpansion_trigger = True
+            if anchor_top > 0 and cur_close >= anchor_top * 1.003 and cur_pos >= 0.70:
+                daily_reexpansion_trigger = True
+
+            # 主导标签互斥：只取一个主行为，分数不线性堆加。
+            dominant_behavior = "cooling" if cooling_valid else "neutral"
+            behavior_bonus = 0.0
+            if bear_event_type == "distribution":
+                dominant_behavior = "distribution"
+            elif bear_event_type == "reaccumulation" and cooling_valid:
+                dominant_behavior = "reaccumulation"
+                behavior_bonus = min(2.0, reaccumulation_score)
+            elif bear_event_type.startswith("conflict") and not cooling_valid:
+                dominant_behavior = "conflict"
+                behavior_bonus = min(1.0, conflict_score)
+            if daily_reexpansion_trigger and dominant_behavior in ["cooling", "reaccumulation"]:
+                behavior_bonus += 1.0
+
+            cycle_score = cooling_score + behavior_bonus + risk_penalty
+            cycle_score = max(0.0, min(cfg["cap"] + 2.0, cycle_score))
+            if cycle_score <= 0.1 and dominant_behavior != "distribution":
+                continue
+            try:
+                anchor_date_text = pd.to_datetime(row.get("date", "")).strftime("%Y-%m-%d")
+            except Exception:
+                anchor_date_text = str(row.get("date", ""))
+            grade = "C"
+            if dominant_behavior in ["cooling", "reaccumulation"] and cycle_score >= cfg["cap"] * 0.82 and risk_penalty >= -1.0:
+                grade = "S" if cfg["cycle"] in ["Y", "Q", "M"] else "A"
+            elif cycle_score >= cfg["cap"] * 0.62 and risk_penalty >= -2.0:
+                grade = "A"
+            elif cycle_score >= cfg["cap"] * 0.40:
+                grade = "B"
+            candidates.append({
+                "score": float(cycle_score), "cooling_score": float(cooling_score), "conflict_score": float(conflict_score),
+                "reaccumulation_score": float(reaccumulation_score), "risk_penalty": float(risk_penalty), "markup_score": float(markup_score),
+                "grade": grade, "dominant_behavior": dominant_behavior, "cycle": cfg["cycle"], "cycle_name": cfg["name"], "unit": cfg["unit"],
+                "anchor_date": anchor_date_text, "anchor_mid": float(anchor_mid), "anchor_top": float(anchor_top), "anchor_volume": float(anchor_vol),
+                "volume_contraction_ratio": float(volume_contraction_ratio), "range_contraction_ratio": float(range_contraction_ratio),
+                "close_above_mid_ratio": float(close_above_mid_ratio), "higher_low_score": float(higher_low_score),
+                "bear_event_type": bear_event_type, "bear_event_count": int(bear_count), "daily_reexpansion_trigger": bool(daily_reexpansion_trigger),
+                "defense_periods": int(len(after)), "active_window_min": int(cfg.get("cool_min", 0)), "active_window_max": int(cfg.get("cool_max", 0)),
+                "breach_streak": int(max_breach_streak), "recent_daily_liquidity_ok": bool(recent_daily_liquidity_ok),
+            })
+
+    if not candidates:
+        out = dict(empty)
+        out["detail"] = "未通过机构扩张门控：没有同时满足大周期强阳、结构突破/重新定价、量能接受后的稳定化背景"
+        return out
+    priority = {"distribution": -1, "conflict": 0, "neutral": 1, "cooling": 2, "reaccumulation": 3}
+    cyc_rank = {"Y": 5, "Q": 4, "M": 3, "W": 2, "D": 1}
+    candidates = sorted(candidates, key=lambda x: (x["score"], priority.get(x["dominant_behavior"], 0), cyc_rank.get(x["cycle"], 0)), reverse=True)
+    best = candidates[0]
+    resonance = [c for c in candidates[1:] if c["dominant_behavior"] in ["cooling", "reaccumulation"] and c["grade"] in ["S", "A"] and c["risk_penalty"] >= -1.0]
+    resonance_add = min(1.5, len(resonance) * 0.5)
+    total = max(0.0, min(13.0, best["score"] + resonance_add))
+    risk_penalty = max(-8.0, min(0.0, best["risk_penalty"] + sum(c["risk_penalty"] for c in resonance) * 0.20))
+    total = max(0.0, min(13.0, total + min(0.0, risk_penalty - best["risk_penalty"])))
+    if best["dominant_behavior"] == "distribution":
+        grade = "D"
+    elif total >= 10.5 and best["grade"] in ["S", "A"]:
+        grade = "S"
+    elif total >= 7.5:
+        grade = "A"
+    elif total >= 4.5:
+        grade = "B"
+    else:
+        grade = "C"
+    behavior_cn = {
+        "cooling": "主动冷却", "reaccumulation": "放量阴线后再换手承接", "conflict": "大冲突待确认",
+        "distribution": "派发风险", "neutral": "中性稳定化"
+    }.get(best["dominant_behavior"], best["dominant_behavior"])
+    flag = f"{best['cycle_name']}{behavior_cn}{grade}级"
+    if resonance:
+        flag += f"+{len(resonance)}周期共振"
+    detail = (
+        f"{best['cycle_name']}机构扩张K({best['anchor_date']})后进入{behavior_cn}："
+        f"扩张门控{best['markup_score']:.1f}，中位{best['anchor_mid']:.2f}，"
+        f"后续{best['defense_periods']}{best['unit']}处于主动冷却有效窗口({best.get('active_window_min',0)}-{best.get('active_window_max',0)}{best['unit']})，"
+        f"收盘守中位比例{best['close_above_mid_ratio']:.0%}，"
+        f"量能收缩比{best['volume_contraction_ratio']:.2f}，波动收缩比{best['range_contraction_ratio']:.2f}，"
+        f"低点抬高{best['higher_low_score']:.1f}，放量阴线分类{best['bear_event_type']}({best['bear_event_count']}次)，"
+        f"日线再扩张触发{'是' if best['daily_reexpansion_trigger'] else '否'}，风险{risk_penalty:.1f}"
+    )
+    return {
+        "score": float(total), "cooling_score": float(best["cooling_score"]), "conflict_score": float(best["conflict_score"]),
+        "reaccumulation_score": float(best["reaccumulation_score"]), "risk_penalty": float(risk_penalty), "markup_score": float(best["markup_score"]),
+        "grade": grade, "dominant_behavior": best["dominant_behavior"], "flag": flag, "detail": detail,
+        "cycle": best["cycle"], "anchor_date": best["anchor_date"], "anchor_mid": float(best["anchor_mid"]),
+        "anchor_top": float(best["anchor_top"]), "anchor_volume": float(best["anchor_volume"]),
+        "volume_contraction_ratio": float(best["volume_contraction_ratio"]), "range_contraction_ratio": float(best["range_contraction_ratio"]),
+        "close_above_mid_ratio": float(best["close_above_mid_ratio"]), "higher_low_score": float(best["higher_low_score"]),
+        "bear_event_type": best["bear_event_type"], "bear_event_count": int(best["bear_event_count"]),
+        "daily_reexpansion_trigger": bool(best["daily_reexpansion_trigger"]), "resonance_count": int(len(resonance)),
+    }
 
 def _count_consecutive_true(values):
     count = 0
@@ -1699,7 +2440,7 @@ def normalize_full_history_cache_df(df):
     if d.empty:
         return None
     if len(d) < before:
-        pass
+        d.attrs["dropped_non_positive_ohlc_rows"] = int(before - len(d))
     d["pct_chg"] = d["close"].pct_change().fillna(0) * 100
     d["turnover"] = 0.0
     d = d[["date", "open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover"]]
@@ -6609,6 +7350,8 @@ def calc_deep_rows(df, code):
     _active_deep_indices = set(range(max(0, len(df) - max(1, CHECK_DAYS)), len(df)))
 
     monthly_ctx = detect_monthly_midline_reclaim(df)
+    anchor_midline_ctx = detect_anchored_big_bull_midline_defense(df)
+    institutional_cooling_ctx = detect_institutional_cooling_behavior(df, anchor_midline_ctx)
 
     limit_threshold = get_limit_threshold(code)
 
@@ -7712,6 +8455,46 @@ def calc_deep_rows(df, code):
     extra["monthly_volume_score"] = float(monthly_ctx.get("volume_score", 0.0))
     extra["monthly_detail"] = str(monthly_ctx.get("detail", ""))
 
+    # V27.3：年/季/月/周/日锚定超级阳线中位防守模型。
+    # 拆成结构、长期防守、日线触发、风险四块，分别进入不同评分块，避免与月线中轨、压力带、普通强阳重复加分。
+    extra["score_anchor_big_bull_midline"] = float(anchor_midline_ctx.get("score", 0.0))
+    extra["anchor_midline_structure_score"] = float(anchor_midline_ctx.get("structure_score", 0.0))
+    extra["anchor_midline_hold_score"] = float(anchor_midline_ctx.get("hold_score", 0.0))
+    extra["anchor_midline_trigger_score"] = float(anchor_midline_ctx.get("trigger_score", 0.0))
+    extra["anchor_midline_risk_penalty"] = float(anchor_midline_ctx.get("risk_penalty", 0.0))
+    extra["anchor_midline_grade"] = str(anchor_midline_ctx.get("grade", ""))
+    extra["anchor_midline_flag"] = str(anchor_midline_ctx.get("flag", ""))
+    extra["anchor_midline_detail"] = str(anchor_midline_ctx.get("detail", ""))
+    extra["anchor_midline_cycle"] = str(anchor_midline_ctx.get("cycle", ""))
+    extra["anchor_midline_date"] = str(anchor_midline_ctx.get("anchor_date", ""))
+    extra["anchor_midline_level"] = float(anchor_midline_ctx.get("anchor_mid", 0.0))
+    extra["anchor_midline_top"] = float(anchor_midline_ctx.get("anchor_top", 0.0))
+    extra["anchor_midline_bottom"] = float(anchor_midline_ctx.get("anchor_bottom", 0.0))
+    extra["anchor_midline_defense_periods"] = int(anchor_midline_ctx.get("defense_periods", 0))
+    extra["anchor_midline_breach_count"] = int(anchor_midline_ctx.get("breach_count", 0))
+    extra["anchor_midline_daily_trigger"] = bool(anchor_midline_ctx.get("daily_trigger", False))
+
+    # V27.4：机构级主动冷却/再换手/大冲突行为引擎。
+    # 先做机构扩张门控，再判断扩张后的稳定化；缩量、波动收缩、中位防守、低点抬高只作为同一行为的组成因子，避免重复加分。
+    extra["score_institutional_cooling"] = float(institutional_cooling_ctx.get("score", 0.0))
+    extra["institutional_cooling_score"] = float(institutional_cooling_ctx.get("cooling_score", 0.0))
+    extra["institutional_conflict_score"] = float(institutional_cooling_ctx.get("conflict_score", 0.0))
+    extra["institutional_reaccumulation_score"] = float(institutional_cooling_ctx.get("reaccumulation_score", 0.0))
+    extra["institutional_behavior_risk_penalty"] = float(institutional_cooling_ctx.get("risk_penalty", 0.0))
+    extra["institutional_markup_score"] = float(institutional_cooling_ctx.get("markup_score", 0.0))
+    extra["institutional_behavior_grade"] = str(institutional_cooling_ctx.get("grade", ""))
+    extra["institutional_dominant_behavior"] = str(institutional_cooling_ctx.get("dominant_behavior", ""))
+    extra["institutional_behavior_flag"] = str(institutional_cooling_ctx.get("flag", ""))
+    extra["institutional_behavior_detail"] = str(institutional_cooling_ctx.get("detail", ""))
+    extra["institutional_behavior_cycle"] = str(institutional_cooling_ctx.get("cycle", ""))
+    extra["institutional_behavior_anchor_date"] = str(institutional_cooling_ctx.get("anchor_date", ""))
+    extra["institutional_behavior_anchor_mid"] = float(institutional_cooling_ctx.get("anchor_mid", 0.0))
+    extra["institutional_volume_contraction_ratio"] = float(institutional_cooling_ctx.get("volume_contraction_ratio", 0.0))
+    extra["institutional_range_contraction_ratio"] = float(institutional_cooling_ctx.get("range_contraction_ratio", 0.0))
+    extra["institutional_close_above_mid_ratio"] = float(institutional_cooling_ctx.get("close_above_mid_ratio", 0.0))
+    extra["institutional_bear_event_type"] = str(institutional_cooling_ctx.get("bear_event_type", ""))
+    extra["institutional_daily_reexpansion_trigger"] = bool(institutional_cooling_ctx.get("daily_reexpansion_trigger", False))
+
     # V11.1：月线高度/大周期空间风险。月线修复本身加分，但如果已经远离中轨、年内偏高、压力贴脸，要降级。
     extra["score_monthly_height_space"] = 0.0
     extra.loc[df["long_pos_250"] <= 0.35, "score_monthly_height_space"] += 8
@@ -7734,6 +8517,10 @@ def calc_deep_rows(df, code):
     ], axis=1)
     extra["structure_key_level"] = defense_candidates.max(axis=1)
     extra["defense_source"] = "均线/前高粗防守"
+    mask_anchor_midline = (extra["anchor_midline_level"] > 0) & (df["close"] >= extra["anchor_midline_level"] * 0.985)
+    # 年/季/月锚定超级阳线中位属于固定机构成本防守线；只在当前仍站在线上时参与真实防守位。
+    extra.loc[mask_anchor_midline, "structure_key_level"] = extra.loc[mask_anchor_midline, "anchor_midline_level"]
+    extra.loc[mask_anchor_midline, "defense_source"] = "锚定超级阳线中位"
     # 结构颈线/首次倍量100%位是结构关键位；真实交易防守位必须给缓冲。
     mask_struct = extra["structure_neckline"] > 0
     extra.loc[mask_struct, "structure_key_level"] = extra.loc[mask_struct, "structure_neckline"]
@@ -7747,6 +8534,7 @@ def calc_deep_rows(df, code):
     extra.loc[mask_struct, "defense_buffer_pct"] = 0.018
     extra.loc[extra["score_advanced_ao_kou"] >= 8, "defense_buffer_pct"] = 0.020
     extra.loc[extra["limit_up"], "defense_buffer_pct"] = 0.018
+    extra.loc[mask_anchor_midline, "defense_buffer_pct"] = 0.020
 
     extra["real_defense_level"] = extra["structure_key_level"] * (1 - extra["defense_buffer_pct"])
     # 兼容原字段：defense_level现在代表真实交易防守位；structure_key_level单独输出。
@@ -7876,6 +8664,8 @@ def calc_deep_rows(df, code):
     extra["score_v121_risk_gate_block"] = (
         extra["score_penalty"].fillna(0)
         + extra["score_overlap_adjustment"].fillna(0) * 0.60
+        + extra["anchor_midline_risk_penalty"].fillna(0)
+        + extra["institutional_behavior_risk_penalty"].fillna(0)
     ).clip(-32.0, 0.0)
 
     # 结构种子块：大周期、凹口/平台、最大量阳K实底/高点、黄金倍量等统一到关键结构位，不再逐项相加。
@@ -7883,6 +8673,7 @@ def calc_deep_rows(df, code):
         _structure_merged_allowance.fillna(0)
         + extra["score_monthly_cycle"].fillna(0) * 0.60
         + extra["score_long_cycle"].fillna(0) * 0.45
+        + extra["anchor_midline_structure_score"].fillna(0) * 0.70
     ).clip(0.0, 34.0)
 
     # 突破质量块：所有关键位突破只判断一次突破质量。影线试探/假突破不得因为多个模块重复加分。
@@ -7891,12 +8682,14 @@ def calc_deep_rows(df, code):
         extra["score_multi_tf_break_quality"].fillna(0) * 0.85,
         extra["score_pattern"].fillna(0) * 0.65,
     ], axis=1)
-    extra["score_v121_breakout_quality_block"] = _breakout_candidates.max(axis=1).clip(0.0, 16.0)
+    extra["score_v121_breakout_quality_block"] = (_breakout_candidates.max(axis=1) + extra["anchor_midline_trigger_score"].fillna(0) * 0.40).clip(0.0, 16.0)
 
     # 回踩承接块：BBIBOLL/BBI/均线/强阳实体/涨停实体/大量阳K实底/结构关键位回踩统一归为承接。
     extra["score_v121_pullback_confirm_block"] = (
         extra["score_v12_pullback_entry"].fillna(0) * 1.25
         + extra["score_carry_structure"].fillna(0) * 0.80
+        + extra["anchor_midline_hold_score"].fillna(0) * 0.55
+        + extra["score_institutional_cooling"].fillna(0) * 0.45
         + extra["score_stepwise_push"].fillna(0) * 0.35
         + extra["score_v125_step_platform_lift"].fillna(0) * 0.55
         + extra["score_v126_multiframe_center_volume"].fillna(0) * 0.35
@@ -7909,6 +8702,7 @@ def calc_deep_rows(df, code):
         + extra["score_yang_yin_volume"].fillna(0) * 0.50
         + extra["score_v125_timing_window"].fillna(0) * 0.25
         + extra["score_v126_multiframe_center_volume"].fillna(0) * 0.20
+        + extra["institutional_reaccumulation_score"].fillna(0) * 0.25
         + extra["score_count"].fillna(0) * 0.30
     ).clip(-5.0, 22.0)
 
@@ -7964,6 +8758,7 @@ def calc_deep_rows(df, code):
         + "/交易" + extra["score_v121_trade_quality_block"].round(1).astype(str)
         + "/时窗" + extra["score_v125_timing_block"].round(1).astype(str)
         + "/充分" + extra["score_v126_timing_sufficiency"].round(1).astype(str)
+        + "/锚中" + extra["score_anchor_big_bull_midline"].round(1).astype(str)
         + "/风险" + extra["score_v121_risk_gate_block"].round(1).astype(str)
     )
 
@@ -8416,6 +9211,9 @@ def process_stock_base(row):
     if recent.empty:
         return rows
 
+    # V27.1：200日K线组合记忆在基础层计算，按信号日期截断，避免未来函数。
+    _v27_pattern_memo = {}
+
     for _, r in recent.iterrows():
         rows.append({
             "code": code,
@@ -8491,6 +9289,15 @@ def process_stock_base(row):
             "long_pos_250": float(r["long_pos_250"]) if pd.notna(r["long_pos_250"]) else 0,
             "xg": bool(r["xg"]),
         })
+        # V27.1：把200日阳包阴/双阳夹阴/上涨分手线/跳空等形态记忆接入基础行。
+        try:
+            _asof = str(r.get("date", ""))
+            if _asof not in _v27_pattern_memo:
+                _v27_pattern_memo[_asof] = score_200d_bullish_pattern_memory(df, as_of_date=_asof)
+            rows[-1].update(_v27_pattern_memo.get(_asof, {}))
+        except Exception as _e:
+            rows[-1]["pattern_memory_score"] = 0.0
+            rows[-1]["pattern_memory_reason"] = f"200日K线组合记忆计算失败：{str(_e)[:80]}"
 
     return rows
 
@@ -8740,6 +9547,8 @@ def process_stock_deep(row):
         rr["risk_hard_exclude"] = bool(risk.get("hard_exclude", False))
         rr["risk_flags"] = "；".join(risk.get("flags", []))
         rr["risk_note"] = str(risk.get("note", ""))
+        rr["risk_data_status"] = str(risk.get("risk_data_status", "ok"))
+        rr["risk_action"] = str(risk.get("risk_action", ""))
         rr["total_score"] = float(rr.get("total_score", 0.0)) + rr["score_regulatory_risk"]
         if rr["risk_hard_exclude"]:
             rr["total_score"] = min(rr["total_score"], 59.0)
@@ -11051,14 +11860,32 @@ def save_v19_1_outputs(final_signals, diagnostics, audited_rows, dates=None, met
             f.write("\n".join(lines))
         print(f"V19.3日报已保存：{V19_DAILY_REPORT_FILE}")
 
+        # V27.1：复盘归因不再写“占位”。优先读取条件概率表/回测交易记录，输出当前可用的T+窗口统计；
+        # 若暂无历史交易记录，则明确标记pending，不伪装成已完成复盘。
+        condition_table = build_v20_condition_probability_placeholder(payload)
         review_lines = [
-            "一号员工 V19.3 复盘归因报告占位",
+            "一号员工 V19.3/V27 复盘归因报告",
             f"生成时间：{bj_time_str()} 北京时间",
-            "当前版本已保存每日Top3与后台跟踪池；下一步接入历史score_cards后，可生成T+1/T+3/T+5/T+8/T+13/T+20复盘。",
+            f"条件概率来源：{condition_table.get('source','unknown')}",
+            f"复盘窗口：{','.join([str(x) for x in V20_REVIEW_WINDOWS])}",
+            "",
+            "【按交易假设统计】",
         ]
+        for hypo, stat in (condition_table.get("by_hypothesis", {}) or {}).items():
+            line = f"- {hypo}：样本{stat.get('sample_count',0)}，待跟踪{stat.get('pending_count',0)}"
+            for w in V20_REVIEW_WINDOWS:
+                ww = stat.get(f"T+{w}", {}) or {}
+                if ww.get("sample_count", 0):
+                    line += f"｜T+{w}胜率{safe_float(ww.get('win_rate',0)):.1%} 中位{safe_float(ww.get('median_return',0)):.1%}"
+            if stat.get("strategy"):
+                ss = stat.get("strategy", {})
+                line += f"｜策略胜率{safe_float(ss.get('win_rate',0)):.1%} 中位{safe_float(ss.get('median_return',0)):.1%}"
+            review_lines.append(line)
+        if len(review_lines) <= 6:
+            review_lines.append("暂无可用历史交易记录；本次信号已写入pending池，后续T+窗口补全后再参与条件概率统计。")
         with open(V19_REVIEW_REPORT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(review_lines))
-        print(f"V19.3复盘报告占位已保存：{V19_REVIEW_REPORT_FILE}")
+        print(f"V19.3/V27复盘归因报告已保存：{V19_REVIEW_REPORT_FILE}")
     except Exception as e:
         print(f"V19.3输出保存失败：{e}")
 
@@ -11270,9 +12097,10 @@ def v2562_apply_trade_invalidation(row, reason=None):
 
 
 def detect_v201_low_volume_precise_trigger_line_from_row(row):
-    """V20.1日线小平台低量精准触发线。
-    说明：真正精算需要日线平台OHLCV；本函数先承接已有字段/价格计划，若未来深度层计算出
-    v201_precise_trigger_line，将直接使用。没有该字段时，只做报告占位，不替代最终压力上沿。
+    """V20.1日线小平台低量精准触发线（实算版）。
+    只读取本地全历史K线缓存，不联网，不触碰生产链路。
+    逻辑：在大周期/供需压力带明确时，切回最近日线小平台，寻找平台内低量分位K的最高价、实体顶、收盘共振，
+    作为短线精确触发线；若无法拿到日线序列，才返回invalid并使用旧字段提示。
     """
     explicit = _v20_float(row, "v201_precise_trigger_line", "low_volume_precise_trigger_line", "daily_precise_trigger_line")
     if explicit > 0:
@@ -11282,9 +12110,66 @@ def detect_v201_low_volume_precise_trigger_line_from_row(row):
             "source": "已计算低量平台精准线",
             "note": str(row.get("v201_precise_trigger_note", "平台内低量K高点/实体顶/收盘共振线")),
         }
+    try:
+        df = _v212_get_daily_df(row)
+        if df is not None and not df.empty and len(df) >= 45:
+            if row.get("date") and "date" in df.columns:
+                asof = str(pd.to_datetime(str(row.get("date"))).strftime("%Y-%m-%d"))
+                df = df[df["date"].astype(str) <= asof].copy()
+            x = _v212_norm_df(df).tail(80).reset_index(drop=True)
+            if len(x) >= 35:
+                cur_close = safe_float(x["close"].iloc[-1])
+                # 候选平台：最近18~45日，要求价格收敛、无明显放量长阴破坏。
+                best = None
+                for win in [18, 24, 30, 36, 45]:
+                    if len(x) < win:
+                        continue
+                    seg = x.tail(win).copy()
+                    hi = safe_float(seg["high"].max()); lo = safe_float(seg["low"].min())
+                    mid = (hi + lo) / 2 if hi > 0 and lo > 0 else 0
+                    if mid <= 0:
+                        continue
+                    width = hi / lo - 1 if lo > 0 else 9
+                    if width > 0.18:
+                        continue
+                    rng = (seg["high"] - seg["low"]).replace(0, np.nan)
+                    body_top = seg[["open", "close"]].max(axis=1)
+                    body_ratio = ((seg["close"] - seg["open"]).abs() / rng).fillna(0)
+                    vol_ma = safe_float(seg["volume"].mean())
+                    long_bear = seg[(seg["close"] < seg["open"]) & (body_ratio >= 0.55) & (seg["volume"] >= vol_ma * 1.35)]
+                    if len(long_bear) >= 2:
+                        continue
+                    # 低量分位K：平台内成交量低于35%分位，且位置接近平台上半区，取其高点/实体顶/收盘共振。
+                    q35 = safe_float(seg["volume"].quantile(0.35))
+                    lowvol = seg[(seg["volume"] <= q35) & (seg["high"] >= mid * 0.985)].copy()
+                    if lowvol.empty:
+                        continue
+                    line_high = safe_float(lowvol["high"].quantile(0.80))
+                    line_body = safe_float(body_top.loc[lowvol.index].quantile(0.80))
+                    line_close = safe_float(lowvol["close"].quantile(0.80))
+                    line = max(line_high, line_body, line_close)
+                    if line <= 0:
+                        continue
+                    dist = abs(cur_close / line - 1) if line > 0 else 9
+                    score = 0.0
+                    score += max(0.0, 4.0 - width * 20.0)
+                    score += 2.0 if dist <= 0.035 else (1.0 if dist <= 0.06 else 0.0)
+                    score += 1.0 if len(lowvol) >= max(3, win // 8) else 0.0
+                    score += 1.0 if safe_float(seg["low"].tail(max(5, win//4)).min()) >= lo * 1.01 else 0.0
+                    item = {"score": score, "line": line, "win": win, "width": width, "dist": dist, "lowvol_n": len(lowvol)}
+                    if best is None or item["score"] > best["score"]:
+                        best = item
+                if best and best["score"] >= 4.0:
+                    return {
+                        "line": round(float(best["line"]), 3),
+                        "valid": True,
+                        "source": "日线小平台低量精准触发线实算",
+                        "note": f"最近{best['win']}日平台宽度{best['width']:.1%}，低量K共振{best['lowvol_n']}根，当前距线{best['dist']:.1%}",
+                    }
+    except Exception as e:
+        return {"line": 0.0, "valid": False, "source": "日线精算异常", "note": str(e)[:120]}
+
     m = v20_trade_metrics(row)
-    # 若大周期压力带明确，但尚未有精算线，则用供需压力带下沿/价格计划标准买区上沿做弱占位。
-    # 该占位只用于提示“需要日线精算”，不参与A档强确认。
     approx = 0.0
     if m["core_lower"] > 0 and m["core_pressure"] > 0:
         approx = m["core_lower"]
@@ -11293,10 +12178,9 @@ def detect_v201_low_volume_precise_trigger_line_from_row(row):
     return {
         "line": float(approx),
         "valid": False,
-        "source": "待深度层计算",
-        "note": "需在大周期压力带明确时，切回日线小平台，寻找平台内低量分位K最高价与平台上沿/实体顶/收盘共振线。",
+        "source": "未形成可验证低量平台线",
+        "note": "本次未在缓存日线中找到收敛平台+低量K共振；不作为A档强确认，只保留观察提示。",
     }
-
 
 def detect_v20_main_hypothesis(row):
     """把候选从指标堆叠归因到一个主交易假设。"""
@@ -11848,51 +12732,83 @@ def _v26_market_env_score():
 
 
 def _v26_card_explosion_eve(row):
-    # 爆发前夜：压缩、平稳量、资金攻击记忆、关键位贴近、时间窗口共同刻画。
+    # V27.5 爆发前夜卡：旧字段只作为“种子/证据”，不再把V20/V21/V26同源结构分二次拼盘。
     parts = []
     s = 0.0
-    base_eve = max(
+    seed_candidates = [
         safe_float(row.get("base_explosion_eve_score", 0)),
         safe_float(row.get("v23_explosion_eve_score", 0)),
         safe_float(row.get("explosion_eve_score", 0)),
-        safe_float(row.get("v201_structure_position", 0)) * 1.2,
-    )
-    if base_eve > 0:
-        s += min(7.0, base_eve / 2.0)
-        parts.append("已有爆发前夜/结构位置种子")
-    vol_abs = max(safe_float(row.get("v23_supply_absorption_score", 0)), safe_float(row.get("supply_absorption_score", 0)))
-    if vol_abs >= 8:
-        s += 4.0; parts.append("供应吸收/平台压缩较明显")
-    elif vol_abs >= 4:
-        s += 2.0; parts.append("存在供应吸收迹象")
-    if safe_float(row.get("v20_target_dist", row.get("target_dist", 0))) >= 0.12:
-        s += 2.5; parts.append("上方空间支持爆发")
-    if safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) <= 0.07 and safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0))) > 0:
-        s += 2.5; parts.append("距离防守位较舒服")
-    if safe_float(row.get("time_window_score", row.get("v126_time_window_score", 0))) > 0:
-        s += 2.0; parts.append("存在时间窗口/蓄势成熟线索")
-    if safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0)))) >= 1.8:
-        s += 2.0; parts.append("赔率达到爆发前夜候选要求")
-    return _v26_clip(s, 0, 20), parts or ["爆发前夜证据不足，主要依赖旧模型结构分"]
+    ]
+    seed = max(seed_candidates) if seed_candidates else 0.0
+    # v201_structure_position 与关键结构/压力/凹口高度同源，只允许小额种子分。
+    struct_seed = safe_float(row.get("v201_structure_position", 0))
+    if seed >= 12:
+        s += 5.0; parts.append("爆发前夜独立种子强")
+    elif seed >= 7:
+        s += 3.2; parts.append("爆发前夜种子成立")
+    elif struct_seed >= 10:
+        s += 1.5; parts.append("结构位置提供轻量种子，不与关键结构重复加分")
 
+    compression_group = max(
+        safe_float(row.get("compression_score", 0)),
+        safe_float(row.get("flat_volume_score", 0)),
+        safe_float(row.get("platform_volume_lift_score", 0)),
+        safe_float(row.get("score_institutional_cooling", 0)) * 0.55,
+    )
+    if compression_group >= 8:
+        s += 4.0; parts.append("扩张后压缩/平稳量证据强")
+    elif compression_group >= 4:
+        s += 2.2; parts.append("有压缩/平稳量证据")
+
+    # 空间、RR、防守位是交易上下文，允许独立加分。
+    if safe_float(row.get("v20_target_dist", row.get("target_dist", 0))) >= 0.12:
+        s += 2.2; parts.append("上方空间支持爆发")
+    defense_dist = safe_float(row.get("v20_defense_dist", row.get("defense_dist", 0)))
+    if 0 < defense_dist <= 0.07:
+        s += 2.2; parts.append("距离防守位较舒服")
+    if safe_float(row.get("time_window_score", row.get("v126_time_window_score", 0))) > 0:
+        s += 1.5; parts.append("存在时间窗口/蓄势成熟线索")
+    if safe_float(row.get("v20_rr", row.get("risk_reward_ratio", row.get("rr", 0)))) >= 1.8:
+        s += 1.8; parts.append("赔率达到爆发前夜候选要求")
+    return _v26_clip(s, 0, 20), parts or ["爆发前夜证据不足：没有主导压缩/时间/交易上下文共振"]
 
 def _v26_card_key_structure(row):
+    # V27.5 关键结构卡：按同源组取最大/封顶，避免压力、凹口、月线修复、供应吸收来自同一段K线时重复堆分。
     parts = []
-    s = 0.0
+    pressure_group = 0.0
     pressure_grade = str(row.get("v212_pressure_grade", row.get("v15_model_grade", row.get("pressure_zone_grade", ""))))
     if pressure_grade in ["S", "A"] or "S" in pressure_grade or "A" in pressure_grade:
-        s += 5.0; parts.append("核心压力带/关键结构位质量高")
+        pressure_group = 5.0; parts.append("核心压力带/关键结构位质量高")
     elif pressure_grade:
-        s += 2.0; parts.append("有压力带/关键结构位记录")
-    if safe_float(row.get("v201_structure_position", 0)) >= 12:
-        s += 4.0; parts.append("结构位置评分高")
-    elif safe_float(row.get("v201_structure_position", 0)) >= 8:
-        s += 2.5; parts.append("结构位置尚可")
-    for k, label in [("v23_supply_absorption_score", "大级别供应吸收"), ("v231_shadow_acceptance_score", "长上影供应接受度"), ("notch_score", "凹口/平台"), ("monthly_repair_score", "大周期修复")]:
-        if safe_float(row.get(k, 0)) > 0:
-            s += 1.8; parts.append(label)
-    return _v26_clip(s, 0, 15), parts or ["关键结构位证据一般"]
+        pressure_group = 2.2; parts.append("有压力带/关键结构位记录")
 
+    position_group = 0.0
+    pos = safe_float(row.get("v201_structure_position", 0))
+    if pos >= 12:
+        position_group = 3.2; parts.append("结构位置评分高")
+    elif pos >= 8:
+        position_group = 2.0; parts.append("结构位置尚可")
+
+    big_cycle_group = 0.0
+    notch = safe_float(row.get("notch_score", 0))
+    monthly = safe_float(row.get("monthly_repair_score", 0))
+    anchor = safe_float(row.get("score_anchor_midline", row.get("anchored_big_bull_midline_score", 0)))
+    if max(notch, monthly, anchor) > 0:
+        big_cycle_group = min(3.0, max(notch * 0.30, monthly * 0.25, anchor * 0.35, 1.4))
+        labels = []
+        if notch > 0: labels.append("凹口/平台")
+        if monthly > 0: labels.append("大周期修复")
+        if anchor > 0: labels.append("锚定大阳中位")
+        parts.append("/".join(labels) + "同源组封顶")
+
+    # 供应吸收、影线接受度已有独立资金/供应卡，这里只允许边界校准小分。
+    boundary_group = 0.0
+    if max(safe_float(row.get("v23_supply_absorption_score", 0)), safe_float(row.get("v231_shadow_acceptance_score", 0))) > 0:
+        boundary_group = 1.2; parts.append("供应/影线只作结构边界校准，不重复计大分")
+
+    s = pressure_group + min(3.2, max(position_group, big_cycle_group)) + boundary_group
+    return _v26_clip(s, 0, 15), parts or ["关键结构位证据一般"]
 
 def _v26_card_supply_absorption(row):
     parts = []
@@ -12070,6 +12986,68 @@ def _v26_freshness_score(row):
     return 25.0, f"信号偏老/可能过期，约{age}天"
 
 
+def _v26_primary_model_gate(row, cards):
+    """V27.5 主导买点模型门控：先判定是否命中A/S级主模型，再允许分数排序。
+    目的：正式买入池不是六个因子凑够80分，而是必须有一个清晰主导买点。
+    """
+    r = row
+    candidates = []
+    pricing = safe_float(cards.get("pricing", 0))
+    acceptance = safe_float(cards.get("acceptance", 0))
+    breakout = safe_float(cards.get("breakout_expansion", 0))
+    key_structure = safe_float(cards.get("key_structure", 0))
+    explosion = safe_float(cards.get("explosion_eve", 0))
+    supply = safe_float(cards.get("supply_absorption", 0))
+    execution = safe_float(cards.get("execution", 0))
+
+    def add_model(name, score, grade, reason):
+        candidates.append({"model": name, "score": float(score), "grade": grade, "reason": reason})
+
+    # 1. 核心压力带/结构位高级突破：必须有结构 + 突破/扩张 + 交易定价。
+    pressure_grade = str(r.get("v212_pressure_grade", r.get("v15_model_grade", r.get("pressure_zone_grade", ""))))
+    action = str(r.get("v212_action", ""))
+    if (pressure_grade in ["S", "A"] or "S" in pressure_grade or "A" in pressure_grade or action.startswith("V21.2正式")):
+        score = key_structure + breakout + pricing + min(2.0, execution)
+        if key_structure >= 5.0 and breakout >= 5.0 and pricing >= 6.0:
+            add_model("核心压力带/关键结构高级突破", score, "S" if score >= 22 else "A", "结构突破、量价扩张和RR同时成立")
+
+    # 2. 回踩/承接二买：必须有关键结构背景 + 承接质量 + RR，不能只靠分数。
+    pullback_signal = max(
+        safe_float(r.get("v20_pullback", r.get("pullback_score", 0))),
+        safe_float(r.get("volume_after_flat_acceptance_score", r.get("v212_flat_acceptance_score", 0))),
+        safe_float(r.get("score_anchor_midline", r.get("anchored_big_bull_midline_score", 0))) * 0.35,
+    )
+    if pullback_signal > 0 and key_structure >= 4.5 and acceptance >= 6.5 and pricing >= 6.0:
+        score = key_structure + acceptance + pricing + min(2.0, execution)
+        add_model("关键位回踩承接/二买", score, "S" if score >= 21 else "A", "关键位、防守位与承接确认同时成立")
+
+    # 3. 爆发前夜压缩：必须有机构扩张后的压缩/供应吸收 + 触发或承接 + 定价。
+    if explosion >= 10.0 and supply >= 6.0 and pricing >= 6.0 and max(acceptance, breakout) >= 4.5:
+        score = explosion + supply + max(acceptance, breakout) + pricing
+        add_model("爆发前夜压缩蓄势", score, "S" if score >= 28 else "A", "压缩、供应吸收、触发/承接、RR共振")
+
+    # 4. 机构主动冷却/再换手：V27.5独立行为引擎必须给出A/S，且不能只有冷却没有日线再扩张或承接。
+    beh_grade = str(r.get("institutional_behavior_grade", ""))
+    beh = str(r.get("institutional_dominant_behavior", ""))
+    beh_score = safe_float(r.get("score_institutional_cooling", 0))
+    beh_trigger = bool(r.get("institutional_daily_reexpansion_trigger", False)) or max(acceptance, breakout) >= 4.5
+    if beh in ["cooling", "reaccumulation"] and beh_grade in ["S", "A"] and beh_score >= 7.0 and beh_trigger and pricing >= 5.5:
+        score = beh_score + pricing + max(acceptance, breakout)
+        add_model("机构主动冷却后再扩张", score, "S" if beh_grade == "S" and score >= 18 else "A", "机构扩张后的有效冷却/再换手，并出现日线触发或承接")
+
+    # 5. 低位强启动：保留原模型里非压力带路径，但必须低位、量价触发和RR同时成立。
+    low_level = safe_float(r.get("v201_structure_position", 0)) >= 8 and safe_float(r.get("v20_chase_risk", r.get("chase_risk", 0))) <= 0.08
+    if low_level and breakout >= 6.0 and pricing >= 6.0 and acceptance >= 4.5:
+        score = breakout + pricing + acceptance + min(3.0, key_structure)
+        add_model("低位量价强启动", score, "S" if score >= 21 else "A", "低位、量价触发、承接/RR合格")
+
+    if not candidates:
+        return False, "", "", 0.0, "未命中A/S级主导买点模型；分数只能作为观察排序，不能进入最终买入池"
+    rank = {"S": 2, "A": 1, "B": 0}
+    best = sorted(candidates, key=lambda x: (rank.get(x["grade"], 0), x["score"]), reverse=True)[0]
+    return True, best["model"], best["grade"], round(best["score"], 2), best["reason"]
+
+
 def v26_institutional_scorecard(row):
     """V26机构评分卡：输出100分最终买入池口径。只后置增强，不破坏原模型字段。"""
     r = dict(row)
@@ -12123,9 +13101,12 @@ def v26_institutional_scorecard(row):
     liq_ok = _v26_bool(r.get("v241_formal_liquidity_ok", True))
     hard_risk = bool(r.get("v14_blocked", False)) or bool(r.get("exclude_from_final", False)) or str(r.get("v20_trade_tier", "")).startswith("硬风险")
     invalid = bool(r.get("v20_trade_invalidated", False))
-    formal_ok = True
+    primary_ok, primary_model, primary_grade, primary_model_score, primary_reason = _v26_primary_model_gate(r, cards)
+    formal_ok = bool(primary_ok)
     block_reasons = []
-    # V26.2母因子硬门槛：正式买入池不能只靠旧综合分或同源信号堆分。
+    if not primary_ok:
+        block_reasons.append(primary_reason)
+    # V27.5母因子只作为过滤/排序；正式池必须先命中A/S级主导买点模型。
     core_mother_score = (
         safe_float(cards.get("explosion_eve", 0))
         + safe_float(cards.get("key_structure", 0))
@@ -12191,6 +13172,11 @@ def v26_institutional_scorecard(row):
         "v26_raw_score": round(raw, 2),
         "v26_legacy_score": round(legacy, 2),
         "v26_legacy_blend_weight": round(legacy_w, 4),
+        "v26_primary_model_ok": bool(primary_ok),
+        "v26_primary_model": primary_model,
+        "v26_primary_model_grade": primary_grade,
+        "v26_primary_model_score": primary_model_score,
+        "v26_primary_model_reason": primary_reason,
         "v26_core_mother_score": round(core_mother_score, 2),
         "v26_acceptance_or_breakout_score": round(acceptance_or_breakout, 2),
         "v26_final_buy_score": round(final, 2),
@@ -12209,7 +13195,7 @@ def v26_institutional_scorecard(row):
         "v26_position_reason": mult_text,
         "v26_self_learning_mode": V26_AUTO_LEARN_MODE,
         "v26_self_learning_note": "半自动自学习：记录T+1/T+3/T+5/T+8/T+13/T+20结果和调参建议，不自动大幅改权重。",
-        "v26_dedupe_note": "母因子打分、子信号解释；同源信号组内封顶，避免重复堆分。",
+        "v26_dedupe_note": "V27.5：先判定A/S级主导买点模型，再用母因子排序；旧字段按同源组封顶，避免压力/凹口/月修复/供应吸收重复堆分。",
     })
     return r
 
@@ -12280,8 +13266,26 @@ V27_MAX_DEFENSE_DIST = float(os.environ.get("V27_MAX_DEFENSE_DIST", os.environ.g
 V27_MAX_SOFT_DEFENSE_DIST = float(os.environ.get("V27_MAX_SOFT_DEFENSE_DIST", "0.08"))
 V27_MIN_UPSIDE = float(os.environ.get("V27_MIN_UPSIDE", os.environ.get("V26_MIN_UPSIDE", "0.08")))
 V27_MIN_RR = float(os.environ.get("V27_MIN_RR", os.environ.get("V26_MIN_RR", "1.35")))
-V27_NEAR_PRESSURE_BLOCK = float(os.environ.get("V27_NEAR_PRESSURE_BLOCK", os.environ.get("V26_MAX_NEAR_PRESSURE", "0.05")))
+# V27.6：近端压力两级化。0-3% 默认硬拦截；3-5% 观察降级，只有实体突破最终压力上沿/压力带S-A级才允许豁免。
+V27_NEAR_PRESSURE_HARD_BLOCK = float(os.environ.get("V27_NEAR_PRESSURE_HARD_BLOCK", "0.03"))
+V27_NEAR_PRESSURE_SOFT_BLOCK = float(os.environ.get("V27_NEAR_PRESSURE_SOFT_BLOCK", os.environ.get("V27_NEAR_PRESSURE_BLOCK", os.environ.get("V26_MAX_NEAR_PRESSURE", "0.05"))))
+V27_NEAR_PRESSURE_BLOCK = V27_NEAR_PRESSURE_SOFT_BLOCK  # 兼容旧字段引用
+# V27.6：Top5 是最终买入池，非观察池。以下硬条件用于宁缺毋滥，不足则空缺。
+V27_REQUIRE_STRICT_TOP5 = os.environ.get("V27_REQUIRE_STRICT_TOP5", "1")
+V27_DEEP_RISK_TRADE_MIN = float(os.environ.get("V27_DEEP_RISK_TRADE_MIN", "5.5"))
+V27_DEEP_EXPLOSION_MIN = float(os.environ.get("V27_DEEP_EXPLOSION_MIN", "6.0"))
+V27_WEIGHT_FUND = float(os.environ.get("V27_WEIGHT_FUND", "1.08"))
+V27_WEIGHT_STRUCTURE = float(os.environ.get("V27_WEIGHT_STRUCTURE", "0.92"))
+V27_WEIGHT_EXPLOSION = float(os.environ.get("V27_WEIGHT_EXPLOSION", "0.95"))
+V27_WEIGHT_TRIGGER = float(os.environ.get("V27_WEIGHT_TRIGGER", "1.25"))
+V27_WEIGHT_MARKET = float(os.environ.get("V27_WEIGHT_MARKET", "0.75"))
+V27_WEIGHT_RISK_TRADE = float(os.environ.get("V27_WEIGHT_RISK_TRADE", "1.10"))
 V27_BASE_SCORE_FILE = os.environ.get("V27_BASE_SCORE_FILE", "v27_base_recall_overlay.json")
+# V27.7：定价器校准文件。若存在，则使用样本校准后的因子权重/阈值；若不存在，标记未校准并对正式池更严格。
+V27_CALIBRATION_FILE = os.environ.get("V27_CALIBRATION_FILE", os.path.join("outputs", "v27_calibration", "v27_factor_calibration.json"))
+V27_REQUIRE_CALIBRATION_FOR_FORMAL = os.environ.get("V27_REQUIRE_CALIBRATION_FOR_FORMAL", "0")
+V27_UNCALIBRATED_SCORE_HAIRCUT = float(os.environ.get("V27_UNCALIBRATED_SCORE_HAIRCUT", "0.92"))
+V27_MIN_CALIBRATION_SAMPLE = int(os.environ.get("V27_MIN_CALIBRATION_SAMPLE", "80"))
 
 
 def _v27_clip(x, lo=0.0, hi=100.0):
@@ -12297,6 +13301,489 @@ def _v27_clip(x, lo=0.0, hi=100.0):
 def _v27_norm(x, src_hi, dst_hi):
     src_hi = float(src_hi) if src_hi else 1.0
     return _v27_clip(safe_float(x, 0) / src_hi * float(dst_hi), 0, float(dst_hi))
+
+
+_V27_CALIBRATION_CACHE = None
+
+
+def _v27_load_calibration():
+    """读取V27因子校准参数；缺失时显式返回未校准，避免把手工权重伪装成样本定价。"""
+    global _V27_CALIBRATION_CACHE
+    if _V27_CALIBRATION_CACHE is not None:
+        return _V27_CALIBRATION_CACHE
+    default = {
+        "status": "missing",
+        "sample_count": 0,
+        "weights": {
+            "fund": V27_WEIGHT_FUND,
+            "structure": V27_WEIGHT_STRUCTURE,
+            "explosion": V27_WEIGHT_EXPLOSION,
+            "trigger": V27_WEIGHT_TRIGGER,
+            "market": V27_WEIGHT_MARKET,
+            "risk_trade": V27_WEIGHT_RISK_TRADE,
+        },
+        "thresholds": {
+            "min_buy_score": V27_MIN_BUY_SCORE,
+            "min_rr": V27_MIN_RR,
+            "max_defense_dist": V27_MAX_DEFENSE_DIST,
+            "near_pressure_hard": V27_NEAR_PRESSURE_HARD_BLOCK,
+            "near_pressure_soft": V27_NEAR_PRESSURE_SOFT_BLOCK,
+        },
+        "note": "缺少校准文件，当前仅使用经验权重并执行未校准折扣/标记。",
+    }
+    try:
+        if not os.path.exists(V27_CALIBRATION_FILE):
+            _V27_CALIBRATION_CACHE = default
+            return _V27_CALIBRATION_CACHE
+        with open(V27_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            default["status"] = "invalid_format"
+            _V27_CALIBRATION_CACHE = default
+            return _V27_CALIBRATION_CACHE
+        weights = data.get("weights", {}) if isinstance(data.get("weights", {}), dict) else {}
+        thresholds = data.get("thresholds", {}) if isinstance(data.get("thresholds", {}), dict) else {}
+        sample_count = int(safe_float(data.get("sample_count", data.get("n", 0)), 0))
+        status = "ok" if sample_count >= V27_MIN_CALIBRATION_SAMPLE else "small_sample"
+        merged = dict(default)
+        merged.update(data)
+        merged["status"] = status
+        merged["sample_count"] = sample_count
+        merged["weights"] = {**default["weights"], **weights}
+        merged["thresholds"] = {**default["thresholds"], **thresholds}
+        _V27_CALIBRATION_CACHE = merged
+        return _V27_CALIBRATION_CACHE
+    except Exception as e:
+        default["status"] = "read_failed"
+        default["note"] = f"校准文件读取失败:{str(e)[:120]}"
+        _V27_CALIBRATION_CACHE = default
+        return _V27_CALIBRATION_CACHE
+
+
+def _v27_factor_score_from_calibration(f1, f2, f3, f4, f5, f6):
+    cal = _v27_load_calibration()
+    w = cal.get("weights", {}) if isinstance(cal, dict) else {}
+    raw = (
+        f1 * safe_float(w.get("fund", V27_WEIGHT_FUND), V27_WEIGHT_FUND)
+        + f2 * safe_float(w.get("structure", V27_WEIGHT_STRUCTURE), V27_WEIGHT_STRUCTURE)
+        + f3 * safe_float(w.get("explosion", V27_WEIGHT_EXPLOSION), V27_WEIGHT_EXPLOSION)
+        + f4 * safe_float(w.get("trigger", V27_WEIGHT_TRIGGER), V27_WEIGHT_TRIGGER)
+        + f5 * safe_float(w.get("market", V27_WEIGHT_MARKET), V27_WEIGHT_MARKET)
+        + f6 * safe_float(w.get("risk_trade", V27_WEIGHT_RISK_TRADE), V27_WEIGHT_RISK_TRADE)
+    )
+    # 校准缺失/小样本时不再假装机构化：明确降权，迫使正式池更保守。
+    status = str(cal.get("status", "missing"))
+    score = _v27_clip(raw, 0, 100)
+    if status != "ok":
+        score = _v27_clip(score * V27_UNCALIBRATED_SCORE_HAIRCUT, 0, 100)
+    return score, cal
+
+
+def _v27_threshold(cal, key, fallback):
+    try:
+        return float((cal.get("thresholds", {}) or {}).get(key, fallback))
+    except Exception:
+        return float(fallback)
+
+
+def _v27_context_probability_adjustment(row, cal):
+    """把条件概率表的样本结果接入定价器；样本不足只做轻微提示，不硬加分。"""
+    ctx = cal.get("context_probability", {}) if isinstance(cal, dict) else {}
+    if not isinstance(ctx, dict) or not ctx:
+        return 0.0, "未接入上下文概率校准"
+    hypo = str(row.get("v27_trade_hypothesis") or row.get("v20_main_hypothesis") or row.get("main_hypothesis") or "综合结构机会")
+    env = str(row.get("market_env") or row.get("v24_market_env") or row.get("market_regime") or "unknown")
+    tier = str(row.get("v20_trade_tier") or row.get("tier") or "unknown")
+    key_candidates = [f"{hypo}|{env}|{tier}", f"{hypo}|{env}", hypo]
+    for k in key_candidates:
+        item = ctx.get(k)
+        if isinstance(item, dict) and safe_float(item.get("sample_count", 0)) >= 30:
+            wr = safe_float(item.get("win_rate", item.get("T+5", {}).get("win_rate", 0.5)), 0.5)
+            exp = safe_float(item.get("expectancy", item.get("mean_return", item.get("T+5", {}).get("mean_return", 0))), 0)
+            adj = max(-4.0, min(4.0, (wr - 0.5) * 8.0 + exp * 50.0))
+            return adj, f"上下文概率校准:{k} 样本{int(safe_float(item.get('sample_count',0)))} 胜率{wr:.1%} 期望{exp:.2%}"
+    return 0.0, "上下文概率样本不足，未加分"
+
+
+def _v27_has_final_pressure_breakout(row, f4=0.0):
+    """
+    V27.6 近端压力豁免条件：
+    只有已经高质量实体突破最终压力上沿/压力带，才允许从“压力贴脸”升级为“突破确认”。
+    该函数只读选股特征字段，不触碰生产链路。
+    """
+    try:
+        close = safe_float(row.get("close", row.get("last_close", 0)))
+        final_upper = safe_float(row.get("xhu_final_union_upper", row.get("xhu_pressure_union_upper", 0)))
+        core_grade = str(row.get("xhu_pressure_model_grade", ""))
+        day_grade = str(row.get("xhu_breakout_day_grade", ""))
+        breakout_quality = safe_float(row.get("v24_supply_breakout_quality_score", row.get("score_xhu_pressure_breakout", 0)))
+        pressure_score = safe_float(row.get("score_xhu_pressure_breakout", 0))
+        if final_upper > 0 and close >= final_upper * 1.003 and day_grade in ["S", "A"]:
+            return True
+        if final_upper > 0 and close >= final_upper * 1.006 and core_grade in ["S", "A"] and breakout_quality >= 7:
+            return True
+        if pressure_score >= 12 and day_grade in ["S", "A"] and safe_float(f4) >= 9.0:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _v27_make_trade_language(r, formal_ok, block, observe, f1, f2, f3, f4, f6):
+    """生成报告用交易语言：为什么今天能买/不能买、明日确认、放弃条件、仓位口径。"""
+    rr = safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))))
+    defense = safe_float(r.get("v20_defense", r.get("defensive_price", r.get("trade_defense", 0))))
+    defense_dist = safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)))
+    nearp = safe_float(r.get("v20_near_pressure", r.get("near_pressure_dist", 0)))
+    pressure_ok = _v27_has_final_pressure_breakout(r, f4)
+    if formal_ok:
+        why_buy = f"能买原因：当前触发{f4:.1f}/15，资金{f1:.1f}/25，结构{f2:.1f}/20，RR={rr:.2f}，防守距离{defense_dist:.1%}，不是单纯观察票。"
+    else:
+        rs = []
+        if block:
+            rs.extend([str(x) for x in block[:3]])
+        if observe:
+            rs.extend([str(x) for x in observe[:3]])
+        why_buy = "不能买原因：" + ("；".join(rs[:4]) if rs else f"V27分/触发/结构/资金/交易质量未同时达标，当前触发{f4:.1f}、资金{f1:.1f}、结构{f2:.1f}。")
+    confirm = []
+    if f4 < 10:
+        confirm.append("明日需放量阳K/强收盘继续确认")
+    if nearp > 0 and nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and not pressure_ok:
+        confirm.append("必须实体突破近端最终压力上沿，不能只冲高摸线")
+    if defense_dist > 0.06:
+        confirm.append("最好回踩缩量并靠近防守位后再确认")
+    if not confirm:
+        confirm.append("明日只要不快速跌回触发K/核心压力上沿下方，买点有效性提高")
+    abandon = []
+    if defense > 0:
+        abandon.append(f"收盘有效跌破交易防守位{defense:.2f}")
+    abandon.append("放量长上影/冲高回落回到压力带内")
+    if f1 < V27_DEEP_FUND_MIN + 1:
+        abandon.append("后续量能无法维持或承接转弱")
+    pos = str(r.get("v241_position_text", "")) or str(r.get("v26_position_tier", "")) or "轻仓/试错仓，确认后再加"
+    return {
+        "v27_today_buy_reason": why_buy,
+        "v27_tomorrow_confirm": "；".join(confirm[:3]),
+        "v27_abandon_condition": "；".join(abandon[:3]),
+        "v27_position_suggestion": pos,
+    }
+
+
+# ========================= V27.1 200日K线组合记忆：真实海选资金因子 START =========================
+# 说明：本段只属于选股逻辑层。它不触碰生产入口、workflow、缓存、BaoStock、Telegram、PAT、artifact。
+# 目标：把阳包阴/看涨吞没、双阳夹阴/多方炮、上涨分手线、向上跳空等从“近10~20日触发”
+#       扩展为“最近200日资金行为记忆”，并严格区分：三日内承接、三日外延续、未成功、失败。
+V27_PATTERN_MEMORY_LOOKBACK = int(os.environ.get("V27_PATTERN_MEMORY_LOOKBACK", "200") or 200)
+V27_PATTERN_FOLLOW_DAYS = int(os.environ.get("V27_PATTERN_FOLLOW_DAYS", "3") or 3)
+V27_PATTERN_EXTEND_DAYS = int(os.environ.get("V27_PATTERN_EXTEND_DAYS", "10") or 10)
+V27_PATTERN_MEMORY_MAX_SCORE = float(os.environ.get("V27_PATTERN_MEMORY_MAX_SCORE", "22") or 22)
+V27_PATTERN_MEMORY_TO_FUND_MAX = float(os.environ.get("V27_PATTERN_MEMORY_TO_FUND_MAX", "11.0") or 11.0)
+
+V27_PATTERN_CLASS_CAPS = {
+    # V27.2：200日是“形态记忆”窗口，不能所有形态合计几次就过早封顶。
+    # 核心攻击/修复类给更高单类上限，弱修复类给较低上限；最终仍由总上限和失败扣分约束。
+    "阳包阴/看涨吞没": 6.0,
+    "双阳夹阴/多方炮": 6.0,
+    "上涨分手线": 5.0,
+    "向上跳空/缺口承接": 5.0,
+    "曙光初现": 4.0,
+    "早晨之星": 4.0,
+    "假阴真阳修复": 4.0,
+    "三阴后大阳修复": 4.0,
+}
+V27_PATTERN_BASE_POINTS = {
+    # 单次基础分只代表“形态记忆”，承接/延续另算；避免把未验证形态直接当成功。
+    "阳包阴/看涨吞没": 1.00,
+    "双阳夹阴/多方炮": 1.10,
+    "上涨分手线": 0.95,
+    "向上跳空/缺口承接": 0.95,
+    "曙光初现": 0.70,
+    "早晨之星": 0.70,
+    "假阴真阳修复": 0.65,
+    "三阴后大阳修复": 0.85,
+}
+
+
+def _v27_pattern_prepare_df(df):
+    try:
+        x = df.copy()
+        if x is None or x.empty:
+            return pd.DataFrame()
+        if "date" in x.columns:
+            x = x.sort_values("date").reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col not in x.columns:
+                x[col] = 0.0
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+        rng = (x["high"] - x["low"]).replace(0, np.nan)
+        top = x[["open", "close"]].max(axis=1)
+        bot = x[["open", "close"]].min(axis=1)
+        x["body_top"] = top
+        x["body_bottom"] = bot
+        x["body_mid"] = (top + bot) / 2
+        x["body_abs"] = (x["close"] - x["open"]).abs()
+        x["body_ratio2"] = (x["body_abs"] / rng).fillna(0.0)
+        x["close_pos2"] = ((x["close"] - x["low"]) / rng).fillna(0.5)
+        x["upper_ratio2"] = ((x["high"] - top) / rng).fillna(0.0)
+        x["lower_ratio2"] = ((bot - x["low"]) / rng).fillna(0.0)
+        x["pct_chg2"] = x["close"].pct_change().fillna(0.0)
+        x["vol_ma20_p"] = x["volume"].rolling(20, min_periods=5).mean().replace(0, np.nan)
+        x["vol_ratio20_p"] = (x["volume"] / x["vol_ma20_p"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        return x.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _v27_pattern_quality(x, i):
+    try:
+        q = 0.0
+        close_pos = safe_float(x.loc[i, "close_pos2"])
+        body_ratio = safe_float(x.loc[i, "body_ratio2"])
+        upper = safe_float(x.loc[i, "upper_ratio2"])
+        volr = safe_float(x.loc[i, "vol_ratio20_p"], 1.0)
+        pct = safe_float(x.loc[i, "pct_chg2"])
+        if close_pos >= 0.80:
+            q += 0.30
+        elif close_pos >= 0.65:
+            q += 0.20
+        if body_ratio >= 0.55:
+            q += 0.25
+        elif body_ratio >= 0.35:
+            q += 0.12
+        if pct >= 0.03:
+            q += 0.20
+        if 0.85 <= volr <= 2.8:
+            q += 0.20
+        elif volr > 3.8 and close_pos < 0.65:
+            q -= 0.30
+        if upper > 0.42:
+            q -= 0.25
+        return _v27_clip(q, 0.0, 1.0)
+    except Exception:
+        return 0.0
+
+
+def _v27_pattern_names_at(x, i):
+    """返回第i根K线触发的K线组合名称；只判断事件本身，不判断买卖。"""
+    names = []
+    if i < 2 or i >= len(x):
+        return names
+    try:
+        o = x["open"]; h = x["high"]; l = x["low"]; c = x["close"]; v = x["volume"]
+        # 阳包阴/看涨吞没：当前阳，前阴，当前实体基本收复前阴实体。
+        prev_bear = c.iloc[i-1] < o.iloc[i-1]
+        cur_bull = c.iloc[i] > o.iloc[i]
+        if prev_bear and cur_bull:
+            prev_top = max(o.iloc[i-1], c.iloc[i-1]); prev_bot = min(o.iloc[i-1], c.iloc[i-1])
+            recover = (c.iloc[i] - prev_bot) / max(prev_top - prev_bot, 1e-9)
+            if c.iloc[i] >= prev_top * 0.995 and x.loc[i, "close_pos2"] >= 0.62:
+                names.append("阳包阴/看涨吞没")
+            elif recover >= 0.70 and x.loc[i, "close_pos2"] >= 0.68:
+                names.append("曙光初现")
+        # 双阳夹阴/多方炮：阳-阴-阳，第三阳收复中间阴实体顶，第二阴不有效破第一阳实底。
+        if i >= 2:
+            d1_bull = c.iloc[i-2] > o.iloc[i-2]
+            d2_bear = c.iloc[i-1] < o.iloc[i-1]
+            d3_bull = c.iloc[i] > o.iloc[i]
+            d1_bottom = min(o.iloc[i-2], c.iloc[i-2])
+            d2_top = max(o.iloc[i-1], c.iloc[i-1])
+            if d1_bull and d2_bear and d3_bull:
+                d2_not_destroy = c.iloc[i-1] >= d1_bottom * 0.997
+                d3_recover = c.iloc[i] >= d2_top * 0.998
+                vol_ok = v.iloc[i] >= max(v.iloc[i-1] * 0.85, 1)
+                if d2_not_destroy and d3_recover and vol_ok and x.loc[i, "close_pos2"] >= 0.60:
+                    names.append("双阳夹阴/多方炮")
+        # 上涨分手线：前一根阴，当前阳，开盘接近，且前面有修复趋势。
+        if prev_bear and cur_bull:
+            same_open = abs(safe_float(o.iloc[i]) / max(safe_float(o.iloc[i-1]), 1e-9) - 1) <= 0.012
+            trend_ok = False
+            if i >= 8:
+                trend_ok = c.iloc[i-1] >= c.iloc[i-8] * 1.02
+            if same_open and trend_ok and c.iloc[i] > c.iloc[i-1] * 1.005 and x.loc[i, "close_pos2"] >= 0.65:
+                names.append("上涨分手线")
+        # 向上跳空：低点高于前高，且收盘不弱。
+        if l.iloc[i] > h.iloc[i-1] * 1.003 and x.loc[i, "close_pos2"] >= 0.62:
+            names.append("向上跳空/缺口承接")
+        # 早晨之星：阴、小实体、阳，第三根收复第一阴中位。
+        if i >= 2:
+            d1_bear = c.iloc[i-2] < o.iloc[i-2]
+            d2_small = x.loc[i-1, "body_ratio2"] <= 0.28
+            d3_bull = c.iloc[i] > o.iloc[i]
+            d1_mid = (o.iloc[i-2] + c.iloc[i-2]) / 2
+            if d1_bear and d2_small and d3_bull and c.iloc[i] >= d1_mid * 1.002 and x.loc[i, "close_pos2"] >= 0.62:
+                names.append("早晨之星")
+        # 假阴真阳修复：实体阴但相对昨收上涨，且收盘位置不弱。
+        if c.iloc[i] < o.iloc[i] and c.iloc[i] > c.iloc[i-1] * 1.005 and x.loc[i, "close_pos2"] >= 0.62:
+            names.append("假阴真阳修复")
+        # 三阴后大阳修复：前三根阴线，当前阳线收复最近三阴中位/实体顶附近。
+        if i >= 3:
+            three_bear = all(c.iloc[j] < o.iloc[j] for j in [i-3, i-2, i-1])
+            ref_top = max(max(o.iloc[j], c.iloc[j]) for j in [i-3, i-2, i-1])
+            if three_bear and cur_bull and c.iloc[i] >= ref_top * 0.995 and x.loc[i, "close_pos2"] >= 0.65:
+                names.append("三阴后大阳修复")
+    except Exception:
+        return []
+    # 去重保序
+    out = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def _v27_pattern_follow_result(x, i):
+    """三日内承接 + 三日外延续五档分类。"""
+    try:
+        if i + 1 >= len(x):
+            return "样本不足", 0.0, "无后续K线"
+        bottom = safe_float(x.loc[i, "body_bottom"])
+        mid = safe_float(x.loc[i, "body_mid"])
+        high = safe_float(x.loc[i, "high"])
+        confirm_close = safe_float(x.loc[i, "close"])
+        pattern_low = safe_float(x.loc[i, "low"])
+        win3 = x.iloc[i+1:min(len(x), i+1+V27_PATTERN_FOLLOW_DAYS)]
+        win10 = x.iloc[i+1+V27_PATTERN_FOLLOW_DAYS:min(len(x), i+1+V27_PATTERN_EXTEND_DAYS)]
+        if win3.empty:
+            return "样本不足", 0.0, "后三日样本不足"
+        min_close3 = safe_float(win3["close"].min())
+        min_low3 = safe_float(win3["low"].min())
+        max_close3 = safe_float(win3["close"].max())
+        rng3 = (win3["high"] - win3["low"]).replace(0, np.nan)
+        body3 = (win3["close"] - win3["open"]).abs()
+        bear3 = win3[win3["close"] < win3["open"]]
+        vol_long_bear = False
+        if not bear3.empty:
+            bear_rng = (bear3["high"] - bear3["low"]).replace(0, np.nan)
+            bear_body_ratio = ((bear3["close"] - bear3["open"]).abs() / bear_rng).fillna(0)
+            vol_long_bear = bool(((bear3["close"] < bottom * 0.995) & (bear_body_ratio >= 0.50) & (bear3["vol_ratio20_p"] >= 1.25)).any())
+        reverse_engulf = bool(((win3["close"] < bottom * 0.995) & (win3["close"] < win3["open"]) & (win3["body_ratio2"] >= 0.55)).any())
+        fail3 = (min_close3 < bottom * 0.995) or (min_low3 < pattern_low * 0.995) or vol_long_bear or reverse_engulf
+        hold3 = min_close3 >= bottom * 0.995
+        up3 = (max_close3 >= confirm_close * 1.005) or (max_close3 >= high * 1.003)
+        late_confirm = False
+        late_fail = False
+        if not win10.empty:
+            late_confirm = safe_float(win10["close"].max()) >= max(confirm_close * 1.008, high * 1.003)
+            late_fail = safe_float(win10["close"].min()) < bottom * 0.995
+        if fail3:
+            return "三日内失败", -1.4, "三日内跌破确认K实底/低点或放量长阴反吞"
+        if hold3 and up3 and late_confirm:
+            return "强成功", 1.8, "三日内守住并向上确认，三日外继续延续"
+        if hold3 and up3:
+            return "普通成功", 1.25, "三日内守住并向上确认"
+        if hold3 and late_confirm:
+            return "延迟成功", 0.65, "三日内横盘未坏，三日外向上确认"
+        if hold3 and not late_confirm and not late_fail:
+            return "未成功", 0.0, "三日内未破坏但无向上确认"
+        if late_fail:
+            return "三日外失败", -0.75, "三日内未坏但三日外跌破确认K实底"
+        return "未成功", 0.0, "未出现明确延续"
+    except Exception as e:
+        return "异常", 0.0, str(e)[:80]
+
+
+def score_200d_bullish_pattern_memory(df, as_of_date=None, lookback=None):
+    """200日K线组合记忆分：每类形态单独统计，三日内/三日外验证，总分0~22。
+    V27.2核心修正：不是“所有形态合计8次封顶”，而是每类形态分别计数、分别封顶，
+    再用承接/延续/失败结果做质量修正，最后总分封顶。这样5类各出现2次，会明显高于只出现1类多次。
+    """
+    lookback = int(lookback or V27_PATTERN_MEMORY_LOOKBACK)
+    x = _v27_pattern_prepare_df(df)
+    if x.empty or len(x) < 30:
+        return {"pattern_memory_score": 0.0, "pattern_memory_reason": "K线不足，无法计算200日K线组合记忆"}
+    if as_of_date and "date" in x.columns:
+        try:
+            ad = str(pd.to_datetime(as_of_date).strftime("%Y-%m-%d"))
+            x = x[x["date"].astype(str) <= ad].copy().reset_index(drop=True)
+        except Exception:
+            pass
+    if len(x) < 30:
+        return {"pattern_memory_score": 0.0, "pattern_memory_reason": "截至目标日K线不足"}
+    start = max(3, len(x) - lookback)
+    end = len(x) - 1  # 最后一根没有完整后验，不用于历史验证
+    type_counts = {k: 0 for k in V27_PATTERN_CLASS_CAPS}
+    type_scores = {k: 0.0 for k in V27_PATTERN_CLASS_CAPS}
+    result_counts = {"强成功": 0, "普通成功": 0, "延迟成功": 0, "未成功": 0, "三日内失败": 0, "三日外失败": 0, "样本不足": 0, "异常": 0}
+    quality_sum = 0.0
+    events = []
+    # 5日事件簇去重：同一类形态5日内只保留最强一次，避免同一段攻击重复计数。
+    last_counted = {}
+    for i in range(start, max(start, end)):
+        names = _v27_pattern_names_at(x, i)
+        if not names:
+            continue
+        q = _v27_pattern_quality(x, i)
+        result, carry_delta, note = _v27_pattern_follow_result(x, i)
+        for name in names:
+            if i - int(last_counted.get(name, -999)) <= 5:
+                continue
+            last_counted[name] = i
+            base_pt = safe_float(V27_PATTERN_BASE_POINTS.get(name, 0.8))
+            type_counts[name] = type_counts.get(name, 0) + 1
+            class_cap = safe_float(V27_PATTERN_CLASS_CAPS.get(name, 3.0))
+            # 单次得分 = 基础次数分 + 质量修正 + 成功/失败验证；承接未成功不加承接分。
+            event_score = base_pt + q * 0.50 + carry_delta
+            type_scores[name] = min(class_cap, type_scores.get(name, 0.0) + max(-2.0, event_score))
+            result_counts[result] = result_counts.get(result, 0) + 1
+            quality_sum += q
+            events.append({"idx": i, "date": str(x.loc[i, "date"]) if "date" in x.columns else "", "type": name, "result": result, "score": round(event_score, 2), "note": note})
+    total_events = sum(type_counts.values())
+    success_count = result_counts.get("强成功", 0) + result_counts.get("普通成功", 0) + result_counts.get("延迟成功", 0)
+    fail_count = result_counts.get("三日内失败", 0) + result_counts.get("三日外失败", 0)
+    diversity = sum(1 for v in type_counts.values() if v > 0)
+    raw = sum(max(0.0, v) for v in type_scores.values())
+    # 多样性补分：多个形态类型都出现，说明不是单一噪音。
+    diversity_bonus = min(2.0, max(0, diversity - 1) * 0.35)
+    # 成功率修正：成功率低不抹掉次数记忆，但不能高分。
+    success_rate = success_count / max(1, success_count + fail_count + result_counts.get("未成功", 0))
+    if total_events >= 3:
+        if success_rate >= 0.65:
+            rate_adj = 1.15
+        elif success_rate >= 0.45:
+            rate_adj = 0.95
+        elif success_rate >= 0.30:
+            rate_adj = 0.72
+        else:
+            rate_adj = 0.55
+    else:
+        rate_adj = 1.0
+    # 失败集中扣分：失败多说明形态经常被市场否定。
+    failure_penalty = min(4.0, result_counts.get("三日内失败", 0) * 0.9 + result_counts.get("三日外失败", 0) * 0.45)
+    # 短期过密/追涨风险：最近20日事件过多且涨幅大，说明可能已经爆发，不再按“前夜记忆”满分。
+    crowding_penalty = 0.0
+    try:
+        recent20 = x.tail(20)
+        recent_ret = safe_float(recent20["close"].iloc[-1]) / max(safe_float(recent20["close"].iloc[0]), 1e-9) - 1
+        recent_events = sum(1 for e in events if e.get("idx", 0) >= len(x) - 20)
+        if recent_events >= 5 and recent_ret > 0.28:
+            crowding_penalty = 2.5
+        elif recent_events >= 3 and recent_ret > 0.18:
+            crowding_penalty = 1.5
+    except Exception:
+        pass
+    score = _v27_clip((raw + diversity_bonus) * rate_adj - failure_penalty - crowding_penalty, 0, V27_PATTERN_MEMORY_MAX_SCORE)
+    top_types = sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True)
+    # 单类得分也输出到原因里，便于审计“到底是哪类形态贡献了分数”。
+    top_score_types = sorted(type_scores.items(), key=lambda kv: kv[1], reverse=True)
+    reason = f"200日K线组合记忆{score:.1f}/{V27_PATTERN_MEMORY_MAX_SCORE:.0f}：总{total_events}次，成功{success_count}次，未成功{result_counts.get('未成功',0)}次，失败{fail_count}次，类型{diversity}类；主要形态" + "、".join([f"{k}{v}次" for k, v in top_types if v > 0][:4]) + "；贡献" + "、".join([f"{k}{v:.1f}" for k, v in top_score_types if v > 0][:4])
+    return {
+        "pattern_memory_score": round(score, 2),
+        "pattern_memory_count_200": int(total_events),
+        "pattern_memory_success_count_200": int(success_count),
+        "pattern_memory_fail_count_200": int(fail_count),
+        "pattern_memory_not_success_count_200": int(result_counts.get("未成功", 0)),
+        "pattern_memory_success_rate_200": round(success_rate, 4),
+        "pattern_memory_type_counts_200": type_counts,
+        "pattern_memory_result_counts_200": result_counts,
+        "pattern_memory_top_types": "；".join([f"{k}:{v}" for k, v in top_types if v > 0][:8]),
+        "pattern_memory_reason": reason,
+        "pattern_memory_type_scores_200": {k: round(float(v), 2) for k, v in type_scores.items()},
+        "pattern_memory_diversity_200": int(diversity),
+        "pattern_memory_recent_crowding_penalty": round(crowding_penalty, 2),
+        "pattern_memory_failure_penalty": round(failure_penalty, 2),
+        "pattern_memory_events_sample": events[-20:],
+    }
+# ========================= V27.1 200日K线组合记忆 END =========================
 
 
 def _v27_any_text(row, keys):
@@ -12340,6 +13827,16 @@ def _v27_base_factor_funds(row):
         carry += 1.2; reasons.append("涨停后三日实体承接线索")
     if safe_float(row.get("base_observe_k_repair_score", 0)) >= 4:
         carry += 1.0; reasons.append("K线修复/承接记忆")
+
+    # V27.1：200日K线组合记忆。阳包阴/双阳夹阴/上涨分手线/跳空等只归入资金因子，
+    # 以三日内承接和三日外延续验证有效性，避免只看近10~20根K线。
+    pattern_memory = safe_float(row.get("pattern_memory_score", 0))
+    if pattern_memory > 0:
+        sustain += min(V27_PATTERN_MEMORY_TO_FUND_MAX, pattern_memory / max(V27_PATTERN_MEMORY_MAX_SCORE, 1) * V27_PATTERN_MEMORY_TO_FUND_MAX)
+        reasons.append(str(row.get("pattern_memory_reason", "200日K线组合记忆"))[:80])
+    if safe_float(row.get("pattern_memory_fail_count_200", 0)) >= 3:
+        fail += min(3.0, safe_float(row.get("pattern_memory_fail_count_200", 0)) * 0.55)
+        reasons.append("200日K线组合失败记忆偏多")
 
     # 持续性/效率。
     sustain += min(3.0, safe_float(row.get("base_observe_fund_event_score", 0)) * 0.35)
@@ -12501,6 +13998,14 @@ def _v27_deep_factor_funds(row):
         s += min(4.0, safe_float(row.get("v212_acceptance_score", 0)) * 0.35); reasons.append("V21.2承接确认")
     if safe_float(row.get("v26_support_defense_score", 0)) > 0:
         s += min(3.5, safe_float(row.get("v26_support_defense_score", 0)) * 0.35); reasons.append("V26承接/防守确认")
+    pattern_memory = safe_float(row.get("pattern_memory_score", 0))
+    if pattern_memory > 0:
+        s += min(4.0, pattern_memory / max(V27_PATTERN_MEMORY_MAX_SCORE, 1) * 4.0)
+        reasons.append("200日K线组合记忆")
+    if safe_float(row.get("pattern_memory_fail_count_200", 0)) >= 3:
+        s -= min(2.5, safe_float(row.get("pattern_memory_fail_count_200", 0)) * 0.45)
+        reasons.append("200日形态失败记忆扣分")
+
     for k, label, w in [
         ("flat_volume_score", "平量承接", 0.6),
         ("volume_after_flat_acceptance_score", "倍量后平量承接", 0.8),
@@ -12613,8 +14118,13 @@ def _v27_deep_factor_risk_trade(row):
         s += 1.2; reasons.append("上方空间较好")
     elif 0 < upside < V27_MIN_UPSIDE:
         s -= 3.0; reasons.append("上方空间不足")
-    if 0 < nearp < V27_NEAR_PRESSURE_BLOCK:
-        s -= 3.0; reasons.append("近端压力贴脸")
+    pressure_breakout_ok = _v27_has_final_pressure_breakout(row, 0)
+    if 0 < nearp <= V27_NEAR_PRESSURE_HARD_BLOCK and not pressure_breakout_ok:
+        s -= 4.2; reasons.append("近端压力0-3%贴脸硬风险")
+    elif V27_NEAR_PRESSURE_HARD_BLOCK < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and not pressure_breakout_ok:
+        s -= 2.0; reasons.append("近端压力3-5%观察降级")
+    elif 0 < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and pressure_breakout_ok:
+        s += 0.4; reasons.append("已实体突破压力，贴脸压力豁免")
     if safe_float(row.get("v26_failure_similarity_risk", row.get("v26_failure_similarity", 0))) >= 45:
         s -= 2.5; reasons.append("失败相似度偏高")
     if safe_float(row.get("v241_liquidity_score", 70)) < 50:
@@ -12633,8 +14143,6 @@ def v27_wallstreet_decision_engine(row):
     f4, r4 = _v27_deep_factor_trigger(r)
     f5, r5 = _v27_deep_factor_market(r)
     f6, r6 = _v27_deep_factor_risk_trade(r)
-    score = _v27_clip(f1 + f2 + f3 + f4 + f5 + f6, 0, 100)
-
     rr = safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))))
     defense = safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)))
     upside = safe_float(r.get("v20_target_dist", r.get("target_dist", 0)))
@@ -12642,6 +14150,27 @@ def v27_wallstreet_decision_engine(row):
     chase = safe_float(r.get("v20_chase_risk", r.get("chase_risk", 0)))
     bias20 = safe_float(r.get("bias20", r.get("base_bias20", 0)))
     pct_chg = safe_float(r.get("pct_chg", 0))
+
+    # V27.10：交易假设必须先生成，再进入条件概率匹配；否则概率层拿不到最新V27假设。
+    if f3 >= 13 and f4 >= 7:
+        hypo = "爆发前夜临界触发"
+    elif f2 >= 13 and f4 >= 9:
+        hypo = "核心结构位突破/回踩确认"
+    elif f1 >= 15 and f4 >= 8:
+        hypo = "资金承接后转强"
+    elif f3 >= 12 and f4 < 7:
+        hypo = "爆发前夜种子，等待触发"
+    elif chase > 0.10 or defense > V27_MAX_SOFT_DEFENSE_DIST:
+        hypo = "强攻后追涨风险观察"
+    else:
+        hypo = "综合结构观察"
+    r["v27_trade_hypothesis"] = hypo
+    r["buy_point_type"] = str(r.get("buy_point_type") or hypo)
+
+    # V27.10：最终定价器由真实walk-forward预测模型优先接管；无有效WF时只保留经验fallback并强制降级。
+    score, calibration = _v27_factor_score_from_calibration(f1, f2, f3, f4, f5, f6)
+    prob_adj, prob_note = _v27_context_probability_adjustment(r, calibration)
+    score = _v27_clip(score + prob_adj, 0, 100)
     block = []
     observe = []
 
@@ -12649,16 +14178,24 @@ def v27_wallstreet_decision_engine(row):
         block.append("硬雷区/重大风险剔除")
     if bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
         block.append(str(r.get("v20_trade_invalid_reason", r.get("v22_invalid_reason", "交易假设已失效"))))
-    if rr > 0 and rr < V27_MIN_RR:
-        block.append(f"RR {rr:.2f} 低于V27最低{V27_MIN_RR:.2f}")
-    if defense > V27_MAX_DEFENSE_DIST:
+    min_rr = _v27_threshold(calibration, "min_rr", V27_MIN_RR)
+    max_defense_dist = _v27_threshold(calibration, "max_defense_dist", V27_MAX_DEFENSE_DIST)
+    min_buy_score = _v27_threshold(calibration, "min_buy_score", V27_MIN_BUY_SCORE)
+    if rr > 0 and rr < min_rr:
+        block.append(f"RR {rr:.2f} 低于V27校准最低{min_rr:.2f}")
+    if defense > max_defense_dist:
         block.append(f"防守距离{defense:.1%}过远，追涨风险")
     elif defense > V27_MAX_SOFT_DEFENSE_DIST:
         observe.append(f"防守距离{defense:.1%}偏远，观察降级")
     if 0 < upside < V27_MIN_UPSIDE:
         block.append(f"上方空间{upside:.1%}不足")
-    if 0 < nearp < V27_NEAR_PRESSURE_BLOCK:
-        block.append(f"近端压力{nearp:.1%}贴脸")
+    pressure_breakout_ok = _v27_has_final_pressure_breakout(r, f4)
+    if 0 < nearp <= V27_NEAR_PRESSURE_HARD_BLOCK and not pressure_breakout_ok:
+        block.append(f"近端压力{nearp:.1%}处于0-3%硬拦截区，未实体突破最终压力上沿")
+    elif V27_NEAR_PRESSURE_HARD_BLOCK < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and not pressure_breakout_ok:
+        observe.append(f"近端压力{nearp:.1%}处于3-5%观察降级区，需实体突破确认")
+    elif 0 < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and pressure_breakout_ok:
+        observe.append("近端压力已被实体突破，按突破确认而非贴脸压力处理")
     if chase > 0.12:
         block.append(f"追高风险{chase:.1%}过高")
     elif chase > 0.09:
@@ -12674,7 +14211,26 @@ def v27_wallstreet_decision_engine(row):
     if f1 < V27_DEEP_FUND_MIN:
         observe.append("资金有效性/承接不足")
 
-    formal_ok = (score >= V27_MIN_BUY_SCORE) and not block and f4 >= V27_DEEP_TRIGGER_MIN and f2 >= V27_DEEP_STRUCTURE_MIN and f1 >= V27_DEEP_FUND_MIN
+    if calibration.get("status") != "ok":
+        observe.append("V27定价器未完成样本校准：正式池按未校准折扣处理")
+        if V27_REQUIRE_CALIBRATION_FOR_FORMAL == "1":
+            block.append("缺少有效V27校准样本，禁止进入正式买入池")
+
+    if V27_REQUIRE_STRICT_TOP5 == "1":
+        if f6 < V27_DEEP_RISK_TRADE_MIN:
+            observe.append("交易质量/RR/防守综合不足，Top5宁缺毋滥")
+        if f3 < V27_DEEP_EXPLOSION_MIN and f4 < 10.0:
+            observe.append("爆发前夜证据不足且当前触发不强，不补位进入Top5")
+
+    formal_ok = (
+        (score >= min_buy_score)
+        and not block
+        and f4 >= V27_DEEP_TRIGGER_MIN
+        and f2 >= V27_DEEP_STRUCTURE_MIN
+        and f1 >= V27_DEEP_FUND_MIN
+        and (V27_REQUIRE_STRICT_TOP5 != "1" or f6 >= V27_DEEP_RISK_TRADE_MIN)
+        and (V27_REQUIRE_STRICT_TOP5 != "1" or f3 >= V27_DEEP_EXPLOSION_MIN or f4 >= 10.0)
+    )
     if formal_ok:
         pool = "V27最终买入池"
     elif block:
@@ -12682,19 +14238,8 @@ def v27_wallstreet_decision_engine(row):
     else:
         pool = "V27观察池"
 
-    # 交易假设分类：先分类，再定价。
-    if f3 >= 13 and f4 >= 7:
-        hypo = "爆发前夜临界触发"
-    elif f2 >= 13 and f4 >= 9:
-        hypo = "核心结构位突破/回踩确认"
-    elif f1 >= 15 and f4 >= 8:
-        hypo = "资金承接后转强"
-    elif f3 >= 12 and f4 < 7:
-        hypo = "爆发前夜种子，等待触发"
-    elif chase > 0.10 or defense > V27_MAX_SOFT_DEFENSE_DIST:
-        hypo = "强攻后追涨风险观察"
-    else:
-        hypo = "综合结构观察"
+    # 交易假设已在概率校准前生成，避免上下文概率匹配使用旧字段。
+    trade_language = _v27_make_trade_language(r, formal_ok, block, observe, f1, f2, f3, f4, f6)
 
     r.update({
         "v27_enabled": True,
@@ -12705,6 +14250,11 @@ def v27_wallstreet_decision_engine(row):
         "v27_market_factor": round(f5, 2),
         "v27_risk_trade_factor": round(f6, 2),
         "v27_final_score": round(score, 2),
+        "v27_calibration_status": str(calibration.get("status", "missing")),
+        "v27_calibration_sample_count": int(safe_float(calibration.get("sample_count", 0), 0)),
+        "v27_calibration_note": str(calibration.get("note", "")),
+        "v27_probability_adjustment": round(prob_adj, 2),
+        "v27_probability_note": prob_note,
         "v27_buy_eligible": bool(formal_ok),
         "v27_pool": pool,
         "v27_trade_hypothesis": hypo,
@@ -12713,6 +14263,9 @@ def v27_wallstreet_decision_engine(row):
         "v27_reason_summary": "｜".join((r1[:2] + r2[:2] + r3[:2] + r4[:2] + r6[:2])[:10]),
         "v27_dedup_note": "旧模型=特征库；V27=交易定价器。资金/结构/爆发/触发/市场/风险六大因子组内封顶，防止阳包阴、分手线、跳空等K线事件重复加分。",
         "v27_failure_path_note": "正式买入池必须满足RR、防守位、第一压力空间、当前触发、资金有效性；不满足则观察或剔除。",
+        "v27_final_exit_note": "V26/V20/V21.2/V22只作为特征库和审计层；正式排序、买入池和空缺机制以V27为唯一最终出口。",
+        "v27_near_pressure_rule": f"0-{V27_NEAR_PRESSURE_HARD_BLOCK:.0%}硬拦截；{V27_NEAR_PRESSURE_HARD_BLOCK:.0%}-{V27_NEAR_PRESSURE_SOFT_BLOCK:.0%}观察降级；实体突破最终压力上沿可豁免",
+        **trade_language,
     })
     return r
 
@@ -14525,8 +16078,12 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         key=lambda x: (
             1 if bool(x.get("v27_buy_eligible", False)) else 0,
             safe_float(x.get("v27_final_score", 0)),
-            1 if bool(x.get("v26_buy_eligible", False)) else 0,
-            safe_float(x.get("v26_final_buy_score", 0)),
+            safe_float(x.get("v27_current_trigger_factor", 0)),
+            safe_float(x.get("v27_fund_factor", 0)),
+            safe_float(x.get("v27_risk_trade_factor", 0)),
+            # V26只作审计兜底，不再与V27争夺最终出口。
+            1 if (V27_ENABLE_CORE_ENGINE != "1" and bool(x.get("v26_buy_eligible", False))) else 0,
+            safe_float(x.get("v26_final_buy_score", 0)) if V27_ENABLE_CORE_ENGINE != "1" else 0.0,
             1 if str(x.get("v212_action", "")).startswith("V21.2正式") else 0,
             tier_rank(x),
             safe_float(x.get("v22_composite_trade_score", 0)) if _valid_score_field(x, "v22_composite_trade_score") else -1.0,
@@ -14600,7 +16157,7 @@ def select_final_signals_v20(deep_rows, history=None, limit=None):
         if str(r.get("code")) not in selected_codes:
             rr = dict(r)
             rr["v20_pool"] = "后台跟踪"
-            rr["v20_skip_reason"] = "未进入V26最终买入池，进入跟踪池用于条件概率复盘"
+            rr["v20_skip_reason"] = "未进入V27最终买入池，进入跟踪池用于条件概率复盘"
             diagnostics.append(rr)
 
     return final, diagnostics[:80], audited
@@ -14680,6 +16237,24 @@ def _v20_compact_row(r, pool=""):
         "v26_signal_age": r.get("v26_signal_age", ""),
         "v26_signal_freshness_score": safe_float(r.get("v26_signal_freshness_score", 0)),
         "v26_same_source_dedup_note": r.get("v26_same_source_dedup_note", ""),
+        "v27_final_score": safe_float(r.get("v27_final_score", 0)),
+        "v27_buy_eligible": bool(r.get("v27_buy_eligible", False)),
+        "v27_pool": r.get("v27_pool", ""),
+        "v27_trade_hypothesis": r.get("v27_trade_hypothesis", ""),
+        "v27_fund_factor": safe_float(r.get("v27_fund_factor", 0)),
+        "v27_structure_factor": safe_float(r.get("v27_structure_factor", 0)),
+        "v27_explosion_eve_factor": safe_float(r.get("v27_explosion_eve_factor", 0)),
+        "v27_current_trigger_factor": safe_float(r.get("v27_current_trigger_factor", 0)),
+        "v27_risk_trade_factor": safe_float(r.get("v27_risk_trade_factor", 0)),
+        "v27_reason_summary": r.get("v27_reason_summary", ""),
+        "v27_block_reasons": r.get("v27_block_reasons", []),
+        "v27_observe_reasons": r.get("v27_observe_reasons", []),
+        "v27_today_buy_reason": r.get("v27_today_buy_reason", ""),
+        "v27_tomorrow_confirm": r.get("v27_tomorrow_confirm", ""),
+        "v27_abandon_condition": r.get("v27_abandon_condition", ""),
+        "v27_position_suggestion": r.get("v27_position_suggestion", ""),
+        "v27_final_exit_note": r.get("v27_final_exit_note", ""),
+        "v27_near_pressure_rule": r.get("v27_near_pressure_rule", ""),
         "data_quality_tier": r.get("data_quality_tier", ""),
         "data_quality_reason": r.get("data_quality_reason", ""),
     })
@@ -14696,42 +16271,207 @@ def _v20_signal_group_key(row):
     return f"{hypo}|{tier}"
 
 
+def _v27_first_existing_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _v27_bucket_numeric_series(s, cuts, labels):
+    try:
+        return pd.cut(pd.to_numeric(s, errors="coerce"), bins=cuts, labels=labels, include_lowest=True).astype(str).fillna("unknown")
+    except Exception:
+        return pd.Series(["unknown"] * len(s))
+
+
 def build_v20_condition_probability_placeholder(payload):
-    """当前文件级统计占位：真实T+表现需在后续交易日读取历史score_cards与K线补全。"""
-    by_hypothesis = {}
-    rows = []
-    for section in ["final_top3", "watch_pool"]:
+    """V20/V27条件概率反馈表（V27.7 多上下文实算优先）。
+    1）无回测/复盘交易文件：只保存pending，不伪装概率。
+    2）有交易文件：按市场环境、板块/行业、主假设、买点类型、RR区间、防守距离、压力距离、风险层级分层统计。
+    3）小样本不硬加分，只作为probability_note；达到样本门槛后可供V27_CALIBRATION_FILE吸收。
+    """
+    trade_paths = []
+    try:
+        trade_paths.append(os.path.join(V25_BACKTEST_OUTPUT_DIR, V25_BACKTEST_TRADES_CSV))
+    except Exception:
+        pass
+    trade_paths.append(V25_BACKTEST_TRADES_CSV if 'V25_BACKTEST_TRADES_CSV' in globals() else 'v25_backtest_trades.csv')
+    trade_paths.append(os.path.join('outputs', 'v25_backtest', 'v25_backtest_trades.csv'))
+    trade_paths.append(os.path.join('outputs', 'v20_feedback', 'v20_signal_feedback_realized.csv'))
+    trades = []
+    seen_paths = set()
+    for path in trade_paths:
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        try:
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                if df is not None and not df.empty:
+                    df["_source_file"] = path
+                    trades.append(df)
+        except Exception:
+            continue
+
+    rows_pending = []
+    for section in ["final_top3", "watch_pool", "final_top5", "buy_pool"]:
         for r in payload.get(section, []) or []:
-            hypo = str(r.get("v20_main_hypothesis") or "综合结构机会")
-            d = by_hypothesis.setdefault(hypo, {"sample_count": 0, "pending_count": 0, "windows": V20_REVIEW_WINDOWS})
-            d["sample_count"] += 1
-            d["pending_count"] += 1
-            rows.append({
-                "hypothesis": hypo,
-                "tier": r.get("v20_trade_tier", ""),
-                "pool": r.get("pool", ""),
+            rows_pending.append({
+                "hypothesis": str(r.get("v27_trade_hypothesis") or r.get("v20_main_hypothesis") or r.get("main_hypothesis") or "综合结构机会"),
+                "tier": r.get("v20_trade_tier", r.get("tier", "")),
+                "pool": r.get("pool", section),
                 "code": r.get("code", ""),
+                "name": r.get("name", ""),
                 "date": r.get("date", ""),
+                "industry": r.get("industry", r.get("板块", "unknown")),
+                "market_env": r.get("market_env", r.get("v24_market_env", r.get("market_regime", "unknown"))),
+                "buy_point_type": r.get("v27_trade_hypothesis", r.get("v20_main_hypothesis", "unknown")),
+                "rr": r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))),
+                "defense_dist": r.get("v20_defense_dist", r.get("defense_dist", 0)),
+                "near_pressure": r.get("v20_near_pressure", r.get("near_pressure_dist", 0)),
                 "v20_final_score": r.get("v20_final_score", 0),
-                "v201_precise_trigger_line": r.get("v201_precise_trigger_line", 0),
+                "v27_final_score": r.get("v27_final_score", 0),
                 "status": "pending_forward_kline",
             })
+
+    by_hypothesis = {}
+    by_context = {}
+    calibration_seed = {}
+    source = "pending_only"
+    min_n = 20
+
+    def _stat_block(g, ret_col=None):
+        if ret_col and ret_col in g.columns:
+            sret = pd.to_numeric(g[ret_col], errors="coerce").dropna()
+        else:
+            sret = pd.Series(dtype=float)
+        out = {"sample_count": int(len(g))}
+        if len(sret):
+            out.update({
+                "win_rate": float((sret > 0).mean()),
+                "mean_return": float(sret.mean()),
+                "median_return": float(sret.median()),
+                "expectancy": float(sret.mean()),
+            })
+        if "max_adverse" in g.columns:
+            dd = pd.to_numeric(g["max_adverse"], errors="coerce").dropna()
+            if len(dd):
+                out["median_max_drawdown"] = float(dd.median())
+                out["worst_drawdown"] = float(dd.min())
+        if "strategy_ret" in g.columns:
+            sr = pd.to_numeric(g["strategy_ret"], errors="coerce").dropna()
+            if len(sr):
+                out["strategy_win_rate"] = float((sr > 0).mean())
+                out["strategy_expectancy"] = float(sr.mean())
+        return out
+
+    if trades:
+        try:
+            all_trades = pd.concat(trades, ignore_index=True)
+            source = "realized_backtest_or_feedback"
+            hypo_col = _v27_first_existing_col(all_trades, ["v27_trade_hypothesis", "main_hypothesis", "v20_main_hypothesis", "hypothesis"])
+            tier_col = _v27_first_existing_col(all_trades, ["v20_trade_tier", "tier", "trade_tier"])
+            env_col = _v27_first_existing_col(all_trades, ["market_env", "v24_market_env", "market_regime", "env"])
+            industry_col = _v27_first_existing_col(all_trades, ["industry", "板块", "sector", "concept"])
+            buy_col = _v27_first_existing_col(all_trades, ["buy_point_type", "v27_trade_hypothesis", "entry_type", "trigger_type"])
+            rr_col = _v27_first_existing_col(all_trades, ["v20_rr", "risk_reward_ratio", "rr"])
+            defense_col = _v27_first_existing_col(all_trades, ["v20_defense_dist", "defense_dist"])
+            pressure_col = _v27_first_existing_col(all_trades, ["v20_near_pressure", "near_pressure_dist", "near_pressure"])
+            risk_col = _v27_first_existing_col(all_trades, ["base_risk_level", "risk_level", "v27_risk_level"])
+
+            all_trades["_hypothesis"] = all_trades[hypo_col].astype(str) if hypo_col else "综合结构机会"
+            all_trades["_tier"] = all_trades[tier_col].astype(str) if tier_col else "unknown"
+            all_trades["_market_env"] = all_trades[env_col].astype(str) if env_col else "unknown"
+            all_trades["_industry"] = all_trades[industry_col].astype(str) if industry_col else "unknown"
+            all_trades["_buy_point_type"] = all_trades[buy_col].astype(str) if buy_col else all_trades["_hypothesis"]
+            all_trades["_risk_level"] = all_trades[risk_col].astype(str) if risk_col else "unknown"
+            if rr_col:
+                all_trades["_rr_bucket"] = _v27_bucket_numeric_series(all_trades[rr_col], [0, 1.0, 1.35, 2.0, 99], ["RR<1", "RR1-1.35", "RR1.35-2", "RR>2"])
+            else:
+                all_trades["_rr_bucket"] = "unknown"
+            if defense_col:
+                all_trades["_defense_bucket"] = _v27_bucket_numeric_series(all_trades[defense_col], [0, 0.04, 0.08, 0.12, 99], ["def<=4%", "def4-8%", "def8-12%", "def>12%"])
+            else:
+                all_trades["_defense_bucket"] = "unknown"
+            if pressure_col:
+                all_trades["_pressure_bucket"] = _v27_bucket_numeric_series(all_trades[pressure_col], [0, 0.03, 0.05, 0.10, 99], ["press<=3%", "press3-5%", "press5-10%", "press>10%"])
+            else:
+                all_trades["_pressure_bucket"] = "unknown"
+
+            ret_cols = []
+            for w in V20_REVIEW_WINDOWS:
+                ret_cols.append((w, f"net_ret_t{w}" if f"net_ret_t{w}" in all_trades.columns else (f"ret_t{w}" if f"ret_t{w}" in all_trades.columns else None)))
+            main_ret_col = next((c for w, c in ret_cols if w in [5, 8, 13] and c), None) or next((c for w, c in ret_cols if c), None)
+
+            for hypo, g in all_trades.groupby("_hypothesis", dropna=False):
+                item = {"sample_count": int(len(g)), "pending_count": 0, "windows": V20_REVIEW_WINDOWS}
+                for w, ret_col in ret_cols:
+                    if ret_col:
+                        item[f"T+{w}"] = _stat_block(g, ret_col)
+                if main_ret_col:
+                    item.update(_stat_block(g, main_ret_col))
+                by_hypothesis[str(hypo or "综合结构机会")] = item
+
+            context_specs = {
+                "hypothesis|market_env|tier": ["_hypothesis", "_market_env", "_tier"],
+                "hypothesis|industry|buy_point": ["_hypothesis", "_industry", "_buy_point_type"],
+                "hypothesis|rr|defense|pressure": ["_hypothesis", "_rr_bucket", "_defense_bucket", "_pressure_bucket"],
+                "hypothesis|risk|market_env": ["_hypothesis", "_risk_level", "_market_env"],
+            }
+            for spec_name, cols in context_specs.items():
+                bucket = {}
+                for key, g in all_trades.groupby(cols, dropna=False):
+                    if not isinstance(key, tuple):
+                        key = (key,)
+                    k = "|".join(str(x) for x in key)
+                    item = _stat_block(g, main_ret_col)
+                    item["slice"] = spec_name
+                    item["sample_quality"] = "usable" if int(item.get("sample_count", 0)) >= min_n else "small_sample"
+                    bucket[k] = item
+                    if item["sample_quality"] == "usable":
+                        calibration_seed[k] = item
+                by_context[spec_name] = bucket
+        except Exception as e:
+            source = f"trade_read_failed:{str(e)[:100]}"
+
+    # 当前pending也写入，供后续T+补全。
+    for r in rows_pending:
+        d = by_hypothesis.setdefault(r["hypothesis"], {"sample_count": 0, "pending_count": 0, "windows": V20_REVIEW_WINDOWS})
+        d["pending_count"] = int(d.get("pending_count", 0)) + 1
+
     table = {
         "model_version": MODEL_VERSION,
         "generated_at_bj": bj_time_str(),
-        "note": "V20.1已保存条件概率分组底座；真实T+1/T+3/T+5/T+8/T+13/T+20收益需在后续交易日读取历史score_cards与K线后更新。",
+        "source": source,
+        "note": "V27.7已按市场环境/板块/买点类型/RR/防守/压力/风险层级生成条件概率；无历史记录时只保存pending，不伪装胜率。",
         "review_windows": V20_REVIEW_WINDOWS,
         "by_hypothesis": by_hypothesis,
+        "by_context": by_context,
+        "calibration_seed_context_probability": calibration_seed,
+        "pending_rows": len(rows_pending),
     }
     try:
         with open(V20_CONDITION_TABLE_FILE, "w", encoding="utf-8") as f:
             json.dump(table, f, ensure_ascii=False, indent=2)
-        if rows:
-            pd.DataFrame(rows).to_csv(V20_SIGNAL_FEEDBACK_CSV, index=False, encoding="utf-8-sig")
+        if rows_pending:
+            pd.DataFrame(rows_pending).to_csv(V20_SIGNAL_FEEDBACK_CSV, index=False, encoding="utf-8-sig")
+        # 同步输出一个可被V27定价器吸收的轻量校准种子；不会修改生产链路。
+        try:
+            os.makedirs(os.path.dirname(V27_CALIBRATION_FILE), exist_ok=True)
+            if calibration_seed:
+                with open(V27_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "generated_at_bj": bj_time_str(),
+                        "sample_count": int(sum(v.get("sample_count", 0) for v in calibration_seed.values())),
+                        "context_probability": calibration_seed,
+                        "note": "由条件概率反馈表生成的上下文概率校准种子；权重仍需离线walk-forward进一步校准。",
+                    }, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     except Exception as e:
-        print(f"V20.1条件概率占位表保存失败：{e}")
+        print(f"V20.1条件概率表保存失败：{e}")
     return table
-
 
 
 def _v20_parse_date_safe(x):
@@ -15044,7 +16784,17 @@ def save_v20_outputs(final_signals, diagnostics, audited_rows, dates=None, meta=
         if final_cards:
             lines.append("【今日V22正式Top3】")
             for i, row in enumerate(final_cards, 1):
-                lines.append(f"{i}. {row['name']}({row['code']}) | V26买入分 {safe_float(row.get('v26_final_buy_score',0)):.2f} | {row.get('v26_position_tier','')} | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | {row['v20_trade_tier']} | 主假设：{row['v20_main_hypothesis']}")
+                lines.append(f"{i}. {row['name']}({row['code']}) | V27最终分 {safe_float(row.get('v27_final_score',0)):.2f} | {row.get('v27_pool','')} | V26审计分 {safe_float(row.get('v26_final_buy_score',0)):.2f} | V22融合分 {safe_float(row.get('v22_composite_trade_score',0)):.2f} | 主假设：{row.get('v27_trade_hypothesis') or row.get('v20_main_hypothesis','')}")
+                if safe_float(row.get('v27_final_score',0)) > 0:
+                    lines.append(f"   V27六因子：资金{safe_float(row.get('v27_fund_factor')):.1f}/25｜结构{safe_float(row.get('v27_structure_factor')):.1f}/20｜爆发前夜{safe_float(row.get('v27_explosion_eve_factor')):.1f}/20｜触发{safe_float(row.get('v27_current_trigger_factor')):.1f}/15｜交易{safe_float(row.get('v27_risk_trade_factor')):.1f}/10")
+                    if row.get('v27_today_buy_reason'):
+                        lines.append(f"   {row.get('v27_today_buy_reason')}")
+                    if row.get('v27_tomorrow_confirm'):
+                        lines.append(f"   明日确认：{row.get('v27_tomorrow_confirm')}")
+                    if row.get('v27_abandon_condition'):
+                        lines.append(f"   放弃条件：{row.get('v27_abandon_condition')}")
+                    if row.get('v27_position_suggestion'):
+                        lines.append(f"   仓位建议：{row.get('v27_position_suggestion')}")
                 if safe_float(row.get('v26_final_buy_score',0)) > 0:
                     lines.append(f"   V26母因子：爆发前夜{safe_float(row.get('v26_explosion_eve_score',0)):.1f}/20｜关键位{safe_float(row.get('v26_key_structure_score',0)):.1f}/15｜供应吸收{safe_float(row.get('v26_supply_absorption_mother_score',0)):.1f}/12｜承接{safe_float(row.get('v26_support_defense_score',0)):.1f}/12｜突破{safe_float(row.get('v26_breakout_expansion_score',0)):.1f}/12｜定价{safe_float(row.get('v26_pricing_rr_score',0)):.1f}/12")
                 if row.get("bottom_pattern_type"):
@@ -16234,6 +17984,3260 @@ def main():
 
     finally:
         baostock_logout()
+
+
+# =========================
+# V27.8 增量补丁：真实雷区源接口 + Walk-Forward 样本驱动校准 + 条件概率定价
+# 只覆盖选股逻辑函数；不触碰入口/workflow/缓存/Telegram/PAT/生产链路。
+# =========================
+V278_RISK_DYNAMIC_FILES = os.environ.get("V278_RISK_DYNAMIC_FILES", os.environ.get("RISK_DYNAMIC_FILES", ""))
+V278_RISK_REQUIRE_DYNAMIC_SOURCE = os.environ.get("V278_RISK_REQUIRE_DYNAMIC_SOURCE", "0")
+V278_RISK_DYNAMIC_MISSING_PENALTY = float(os.environ.get("V278_RISK_DYNAMIC_MISSING_PENALTY", "-8"))
+V278_RISK_DYNAMIC_HARD_EXCLUDE = os.environ.get("V278_RISK_DYNAMIC_HARD_EXCLUDE", "0")
+V278_WALK_FORWARD_TRADE_FILES = os.environ.get("V278_WALK_FORWARD_TRADE_FILES", os.environ.get("V27_WALK_FORWARD_TRADE_FILES", ""))
+V278_WF_MIN_SAMPLE = int(os.environ.get("V278_WF_MIN_SAMPLE", str(max(V27_MIN_CALIBRATION_SAMPLE, 120))))
+V278_WF_MIN_TEST_SAMPLE = int(os.environ.get("V278_WF_MIN_TEST_SAMPLE", "30"))
+V278_WF_RIDGE_LAMBDA = float(os.environ.get("V278_WF_RIDGE_LAMBDA", "1.0"))
+V278_WF_TARGET_WINDOW = os.environ.get("V278_WF_TARGET_WINDOW", "8")
+V278_AUTO_BUILD_CALIBRATION = os.environ.get("V278_AUTO_BUILD_CALIBRATION", "1")
+V278_SAMPLE_INSUFFICIENT_FORMAL_POLICY = os.environ.get("V278_SAMPLE_INSUFFICIENT_FORMAL_POLICY", "observe_only")
+
+
+def _v278_split_paths(x):
+    out=[]
+    for part in str(x or "").replace(";", ",").split(","):
+        part=part.strip()
+        if part:
+            out.append(part)
+    return out
+
+
+def _v278_read_table(path):
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        if str(path).lower().endswith(('.xlsx','.xls')):
+            return pd.read_excel(path)
+        if str(path).lower().endswith('.json'):
+            data=json.load(open(path,'r',encoding='utf-8'))
+            if isinstance(data, list):
+                return pd.DataFrame(data)
+            if isinstance(data, dict):
+                for k in ['rows','items','trades','signals','history']:
+                    if isinstance(data.get(k), list):
+                        return pd.DataFrame(data[k])
+                return pd.DataFrame([data])
+        return pd.read_csv(path, encoding='utf-8-sig')
+    except Exception:
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return None
+
+
+def _v278_normalize_code(code):
+    s=str(code or '').strip()
+    digits=''.join(ch for ch in s if ch.isdigit())
+    return digits[-6:].zfill(6) if len(digits)>=1 else s
+
+
+def _v278_load_dynamic_risk_sources():
+    """读取外部公告/财报/监管动态落地文件。支持csv/json/xlsx；字段尽量自适应。"""
+    paths=_v278_split_paths(V278_RISK_DYNAMIC_FILES)
+    rows=[]; missing=[]; loaded=[]
+    for path in paths:
+        if not os.path.exists(path):
+            missing.append(path); continue
+        df=_v278_read_table(path)
+        if df is None or df.empty:
+            missing.append(path); continue
+        loaded.append(path)
+        cols={str(c).lower():c for c in df.columns}
+        code_col=cols.get('code') or cols.get('股票代码') or cols.get('symbol') or cols.get('证券代码')
+        flag_col=cols.get('flag') or cols.get('flags') or cols.get('risk_flag') or cols.get('风险标签') or cols.get('雷区') or cols.get('title') or cols.get('公告标题')
+        note_col=cols.get('note') or cols.get('reason') or cols.get('content') or cols.get('摘要') or cols.get('公告内容')
+        date_col=cols.get('date') or cols.get('公告日期') or cols.get('report_date')
+        for _,r in df.iterrows():
+            code=_v278_normalize_code(r.get(code_col,'')) if code_col else ''
+            if not code:
+                continue
+            flag=str(r.get(flag_col,'')) if flag_col else ''
+            note=str(r.get(note_col,'')) if note_col else ''
+            dt=str(r.get(date_col,'')) if date_col else ''
+            txt='；'.join([x for x in [flag,note] if x and x.lower()!='nan'])
+            if txt:
+                rows.append({'code':code,'flag':flag or txt[:50],'note':note,'date':dt,'source':'dynamic'})
+    return {'rows':rows,'loaded':loaded,'missing':missing,'status':'ok' if loaded else ('not_configured' if not paths else 'unavailable')}
+
+
+def load_risk_flags(path=RISK_FLAGS_FILE):
+    """V27.8：本地静态雷区库 + 外部动态风险落地文件；缺源不再默认为零风险。"""
+    meta={"__meta__":{"path":path,"status":"ok","reason":"","dynamic_status":""}}
+    data={}
+    if os.path.exists(path):
+        try:
+            raw=json.load(open(path,'r',encoding='utf-8'))
+            if isinstance(raw,dict):
+                data.update({k:v for k,v in raw.items() if k!='__meta__'})
+            else:
+                meta['__meta__']['status']='invalid_format'
+                meta['__meta__']['reason']='risk_flags.json不是dict格式'
+        except Exception as e:
+            meta['__meta__']['status']='read_failed'
+            meta['__meta__']['reason']=f'risk_flags.json读取失败:{str(e)[:120]}'
+    else:
+        meta['__meta__']['status']='missing'
+        meta['__meta__']['reason']=f'静态雷区库不存在:{path}'
+    dyn=_v278_load_dynamic_risk_sources()
+    meta['__meta__']['dynamic_status']=dyn.get('status','unknown')
+    meta['__meta__']['dynamic_loaded']=dyn.get('loaded',[])
+    meta['__meta__']['dynamic_missing']=dyn.get('missing',[])
+    for row in dyn.get('rows',[]):
+        code=_v278_normalize_code(row.get('code',''))
+        if not code: continue
+        item=data.get(code, {'flags':[], 'note':''})
+        if isinstance(item,list):
+            item={'flags':item,'note':''}
+        if not isinstance(item,dict):
+            item={'flags':[str(item)],'note':''}
+        flags=item.setdefault('flags',[])
+        flag=str(row.get('flag') or row.get('note') or '').strip()
+        if flag and flag not in flags:
+            flags.append(flag)
+        note='；'.join([str(x) for x in [item.get('note',''), row.get('date',''), row.get('note','')] if str(x).strip() and str(x).lower()!='nan'])
+        item['note']=note
+        item['source']='static+dynamic' if code in data else 'dynamic'
+        data[code]=item
+    if V278_RISK_REQUIRE_DYNAMIC_SOURCE=='1' and dyn.get('status')!='ok':
+        meta['__meta__']['status']='dynamic_unavailable'
+        meta['__meta__']['reason']='要求动态监管/财报源，但V278_RISK_DYNAMIC_FILES未可用'
+    elif meta['__meta__']['status']!='ok' and dyn.get('status')=='ok':
+        meta['__meta__']['status']='ok_with_dynamic_only'
+        meta['__meta__']['reason']='静态库缺失，但动态风险源可用'
+    data['__meta__']=meta['__meta__']
+    return data
+
+
+def _risk_data_unavailable_result(reason):
+    hard = ((RISK_FLAGS_STRICT_REQUIRED == "1" and RISK_FLAGS_MISSING_HARD_EXCLUDE == "1") or V278_RISK_DYNAMIC_HARD_EXCLUDE=='1')
+    penalty = RISK_FLAGS_MISSING_PENALTY if RISK_FLAGS_STRICT_REQUIRED == "1" else V278_RISK_DYNAMIC_MISSING_PENALTY
+    return {
+        "penalty": float(penalty),
+        "hard_exclude": bool(hard),
+        "flags": ["雷区数据源不可用：静态库/动态公告财报源未完成，正式买入池需降级"],
+        "note": reason or "risk_source_unavailable",
+        "risk_data_status": "unavailable",
+        "risk_action": "fail_closed" if hard else "penalty_observe_only",
+    }
+
+
+def evaluate_regulatory_risk(code, name=""):
+    """V27.8：硬过滤框架升级为多源风险过滤。动态源未配置时可惩罚/可失败关闭。"""
+    global _RISK_FLAGS_CACHE
+    if _RISK_FLAGS_CACHE is None:
+        _RISK_FLAGS_CACHE = load_risk_flags()
+    meta = _RISK_FLAGS_CACHE.get("__meta__", {}) if isinstance(_RISK_FLAGS_CACHE, dict) else {}
+    if meta and meta.get('status') not in ['ok','ok_with_dynamic_only']:
+        return _risk_data_unavailable_result(str(meta.get('reason','雷区源不可用')))
+    key=str(code).strip(); zkey=_v278_normalize_code(key)
+    raw=_RISK_FLAGS_CACHE.get(key, _RISK_FLAGS_CACHE.get(zkey, None)) if isinstance(_RISK_FLAGS_CACHE, dict) else None
+    if not raw:
+        if V278_RISK_REQUIRE_DYNAMIC_SOURCE=='1' and meta.get('dynamic_status')!='ok':
+            return _risk_data_unavailable_result('动态监管/财报源不可用，不能证明无雷')
+        return {"penalty":0.0,"hard_exclude":False,"flags":[],"note":"","risk_data_status":"ok","risk_action":"pass","risk_source_status":meta.get('dynamic_status','')}
+    if isinstance(raw,dict):
+        flags=raw.get('flags',[]); note=str(raw.get('note',''))
+    elif isinstance(raw,list):
+        flags=raw; note=''
+    else:
+        flags=[str(raw)]; note=''
+    flags=[str(x) for x in flags if str(x).strip()]
+    joined='；'.join(flags)+('；'+note if note else '')
+    major_keywords=['立案','证监会','调查','信披违规','资金占用','违规担保','重大处罚','行政处罚','非标','无法表示','保留意见','否定意见','退市','ST','债务违约','暂停上市','终止上市','欺诈','财务造假','被实施退市风险警示']
+    medium_keywords=['监管措施','警示函','问询函','关注函','高质押','质押','冻结','司法拍卖','诉讼','仲裁','高管处罚','股权分散','会计师事务所变动','频繁更名','延期披露','更正公告']
+    financial_keywords=['亏损','连续亏损','扣非亏损','经营现金流','现金流为负','应收','坏账','减值','高商誉','商誉','负债率','客户集中','供应商集中','毛利率下滑','营收下滑']
+    major_hits=sum(1 for k in major_keywords if k in joined)
+    medium_hits=sum(1 for k in medium_keywords if k in joined)
+    financial_hits=sum(1 for k in financial_keywords if k in joined)
+    if major_hits>0:
+        penalty=-45.0-min(30.0,6.0*max(0,major_hits-1)+3.0*medium_hits+2.0*financial_hits)
+        return {"penalty":penalty,"hard_exclude":True,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"hard_exclude","risk_source_status":meta.get('dynamic_status','')}
+    if medium_hits>0:
+        penalty=-22.0-min(28.0,5.0*max(0,medium_hits-1)+2.0*financial_hits)
+        hard=medium_hits>=3 or (medium_hits>=2 and financial_hits>=1)
+        if hard: penalty=min(penalty,-40.0)
+        return {"penalty":penalty,"hard_exclude":hard,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"hard_exclude" if hard else "downgrade","risk_source_status":meta.get('dynamic_status','')}
+    if financial_hits>0:
+        penalty=-12.0-min(20.0,4.0*financial_hits)
+        return {"penalty":penalty,"hard_exclude":False,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"financial_penalty","risk_source_status":meta.get('dynamic_status','')}
+    return {"penalty":-5.0 if flags else 0.0,"hard_exclude":False,"flags":flags,"note":note,"risk_data_status":"ok","risk_action":"minor_flag","risk_source_status":meta.get('dynamic_status','')}
+
+
+def _v278_candidate_trade_files():
+    paths=[]
+    paths += _v278_split_paths(V278_WALK_FORWARD_TRADE_FILES)
+    for pth in [globals().get('V20_SIGNAL_FEEDBACK_CSV',''), globals().get('V20_CONDITION_TABLE_FILE','')]:
+        if pth: paths.append(pth)
+    for pth in [os.path.join('outputs','v20_signal_feedback.csv'), os.path.join('outputs','v20_signal_feedback_history.csv'), os.path.join('outputs','review','signal_feedback.csv')]:
+        paths.append(pth)
+    seen=[]
+    for x in paths:
+        if x and x not in seen and os.path.exists(x): seen.append(x)
+    return seen
+
+
+def _v278_first_col(df, names):
+    lower={str(c).lower():c for c in df.columns}
+    for n in names:
+        if n in df.columns: return n
+        if str(n).lower() in lower: return lower[str(n).lower()]
+    return None
+
+
+def _v278_build_walk_forward_calibration():
+    files=_v278_candidate_trade_files()
+    dfs=[]
+    for pth in files:
+        df=_v278_read_table(pth)
+        if df is not None and not df.empty:
+            df=df.copy(); df['_source_file']=pth; dfs.append(df)
+    if not dfs:
+        return None
+    df=pd.concat(dfs,ignore_index=True)
+    factor_map={
+        'fund':['v27_fund_factor','fund_factor','f1'],
+        'structure':['v27_structure_factor','structure_factor','f2'],
+        'explosion':['v27_explosion_eve_factor','explosion_factor','f3'],
+        'trigger':['v27_current_trigger_factor','trigger_factor','f4'],
+        'market':['v27_market_factor','market_factor','f5'],
+        'risk_trade':['v27_risk_trade_factor','risk_trade_factor','f6'],
+    }
+    cols={k:_v278_first_col(df,v) for k,v in factor_map.items()}
+    ret_col=_v278_first_col(df,[f'net_ret_t{V278_WF_TARGET_WINDOW}',f'ret_t{V278_WF_TARGET_WINDOW}','strategy_ret','future_ret','return','收益率'])
+    date_col=_v278_first_col(df,['date','signal_date','trade_date','推荐日期'])
+    if not ret_col or any(v is None for v in cols.values()):
+        return {"status":"insufficient_columns","sample_count":0,"note":"缺少V27因子列或收益列，无法walk-forward校准","source_files":files}
+    work=df[[c for c in cols.values()]+[ret_col]+([date_col] if date_col else [])].copy()
+    for c in cols.values(): work[c]=pd.to_numeric(work[c],errors='coerce')
+    work['_ret']=pd.to_numeric(work[ret_col],errors='coerce')
+    work=work.dropna(subset=list(cols.values())+['_ret'])
+    if date_col:
+        work['_date']=pd.to_datetime(work[date_col],errors='coerce')
+        work=work.sort_values('_date')
+    if len(work)<V278_WF_MIN_SAMPLE:
+        return {"status":"small_sample","sample_count":int(len(work)),"note":f"可用样本<{V278_WF_MIN_SAMPLE}，不做权重校准","source_files":files}
+    X=work[list(cols.values())].astype(float).values
+    y=work['_ret'].astype(float).values
+    # 标准化后岭回归；用收益方向和幅度共同定价。
+    mu=X.mean(axis=0); sd=X.std(axis=0); sd[sd==0]=1.0
+    Xz=(X-mu)/sd
+    n=len(work)
+    splits=[]
+    for frac in [0.55,0.65,0.75,0.85]:
+        cut=int(n*frac)
+        if cut>=30 and n-cut>=V278_WF_MIN_TEST_SAMPLE:
+            splits.append(cut)
+    oos=[]; betas=[]
+    for cut in splits:
+        Xt=Xz[:cut]; yt=y[:cut]; Xv=Xz[cut:]; yv=y[cut:]
+        A=Xt.T@Xt+V278_WF_RIDGE_LAMBDA*np.eye(Xt.shape[1])
+        try: beta=np.linalg.solve(A,Xt.T@yt)
+        except Exception: beta=np.linalg.pinv(A)@(Xt.T@yt)
+        pred=Xv@beta
+        win=float(((pred>np.median(pred))==(yv>0)).mean()) if len(yv) else 0.0
+        corr=float(np.corrcoef(pred,yv)[0,1]) if len(yv)>2 and np.std(pred)>0 and np.std(yv)>0 else 0.0
+        top=np.percentile(pred,70) if len(pred) else 0
+        top_ret=float(np.mean(yv[pred>=top])) if len(yv[pred>=top]) else 0.0
+        oos.append({'train_n':int(cut),'test_n':int(n-cut),'direction_accuracy':win,'corr':corr,'top30_mean_ret':top_ret})
+        betas.append(beta)
+    if not betas:
+        return {"status":"small_oos","sample_count":int(n),"note":"样本虽足但无法形成有效OOS切片","source_files":files}
+    beta=np.mean(np.vstack(betas),axis=0)
+    pos=np.maximum(beta,0)
+    if pos.sum()<=0:
+        pos=np.abs(beta)
+    if pos.sum()<=0:
+        pos=np.ones_like(pos)
+    base_sum=V27_WEIGHT_FUND+V27_WEIGHT_STRUCTURE+V27_WEIGHT_EXPLOSION+V27_WEIGHT_TRIGGER+V27_WEIGHT_MARKET+V27_WEIGHT_RISK_TRADE
+    norm=pos/pos.sum()*base_sum
+    keys=['fund','structure','explosion','trigger','market','risk_trade']
+    weights={k:float(max(0.25,min(1.85,norm[i]))) for i,k in enumerate(keys)}
+    raw=(X[:,0]*weights['fund']+X[:,1]*weights['structure']+X[:,2]*weights['explosion']+X[:,3]*weights['trigger']+X[:,4]*weights['market']+X[:,5]*weights['risk_trade'])
+    good=work['_ret'].values>0
+    min_buy=float(np.percentile(raw[good],55)) if good.any() else V27_MIN_BUY_SCORE
+    min_buy=max(72.0,min(88.0,min_buy))
+    cal={
+        'status':'ok', 'method':'walk_forward_ridge_v278', 'generated_at_bj': bj_time_str(),
+        'sample_count':int(n), 'source_files':files, 'target_return_col':ret_col,
+        'weights':weights,
+        'thresholds':{'min_buy_score':min_buy,'min_rr':V27_MIN_RR,'max_defense_dist':V27_MAX_DEFENSE_DIST,'near_pressure_hard':V27_NEAR_PRESSURE_HARD_BLOCK,'near_pressure_soft':V27_NEAR_PRESSURE_SOFT_BLOCK},
+        'oos_metrics':oos,
+        'factor_columns':cols,
+        'note':'V27.8自动walk-forward岭回归校准；若OOS弱，正式池仍需RR/防守/雷区硬约束。'
+    }
+    try:
+        os.makedirs(os.path.dirname(V27_CALIBRATION_FILE),exist_ok=True)
+        json.dump(cal,open(V27_CALIBRATION_FILE,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+    except Exception:
+        pass
+    return cal
+
+
+def _v27_load_calibration():
+    """V27.8：优先读取walk-forward校准；缺文件时尝试从复盘交易样本自动生成。"""
+    global _V27_CALIBRATION_CACHE
+    if _V27_CALIBRATION_CACHE is not None:
+        return _V27_CALIBRATION_CACHE
+    default={
+        'status':'missing','sample_count':0,
+        'weights':{'fund':V27_WEIGHT_FUND,'structure':V27_WEIGHT_STRUCTURE,'explosion':V27_WEIGHT_EXPLOSION,'trigger':V27_WEIGHT_TRIGGER,'market':V27_WEIGHT_MARKET,'risk_trade':V27_WEIGHT_RISK_TRADE},
+        'thresholds':{'min_buy_score':V27_MIN_BUY_SCORE,'min_rr':V27_MIN_RR,'max_defense_dist':V27_MAX_DEFENSE_DIST,'near_pressure_hard':V27_NEAR_PRESSURE_HARD_BLOCK,'near_pressure_soft':V27_NEAR_PRESSURE_SOFT_BLOCK},
+        'note':'缺少walk-forward校准文件；经验权重只作降级兜底。'
+    }
+    data=None
+    if os.path.exists(V27_CALIBRATION_FILE):
+        try:
+            data=json.load(open(V27_CALIBRATION_FILE,'r',encoding='utf-8'))
+        except Exception as e:
+            data={'status':'read_failed','note':f'校准文件读取失败:{str(e)[:120]}'}
+    elif V278_AUTO_BUILD_CALIBRATION=='1':
+        data=_v278_build_walk_forward_calibration()
+    if not isinstance(data,dict):
+        _V27_CALIBRATION_CACHE=default; return default
+    sample=int(safe_float(data.get('sample_count',data.get('n',0)),0))
+    method=str(data.get('method',''))
+    status=str(data.get('status',''))
+    if method.startswith('walk_forward') and sample>=V278_WF_MIN_SAMPLE and status=='ok':
+        final_status='ok'
+    elif sample>=V27_MIN_CALIBRATION_SAMPLE and data.get('weights'):
+        final_status='ok' if method else 'probability_only'
+    elif sample>0:
+        final_status='small_sample'
+    else:
+        final_status=status if status else 'missing'
+    merged=dict(default); merged.update(data)
+    merged['status']=final_status; merged['sample_count']=sample
+    merged['weights']={**default['weights'], **(data.get('weights') or {})}
+    merged['thresholds']={**default['thresholds'], **(data.get('thresholds') or {})}
+    if final_status in ['probability_only','small_sample','missing','insufficient_columns','small_oos']:
+        merged['note']=str(merged.get('note',''))+'｜V27.8提示：未形成完整walk-forward权重校准，正式买入池应降级。'
+    _V27_CALIBRATION_CACHE=merged
+    return merged
+
+
+def _v27_factor_score_from_calibration(f1,f2,f3,f4,f5,f6):
+    cal=_v27_load_calibration(); w=cal.get('weights',{}) if isinstance(cal,dict) else {}
+    raw=(f1*safe_float(w.get('fund',V27_WEIGHT_FUND),V27_WEIGHT_FUND)+f2*safe_float(w.get('structure',V27_WEIGHT_STRUCTURE),V27_WEIGHT_STRUCTURE)+f3*safe_float(w.get('explosion',V27_WEIGHT_EXPLOSION),V27_WEIGHT_EXPLOSION)+f4*safe_float(w.get('trigger',V27_WEIGHT_TRIGGER),V27_WEIGHT_TRIGGER)+f5*safe_float(w.get('market',V27_WEIGHT_MARKET),V27_WEIGHT_MARKET)+f6*safe_float(w.get('risk_trade',V27_WEIGHT_RISK_TRADE),V27_WEIGHT_RISK_TRADE))
+    status=str(cal.get('status','missing'))
+    score=_v27_clip(raw,0,100)
+    if status!='ok':
+        score=_v27_clip(score*V27_UNCALIBRATED_SCORE_HAIRCUT,0,100)
+    # OOS很弱时继续折扣，避免“有文件但无效校准”。
+    oos=cal.get('oos_metrics',[]) if isinstance(cal,dict) else []
+    if status=='ok' and isinstance(oos,list) and oos:
+        avg_corr=np.nanmean([safe_float(x.get('corr',0),0) for x in oos])
+        avg_top=np.nanmean([safe_float(x.get('top30_mean_ret',0),0) for x in oos])
+        if avg_corr<0.01 and avg_top<=0:
+            score=_v27_clip(score*0.95,0,100)
+            cal['status']='weak_oos'
+            cal['note']=str(cal.get('note',''))+'｜OOS相关性/Top组收益偏弱，自动降权。'
+    return score, cal
+
+
+def _v278_context_keys(row):
+    hypo=str(row.get('v27_trade_hypothesis') or row.get('v20_main_hypothesis') or row.get('main_hypothesis') or '综合结构机会')
+    env=str(row.get('market_env') or row.get('v24_market_env') or row.get('market_regime') or 'unknown')
+    tier=str(row.get('v20_trade_tier') or row.get('tier') or 'unknown')
+    industry=str(row.get('industry') or row.get('板块') or row.get('sector') or 'unknown')
+    buy=str(row.get('buy_point_type') or row.get('v27_trade_hypothesis') or hypo)
+    rr=safe_float(row.get('v20_rr',row.get('risk_reward_ratio',row.get('rr',0))))
+    defense=safe_float(row.get('v20_defense_dist',row.get('defense_dist',0)))
+    pressure=safe_float(row.get('v20_near_pressure',row.get('near_pressure_dist',0)))
+    risk=str(row.get('base_risk_level') or row.get('risk_level') or row.get('v27_risk_level') or 'unknown')
+    rr_b='RR<1' if rr<1 else ('RR1-1.35' if rr<1.35 else ('RR1.35-2' if rr<2 else 'RR>2'))
+    def_b='def<=4%' if defense<=0.04 else ('def4-8%' if defense<=0.08 else ('def8-12%' if defense<=0.12 else 'def>12%'))
+    pre_b='press<=3%' if pressure<=0.03 else ('press3-5%' if pressure<=0.05 else ('press5-10%' if pressure<=0.10 else 'press>10%'))
+    return [f'{hypo}|{env}|{tier}', f'{hypo}|{industry}|{buy}', f'{hypo}|{rr_b}|{def_b}|{pre_b}', f'{hypo}|{risk}|{env}', hypo]
+
+
+def _v27_context_probability_adjustment(row, cal):
+    ctx=cal.get('context_probability') or cal.get('calibration_seed_context_probability') or {}
+    if not isinstance(ctx,dict) or not ctx:
+        return 0.0,'未接入上下文概率校准'
+    best=None; best_key=''
+    for k in _v278_context_keys(row):
+        item=ctx.get(k)
+        if isinstance(item,dict):
+            n=int(safe_float(item.get('sample_count',0),0))
+            if n>=20 and (best is None or n>safe_float(best.get('sample_count',0),0)):
+                best=item; best_key=k
+    if not best:
+        return 0.0,'上下文概率样本不足：仅记录，不加分'
+    n=int(safe_float(best.get('sample_count',0),0))
+    wr=safe_float(best.get('win_rate', best.get('T+8',{}).get('win_rate', best.get('T+5',{}).get('win_rate',0.5))),0.5)
+    exp=safe_float(best.get('expectancy', best.get('mean_return', best.get('T+8',{}).get('mean_return',0))),0)
+    shrink=min(1.0, n/80.0)
+    adj=((wr-0.5)*8.0 + exp*45.0)*shrink
+    adj=max(-5.0,min(5.0,adj))
+    return adj, f'上下文概率:{best_key} 样本{n} 胜率{wr:.1%} 期望{exp:.2%} shrink={shrink:.2f}'
+
+# V27.8 覆盖决策器：在原V27.7基础上，把“无walk-forward完整校准”从仅提示升级为正式池降级策略。
+_v277_wallstreet_decision_engine = v27_wallstreet_decision_engine
+
+def v27_wallstreet_decision_engine(row):
+    r=_v277_wallstreet_decision_engine(row)
+    cal_status=str(r.get('v27_calibration_status','missing'))
+    if cal_status!='ok' and V278_SAMPLE_INSUFFICIENT_FORMAL_POLICY=='observe_only' and bool(r.get('v27_buy_eligible',False)):
+        r['v27_buy_eligible']=False
+        r['v27_pool']='V27观察池'
+        obs=list(r.get('v27_observe_reasons',[]) or [])
+        obs.append('V27.8：缺少完整walk-forward校准/OOS有效性，禁止从经验权重直接进入最终买入池')
+        r['v27_observe_reasons']=obs
+        r['v27_uncalibrated_policy']='observe_only'
+    return r
+
+
+# =========================
+# V27.9 增量补丁：内置公告/监管雷区采集器（不触碰生产链路）
+# 目标：把“外部程序整理动态风险文件”内置到选股逻辑层；主流程仍只调用 evaluate_regulatory_risk。
+# 安全策略：优先用本地缓存；联网失败不伪装零风险，按 V27.8 失败关闭/降级规则处理。
+# =========================
+V279_RISK_AUTO_FETCH = os.environ.get("V279_RISK_AUTO_FETCH", os.environ.get("RISK_AUTO_FETCH", "1"))
+V279_RISK_AUTO_CACHE_FILE = os.environ.get("V279_RISK_AUTO_CACHE_FILE", os.environ.get("RISK_AUTO_CACHE_FILE", "risk_dynamic_events_auto.json"))
+V279_RISK_FETCH_DAYS = int(os.environ.get("V279_RISK_FETCH_DAYS", "120"))
+V279_RISK_FETCH_MAX_PAGES = int(os.environ.get("V279_RISK_FETCH_MAX_PAGES", "80"))
+V279_RISK_FETCH_PAGE_SIZE = int(os.environ.get("V279_RISK_FETCH_PAGE_SIZE", "30"))
+V279_RISK_FETCH_TIMEOUT = float(os.environ.get("V279_RISK_FETCH_TIMEOUT", "8"))
+V279_RISK_CACHE_MAX_AGE_HOURS = float(os.environ.get("V279_RISK_CACHE_MAX_AGE_HOURS", "36"))
+V279_RISK_CNINFO_URL = os.environ.get("V279_RISK_CNINFO_URL", "http://www.cninfo.com.cn/new/hisAnnouncement/query")
+V279_RISK_FETCH_SLEEP = float(os.environ.get("V279_RISK_FETCH_SLEEP", "0.12"))
+V279_RISK_KEYWORDS_MAJOR = [
+    "立案", "证监会立案", "被立案", "调查通知书", "行政处罚", "重大违法", "财务造假", "欺诈发行",
+    "资金占用", "违规担保", "非标", "无法表示意见", "否定意见", "保留意见", "退市风险警示",
+    "终止上市", "暂停上市", "债务违约", "破产重整", "被实施退市风险警示"
+]
+V279_RISK_KEYWORDS_MEDIUM = [
+    "监管措施", "警示函", "问询函", "关注函", "责令改正", "纪律处分", "公开谴责", "通报批评",
+    "股份冻结", "司法冻结", "司法拍卖", "质押", "高质押", "诉讼", "仲裁", "延期披露", "更正公告",
+    "会计差错", "前期会计差错", "年报问询", "半年报问询"
+]
+V279_RISK_KEYWORDS_FINANCIAL = [
+    "业绩预亏", "续亏", "亏损", "扣非亏损", "商誉减值", "资产减值", "信用减值", "债务逾期",
+    "经营活动现金流量净额为负", "流动性风险", "偿债风险", "净资产为负", "资不抵债"
+]
+V279_RISK_KEYWORDS = tuple(dict.fromkeys(V279_RISK_KEYWORDS_MAJOR + V279_RISK_KEYWORDS_MEDIUM + V279_RISK_KEYWORDS_FINANCIAL))
+
+
+def _v279_now_str():
+    try:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _v279_cache_is_fresh(path):
+    try:
+        if not path or not os.path.exists(path):
+            return False
+        age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
+        return age_hours <= V279_RISK_CACHE_MAX_AGE_HOURS
+    except Exception:
+        return False
+
+
+def _v279_load_auto_cache(path=V279_RISK_AUTO_CACHE_FILE):
+    try:
+        if not path or not os.path.exists(path):
+            return {"rows": [], "meta": {"status": "missing", "path": path}}
+        raw = json.load(open(path, "r", encoding="utf-8"))
+        if isinstance(raw, dict):
+            rows = raw.get("rows") if isinstance(raw.get("rows"), list) else []
+            meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+            meta.setdefault("status", "cached")
+            meta.setdefault("path", path)
+            return {"rows": rows, "meta": meta}
+        if isinstance(raw, list):
+            return {"rows": raw, "meta": {"status": "cached_list", "path": path}}
+    except Exception as e:
+        return {"rows": [], "meta": {"status": "read_failed", "path": path, "reason": str(e)[:160]}}
+    return {"rows": [], "meta": {"status": "invalid", "path": path}}
+
+
+def _v279_save_auto_cache(rows, meta, path=V279_RISK_AUTO_CACHE_FILE):
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        payload = {"meta": meta or {}, "rows": rows or []}
+        payload["meta"].setdefault("generated_at", _v279_now_str())
+        payload["meta"].setdefault("source", "cninfo_hisAnnouncement_query")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _v279_classify_risk_title(title):
+    text = str(title or "")
+    hits_major = [k for k in V279_RISK_KEYWORDS_MAJOR if k in text]
+    hits_medium = [k for k in V279_RISK_KEYWORDS_MEDIUM if k in text]
+    hits_fin = [k for k in V279_RISK_KEYWORDS_FINANCIAL if k in text]
+    if hits_major:
+        level = "major"
+        flag = "重大监管/治理/退市/非标风险"
+    elif hits_medium:
+        level = "medium"
+        flag = "监管问询/质押冻结/诉讼等中度风险"
+    elif hits_fin:
+        level = "financial"
+        flag = "财务亏损/减值/偿债风险"
+    else:
+        return None
+    return {"level": level, "flag": flag, "keywords": list(dict.fromkeys(hits_major + hits_medium + hits_fin))}
+
+
+def _v279_fetch_cninfo_risk_announcements():
+    """从巨潮资讯公告查询接口抓取近期公告标题，并抽取雷区事件。
+    说明：只解析公告标题/元数据，不下载全文，避免拖慢主链路；若接口变更或网络失败，返回失败状态并走缓存/失败关闭。
+    """
+    rows = []
+    errors = []
+    end = datetime.now().date()
+    start = end - timedelta(days=max(1, V279_RISK_FETCH_DAYS))
+    se_date = f"{start.strftime('%Y-%m-%d')}~{end.strftime('%Y-%m-%d')}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+        "Origin": "http://www.cninfo.com.cn",
+        "Accept": "application/json, text/plain, */*",
+    }
+    session = requests.Session()
+    for page in range(1, max(1, V279_RISK_FETCH_MAX_PAGES) + 1):
+        data = {
+            "pageNum": page,
+            "pageSize": max(1, V279_RISK_FETCH_PAGE_SIZE),
+            "column": "szse",
+            "tabName": "fulltext",
+            "plate": "",
+            "stock": "",
+            "searchkey": "",
+            "secid": "",
+            "category": "",
+            "trade": "",
+            "seDate": se_date,
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+        try:
+            resp = session.post(V279_RISK_CNINFO_URL, headers=headers, data=data, timeout=V279_RISK_FETCH_TIMEOUT)
+            if resp.status_code != 200:
+                errors.append(f"page{page}:HTTP{resp.status_code}")
+                if page <= 2:
+                    continue
+                break
+            js = resp.json()
+            anns = js.get("announcements") or []
+            if not anns:
+                break
+            for a in anns:
+                title = str(a.get("announcementTitle") or a.get("title") or "")
+                cls = _v279_classify_risk_title(title)
+                if not cls:
+                    continue
+                code = _v278_normalize_code(a.get("secCode") or a.get("code") or "")
+                if not code:
+                    continue
+                ts = a.get("announcementTime") or a.get("announcementDate") or ""
+                try:
+                    if isinstance(ts, (int, float)):
+                        dt = datetime.fromtimestamp(float(ts) / 1000.0).strftime("%Y-%m-%d")
+                    else:
+                        dt = str(ts)[:10]
+                except Exception:
+                    dt = str(ts)[:10]
+                rows.append({
+                    "code": code,
+                    "name": str(a.get("secName") or a.get("secNameList") or ""),
+                    "date": dt,
+                    "flag": cls["flag"],
+                    "risk_level": cls["level"],
+                    "keywords": "|".join(cls["keywords"]),
+                    "note": title,
+                    "source": "cninfo_auto",
+                    "url": str(a.get("adjunctUrl") or ""),
+                })
+            try:
+                total = int(js.get("totalAnnouncement", 0) or 0)
+                if total and page * V279_RISK_FETCH_PAGE_SIZE >= total:
+                    break
+            except Exception:
+                pass
+            if V279_RISK_FETCH_SLEEP > 0:
+                time.sleep(V279_RISK_FETCH_SLEEP)
+        except Exception as e:
+            errors.append(f"page{page}:{str(e)[:120]}")
+            if page <= 2:
+                continue
+            break
+    # 同一股票同一公告去重
+    seen = set(); clean = []
+    for r in rows:
+        key = (r.get("code"), r.get("date"), r.get("note"))
+        if key in seen:
+            continue
+        seen.add(key); clean.append(r)
+    status = "ok" if clean else ("empty" if not errors else "failed")
+    meta = {
+        "status": status,
+        "generated_at": _v279_now_str(),
+        "source": "cninfo_hisAnnouncement_query",
+        "seDate": se_date,
+        "rows": len(clean),
+        "errors": errors[:10],
+        "max_pages": V279_RISK_FETCH_MAX_PAGES,
+        "page_size": V279_RISK_FETCH_PAGE_SIZE,
+    }
+    return {"rows": clean, "meta": meta}
+
+
+def _v279_sync_auto_risk_cache_if_needed(force=False):
+    if str(V279_RISK_AUTO_FETCH) != "1":
+        return _v279_load_auto_cache()
+    if (not force) and _v279_cache_is_fresh(V279_RISK_AUTO_CACHE_FILE):
+        cached = _v279_load_auto_cache()
+        cached["meta"]["status"] = cached["meta"].get("status", "cached_fresh")
+        cached["meta"]["cache_fresh"] = True
+        return cached
+    fetched = _v279_fetch_cninfo_risk_announcements()
+    if fetched.get("rows"):
+        _v279_save_auto_cache(fetched.get("rows", []), fetched.get("meta", {}))
+        return fetched
+    cached = _v279_load_auto_cache()
+    if cached.get("rows"):
+        cached["meta"]["status"] = "cached_after_fetch_failed"
+        cached["meta"]["fetch_error"] = fetched.get("meta", {}).get("errors", [])
+        return cached
+    return {"rows": [], "meta": {"status": "fetch_failed_no_cache", "fetch_meta": fetched.get("meta", {})}}
+
+
+# 覆盖 V27.8 动态风险读取：先自动采集/刷新风险公告缓存，再合并用户显式配置的动态文件。
+def _v278_load_dynamic_risk_sources():
+    rows = []
+    missing = []
+    loaded = []
+    auto = _v279_sync_auto_risk_cache_if_needed(force=False)
+    auto_meta = auto.get("meta", {}) if isinstance(auto, dict) else {}
+    if auto.get("rows"):
+        rows.extend(auto.get("rows") or [])
+        loaded.append(V279_RISK_AUTO_CACHE_FILE)
+    elif str(V279_RISK_AUTO_FETCH) == "1":
+        missing.append(f"auto_cninfo:{auto_meta.get('status','unknown')}")
+
+    paths = _v278_split_paths(V278_RISK_DYNAMIC_FILES)
+    for path in paths:
+        if not os.path.exists(path):
+            missing.append(path); continue
+        df = _v278_read_table(path)
+        if df is None or df.empty:
+            missing.append(path); continue
+        loaded.append(path)
+        cols = {str(c).lower(): c for c in df.columns}
+        code_col = cols.get('code') or cols.get('股票代码') or cols.get('symbol') or cols.get('证券代码')
+        flag_col = cols.get('flag') or cols.get('flags') or cols.get('risk_flag') or cols.get('风险标签') or cols.get('雷区') or cols.get('title') or cols.get('公告标题')
+        note_col = cols.get('note') or cols.get('reason') or cols.get('content') or cols.get('摘要') or cols.get('公告内容')
+        date_col = cols.get('date') or cols.get('公告日期') or cols.get('report_date')
+        for _, r in df.iterrows():
+            code = _v278_normalize_code(r.get(code_col, '')) if code_col else ''
+            if not code:
+                continue
+            flag = str(r.get(flag_col, '')) if flag_col else ''
+            note = str(r.get(note_col, '')) if note_col else ''
+            dt = str(r.get(date_col, '')) if date_col else ''
+            txt = '；'.join([x for x in [flag, note] if x and x.lower() != 'nan'])
+            if txt:
+                rows.append({'code': code, 'flag': flag or txt[:50], 'note': note, 'date': dt, 'source': 'dynamic_file'})
+    status = 'ok' if loaded else ('not_configured' if not paths and str(V279_RISK_AUTO_FETCH) != '1' else 'unavailable')
+    return {
+        'rows': rows,
+        'loaded': loaded,
+        'missing': missing,
+        'status': status,
+        'auto_status': auto_meta.get('status', ''),
+        'auto_meta': auto_meta,
+    }
+
+
+# =============================================================================
+# V27.10 增量补丁：真 Walk-Forward 定价 + 条件概率顺序修复
+# 说明：只覆盖选股逻辑层，不触碰入口/workflow/cache/PAT/Telegram/BaoStock 等生产链路。
+# =============================================================================
+V2710_WF_MIN_OOS_CORR = float(os.environ.get("V2710_WF_MIN_OOS_CORR", "0.005"))
+V2710_WF_MIN_TOP_RET = float(os.environ.get("V2710_WF_MIN_TOP_RET", "0.0"))
+V2710_FALLBACK_STATUS = os.environ.get("V2710_FALLBACK_STATUS", "fallback_experience")
+
+
+def _v278_build_walk_forward_calibration():
+    """V27.10：用 walk-forward 岭回归生成真实预测模型，而不是只生成一组经验权重。"""
+    files = _v278_candidate_trade_files()
+    dfs = []
+    for pth in files:
+        df = _v278_read_table(pth)
+        if df is not None and not df.empty:
+            df = df.copy(); df["_source_file"] = pth; dfs.append(df)
+    if not dfs:
+        return None
+    df = pd.concat(dfs, ignore_index=True)
+    factor_map = {
+        "fund": ["v27_fund_factor", "fund_factor", "f1"],
+        "structure": ["v27_structure_factor", "structure_factor", "f2"],
+        "explosion": ["v27_explosion_eve_factor", "explosion_factor", "f3"],
+        "trigger": ["v27_current_trigger_factor", "trigger_factor", "f4"],
+        "market": ["v27_market_factor", "market_factor", "f5"],
+        "risk_trade": ["v27_risk_trade_factor", "risk_trade_factor", "f6"],
+    }
+    keys = ["fund", "structure", "explosion", "trigger", "market", "risk_trade"]
+    cols = {k: _v278_first_col(df, v) for k, v in factor_map.items()}
+    ret_col = _v278_first_col(df, [f"net_ret_t{V278_WF_TARGET_WINDOW}", f"ret_t{V278_WF_TARGET_WINDOW}", "strategy_ret", "future_ret", "return", "收益率"])
+    date_col = _v278_first_col(df, ["date", "signal_date", "trade_date", "推荐日期"])
+    if not ret_col or any(cols.get(k) is None for k in keys):
+        return {"status": "insufficient_columns", "sample_count": 0, "note": "缺少V27因子列或收益列，无法walk-forward校准", "source_files": files, "factor_columns": cols, "target_return_col": ret_col}
+    work = df[[cols[k] for k in keys] + [ret_col] + ([date_col] if date_col else [])].copy()
+    for k in keys:
+        work[cols[k]] = pd.to_numeric(work[cols[k]], errors="coerce")
+    work["_ret"] = pd.to_numeric(work[ret_col], errors="coerce")
+    work = work.dropna(subset=[cols[k] for k in keys] + ["_ret"])
+    # V28.4：严格 walk-forward 必须先按交易日期排序，且无有效日期不得进入科学校准。
+    if not date_col:
+        return {"status": "missing_chronological_date", "sample_count": int(len(work)), "note": "历史样本缺少交易日期列，禁止执行严格walk-forward，避免乱序验证", "source_files": files, "factor_columns": cols, "target_return_col": ret_col}
+    work["_date"] = pd.to_datetime(work[date_col], errors="coerce")
+    invalid_date_count = int(work["_date"].isna().sum())
+    if invalid_date_count > 0:
+        work = work.dropna(subset=["_date"]).copy()
+    if work.empty:
+        return {"status": "invalid_chronological_date", "sample_count": 0, "note": "交易日期列无法解析，禁止执行严格walk-forward", "source_files": files, "date_column": date_col}
+    work = work.sort_values(["_date"]).reset_index(drop=True)
+    work["_date_ord"] = pd.factorize(work["_date"].dt.strftime("%Y-%m-%d"), sort=False)[0]
+    n = int(len(work))
+    if n < V278_WF_MIN_SAMPLE:
+        return {"status": "small_sample", "sample_count": n, "note": f"可用样本<{V278_WF_MIN_SAMPLE}，不做真实walk-forward定价", "source_files": files}
+
+    X = work[[cols[k] for k in keys]].astype(float).values
+    y = work["_ret"].astype(float).values
+    splits = []
+    for frac in [0.50, 0.60, 0.70, 0.80]:
+        cut = int(n * frac)
+        if cut >= max(40, V278_WF_MIN_SAMPLE // 2) and n - cut >= V278_WF_MIN_TEST_SAMPLE:
+            splits.append(cut)
+    oos = []
+    fold_models = []
+    for cut in splits:
+        Xt, yt = X[:cut], y[:cut]
+        Xv, yv = X[cut:], y[cut:]
+        mu = Xt.mean(axis=0); sd = Xt.std(axis=0); sd[sd == 0] = 1.0
+        Xt_z = (Xt - mu) / sd
+        Xv_z = (Xv - mu) / sd
+        A = np.column_stack([np.ones(len(Xt_z)), Xt_z])
+        Av = np.column_stack([np.ones(len(Xv_z)), Xv_z])
+        ridge = V278_WF_RIDGE_LAMBDA * np.eye(A.shape[1]); ridge[0, 0] = 0.0
+        try:
+            coef = np.linalg.solve(A.T @ A + ridge, A.T @ yt)
+        except Exception:
+            coef = np.linalg.pinv(A.T @ A + ridge) @ (A.T @ yt)
+        pred = Av @ coef
+        top_line = np.percentile(pred, 70) if len(pred) else 0.0
+        top_mask = pred >= top_line
+        corr = float(np.corrcoef(pred, yv)[0, 1]) if len(yv) > 2 and np.std(pred) > 0 and np.std(yv) > 0 else 0.0
+        dir_acc = float(((pred > np.median(pred)) == (yv > 0)).mean()) if len(yv) else 0.0
+        top_ret = float(np.mean(yv[top_mask])) if top_mask.any() else 0.0
+        all_ret = float(np.mean(yv)) if len(yv) else 0.0
+        oos.append({"train_n": int(cut), "test_n": int(n - cut), "direction_accuracy": dir_acc, "corr": corr, "top30_mean_ret": top_ret, "all_mean_ret": all_ret, "top30_excess_ret": top_ret - all_ret})
+        fold_models.append(coef)
+    if not fold_models:
+        return {"status": "small_oos", "sample_count": n, "note": "样本虽足但无法形成有效OOS切片", "source_files": files}
+
+    # 最终模型用全样本重新拟合；OOS只用于验证和正式池权限。
+    mu = X.mean(axis=0); sd = X.std(axis=0); sd[sd == 0] = 1.0
+    Xz = (X - mu) / sd
+    A = np.column_stack([np.ones(len(Xz)), Xz])
+    ridge = V278_WF_RIDGE_LAMBDA * np.eye(A.shape[1]); ridge[0, 0] = 0.0
+    try:
+        coef = np.linalg.solve(A.T @ A + ridge, A.T @ y)
+    except Exception:
+        coef = np.linalg.pinv(A.T @ A + ridge) @ (A.T @ y)
+    pred_all = A @ coef
+    p10, p50, p90 = [float(np.percentile(pred_all, q)) for q in [10, 50, 90]]
+    if abs(p90 - p10) < 1e-9:
+        p10, p90 = p50 - 0.01, p50 + 0.01
+    score_all = np.clip(50.0 + (pred_all - p50) / (p90 - p10) * 40.0, 0, 100)
+    good = y > 0
+    min_buy = float(np.percentile(score_all[good], 55)) if good.any() else V27_MIN_BUY_SCORE
+    min_buy = max(72.0, min(90.0, min_buy))
+    avg_corr = float(np.nanmean([safe_float(x.get("corr", 0), 0) for x in oos])) if oos else 0.0
+    avg_top = float(np.nanmean([safe_float(x.get("top30_mean_ret", 0), 0) for x in oos])) if oos else 0.0
+    avg_excess = float(np.nanmean([safe_float(x.get("top30_excess_ret", 0), 0) for x in oos])) if oos else 0.0
+    status = "ok" if (avg_corr >= V2710_WF_MIN_OOS_CORR or avg_top > V2710_WF_MIN_TOP_RET or avg_excess > 0) else "weak_oos"
+
+    # weights 只做解释字段；真实定价使用 pricing_model，不再用 f1~f6 固定加权冒充校准。
+    beta = coef[1:]
+    pos = np.maximum(beta, 0)
+    if pos.sum() <= 0:
+        pos = np.abs(beta)
+    if pos.sum() <= 0:
+        pos = np.ones_like(pos)
+    base_sum = V27_WEIGHT_FUND + V27_WEIGHT_STRUCTURE + V27_WEIGHT_EXPLOSION + V27_WEIGHT_TRIGGER + V27_WEIGHT_MARKET + V27_WEIGHT_RISK_TRADE
+    explain_w = {k: float(max(0.0, pos[i] / pos.sum() * base_sum)) for i, k in enumerate(keys)}
+    cal = {
+        "status": status,
+        "method": "walk_forward_ridge_v2710_true_pricing",
+        "generated_at_bj": bj_time_str(),
+        "sample_count": n,
+        "source_files": files,
+        "target_return_col": ret_col,
+        "factor_columns": cols,
+        "weights": explain_w,
+        "pricing_model": {
+            "type": "ridge_return_predictor",
+            "factor_order": keys,
+            "intercept": float(coef[0]),
+            "beta": [float(x) for x in beta],
+            "feature_mean": [float(x) for x in mu],
+            "feature_std": [float(x) for x in sd],
+            "pred_p10": p10,
+            "pred_p50": p50,
+            "pred_p90": p90,
+            "score_formula": "score=clip(50+(pred-p50)/(p90-p10)*40,0,100)",
+        },
+        "thresholds": {"min_buy_score": min_buy, "min_rr": V27_MIN_RR, "max_defense_dist": V27_MAX_DEFENSE_DIST, "near_pressure_hard": V27_NEAR_PRESSURE_HARD_BLOCK, "near_pressure_soft": V27_NEAR_PRESSURE_SOFT_BLOCK},
+        "oos_metrics": oos,
+        "oos_summary": {"avg_corr": avg_corr, "avg_top30_mean_ret": avg_top, "avg_top30_excess_ret": avg_excess},
+        "note": "V27.10真实walk-forward定价：正式分由OOS验证后的岭回归预测模型生成；weights仅作解释，不再作为手工拼分。" if status == "ok" else "V27.10形成了模型但OOS偏弱：只允许观察/降级，不允许经验权重伪装正式定价。",
+    }
+    try:
+        os.makedirs(os.path.dirname(V27_CALIBRATION_FILE), exist_ok=True)
+        with open(V27_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(cal, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return cal
+
+
+def _v27_load_calibration():
+    """V27.10：只有带 pricing_model 的 walk-forward 文件才算真正校准；其它一律降级为fallback。"""
+    global _V27_CALIBRATION_CACHE
+    if _V27_CALIBRATION_CACHE is not None:
+        return _V27_CALIBRATION_CACHE
+    default = {
+        "status": V2710_FALLBACK_STATUS,
+        "sample_count": 0,
+        "weights": {"fund": V27_WEIGHT_FUND, "structure": V27_WEIGHT_STRUCTURE, "explosion": V27_WEIGHT_EXPLOSION, "trigger": V27_WEIGHT_TRIGGER, "market": V27_WEIGHT_MARKET, "risk_trade": V27_WEIGHT_RISK_TRADE},
+        "thresholds": {"min_buy_score": V27_MIN_BUY_SCORE, "min_rr": V27_MIN_RR, "max_defense_dist": V27_MAX_DEFENSE_DIST, "near_pressure_hard": V27_NEAR_PRESSURE_HARD_BLOCK, "near_pressure_soft": V27_NEAR_PRESSURE_SOFT_BLOCK},
+        "note": "缺少真实walk-forward pricing_model；经验权重仅作fallback且不得进入最终买入池。",
+    }
+    data = None
+    if os.path.exists(V27_CALIBRATION_FILE):
+        try:
+            with open(V27_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            data = {"status": "read_failed", "note": f"校准文件读取失败:{str(e)[:120]}"}
+    elif V278_AUTO_BUILD_CALIBRATION == "1":
+        data = _v278_build_walk_forward_calibration()
+    if not isinstance(data, dict):
+        _V27_CALIBRATION_CACHE = default
+        return default
+    sample = int(safe_float(data.get("sample_count", data.get("n", 0)), 0))
+    method = str(data.get("method", ""))
+    pm = data.get("pricing_model") if isinstance(data.get("pricing_model"), dict) else {}
+    has_true_model = method.startswith("walk_forward") and pm.get("type") == "ridge_return_predictor" and sample >= V278_WF_MIN_SAMPLE
+    merged = dict(default); merged.update(data)
+    merged["sample_count"] = sample
+    merged["weights"] = {**default["weights"], **(data.get("weights") or {})}
+    merged["thresholds"] = {**default["thresholds"], **(data.get("thresholds") or {})}
+    if has_true_model and str(data.get("status")) == "ok":
+        merged["status"] = "ok"
+    elif has_true_model:
+        merged["status"] = "weak_oos"
+        merged["note"] = str(merged.get("note", "")) + "｜V27.10：有真实WF模型但OOS弱，正式池降级。"
+    elif sample > 0:
+        merged["status"] = "probability_only" if data.get("context_probability") else "legacy_weight_file"
+        merged["note"] = str(merged.get("note", "")) + "｜V27.10：该文件不是真实pricing_model，不能接管最终定价。"
+    else:
+        merged["status"] = str(data.get("status") or V2710_FALLBACK_STATUS)
+    _V27_CALIBRATION_CACHE = merged
+    return merged
+
+
+def _v27_factor_score_from_calibration(f1, f2, f3, f4, f5, f6):
+    """V27.10：真实WF模型优先；无模型时才经验fallback，并明确状态降级。"""
+    cal = _v27_load_calibration()
+    vals = np.array([safe_float(f1), safe_float(f2), safe_float(f3), safe_float(f4), safe_float(f5), safe_float(f6)], dtype=float)
+    pm = cal.get("pricing_model") if isinstance(cal, dict) and isinstance(cal.get("pricing_model"), dict) else {}
+    status = str(cal.get("status", V2710_FALLBACK_STATUS))
+    if status == "ok" and pm.get("type") == "ridge_return_predictor":
+        mean = np.array(pm.get("feature_mean", [0, 0, 0, 0, 0, 0]), dtype=float)
+        std = np.array(pm.get("feature_std", [1, 1, 1, 1, 1, 1]), dtype=float)
+        beta = np.array(pm.get("beta", [0, 0, 0, 0, 0, 0]), dtype=float)
+        if len(mean) == 6 and len(std) == 6 and len(beta) == 6:
+            std[std == 0] = 1.0
+            pred = safe_float(pm.get("intercept", 0), 0) + float(((vals - mean) / std) @ beta)
+            p10 = safe_float(pm.get("pred_p10", -0.01), -0.01)
+            p50 = safe_float(pm.get("pred_p50", 0), 0)
+            p90 = safe_float(pm.get("pred_p90", 0.01), 0.01)
+            den = p90 - p10
+            if abs(den) < 1e-9:
+                den = 0.02
+            score = _v27_clip(50.0 + (pred - p50) / den * 40.0, 0, 100)
+            cal["v2710_pricing_mode"] = "walk_forward_predictive_model"
+            cal["v2710_predicted_return_score"] = round(pred, 6)
+            return score, cal
+    w = cal.get("weights", {}) if isinstance(cal, dict) else {}
+    raw = (
+        f1 * safe_float(w.get("fund", V27_WEIGHT_FUND), V27_WEIGHT_FUND)
+        + f2 * safe_float(w.get("structure", V27_WEIGHT_STRUCTURE), V27_WEIGHT_STRUCTURE)
+        + f3 * safe_float(w.get("explosion", V27_WEIGHT_EXPLOSION), V27_WEIGHT_EXPLOSION)
+        + f4 * safe_float(w.get("trigger", V27_WEIGHT_TRIGGER), V27_WEIGHT_TRIGGER)
+        + f5 * safe_float(w.get("market", V27_WEIGHT_MARKET), V27_WEIGHT_MARKET)
+        + f6 * safe_float(w.get("risk_trade", V27_WEIGHT_RISK_TRADE), V27_WEIGHT_RISK_TRADE)
+    )
+    score = _v27_clip(raw * V27_UNCALIBRATED_SCORE_HAIRCUT, 0, 100)
+    cal["status"] = status if status != "ok" else "legacy_weight_file"
+    cal["v2710_pricing_mode"] = "experience_fallback_observe_only"
+    cal["note"] = str(cal.get("note", "")) + "｜V27.10：未使用真实WF预测模型，本分数只作观察排序。"
+    return score, cal
+
+
+# 覆盖 V27.8 包装决策器：保留样本不足降级，同时输出V27.10定价模式。
+_v278_wallstreet_decision_engine = v27_wallstreet_decision_engine
+
+def v27_wallstreet_decision_engine(row):
+    r = _v278_wallstreet_decision_engine(row)
+    cal = _v27_load_calibration()
+    r["v2710_pricing_mode"] = str(cal.get("v2710_pricing_mode", "walk_forward_predictive_model" if cal.get("status") == "ok" else "experience_fallback_observe_only"))
+    r["v2710_oos_summary"] = cal.get("oos_summary", {}) if isinstance(cal, dict) else {}
+    if str(cal.get("status", "")) != "ok" and bool(r.get("v27_buy_eligible", False)):
+        r["v27_buy_eligible"] = False
+        r["v27_pool"] = "V27观察池"
+        obs = list(r.get("v27_observe_reasons", []) or [])
+        obs.append("V27.10：无有效真实walk-forward pricing_model，经验fallback只能观察排序，不能进最终买入池")
+        r["v27_observe_reasons"] = obs
+    return r
+
+
+# =============================================================================
+# V28 增量补丁：Market Context Engine + Regime-Aware Walk-Forward Pricing
+# 说明：只覆盖选股逻辑层，不触碰入口/workflow/cache/PAT/Telegram/BaoStock/报告主链路。
+# 目标：市场状态先行，按 市场环境+板块强弱+风格+买点类型 调用不同定价模型；
+#       无足够样本时降级观察，不用经验权重伪装正式买入池。
+# =============================================================================
+V28_ENABLE_MARKET_CONTEXT_ENGINE = os.environ.get("V28_ENABLE_MARKET_CONTEXT_ENGINE", "1")
+V28_ENABLE_REGIME_AWARE_WF = os.environ.get("V28_ENABLE_REGIME_AWARE_WF", "1")
+V28_MIN_SEGMENT_SAMPLE = int(os.environ.get("V28_MIN_SEGMENT_SAMPLE", "60"))
+V28_MIN_SEGMENT_TEST_SAMPLE = int(os.environ.get("V28_MIN_SEGMENT_TEST_SAMPLE", "18"))
+V28_SEGMENT_TOP_N = int(os.environ.get("V28_SEGMENT_TOP_N", "80"))
+V28_REQUIRE_SEGMENT_FOR_FORMAL = os.environ.get("V28_REQUIRE_SEGMENT_FOR_FORMAL", "0")
+V28_CONTEXT_MODEL_VERSION = "v28_market_context_regime_walkforward"
+
+
+def _v28_bucket_text(x, default="unknown"):
+    s = str(x or "").strip()
+    if not s or s.lower() in ["nan", "none", "null"]:
+        return default
+    return s[:32]
+
+
+def _v28_quantile_bucket(v, lo, hi, labels=("weak", "neutral", "strong")):
+    x = safe_float(v, None)
+    if x is None:
+        return "unknown"
+    if x <= lo:
+        return labels[0]
+    if x >= hi:
+        return labels[2]
+    return labels[1]
+
+
+def build_market_context_engine(row=None):
+    """
+    V28 市场状态前置层。
+    只从已有行情/评分字段推断，不联网、不改生产链路。
+    输出 market_context，供条件概率和walk-forward子模型选择使用。
+    """
+    r = row or {}
+    try:
+        base_regime = str(r.get("market_regime") or r.get("v24_market_regime") or r.get("market_env") or r.get("v24_market_env") or "")
+        if not base_regime:
+            try:
+                base_regime = str(_v26_regime())
+            except Exception:
+                base_regime = "unknown"
+    except Exception:
+        base_regime = "unknown"
+    mscore = safe_float(r.get("v26_market_score", r.get("market_score", r.get("base_market_score", 0))), 0)
+    idx_ret = safe_float(r.get("index_pct_chg", r.get("market_pct_chg", r.get("沪深300涨幅", 0))), 0)
+    breadth = safe_float(r.get("market_breadth", r.get("up_ratio", r.get("上涨家数占比", 0))), 0)
+    vol = safe_float(r.get("market_volatility", r.get("index_atr20", r.get("vix_like", 0))), 0)
+
+    br = base_regime.lower()
+    if any(k in br for k in ["panic", "crash", "bear", "weak", "弱", "熊"]):
+        market_regime = "weak"
+    elif any(k in br for k in ["bull", "strong", "risk_on", "强", "牛"]):
+        market_regime = "strong"
+    elif mscore >= 4 or idx_ret >= 1.2 or breadth >= 0.62:
+        market_regime = "strong"
+    elif mscore <= -2 or idx_ret <= -1.2 or (breadth > 0 and breadth <= 0.38):
+        market_regime = "weak"
+    else:
+        market_regime = "range"
+
+    if vol >= 0.035:
+        volatility_regime = "high_vol"
+    elif 0 < vol <= 0.015:
+        volatility_regime = "low_vol"
+    else:
+        volatility_regime = "mid_vol"
+
+    sector = _v28_bucket_text(r.get("industry") or r.get("sector") or r.get("concept") or r.get("板块"), "unknown_sector")
+    sector_heat = safe_float(r.get("sector_heat_score", r.get("v26_sector_lifecycle_score", r.get("板块热度", 0))), 0)
+    sector_regime = _v28_quantile_bucket(sector_heat, 35, 65, ("sector_cold", "sector_neutral", "sector_hot"))
+
+    mcap = safe_float(r.get("market_cap", r.get("total_mv", r.get("总市值", 0))), 0)
+    amount = safe_float(r.get("amount", r.get("turnover", r.get("成交额", 0))), 0)
+    # 兼容不同单位：如果总市值字段很大，直接按分位粗分；没有则用成交额/活跃度。
+    if mcap > 0:
+        if mcap < 8e9 or mcap < 80:  # 元或亿元字段都尽量兼容
+            style_regime = "small_cap"
+        elif mcap > 5e10 or mcap > 500:
+            style_regime = "large_cap"
+        else:
+            style_regime = "mid_cap"
+    elif amount > 0 and amount < 2e8:
+        style_regime = "small_liquidity"
+    else:
+        style_regime = "style_unknown"
+
+    hypo = _v28_bucket_text(r.get("v27_trade_hypothesis") or r.get("buy_point_type") or r.get("v20_main_hypothesis") or r.get("main_hypothesis"), "综合结构观察")
+    risk_level = _v28_bucket_text(r.get("base_risk_level") or r.get("risk_level") or r.get("v27_risk_level"), "risk_unknown")
+    risk_appetite_score = 50.0 + mscore * 6.0 + idx_ret * 5.0 + (breadth - 0.5) * 40.0 - max(0.0, vol - 0.02) * 300.0
+    if market_regime == "weak":
+        risk_appetite = "risk_off"
+    elif market_regime == "strong" and risk_appetite_score >= 55:
+        risk_appetite = "risk_on"
+    else:
+        risk_appetite = "neutral"
+
+    ctx = {
+        "version": V28_CONTEXT_MODEL_VERSION,
+        "market_regime": market_regime,
+        "raw_market_regime": base_regime,
+        "volatility_regime": volatility_regime,
+        "sector": sector,
+        "sector_regime": sector_regime,
+        "style_regime": style_regime,
+        "buy_point_type": hypo,
+        "risk_level": risk_level,
+        "risk_appetite": risk_appetite,
+        "risk_appetite_score": round(float(risk_appetite_score), 3),
+        "context_key": "|".join([market_regime, sector_regime, style_regime, hypo]),
+        "context_key_soft": "|".join([market_regime, sector_regime, hypo]),
+        "context_key_market_buy": "|".join([market_regime, hypo]),
+    }
+    return ctx
+
+
+def _v28_first_existing_col(df, names):
+    try:
+        return _v278_first_col(df, names)
+    except Exception:
+        lower = {str(c).lower(): c for c in df.columns}
+        for n in names:
+            if n in df.columns:
+                return n
+            if str(n).lower() in lower:
+                return lower[str(n).lower()]
+    return None
+
+
+def _v28_infer_context_columns(df):
+    return {
+        "market_regime": _v28_first_existing_col(df, ["market_regime", "market_env", "v24_market_regime", "v24_market_env", "市场环境"]),
+        "sector": _v28_first_existing_col(df, ["sector", "industry", "concept", "板块", "行业"]),
+        "sector_heat": _v28_first_existing_col(df, ["sector_heat_score", "v26_sector_lifecycle_score", "板块热度"]),
+        "style": _v28_first_existing_col(df, ["style_regime", "style", "market_cap_bucket", "市值风格"]),
+        "buy_point": _v28_first_existing_col(df, ["v27_trade_hypothesis", "buy_point_type", "v20_main_hypothesis", "main_hypothesis", "买点类型"]),
+        "risk_level": _v28_first_existing_col(df, ["risk_level", "base_risk_level", "v27_risk_level", "风险等级"]),
+    }
+
+
+def _v28_row_context_from_record(rec, ctx_cols):
+    def getc(k, default=""):
+        c = ctx_cols.get(k)
+        return rec.get(c, default) if c else default
+    market_regime = _v28_bucket_text(getc("market_regime"), "range")
+    mlow = market_regime.lower()
+    if any(x in mlow for x in ["bear", "weak", "panic", "弱", "熊"]):
+        market_regime = "weak"
+    elif any(x in mlow for x in ["bull", "strong", "强", "牛"]):
+        market_regime = "strong"
+    elif market_regime not in ["weak", "strong", "range"]:
+        market_regime = "range"
+    sector_heat = safe_float(getc("sector_heat"), None)
+    sector_regime = _v28_quantile_bucket(sector_heat, 35, 65, ("sector_cold", "sector_neutral", "sector_hot")) if sector_heat is not None else "sector_unknown"
+    style_regime = _v28_bucket_text(getc("style"), "style_unknown")
+    buy_point = _v28_bucket_text(getc("buy_point"), "综合结构观察")
+    sector = _v28_bucket_text(getc("sector"), "unknown_sector")
+    risk_level = _v28_bucket_text(getc("risk_level"), "risk_unknown")
+    return {
+        "market_regime": market_regime,
+        "sector": sector,
+        "sector_regime": sector_regime,
+        "style_regime": style_regime,
+        "buy_point_type": buy_point,
+        "risk_level": risk_level,
+        "context_key": "|".join([market_regime, sector_regime, style_regime, buy_point]),
+        "context_key_soft": "|".join([market_regime, sector_regime, buy_point]),
+        "context_key_market_buy": "|".join([market_regime, buy_point]),
+    }
+
+
+def _v28_fit_ridge_pricing_model(X, y, keys):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(X) < 10:
+        return None
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Xz = (X - mu) / sd
+    A = np.column_stack([np.ones(len(Xz)), Xz])
+    ridge = V278_WF_RIDGE_LAMBDA * np.eye(A.shape[1])
+    ridge[0, 0] = 0.0
+    try:
+        coef = np.linalg.solve(A.T @ A + ridge, A.T @ y)
+    except Exception:
+        coef = np.linalg.pinv(A.T @ A + ridge) @ (A.T @ y)
+    pred_all = A @ coef
+    p10, p50, p90 = [float(np.percentile(pred_all, q)) for q in [10, 50, 90]]
+    if abs(p90 - p10) < 1e-9:
+        p10, p90 = p50 - 0.01, p50 + 0.01
+    return {
+        "type": "ridge_return_predictor",
+        "factor_order": list(keys),
+        "intercept": float(coef[0]),
+        "beta": [float(x) for x in coef[1:]],
+        "feature_mean": [float(x) for x in mu],
+        "feature_std": [float(x) for x in sd],
+        "pred_p10": p10,
+        "pred_p50": p50,
+        "pred_p90": p90,
+        "score_formula": "score=clip(50+(pred-p50)/(p90-p10)*40,0,100)",
+    }
+
+
+def _v28_walk_forward_validate(X, y, min_test=None):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    min_test = int(min_test or V28_MIN_SEGMENT_TEST_SAMPLE)
+    if n < max(30, min_test * 2):
+        return []
+    oos = []
+    # 固定比例滚动，不改交易主链路；样本越多切片越多。
+    for frac in [0.50, 0.60, 0.70, 0.80]:
+        cut = int(n * frac)
+        if cut < max(20, min_test) or n - cut < min_test:
+            continue
+        model = _v28_fit_ridge_pricing_model(X[:cut], y[:cut], ["fund", "structure", "explosion", "trigger", "market", "risk_trade"])
+        if not model:
+            continue
+        pred = _v28_predict_raw(model, X[cut:])
+        yv = y[cut:]
+        if len(pred) == 0:
+            continue
+        top_line = np.percentile(pred, 70)
+        top_mask = pred >= top_line
+        corr = float(np.corrcoef(pred, yv)[0, 1]) if len(yv) > 2 and np.std(pred) > 0 and np.std(yv) > 0 else 0.0
+        top_ret = float(np.mean(yv[top_mask])) if top_mask.any() else 0.0
+        all_ret = float(np.mean(yv)) if len(yv) else 0.0
+        dir_acc = float(((pred > np.median(pred)) == (yv > 0)).mean()) if len(yv) else 0.0
+        oos.append({"train_n": int(cut), "test_n": int(n - cut), "corr": corr, "direction_accuracy": dir_acc, "top30_mean_ret": top_ret, "all_mean_ret": all_ret, "top30_excess_ret": top_ret - all_ret})
+    return oos
+
+
+def _v28_predict_raw(model, X):
+    X = np.asarray(X, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    mean = np.array(model.get("feature_mean", [0, 0, 0, 0, 0, 0]), dtype=float)
+    std = np.array(model.get("feature_std", [1, 1, 1, 1, 1, 1]), dtype=float)
+    beta = np.array(model.get("beta", [0, 0, 0, 0, 0, 0]), dtype=float)
+    if len(mean) != X.shape[1] or len(std) != X.shape[1] or len(beta) != X.shape[1]:
+        return np.zeros(X.shape[0])
+    std[std == 0] = 1.0
+    return safe_float(model.get("intercept", 0), 0) + ((X - mean) / std) @ beta
+
+
+def _v28_model_oos_ok(oos):
+    if not oos:
+        return False
+    avg_corr = float(np.nanmean([safe_float(x.get("corr", 0), 0) for x in oos]))
+    avg_top = float(np.nanmean([safe_float(x.get("top30_mean_ret", 0), 0) for x in oos]))
+    avg_excess = float(np.nanmean([safe_float(x.get("top30_excess_ret", 0), 0) for x in oos]))
+    return bool(avg_corr >= V2710_WF_MIN_OOS_CORR or avg_top > V2710_WF_MIN_TOP_RET or avg_excess > 0)
+
+
+def _v28_oos_summary(oos):
+    if not oos:
+        return {"avg_corr": 0.0, "avg_top30_mean_ret": 0.0, "avg_top30_excess_ret": 0.0, "folds": 0}
+    return {
+        "avg_corr": float(np.nanmean([safe_float(x.get("corr", 0), 0) for x in oos])),
+        "avg_top30_mean_ret": float(np.nanmean([safe_float(x.get("top30_mean_ret", 0), 0) for x in oos])),
+        "avg_top30_excess_ret": float(np.nanmean([safe_float(x.get("top30_excess_ret", 0), 0) for x in oos])),
+        "folds": int(len(oos)),
+    }
+
+
+def _v278_build_walk_forward_calibration():
+    """
+    V28 覆盖版：生成全局模型 + 分情景segment_models。
+    segment key 优先级：
+      1）market_regime|sector_regime|style_regime|buy_point_type
+      2）market_regime|sector_regime|buy_point_type
+      3）market_regime|buy_point_type
+      4）global pricing_model
+    """
+    files = _v278_candidate_trade_files()
+    dfs = []
+    for pth in files:
+        df = _v278_read_table(pth)
+        if df is not None and not df.empty:
+            df = df.copy(); df["_source_file"] = pth; dfs.append(df)
+    if not dfs:
+        return None
+    df = pd.concat(dfs, ignore_index=True)
+    factor_map = {
+        "fund": ["v27_fund_factor", "fund_factor", "f1"],
+        "structure": ["v27_structure_factor", "structure_factor", "f2"],
+        "explosion": ["v27_explosion_eve_factor", "explosion_factor", "f3"],
+        "trigger": ["v27_current_trigger_factor", "trigger_factor", "f4"],
+        "market": ["v27_market_factor", "market_factor", "f5"],
+        "risk_trade": ["v27_risk_trade_factor", "risk_trade_factor", "f6"],
+    }
+    keys = ["fund", "structure", "explosion", "trigger", "market", "risk_trade"]
+    cols = {k: _v278_first_col(df, v) for k, v in factor_map.items()}
+    ret_col = _v278_first_col(df, [f"net_ret_t{V278_WF_TARGET_WINDOW}", f"ret_t{V278_WF_TARGET_WINDOW}", "strategy_ret", "future_ret", "return", "收益率"])
+    date_col = _v278_first_col(df, ["date", "signal_date", "trade_date", "推荐日期"])
+    if not ret_col or any(cols.get(k) is None for k in keys):
+        return {"status": "insufficient_columns", "sample_count": 0, "note": "缺少V27因子列或收益列，无法V28分情景walk-forward校准", "source_files": files, "factor_columns": cols, "target_return_col": ret_col}
+    keep_cols = [cols[k] for k in keys] + [ret_col] + ([date_col] if date_col else [])
+    ctx_cols = _v28_infer_context_columns(df)
+    for c in ctx_cols.values():
+        if c and c not in keep_cols:
+            keep_cols.append(c)
+    work = df[keep_cols].copy()
+    for k in keys:
+        work[cols[k]] = pd.to_numeric(work[cols[k]], errors="coerce")
+    work["_ret"] = pd.to_numeric(work[ret_col], errors="coerce")
+    work = work.dropna(subset=[cols[k] for k in keys] + ["_ret"])
+    if date_col:
+        work["_date"] = pd.to_datetime(work[date_col], errors="coerce")
+        work = work.sort_values("_date")
+    n = int(len(work))
+    if n < V278_WF_MIN_SAMPLE:
+        return {"status": "small_sample", "sample_count": n, "note": f"可用样本<{V278_WF_MIN_SAMPLE}，不做V28真实walk-forward定价", "source_files": files}
+    ctx_records = []
+    for _, rec in work.iterrows():
+        ctx_records.append(_v28_row_context_from_record(rec, ctx_cols))
+    ctx_df = pd.DataFrame(ctx_records, index=work.index)
+    work = pd.concat([work.reset_index(drop=True), ctx_df.reset_index(drop=True).add_prefix("_ctx_")], axis=1)
+    X = work[[cols[k] for k in keys]].astype(float).values
+    y = work["_ret"].astype(float).values
+    global_oos = _v28_walk_forward_validate(X, y, V278_WF_MIN_TEST_SAMPLE)
+    global_model = _v28_fit_ridge_pricing_model(X, y, keys)
+    if not global_model:
+        return {"status": "fit_failed", "sample_count": n, "note": "全局模型拟合失败", "source_files": files}
+    global_ok = _v28_model_oos_ok(global_oos)
+    segment_models = {}
+    segment_stats = []
+    segment_columns = ["_ctx_context_key", "_ctx_context_key_soft", "_ctx_context_key_market_buy"]
+    for seg_col in segment_columns:
+        if seg_col not in work.columns:
+            continue
+        vc = work[seg_col].value_counts().head(max(20, V28_SEGMENT_TOP_N))
+        for seg_key, cnt in vc.items():
+            if int(cnt) < V28_MIN_SEGMENT_SAMPLE:
+                continue
+            mask = (work[seg_col] == seg_key).values
+            Xs = X[mask]; ys = y[mask]
+            if len(ys) < V28_MIN_SEGMENT_SAMPLE:
+                continue
+            oos = _v28_walk_forward_validate(Xs, ys, V28_MIN_SEGMENT_TEST_SAMPLE)
+            if not _v28_model_oos_ok(oos):
+                # 弱OOS不进入可接管segment，但保留统计供审计。
+                segment_stats.append({"key": str(seg_key), "level": seg_col.replace("_ctx_", ""), "sample_count": int(len(ys)), "status": "weak_oos", "oos_summary": _v28_oos_summary(oos)})
+                continue
+            model = _v28_fit_ridge_pricing_model(Xs, ys, keys)
+            if not model:
+                continue
+            model["segment_key"] = str(seg_key)
+            model["segment_level"] = seg_col.replace("_ctx_", "")
+            model["sample_count"] = int(len(ys))
+            model["oos_summary"] = _v28_oos_summary(oos)
+            segment_models[str(seg_key)] = model
+            segment_stats.append({"key": str(seg_key), "level": model["segment_level"], "sample_count": int(len(ys)), "status": "ok", "oos_summary": model["oos_summary"]})
+            if len(segment_models) >= V28_SEGMENT_TOP_N:
+                break
+        if len(segment_models) >= V28_SEGMENT_TOP_N:
+            break
+    pred_all = _v28_predict_raw(global_model, X)
+    score_all = np.clip(50.0 + (pred_all - global_model["pred_p50"]) / max(1e-9, (global_model["pred_p90"] - global_model["pred_p10"])) * 40.0, 0, 100)
+    good = y > 0
+    min_buy = float(np.percentile(score_all[good], 55)) if good.any() else V27_MIN_BUY_SCORE
+    min_buy = max(72.0, min(90.0, min_buy))
+    beta = np.array(global_model.get("beta", [0, 0, 0, 0, 0, 0]), dtype=float)
+    pos = np.maximum(beta, 0)
+    if pos.sum() <= 0:
+        pos = np.abs(beta)
+    if pos.sum() <= 0:
+        pos = np.ones_like(pos)
+    base_sum = V27_WEIGHT_FUND + V27_WEIGHT_STRUCTURE + V27_WEIGHT_EXPLOSION + V27_WEIGHT_TRIGGER + V27_WEIGHT_MARKET + V27_WEIGHT_RISK_TRADE
+    explain_w = {k: float(max(0.0, pos[i] / pos.sum() * base_sum)) for i, k in enumerate(keys)}
+    status = "ok" if global_ok else "weak_oos"
+    if V28_ENABLE_REGIME_AWARE_WF == "1" and segment_models:
+        status = "ok"
+    cal = {
+        "status": status,
+        "method": "walk_forward_ridge_v28_regime_aware_pricing",
+        "generated_at_bj": bj_time_str(),
+        "sample_count": n,
+        "source_files": files,
+        "target_return_col": ret_col,
+        "factor_columns": cols,
+        "context_columns": ctx_cols,
+        "weights": explain_w,
+        "pricing_model": global_model,
+        "segment_models": segment_models,
+        "segment_model_count": int(len(segment_models)),
+        "segment_stats": segment_stats[:max(50, V28_SEGMENT_TOP_N)],
+        "thresholds": {"min_buy_score": min_buy, "min_rr": V27_MIN_RR, "max_defense_dist": V27_MAX_DEFENSE_DIST, "near_pressure_hard": V27_NEAR_PRESSURE_HARD_BLOCK, "near_pressure_soft": V27_NEAR_PRESSURE_SOFT_BLOCK},
+        "oos_metrics": global_oos,
+        "oos_summary": _v28_oos_summary(global_oos),
+        "note": "V28分情景walk-forward定价：市场状态/板块强弱/风格/买点类型先决定segment模型；无segment再用全局OOS模型；无有效OOS则观察降级。",
+    }
+    try:
+        os.makedirs(os.path.dirname(V27_CALIBRATION_FILE), exist_ok=True)
+        with open(V27_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(cal, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return cal
+
+
+def _v28_select_pricing_model(cal, market_context):
+    if not isinstance(cal, dict):
+        return {}, "none", "无校准对象"
+    segs = cal.get("segment_models") if isinstance(cal.get("segment_models"), dict) else {}
+    keys = []
+    if isinstance(market_context, dict):
+        keys = [market_context.get("context_key"), market_context.get("context_key_soft"), market_context.get("context_key_market_buy")]
+    for k in keys:
+        if k and str(k) in segs and isinstance(segs[str(k)], dict):
+            return segs[str(k)], "segment", f"命中V28分情景模型:{k}"
+    pm = cal.get("pricing_model") if isinstance(cal.get("pricing_model"), dict) else {}
+    if pm.get("type") == "ridge_return_predictor":
+        return pm, "global", "未命中分情景模型，使用全局walk-forward模型"
+    return {}, "fallback", "无有效walk-forward模型"
+
+
+def _v28_predictive_pricing_score(factors, cal, market_context):
+    vals = np.array([safe_float(x) for x in factors], dtype=float)
+    model, mode, note = _v28_select_pricing_model(cal, market_context)
+    if model and model.get("type") == "ridge_return_predictor" and str(cal.get("status")) == "ok":
+        pred = float(_v28_predict_raw(model, vals)[0])
+        p10 = safe_float(model.get("pred_p10", -0.01), -0.01)
+        p50 = safe_float(model.get("pred_p50", 0), 0)
+        p90 = safe_float(model.get("pred_p90", 0.01), 0.01)
+        den = p90 - p10
+        if abs(den) < 1e-9:
+            den = 0.02
+        score = _v27_clip(50.0 + (pred - p50) / den * 40.0, 0, 100)
+        out = dict(cal)
+        out["v28_pricing_mode"] = "segment_walk_forward" if mode == "segment" else "global_walk_forward"
+        out["v28_model_note"] = note
+        out["v28_predicted_return"] = round(pred, 6)
+        out["v28_market_context"] = market_context
+        if mode == "segment":
+            out["v28_segment_sample_count"] = int(safe_float(model.get("sample_count", 0), 0))
+            out["v28_segment_oos_summary"] = model.get("oos_summary", {})
+        return score, out
+    # fallback只作观察排序
+    w = cal.get("weights", {}) if isinstance(cal, dict) else {}
+    raw = (
+        vals[0] * safe_float(w.get("fund", V27_WEIGHT_FUND), V27_WEIGHT_FUND)
+        + vals[1] * safe_float(w.get("structure", V27_WEIGHT_STRUCTURE), V27_WEIGHT_STRUCTURE)
+        + vals[2] * safe_float(w.get("explosion", V27_WEIGHT_EXPLOSION), V27_WEIGHT_EXPLOSION)
+        + vals[3] * safe_float(w.get("trigger", V27_WEIGHT_TRIGGER), V27_WEIGHT_TRIGGER)
+        + vals[4] * safe_float(w.get("market", V27_WEIGHT_MARKET), V27_WEIGHT_MARKET)
+        + vals[5] * safe_float(w.get("risk_trade", V27_WEIGHT_RISK_TRADE), V27_WEIGHT_RISK_TRADE)
+    )
+    out = dict(cal) if isinstance(cal, dict) else {}
+    out["status"] = str(out.get("status") or "fallback_experience")
+    out["v28_pricing_mode"] = "experience_fallback_observe_only"
+    out["v28_model_note"] = note + "｜经验权重仅作观察排序"
+    out["v28_market_context"] = market_context
+    return _v27_clip(raw * V27_UNCALIBRATED_SCORE_HAIRCUT, 0, 100), out
+
+
+def _v27_context_probability_adjustment(row, cal):
+    """V28：条件概率匹配使用最新v27_trade_hypothesis + market_context，多层key回退。"""
+    ctx = cal.get("context_probability", {}) if isinstance(cal, dict) else {}
+    if not isinstance(ctx, dict) or not ctx:
+        return 0.0, "未接入上下文概率校准"
+    mc = row.get("market_context") if isinstance(row.get("market_context"), dict) else build_market_context_engine(row)
+    hypo = str(row.get("v27_trade_hypothesis") or mc.get("buy_point_type") or row.get("buy_point_type") or row.get("v20_main_hypothesis") or row.get("main_hypothesis") or "综合结构机会")
+    env = str(mc.get("market_regime") or row.get("market_env") or row.get("v24_market_env") or row.get("market_regime") or "unknown")
+    tier = str(row.get("v20_trade_tier") or row.get("tier") or mc.get("risk_level") or "unknown")
+    sector_regime = str(mc.get("sector_regime") or "sector_unknown")
+    style_regime = str(mc.get("style_regime") or "style_unknown")
+    key_candidates = [
+        str(mc.get("context_key", "")),
+        str(mc.get("context_key_soft", "")),
+        str(mc.get("context_key_market_buy", "")),
+        f"{hypo}|{env}|{sector_regime}|{style_regime}",
+        f"{hypo}|{env}|{sector_regime}",
+        f"{hypo}|{env}|{tier}",
+        f"{hypo}|{env}",
+        hypo,
+    ]
+    seen = set()
+    for k in key_candidates:
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        item = ctx.get(k)
+        if isinstance(item, dict) and safe_float(item.get("sample_count", 0)) >= 30:
+            wr = safe_float(item.get("win_rate", item.get("T+5", {}).get("win_rate", 0.5)), 0.5)
+            exp = safe_float(item.get("expectancy", item.get("mean_return", item.get("T+5", {}).get("mean_return", 0))), 0)
+            adj = max(-4.0, min(4.0, (wr - 0.5) * 8.0 + exp * 50.0))
+            return adj, f"V28上下文概率校准:{k} 样本{int(safe_float(item.get('sample_count',0)))} 胜率{wr:.1%} 期望{exp:.2%}"
+    return 0.0, "V28上下文概率样本不足，未加分"
+
+
+# 保存V27.10决策器引用，V28用完整定价层覆盖；仍然不触碰生产链路。
+_v2710_wallstreet_decision_engine = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    """V28：市场状态前置 + 分情景walk-forward模型接管最终定价。"""
+    if V27_ENABLE_CORE_ENGINE != "1":
+        return row
+    r = dict(row)
+    f1, r1 = _v27_deep_factor_funds(r)
+    f2, r2 = _v27_deep_factor_structure(r)
+    f3, r3 = _v27_deep_factor_explosion(r)
+    f4, r4 = _v27_deep_factor_trigger(r)
+    f5, r5 = _v27_deep_factor_market(r)
+    f6, r6 = _v27_deep_factor_risk_trade(r)
+    rr = safe_float(r.get("v20_rr", r.get("risk_reward_ratio", r.get("rr", 0))))
+    defense = safe_float(r.get("v20_defense_dist", r.get("defense_dist", 0)))
+    upside = safe_float(r.get("v20_target_dist", r.get("target_dist", 0)))
+    nearp = safe_float(r.get("v20_near_pressure", r.get("near_pressure_dist", 0)))
+    chase = safe_float(r.get("v20_chase_risk", r.get("chase_risk", 0)))
+    bias20 = safe_float(r.get("bias20", r.get("base_bias20", 0)))
+    pct_chg = safe_float(r.get("pct_chg", 0))
+
+    if f3 >= 13 and f4 >= 7:
+        hypo = "爆发前夜临界触发"
+    elif f2 >= 13 and f4 >= 9:
+        hypo = "核心结构位突破/回踩确认"
+    elif f1 >= 15 and f4 >= 8:
+        hypo = "资金承接后转强"
+    elif f3 >= 12 and f4 < 7:
+        hypo = "爆发前夜种子，等待触发"
+    elif chase > 0.10 or defense > V27_MAX_SOFT_DEFENSE_DIST:
+        hypo = "强攻后追涨风险观察"
+    else:
+        hypo = "综合结构观察"
+    r["v27_trade_hypothesis"] = hypo
+    r["buy_point_type"] = str(r.get("buy_point_type") or hypo)
+
+    market_context = build_market_context_engine(r) if V28_ENABLE_MARKET_CONTEXT_ENGINE == "1" else {}
+    r["market_context"] = market_context
+    r["v28_market_regime"] = market_context.get("market_regime", "unknown")
+    r["v28_sector_regime"] = market_context.get("sector_regime", "unknown")
+    r["v28_style_regime"] = market_context.get("style_regime", "unknown")
+    r["v28_context_key"] = market_context.get("context_key", "")
+
+    cal = _v27_load_calibration()
+    score, calibration = _v28_predictive_pricing_score([f1, f2, f3, f4, f5, f6], cal, market_context)
+    prob_adj, prob_note = _v27_context_probability_adjustment(r, calibration)
+    score = _v27_clip(score + prob_adj, 0, 100)
+    block = []
+    observe = []
+
+    if bool(r.get("v14_blocked", False)) or bool(r.get("risk_hard_exclude", False)):
+        block.append("硬雷区/重大风险剔除")
+    if bool(r.get("exclude_from_final", False)) or bool(r.get("v20_trade_invalidated", False)):
+        block.append(str(r.get("v20_trade_invalid_reason", r.get("v22_invalid_reason", "交易假设已失效"))))
+    min_rr = _v27_threshold(calibration, "min_rr", V27_MIN_RR)
+    max_defense_dist = _v27_threshold(calibration, "max_defense_dist", V27_MAX_DEFENSE_DIST)
+    min_buy_score = _v27_threshold(calibration, "min_buy_score", V27_MIN_BUY_SCORE)
+    if rr > 0 and rr < min_rr:
+        block.append(f"RR {rr:.2f} 低于V28校准最低{min_rr:.2f}")
+    if defense > max_defense_dist:
+        block.append(f"防守距离{defense:.1%}过远，追涨风险")
+    elif defense > V27_MAX_SOFT_DEFENSE_DIST:
+        observe.append(f"防守距离{defense:.1%}偏远，观察降级")
+    if 0 < upside < V27_MIN_UPSIDE:
+        block.append(f"上方空间{upside:.1%}不足")
+    pressure_breakout_ok = _v27_has_final_pressure_breakout(r, f4)
+    if 0 < nearp <= V27_NEAR_PRESSURE_HARD_BLOCK and not pressure_breakout_ok:
+        block.append(f"近端压力{nearp:.1%}处于0-3%硬拦截区，未实体突破最终压力上沿")
+    elif V27_NEAR_PRESSURE_HARD_BLOCK < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and not pressure_breakout_ok:
+        observe.append(f"近端压力{nearp:.1%}处于3-5%观察降级区，需实体突破确认")
+    elif 0 < nearp <= V27_NEAR_PRESSURE_SOFT_BLOCK and pressure_breakout_ok:
+        observe.append("近端压力已被实体突破，按突破确认而非贴脸压力处理")
+    if chase > 0.12:
+        block.append(f"追高风险{chase:.1%}过高")
+    elif chase > 0.09:
+        observe.append("追高风险偏高，需回踩确认")
+    if bias20 > V27_CHASE_HARD_BLOCK_BIAS20 and defense > 0.06:
+        block.append("20日乖离偏高且防守位偏远")
+    if pct_chg >= 7.0 and defense > 0.075 and f4 < 10:
+        block.append("当日强攻但防守位远、触发质量不足")
+    if f4 < V27_DEEP_TRIGGER_MIN:
+        observe.append("当前触发不足：基础好但买点未成熟")
+    if f2 < V27_DEEP_STRUCTURE_MIN:
+        observe.append("核心结构质量不足，不能作为正式买入主因")
+    if f1 < V27_DEEP_FUND_MIN:
+        observe.append("资金有效性/承接不足")
+
+    pricing_mode = str(calibration.get("v28_pricing_mode", ""))
+    if calibration.get("status") != "ok":
+        observe.append("V28定价器未完成有效OOS样本校准：正式池降级")
+        if V27_REQUIRE_CALIBRATION_FOR_FORMAL == "1":
+            block.append("缺少有效V28 walk-forward校准样本，禁止进入正式买入池")
+    if pricing_mode == "global_walk_forward" and V28_REQUIRE_SEGMENT_FOR_FORMAL == "1":
+        block.append("V28要求分情景segment模型确认，但当前仅命中全局模型")
+    if pricing_mode == "experience_fallback_observe_only":
+        block.append("V28无有效walk-forward模型，经验fallback只能观察排序")
+
+    if V27_REQUIRE_STRICT_TOP5 == "1":
+        if f6 < V27_DEEP_RISK_TRADE_MIN:
+            observe.append("交易质量/RR/防守综合不足，Top5宁缺毋滥")
+        if f3 < V27_DEEP_EXPLOSION_MIN and f4 < 10.0:
+            observe.append("爆发前夜证据不足且当前触发不强，不补位进入Top5")
+
+    formal_ok = (
+        (score >= min_buy_score)
+        and not block
+        and f4 >= V27_DEEP_TRIGGER_MIN
+        and f2 >= V27_DEEP_STRUCTURE_MIN
+        and f1 >= V27_DEEP_FUND_MIN
+        and (V27_REQUIRE_STRICT_TOP5 != "1" or f6 >= V27_DEEP_RISK_TRADE_MIN)
+        and (V27_REQUIRE_STRICT_TOP5 != "1" or f3 >= V27_DEEP_EXPLOSION_MIN or f4 >= 10.0)
+    )
+    if formal_ok:
+        pool = "V28最终买入池"
+    elif block:
+        pool = "V28剔除/禁止买入"
+    else:
+        pool = "V28观察池"
+
+    trade_lang = _v27_make_trade_language(r, formal_ok, block, observe, f1, f2, f3, f4, f6)
+    r.update({
+        "v27_fund_factor": round(float(f1), 2),
+        "v27_structure_factor": round(float(f2), 2),
+        "v27_explosion_eve_factor": round(float(f3), 2),
+        "v27_current_trigger_factor": round(float(f4), 2),
+        "v27_market_factor": round(float(f5), 2),
+        "v27_risk_trade_factor": round(float(f6), 2),
+        "v27_final_price_score": round(float(score), 2),
+        "v27_score": round(float(score), 2),
+        "v27_pool": pool,
+        "v27_buy_eligible": bool(formal_ok),
+        "v27_block_reasons": block,
+        "v27_observe_reasons": observe,
+        "v27_factor_reasons": {
+            "资金行为": r1,
+            "结构位置": r2,
+            "爆发前夜": r3,
+            "当前触发": r4,
+            "市场板块": r5,
+            "交易质量": r6,
+            "条件概率": [prob_note],
+            "V28市场状态": [market_context],
+        },
+        "v27_calibration_status": calibration.get("status", "unknown"),
+        "v27_calibration_sample": calibration.get("sample_count", 0),
+        "v27_calibration_note": calibration.get("note", ""),
+        "v2710_pricing_mode": calibration.get("v2710_pricing_mode", calibration.get("v28_pricing_mode", "")),
+        "v2710_oos_summary": calibration.get("oos_summary", {}),
+        "v28_pricing_mode": calibration.get("v28_pricing_mode", ""),
+        "v28_model_note": calibration.get("v28_model_note", ""),
+        "v28_predicted_return": calibration.get("v28_predicted_return", None),
+        "v28_segment_sample_count": calibration.get("v28_segment_sample_count", 0),
+        "v28_segment_oos_summary": calibration.get("v28_segment_oos_summary", {}),
+        "v28_market_context": market_context,
+        "v27_trade_language": trade_lang,
+    })
+    return r
+
+
+
+# =============================================================================
+# V28.1 增量补丁：真实市场环境缓存 + 分层Segment降级 + Utility交易决策模型
+# 说明：仍然只覆盖选股逻辑层，不触碰入口/workflow/cache/PAT/Telegram/BaoStock/报告主链路。
+# 核心原则：
+#   1）市场环境只读本地缓存，不在逐票循环中联网，不拖慢主模型；
+#   2）segment模型按 样本充足->半细分->全局 分层降级，提高覆盖率；
+#   3）最终定价从“单一收益预测”升级为 return/win/drawdown/utility 联合决策。
+# =============================================================================
+V281_CONTEXT_MODEL_VERSION = "v28_1_market_reality_utility_model"
+V281_ENABLE_REALITY_CACHE = os.environ.get("V281_ENABLE_REALITY_CACHE", "1")
+V281_MARKET_CONTEXT_CACHE_FILE = os.environ.get("V281_MARKET_CONTEXT_CACHE_FILE", "market_context_cache.json")
+V281_MARKET_CONTEXT_CACHE_MAX_AGE_HOURS = float(os.environ.get("V281_MARKET_CONTEXT_CACHE_MAX_AGE_HOURS", "36"))
+V281_MIN_SEGMENT_SAMPLE_STRICT = int(os.environ.get("V281_MIN_SEGMENT_SAMPLE_STRICT", str(V28_MIN_SEGMENT_SAMPLE)))
+V281_MIN_SEGMENT_SAMPLE_MID = int(os.environ.get("V281_MIN_SEGMENT_SAMPLE_MID", "35"))
+V281_MIN_SEGMENT_SAMPLE_LOOSE = int(os.environ.get("V281_MIN_SEGMENT_SAMPLE_LOOSE", "25"))
+V281_MIN_SEGMENT_TEST_SAMPLE_MID = int(os.environ.get("V281_MIN_SEGMENT_TEST_SAMPLE_MID", "10"))
+V281_MIN_SEGMENT_TEST_SAMPLE_LOOSE = int(os.environ.get("V281_MIN_SEGMENT_TEST_SAMPLE_LOOSE", "8"))
+V281_UTILITY_RETURN_WEIGHT = float(os.environ.get("V281_UTILITY_RETURN_WEIGHT", "1.0"))
+V281_UTILITY_WIN_WEIGHT = float(os.environ.get("V281_UTILITY_WIN_WEIGHT", "0.018"))
+V281_UTILITY_DRAWDOWN_WEIGHT = float(os.environ.get("V281_UTILITY_DRAWDOWN_WEIGHT", "0.65"))
+V281_REQUIRE_UTILITY_FOR_FORMAL = os.environ.get("V281_REQUIRE_UTILITY_FOR_FORMAL", "0")
+
+_v28_field_infer_build_market_context_engine = build_market_context_engine
+_v28_regime_calibration_builder = _v278_build_walk_forward_calibration
+_v28_regime_predictive_pricing_score = _v28_predictive_pricing_score
+
+
+def _v281_context_cache_candidates():
+    """市场环境缓存候选文件。只读，不创建，不改变生产缓存链路。"""
+    names = [
+        V281_MARKET_CONTEXT_CACHE_FILE,
+        "market_reality_cache.json",
+        "market_context_snapshot.json",
+        "market_context_cache.csv",
+    ]
+    bases = [os.getcwd()]
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    bases.extend(["/mnt/data", "."])
+    out = []
+    for n in names:
+        if os.path.isabs(str(n)):
+            out.append(str(n))
+        else:
+            for b in bases:
+                out.append(os.path.join(b, str(n)))
+    seen = []
+    for p in out:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _v281_read_market_context_cache():
+    """
+    读取盘后预生成的市场真实环境缓存。
+    推荐外部脚本在15:00数据门控后生成 market_context_cache.json；主模型逐票只读该缓存。
+    支持结构示例：
+      {
+        "trade_date":"2026-05-20",
+        "indices":{"沪深300":{"pct_chg":0.8,"above_ma20":true}, ...},
+        "breadth":{"up_ratio":0.61,"limit_up_count":76,"limit_down_count":8,"total_amount_chg":0.12},
+        "sectors":[{"name":"半导体","heat_score":78,"pct_chg":2.1,"limit_up_count":9}],
+        "style":{"small_vs_large":"small_strong","small_cap_score":68,"large_cap_score":45}
+      }
+    """
+    if V281_ENABLE_REALITY_CACHE != "1":
+        return {}
+    for p in _v281_context_cache_candidates():
+        try:
+            if not os.path.exists(p):
+                continue
+            ext = os.path.splitext(p)[1].lower()
+            age_h = None
+            try:
+                age_h = (time.time() - os.path.getmtime(p)) / 3600.0
+            except Exception:
+                age_h = None
+            if ext == ".csv":
+                df = pd.read_csv(p)
+                if df.empty:
+                    continue
+                rec = df.iloc[-1].to_dict()
+                cache = {"source_file": p, "source_type": "csv_last_row", "snapshot": rec}
+            else:
+                with open(p, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                if not isinstance(cache, dict):
+                    continue
+                cache = dict(cache)
+                cache["source_file"] = p
+                cache["source_type"] = "json"
+            cache["cache_age_hours"] = age_h
+            cache["cache_stale"] = bool(age_h is not None and age_h > V281_MARKET_CONTEXT_CACHE_MAX_AGE_HOURS)
+            return cache
+        except Exception:
+            continue
+    return {}
+
+
+def _v281_extract_market_reality(cache):
+    """把缓存统一成市场状态特征；失败时返回低可信度。"""
+    if not isinstance(cache, dict) or not cache:
+        return {"available": False, "confidence": "field_infer", "note": "未找到市场真实缓存，回退到字段推断"}
+    snap = cache.get("snapshot") if isinstance(cache.get("snapshot"), dict) else cache
+    breadth = snap.get("breadth") if isinstance(snap.get("breadth"), dict) else snap
+    indices = snap.get("indices") if isinstance(snap.get("indices"), dict) else {}
+    sectors = snap.get("sectors") if isinstance(snap.get("sectors"), list) else []
+    style = snap.get("style") if isinstance(snap.get("style"), dict) else {}
+
+    def pick_index_metric(keys, default=0.0):
+        vals = []
+        for _, v in indices.items():
+            if not isinstance(v, dict):
+                continue
+            for k in keys:
+                if k in v:
+                    vals.append(safe_float(v.get(k), None))
+                    break
+        vals = [x for x in vals if x is not None]
+        return float(np.nanmean(vals)) if vals else default
+
+    up_ratio = safe_float(breadth.get("up_ratio", breadth.get("上涨家数占比", breadth.get("adv_ratio", 0))), 0)
+    limit_up = safe_float(breadth.get("limit_up_count", breadth.get("涨停数", 0)), 0)
+    limit_down = safe_float(breadth.get("limit_down_count", breadth.get("跌停数", 0)), 0)
+    amount_chg = safe_float(breadth.get("total_amount_chg", breadth.get("成交额变化", breadth.get("amount_chg", 0))), 0)
+    avg_idx_ret = pick_index_metric(["pct_chg", "涨跌幅", "ret"], 0)
+    avg_above_ma20 = pick_index_metric(["above_ma20", "站上20日线"], 0)
+    avg_vol = pick_index_metric(["atr20", "volatility", "波动率"], 0)
+
+    hot_sectors = []
+    for x in sectors:
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("name") or x.get("sector") or x.get("industry") or x.get("板块") or "")[:32]
+        heat = safe_float(x.get("heat_score", x.get("score", x.get("热度", x.get("pct_chg", 0)))), 0)
+        ret = safe_float(x.get("pct_chg", x.get("ret", 0)), 0)
+        lu = safe_float(x.get("limit_up_count", x.get("涨停数", 0)), 0)
+        hot_sectors.append({"name": name, "heat_score": heat, "pct_chg": ret, "limit_up_count": lu})
+    hot_sectors = sorted(hot_sectors, key=lambda z: (safe_float(z.get("heat_score"),0), safe_float(z.get("pct_chg"),0), safe_float(z.get("limit_up_count"),0)), reverse=True)[:20]
+
+    if up_ratio >= 0.62 or avg_idx_ret >= 1.0 or limit_up >= 70:
+        market_regime = "strong"
+    elif (0 < up_ratio <= 0.38) or avg_idx_ret <= -1.0 or limit_down >= max(20, limit_up * 0.6):
+        market_regime = "weak"
+    else:
+        market_regime = "range"
+    if avg_vol >= 0.035:
+        volatility_regime = "high_vol"
+    elif 0 < avg_vol <= 0.015:
+        volatility_regime = "low_vol"
+    else:
+        volatility_regime = "mid_vol"
+    small_score = safe_float(style.get("small_cap_score", style.get("small_score", 0)), 0)
+    large_score = safe_float(style.get("large_cap_score", style.get("large_score", 0)), 0)
+    svl = str(style.get("small_vs_large", "")).lower()
+    if "small" in svl or (small_score and large_score and small_score > large_score + 8):
+        dominant_style = "small_cap"
+    elif "large" in svl or (small_score and large_score and large_score > small_score + 8):
+        dominant_style = "large_cap"
+    else:
+        dominant_style = "balanced_style"
+    risk_appetite_score = 50 + avg_idx_ret * 8 + (up_ratio - 0.5) * 60 + min(limit_up, 120) * 0.18 - min(limit_down, 80) * 0.35 + amount_chg * 20
+    if market_regime == "weak" or risk_appetite_score < 43:
+        risk_appetite = "risk_off"
+    elif market_regime == "strong" and risk_appetite_score > 57:
+        risk_appetite = "risk_on"
+    else:
+        risk_appetite = "neutral"
+    return {
+        "available": True,
+        "confidence": "real_cache_stale" if cache.get("cache_stale") else "real_cache",
+        "source_file": cache.get("source_file", ""),
+        "cache_age_hours": cache.get("cache_age_hours"),
+        "cache_stale": bool(cache.get("cache_stale")),
+        "trade_date": snap.get("trade_date") or snap.get("date") or snap.get("交易日期"),
+        "market_regime": market_regime,
+        "volatility_regime": volatility_regime,
+        "risk_appetite": risk_appetite,
+        "risk_appetite_score": round(float(risk_appetite_score), 3),
+        "up_ratio": round(float(up_ratio), 4),
+        "limit_up_count": int(limit_up),
+        "limit_down_count": int(limit_down),
+        "avg_index_ret": round(float(avg_idx_ret), 4),
+        "avg_index_above_ma20": round(float(avg_above_ma20), 4),
+        "amount_chg": round(float(amount_chg), 4),
+        "dominant_style": dominant_style,
+        "hot_sectors": hot_sectors,
+        "note": "读取市场真实缓存" + ("，但缓存偏旧" if cache.get("cache_stale") else ""),
+    }
+
+
+def _v281_match_sector_regime(row_sector, reality, fallback_sector_regime):
+    sector = str(row_sector or "")[:32]
+    if not sector or not isinstance(reality, dict) or not reality.get("available"):
+        return fallback_sector_regime
+    for x in reality.get("hot_sectors", []) or []:
+        nm = str(x.get("name") or "")
+        if nm and (nm in sector or sector in nm):
+            heat = safe_float(x.get("heat_score", 0), 0)
+            ret = safe_float(x.get("pct_chg", 0), 0)
+            lu = safe_float(x.get("limit_up_count", 0), 0)
+            if heat >= 65 or ret >= 1.5 or lu >= 3:
+                return "sector_hot"
+            if heat <= 35 and ret <= -0.8:
+                return "sector_cold"
+            return "sector_neutral"
+    return fallback_sector_regime
+
+
+def build_market_context_engine(row=None):
+    """V28.1：优先使用市场真实缓存；缓存缺失时回退V28字段推断。"""
+    r = row or {}
+    base = _v28_field_infer_build_market_context_engine(r)
+    cache = _v281_read_market_context_cache()
+    reality = _v281_extract_market_reality(cache)
+    if reality.get("available"):
+        sector = base.get("sector") or _v28_bucket_text(r.get("industry") or r.get("sector") or r.get("concept") or r.get("板块"), "unknown_sector")
+        sector_regime = _v281_match_sector_regime(sector, reality, base.get("sector_regime", "sector_unknown"))
+        style_regime = base.get("style_regime", "style_unknown")
+        dom_style = reality.get("dominant_style")
+        # 市场风格只用于辅助校准：个股市值风格不被强行覆盖，但记录是否顺风。
+        style_tailwind = "style_tailwind" if dom_style == style_regime else ("style_headwind" if dom_style in ["small_cap", "large_cap"] and style_regime in ["small_cap", "large_cap"] else "style_neutral")
+        buy_point = base.get("buy_point_type", "综合结构观察")
+        ctx = dict(base)
+        ctx.update({
+            "version": V281_CONTEXT_MODEL_VERSION,
+            "market_regime": reality.get("market_regime", base.get("market_regime")),
+            "volatility_regime": reality.get("volatility_regime", base.get("volatility_regime")),
+            "risk_appetite": reality.get("risk_appetite", base.get("risk_appetite")),
+            "risk_appetite_score": reality.get("risk_appetite_score", base.get("risk_appetite_score")),
+            "sector_regime": sector_regime,
+            "dominant_style": dom_style,
+            "style_tailwind": style_tailwind,
+            "market_reality": reality,
+            "market_context_confidence": reality.get("confidence", "real_cache"),
+        })
+        ctx["context_key"] = "|".join([ctx.get("market_regime","range"), ctx.get("sector_regime","sector_unknown"), ctx.get("style_regime","style_unknown"), buy_point])
+        ctx["context_key_soft"] = "|".join([ctx.get("market_regime","range"), ctx.get("sector_regime","sector_unknown"), buy_point])
+        ctx["context_key_market_buy"] = "|".join([ctx.get("market_regime","range"), buy_point])
+        ctx["context_key_style_buy"] = "|".join([ctx.get("market_regime","range"), ctx.get("style_regime","style_unknown"), buy_point])
+        return ctx
+    ctx = dict(base)
+    ctx.update({
+        "version": V281_CONTEXT_MODEL_VERSION,
+        "market_reality": reality,
+        "market_context_confidence": "field_infer",
+        "context_key_style_buy": "|".join([ctx.get("market_regime","range"), ctx.get("style_regime","style_unknown"), ctx.get("buy_point_type","综合结构观察")]),
+    })
+    return ctx
+
+
+def _v281_first_drawdown_col(df):
+    return _v278_first_col(df, [
+        f"max_dd_t{V278_WF_TARGET_WINDOW}", f"mdd_t{V278_WF_TARGET_WINDOW}", f"drawdown_t{V278_WF_TARGET_WINDOW}",
+        "max_drawdown", "future_max_drawdown", "最大回撤", "回撤"
+    ])
+
+
+def _v281_fit_aux_model(X, y, keys, model_type):
+    m = _v28_fit_ridge_pricing_model(X, y, keys)
+    if m:
+        m["type"] = model_type
+    return m
+
+
+def _v281_validate_aux_model(X, y, min_test):
+    X = np.asarray(X, dtype=float); y = np.asarray(y, dtype=float)
+    n = len(y); oos = []
+    if n < max(30, min_test * 2):
+        return oos
+    for frac in [0.50, 0.60, 0.70, 0.80]:
+        cut = int(n * frac)
+        if cut < max(20, min_test) or n - cut < min_test:
+            continue
+        m = _v281_fit_aux_model(X[:cut], y[:cut], ["fund","structure","explosion","trigger","market","risk_trade"], "aux_predictor")
+        if not m:
+            continue
+        pred = _v28_predict_raw(m, X[cut:]); yv = y[cut:]
+        corr = float(np.corrcoef(pred, yv)[0,1]) if len(yv) > 2 and np.std(pred) > 0 and np.std(yv) > 0 else 0.0
+        top_line = np.percentile(pred, 70)
+        top_mask = pred >= top_line
+        oos.append({
+            "train_n": int(cut), "test_n": int(n-cut), "corr": corr,
+            "top30_mean": float(np.mean(yv[top_mask])) if top_mask.any() else 0.0,
+            "all_mean": float(np.mean(yv)) if len(yv) else 0.0,
+            "top30_excess": (float(np.mean(yv[top_mask])) - float(np.mean(yv))) if top_mask.any() and len(yv) else 0.0,
+        })
+    return oos
+
+
+def _v281_oos_summary_aux(oos):
+    if not oos:
+        return {"avg_corr": 0.0, "avg_top30_mean": 0.0, "avg_top30_excess": 0.0, "folds": 0}
+    return {
+        "avg_corr": float(np.nanmean([safe_float(x.get("corr",0),0) for x in oos])),
+        "avg_top30_mean": float(np.nanmean([safe_float(x.get("top30_mean",0),0) for x in oos])),
+        "avg_top30_excess": float(np.nanmean([safe_float(x.get("top30_excess",0),0) for x in oos])),
+        "folds": int(len(oos)),
+    }
+
+
+def _v281_make_utility_targets(work, ret_col, dd_col=None):
+    ret = pd.to_numeric(work[ret_col], errors="coerce").astype(float)
+    win = (ret > 0).astype(float)
+    if dd_col and dd_col in work.columns:
+        dd = pd.to_numeric(work[dd_col], errors="coerce").fillna(0).astype(float).abs()
+    else:
+        dd = pd.Series(np.maximum(0.0, -ret.values), index=work.index, dtype=float)
+    utility = V281_UTILITY_RETURN_WEIGHT * ret + V281_UTILITY_WIN_WEIGHT * win - V281_UTILITY_DRAWDOWN_WEIGHT * dd
+    return ret.values.astype(float), win.values.astype(float), dd.values.astype(float), utility.values.astype(float)
+
+
+def _v281_attach_decision_models(model, X, y_ret, y_win, y_dd, y_util, keys, min_test):
+    if not model:
+        return model
+    win_model = _v281_fit_aux_model(X, y_win, keys, "ridge_win_probability_predictor")
+    dd_model = _v281_fit_aux_model(X, y_dd, keys, "ridge_drawdown_predictor")
+    util_model = _v281_fit_aux_model(X, y_util, keys, "ridge_utility_predictor")
+    model["decision_models"] = {
+        "win_model": win_model or {},
+        "drawdown_model": dd_model or {},
+        "utility_model": util_model or {},
+        "utility_formula": "utility = return*%.3f + win*%.3f - abs(drawdown)*%.3f" % (V281_UTILITY_RETURN_WEIGHT, V281_UTILITY_WIN_WEIGHT, V281_UTILITY_DRAWDOWN_WEIGHT),
+        "win_oos_summary": _v281_oos_summary_aux(_v281_validate_aux_model(X, y_win, min_test)),
+        "drawdown_oos_summary": _v281_oos_summary_aux(_v281_validate_aux_model(X, y_dd, min_test)),
+        "utility_oos_summary": _v281_oos_summary_aux(_v281_validate_aux_model(X, y_util, min_test)),
+    }
+    return model
+
+
+def _v278_build_walk_forward_calibration():
+    """
+    V28.1 覆盖版：
+      - 全局 return/win/drawdown/utility 模型；
+      - segment 分三层降级：严格细分、半细分、宽松；
+      - OOS弱的segment只做审计，不接管正式定价。
+    """
+    files = _v278_candidate_trade_files()
+    dfs = []
+    for pth in files:
+        df = _v278_read_table(pth)
+        if df is not None and not df.empty:
+            df = df.copy(); df["_source_file"] = pth; dfs.append(df)
+    if not dfs:
+        return None
+    df = pd.concat(dfs, ignore_index=True)
+    factor_map = {
+        "fund": ["v27_fund_factor", "fund_factor", "f1"],
+        "structure": ["v27_structure_factor", "structure_factor", "f2"],
+        "explosion": ["v27_explosion_eve_factor", "explosion_factor", "f3"],
+        "trigger": ["v27_current_trigger_factor", "trigger_factor", "f4"],
+        "market": ["v27_market_factor", "market_factor", "f5"],
+        "risk_trade": ["v27_risk_trade_factor", "risk_trade_factor", "f6"],
+    }
+    keys = ["fund", "structure", "explosion", "trigger", "market", "risk_trade"]
+    cols = {k: _v278_first_col(df, v) for k, v in factor_map.items()}
+    ret_col = _v278_first_col(df, [f"net_ret_t{V278_WF_TARGET_WINDOW}", f"ret_t{V278_WF_TARGET_WINDOW}", "strategy_ret", "future_ret", "return", "收益率"])
+    dd_col = _v281_first_drawdown_col(df)
+    date_col = _v278_first_col(df, ["date", "signal_date", "trade_date", "推荐日期"])
+    if not ret_col or any(cols.get(k) is None for k in keys):
+        return {"status": "insufficient_columns", "sample_count": 0, "note": "缺少V27因子列或收益列，无法V28.1真实utility walk-forward校准", "source_files": files, "factor_columns": cols, "target_return_col": ret_col}
+    keep_cols = [cols[k] for k in keys] + [ret_col] + ([dd_col] if dd_col else []) + ([date_col] if date_col else [])
+    ctx_cols = _v28_infer_context_columns(df)
+    for c in ctx_cols.values():
+        if c and c not in keep_cols:
+            keep_cols.append(c)
+    work = df[keep_cols].copy()
+    for k in keys:
+        work[cols[k]] = pd.to_numeric(work[cols[k]], errors="coerce")
+    work["_ret"] = pd.to_numeric(work[ret_col], errors="coerce")
+    work = work.dropna(subset=[cols[k] for k in keys] + ["_ret"])
+    if date_col:
+        work["_date"] = pd.to_datetime(work[date_col], errors="coerce")
+        work = work.sort_values("_date")
+    n = int(len(work))
+    if n < V278_WF_MIN_SAMPLE:
+        return {"status": "small_sample", "sample_count": n, "note": f"可用样本<{V278_WF_MIN_SAMPLE}，不做V28.1真实walk-forward定价", "source_files": files}
+
+    ctx_records = []
+    for _, rec in work.iterrows():
+        ctx_records.append(_v28_row_context_from_record(rec, ctx_cols))
+    ctx_df = pd.DataFrame(ctx_records, index=work.index)
+    work = pd.concat([work.reset_index(drop=True), ctx_df.reset_index(drop=True).add_prefix("_ctx_")], axis=1)
+    X = work[[cols[k] for k in keys]].astype(float).values
+    y_ret, y_win, y_dd, y_util = _v281_make_utility_targets(work, "_ret", dd_col)
+
+    global_oos = _v28_walk_forward_validate(X, y_ret, V278_WF_MIN_TEST_SAMPLE)
+    global_model = _v28_fit_ridge_pricing_model(X, y_ret, keys)
+    if not global_model:
+        return {"status": "fit_failed", "sample_count": n, "note": "全局收益模型拟合失败", "source_files": files}
+    global_model = _v281_attach_decision_models(global_model, X, y_ret, y_win, y_dd, y_util, keys, V278_WF_MIN_TEST_SAMPLE)
+    global_ok = _v28_model_oos_ok(global_oos)
+
+    segment_models = {}
+    segment_stats = []
+    segment_specs = [
+        ("_ctx_context_key", "strict_context", V281_MIN_SEGMENT_SAMPLE_STRICT, V28_MIN_SEGMENT_TEST_SAMPLE),
+        ("_ctx_context_key_soft", "mid_context", V281_MIN_SEGMENT_SAMPLE_MID, V281_MIN_SEGMENT_TEST_SAMPLE_MID),
+        ("_ctx_context_key_market_buy", "market_buy", V281_MIN_SEGMENT_SAMPLE_LOOSE, V281_MIN_SEGMENT_TEST_SAMPLE_LOOSE),
+        ("_ctx_context_key_style_buy", "style_buy", V281_MIN_SEGMENT_SAMPLE_LOOSE, V281_MIN_SEGMENT_TEST_SAMPLE_LOOSE),
+    ]
+    for seg_col, level_name, min_sample, min_test in segment_specs:
+        if seg_col not in work.columns:
+            continue
+        vc = work[seg_col].value_counts().head(max(30, V28_SEGMENT_TOP_N))
+        for seg_key, cnt in vc.items():
+            if int(cnt) < int(min_sample):
+                continue
+            mask = (work[seg_col] == seg_key).values
+            Xs = X[mask]; yr = y_ret[mask]; yw = y_win[mask]; yd = y_dd[mask]; yu = y_util[mask]
+            if len(yr) < int(min_sample):
+                continue
+            oos = _v28_walk_forward_validate(Xs, yr, min_test)
+            oos_ok = _v28_model_oos_ok(oos)
+            stat = {"key": str(seg_key), "level": level_name, "sample_count": int(len(yr)), "status": "ok" if oos_ok else "weak_oos", "min_sample": int(min_sample), "oos_summary": _v28_oos_summary(oos)}
+            segment_stats.append(stat)
+            if not oos_ok:
+                continue
+            model = _v28_fit_ridge_pricing_model(Xs, yr, keys)
+            if not model:
+                continue
+            model = _v281_attach_decision_models(model, Xs, yr, yw, yd, yu, keys, min_test)
+            model["segment_key"] = str(seg_key)
+            model["segment_level"] = level_name
+            model["sample_count"] = int(len(yr))
+            model["oos_summary"] = _v28_oos_summary(oos)
+            segment_models[str(seg_key)] = model
+            if len(segment_models) >= V28_SEGMENT_TOP_N:
+                break
+        if len(segment_models) >= V28_SEGMENT_TOP_N:
+            break
+
+    pred_all = _v28_predict_raw(global_model, X)
+    score_all = np.clip(50.0 + (pred_all - global_model["pred_p50"]) / max(1e-9, (global_model["pred_p90"] - global_model["pred_p10"])) * 40.0, 0, 100)
+    good = y_ret > 0
+    min_buy = float(np.percentile(score_all[good], 55)) if good.any() else V27_MIN_BUY_SCORE
+    min_buy = max(72.0, min(90.0, min_buy))
+    beta = np.array(global_model.get("beta", [0,0,0,0,0,0]), dtype=float)
+    pos = np.maximum(beta, 0)
+    if pos.sum() <= 0:
+        pos = np.abs(beta)
+    if pos.sum() <= 0:
+        pos = np.ones_like(pos)
+    base_sum = V27_WEIGHT_FUND + V27_WEIGHT_STRUCTURE + V27_WEIGHT_EXPLOSION + V27_WEIGHT_TRIGGER + V27_WEIGHT_MARKET + V27_WEIGHT_RISK_TRADE
+    explain_w = {k: float(max(0.0, pos[i] / pos.sum() * base_sum)) for i, k in enumerate(keys)}
+    status = "ok" if (global_ok or segment_models) else "weak_oos"
+    cal = {
+        "status": status,
+        "method": "walk_forward_ridge_v281_reality_segment_utility",
+        "generated_at_bj": bj_time_str(),
+        "sample_count": n,
+        "source_files": files,
+        "target_return_col": ret_col,
+        "target_drawdown_col": dd_col,
+        "factor_columns": cols,
+        "context_columns": ctx_cols,
+        "weights": explain_w,
+        "pricing_model": global_model,
+        "segment_models": segment_models,
+        "segment_model_count": int(len(segment_models)),
+        "segment_stats": segment_stats[:max(80, V28_SEGMENT_TOP_N)],
+        "segment_policy": {
+            "strict_min_sample": V281_MIN_SEGMENT_SAMPLE_STRICT,
+            "mid_min_sample": V281_MIN_SEGMENT_SAMPLE_MID,
+            "loose_min_sample": V281_MIN_SEGMENT_SAMPLE_LOOSE,
+            "levels": [x[1] for x in segment_specs],
+        },
+        "thresholds": {"min_buy_score": min_buy, "min_rr": V27_MIN_RR, "max_defense_dist": V27_MAX_DEFENSE_DIST, "near_pressure_hard": V27_NEAR_PRESSURE_HARD_BLOCK, "near_pressure_soft": V27_NEAR_PRESSURE_SOFT_BLOCK},
+        "oos_metrics": global_oos,
+        "oos_summary": _v28_oos_summary(global_oos),
+        "utility_config": {"return_weight": V281_UTILITY_RETURN_WEIGHT, "win_weight": V281_UTILITY_WIN_WEIGHT, "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT},
+        "note": "V28.1真实市场缓存+分层segment+utility定价：先用市场真实缓存识别regime；segment样本不足时逐级降级；最终用收益/胜率/回撤/utility联合评分。",
+    }
+    try:
+        os.makedirs(os.path.dirname(V27_CALIBRATION_FILE), exist_ok=True)
+        with open(V27_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(cal, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return cal
+
+
+def _v281_model_score_from_pred(model, pred):
+    p10 = safe_float(model.get("pred_p10", -0.01), -0.01)
+    p50 = safe_float(model.get("pred_p50", 0), 0)
+    p90 = safe_float(model.get("pred_p90", 0.01), 0.01)
+    den = p90 - p10
+    if abs(den) < 1e-9:
+        den = 0.02
+    return _v27_clip(50.0 + (safe_float(pred, 0) - p50) / den * 40.0, 0, 100)
+
+
+def _v281_predict_aux(model, vals, default=0.0):
+    if isinstance(model, dict) and model.get("beta") is not None:
+        try:
+            return float(_v28_predict_raw(model, vals)[0])
+        except Exception:
+            return default
+    return default
+
+
+def _v28_select_pricing_model(cal, market_context):
+    """V28.1：加入 style_buy 回退；严格->半细分->市场买点->风格买点->全局。"""
+    if not isinstance(cal, dict):
+        return {}, "none", "无校准对象"
+    segs = cal.get("segment_models") if isinstance(cal.get("segment_models"), dict) else {}
+    keys = []
+    if isinstance(market_context, dict):
+        keys = [
+            market_context.get("context_key"),
+            market_context.get("context_key_soft"),
+            market_context.get("context_key_market_buy"),
+            market_context.get("context_key_style_buy"),
+        ]
+    for k in keys:
+        if k and str(k) in segs and isinstance(segs[str(k)], dict):
+            return segs[str(k)], "segment", f"命中V28.1分层情景模型:{k}"
+    pm = cal.get("pricing_model") if isinstance(cal.get("pricing_model"), dict) else {}
+    if pm.get("type") == "ridge_return_predictor":
+        return pm, "global", "未命中分层segment，使用全局V28.1 utility walk-forward模型"
+    return {}, "fallback", "无有效V28.1 walk-forward模型"
+
+
+def _v28_predictive_pricing_score(factors, cal, market_context):
+    """V28.1：收益预测 + 胜率预测 + 回撤预测 + utility预测 联合定价。"""
+    vals = np.array([safe_float(x) for x in factors], dtype=float)
+    model, mode, note = _v28_select_pricing_model(cal, market_context)
+    if model and model.get("type") == "ridge_return_predictor" and str(cal.get("status")) == "ok":
+        pred_ret = float(_v28_predict_raw(model, vals)[0])
+        ret_score = _v281_model_score_from_pred(model, pred_ret)
+        dms = model.get("decision_models") if isinstance(model.get("decision_models"), dict) else {}
+        pred_win = _v281_predict_aux(dms.get("win_model"), vals, 0.5)
+        pred_win = max(0.0, min(1.0, pred_win))
+        pred_dd = abs(_v281_predict_aux(dms.get("drawdown_model"), vals, 0.0))
+        util_model = dms.get("utility_model") if isinstance(dms.get("utility_model"), dict) else {}
+        if util_model:
+            pred_util = _v281_predict_aux(util_model, vals, pred_ret + V281_UTILITY_WIN_WEIGHT * pred_win - V281_UTILITY_DRAWDOWN_WEIGHT * pred_dd)
+            util_score = _v281_model_score_from_pred(util_model, pred_util)
+        else:
+            pred_util = pred_ret + V281_UTILITY_WIN_WEIGHT * pred_win - V281_UTILITY_DRAWDOWN_WEIGHT * pred_dd
+            util_score = ret_score
+        win_score = _v27_clip(pred_win * 100.0, 0, 100)
+        dd_penalty = _v27_clip(pred_dd * 180.0, 0, 25)
+        score = _v27_clip(ret_score * 0.48 + util_score * 0.32 + win_score * 0.20 - dd_penalty, 0, 100)
+        out = dict(cal)
+        out["v28_pricing_mode"] = "segment_walk_forward_utility" if mode == "segment" else "global_walk_forward_utility"
+        out["v28_model_note"] = note
+        out["v28_predicted_return"] = round(pred_ret, 6)
+        out["v281_predicted_win_prob"] = round(float(pred_win), 6)
+        out["v281_predicted_drawdown"] = round(float(pred_dd), 6)
+        out["v281_predicted_utility"] = round(float(pred_util), 6)
+        out["v281_component_scores"] = {"return_score": round(float(ret_score),2), "utility_score": round(float(util_score),2), "win_score": round(float(win_score),2), "drawdown_penalty": round(float(dd_penalty),2)}
+        out["v28_market_context"] = market_context
+        if mode == "segment":
+            out["v28_segment_sample_count"] = int(safe_float(model.get("sample_count", 0), 0))
+            out["v28_segment_oos_summary"] = model.get("oos_summary", {})
+            out["v281_segment_level"] = model.get("segment_level", "")
+        return score, out
+    score, out = _v28_regime_predictive_pricing_score(factors, cal, market_context)
+    out = dict(out) if isinstance(out, dict) else {}
+    out["v28_pricing_mode"] = out.get("v28_pricing_mode", "experience_fallback_observe_only")
+    out["v28_model_note"] = str(out.get("v28_model_note", "")) + "｜V28.1 utility模型不可用，保持观察降级"
+    return score, out
+
+
+# 覆盖V28决策器：仅增加V28.1字段与utility正式池约束；主体逻辑仍沿用V28版本。
+_v28_decision_engine_before_v281 = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    r = _v28_decision_engine_before_v281(row)
+    try:
+        cal_note = str(r.get("v28_model_note", ""))
+        mode = str(r.get("v28_pricing_mode", ""))
+        mc = r.get("v28_market_context") if isinstance(r.get("v28_market_context"), dict) else {}
+        r["v281_market_context_confidence"] = mc.get("market_context_confidence", "unknown")
+        r["v281_market_reality"] = mc.get("market_reality", {})
+        r["v281_predicted_win_prob"] = r.get("v281_predicted_win_prob", None)
+        r["v281_predicted_drawdown"] = r.get("v281_predicted_drawdown", None)
+        r["v281_predicted_utility"] = r.get("v281_predicted_utility", None)
+        r["v281_component_scores"] = r.get("v281_component_scores", {})
+        if V281_REQUIRE_UTILITY_FOR_FORMAL == "1" and "utility" not in mode and r.get("v27_buy_eligible"):
+            r["v27_buy_eligible"] = False
+            r["v27_pool"] = "V28观察池"
+            obs = list(r.get("v27_observe_reasons", []))
+            obs.append("V28.1要求utility模型确认，当前未命中有效utility定价，正式池降级")
+            r["v27_observe_reasons"] = obs
+        if isinstance(r.get("v27_factor_reasons"), dict):
+            r["v27_factor_reasons"].setdefault("V28.1真实市场/Utility", [])
+            r["v27_factor_reasons"]["V28.1真实市场/Utility"].append({
+                "市场缓存可信度": r.get("v281_market_context_confidence"),
+                "定价模式": mode,
+                "模型说明": cal_note,
+                "胜率预测": r.get("v281_predicted_win_prob"),
+                "回撤预测": r.get("v281_predicted_drawdown"),
+                "Utility预测": r.get("v281_predicted_utility"),
+            })
+    except Exception:
+        pass
+    return r
+
+
+# =============================================================================
+# V28.2 增量补丁：市场缓存生成器 + Utility权重样本校准 + 正式池强制Utility确认
+# 说明：只覆盖选股逻辑层；不触碰 workflow/入口/PAT/Telegram/BaoStock/原生产缓存闭环。
+# 核心原则：
+#   1）主筛股逐票不联网、不扫全市场；市场缓存生成器仅在显式调用或环境变量开启时运行；
+#   2）Utility权重从历史复盘样本中自动校准，默认经验参数只作为无样本降级兜底；
+#   3）正式Top5默认必须命中有效Utility模型，否则只能进入观察池。
+# =============================================================================
+V282_MODEL_VERSION = "v28_2_market_cache_utility_calibrated_formal"
+V282_AUTO_BUILD_MARKET_CACHE = os.environ.get("V282_AUTO_BUILD_MARKET_CACHE", "0")
+V282_MARKET_SOURCE_FILES = os.environ.get("V282_MARKET_SOURCE_FILES", "market_reality_source.json,market_reality_source.csv,market_breadth.csv,market_indices.csv,market_sectors.csv")
+V282_MIN_UTILITY_CALIBRATION_SAMPLE = int(os.environ.get("V282_MIN_UTILITY_CALIBRATION_SAMPLE", "80"))
+V282_UTILITY_WEIGHT_GRID_RETURN = [float(x) for x in os.environ.get("V282_UTILITY_WEIGHT_GRID_RETURN", "0.7,1.0,1.3,1.6").split(",") if str(x).strip()]
+V282_UTILITY_WEIGHT_GRID_WIN = [float(x) for x in os.environ.get("V282_UTILITY_WEIGHT_GRID_WIN", "0.006,0.012,0.018,0.026,0.035").split(",") if str(x).strip()]
+V282_UTILITY_WEIGHT_GRID_DRAWDOWN = [float(x) for x in os.environ.get("V282_UTILITY_WEIGHT_GRID_DRAWDOWN", "0.35,0.55,0.75,1.0,1.25").split(",") if str(x).strip()]
+# 从V28.2开始，正式池默认强制Utility确认；如需兼容旧行为，可显式设置环境变量 V281_REQUIRE_UTILITY_FOR_FORMAL=0。
+V281_REQUIRE_UTILITY_FOR_FORMAL = os.environ.get("V281_REQUIRE_UTILITY_FOR_FORMAL", "1")
+V282_CALIBRATED_UTILITY_WEIGHTS = {
+    "return_weight": V281_UTILITY_RETURN_WEIGHT,
+    "win_weight": V281_UTILITY_WIN_WEIGHT,
+    "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+    "status": "default_experience_fallback",
+    "sample_count": 0,
+    "objective": None,
+}
+
+
+def _v282_source_candidates():
+    names = []
+    for x in str(V282_MARKET_SOURCE_FILES).split(','):
+        x = x.strip()
+        if x:
+            names.append(x)
+    bases = [os.getcwd()]
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    bases.extend(["/mnt/data", "."])
+    out = []
+    for n in names:
+        if os.path.isabs(n):
+            out.append(n)
+        else:
+            for b in bases:
+                out.append(os.path.join(b, n))
+    seen = []
+    for p in out:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _v282_read_any_market_source(path):
+    try:
+        if not os.path.exists(path):
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.json':
+            with open(path, 'r', encoding='utf-8') as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                obj = dict(obj)
+                obj['_source_file'] = path
+                return obj
+            if isinstance(obj, list) and obj:
+                return {'rows': obj, '_source_file': path}
+        if ext == '.csv':
+            df = pd.read_csv(path)
+            if df is None or df.empty:
+                return None
+            return {'rows': df.to_dict('records'), 'last_row': df.iloc[-1].to_dict(), '_source_file': path}
+    except Exception:
+        return None
+    return None
+
+
+def _v282_num(obj, *keys, default=0.0):
+    cur = obj if isinstance(obj, dict) else {}
+    for k in keys:
+        if k in cur:
+            try:
+                return safe_float(cur.get(k), default)
+            except Exception:
+                return default
+    return default
+
+
+def _v282_build_market_context_from_sources(sources):
+    """从本地行情/宽度/板块源生成统一market_context_cache结构。不会联网。"""
+    merged = {"indices": {}, "breadth": {}, "sectors": [], "style": {}, "source_files": []}
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        sf = src.get('_source_file', '')
+        if sf:
+            merged['source_files'].append(sf)
+        # 已经是标准结构的JSON直接优先合并
+        if isinstance(src.get('indices'), dict):
+            merged['indices'].update(src.get('indices') or {})
+        if isinstance(src.get('breadth'), dict):
+            merged['breadth'].update(src.get('breadth') or {})
+        if isinstance(src.get('style'), dict):
+            merged['style'].update(src.get('style') or {})
+        if isinstance(src.get('sectors'), list):
+            merged['sectors'].extend([x for x in src.get('sectors') if isinstance(x, dict)])
+        rows = src.get('rows') if isinstance(src.get('rows'), list) else []
+        last = src.get('last_row') if isinstance(src.get('last_row'), dict) else (rows[-1] if rows and isinstance(rows[-1], dict) else {})
+        if last:
+            # 兼容单行breadth/source csv
+            for k in ['trade_date','date','交易日期']:
+                if k in last and not merged.get('trade_date'):
+                    merged['trade_date'] = last.get(k)
+            if any(k in last for k in ['up_ratio','上涨家数占比','adv_ratio','limit_up_count','涨停数','limit_down_count','跌停数','total_amount_chg','amount_chg']):
+                merged['breadth'].update({
+                    'up_ratio': _v282_num(last, 'up_ratio', '上涨家数占比', 'adv_ratio', default=merged['breadth'].get('up_ratio', 0)),
+                    'limit_up_count': _v282_num(last, 'limit_up_count', '涨停数', default=merged['breadth'].get('limit_up_count', 0)),
+                    'limit_down_count': _v282_num(last, 'limit_down_count', '跌停数', default=merged['breadth'].get('limit_down_count', 0)),
+                    'total_amount_chg': _v282_num(last, 'total_amount_chg', 'amount_chg', '成交额变化', default=merged['breadth'].get('total_amount_chg', 0)),
+                })
+            # 兼容指数csv：index/name,pct_chg,above_ma20,volatility
+            idx_name = str(last.get('index') or last.get('指数') or last.get('name') or '')
+            if idx_name and any(k in last for k in ['pct_chg','涨跌幅','ret','above_ma20','站上20日线','volatility','波动率']):
+                merged['indices'][idx_name] = {
+                    'pct_chg': _v282_num(last, 'pct_chg', '涨跌幅', 'ret', default=0),
+                    'above_ma20': _v282_num(last, 'above_ma20', '站上20日线', default=0),
+                    'volatility': _v282_num(last, 'volatility', '波动率', 'atr20', default=0),
+                }
+            # 兼容板块csv多行
+            if rows and any(k in rows[0] for k in ['sector','industry','板块','name','heat_score','热度']):
+                for rr in rows[-200:]:
+                    if not isinstance(rr, dict):
+                        continue
+                    nm = str(rr.get('sector') or rr.get('industry') or rr.get('板块') or rr.get('name') or '')[:32]
+                    if not nm:
+                        continue
+                    merged['sectors'].append({
+                        'name': nm,
+                        'heat_score': _v282_num(rr, 'heat_score', 'score', '热度', default=_v282_num(rr, 'pct_chg', '涨跌幅', 'ret', default=0)),
+                        'pct_chg': _v282_num(rr, 'pct_chg', '涨跌幅', 'ret', default=0),
+                        'limit_up_count': _v282_num(rr, 'limit_up_count', '涨停数', default=0),
+                    })
+    # 去重板块，保留最高热度
+    sec_map = {}
+    for s in merged.get('sectors', []):
+        nm = str(s.get('name') or '')[:32]
+        if not nm:
+            continue
+        old = sec_map.get(nm)
+        if old is None or safe_float(s.get('heat_score'), 0) > safe_float(old.get('heat_score'), 0):
+            sec_map[nm] = s
+    merged['sectors'] = sorted(sec_map.values(), key=lambda z: (safe_float(z.get('heat_score'),0), safe_float(z.get('pct_chg'),0), safe_float(z.get('limit_up_count'),0)), reverse=True)[:80]
+    merged['generated_at_bj'] = bj_time_str()
+    merged['generator'] = V282_MODEL_VERSION
+    return merged
+
+
+def refresh_market_context_cache(output_file=None, force=False):
+    """
+    V28.2 市场缓存生成器：从本地行情/宽度/板块源生成 market_context_cache.json。
+    - 默认不会在主流程自动运行；设置 V282_AUTO_BUILD_MARKET_CACHE=1 才会在读不到缓存时尝试生成一次。
+    - 不联网，不逐票扫描，不改变原生产缓存链路。
+    """
+    out = output_file or V281_MARKET_CONTEXT_CACHE_FILE
+    if not force and os.path.exists(out):
+        try:
+            age_h = (time.time() - os.path.getmtime(out)) / 3600.0
+            if age_h <= V281_MARKET_CONTEXT_CACHE_MAX_AGE_HOURS:
+                return {"status": "fresh_exists", "output_file": out, "age_hours": age_h}
+        except Exception:
+            pass
+    sources = []
+    for p in _v282_source_candidates():
+        obj = _v282_read_any_market_source(p)
+        if obj:
+            sources.append(obj)
+    if not sources:
+        return {"status": "no_source", "output_file": out, "note": "未找到本地市场源文件，未生成缓存"}
+    cache = _v282_build_market_context_from_sources(sources)
+    try:
+        od = os.path.dirname(os.path.abspath(out))
+        if od:
+            os.makedirs(od, exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        return {"status": "ok", "output_file": out, "source_count": len(sources), "source_files": cache.get('source_files', [])}
+    except Exception as e:
+        return {"status": "write_failed", "output_file": out, "error": str(e)}
+
+
+_v281_read_market_context_cache_before_v282 = _v281_read_market_context_cache
+
+
+def _v281_read_market_context_cache():
+    cache = _v281_read_market_context_cache_before_v282()
+    if cache:
+        return cache
+    if V282_AUTO_BUILD_MARKET_CACHE == "1":
+        try:
+            refresh_market_context_cache(force=True)
+        except Exception:
+            pass
+        cache = _v281_read_market_context_cache_before_v282()
+    return cache
+
+
+def _v282_walk_objective(ret, win, dd, wr, ww, wd):
+    """用历史样本自动校准Utility权重：偏好高收益/高胜率/低回撤。"""
+    ret = pd.Series(ret).astype(float).fillna(0.0)
+    win = pd.Series(win).astype(float).fillna(0.0)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0)
+    if len(ret) < V282_MIN_UTILITY_CALIBRATION_SAMPLE:
+        return None
+    util = wr * ret + ww * win - wd * dd
+    q = util.quantile(0.75)
+    top = util >= q
+    if top.sum() < max(12, int(len(util) * 0.08)):
+        return None
+    # 目标：Top层未来收益/胜率要高，同时Top层回撤不能过大；加入稳定性惩罚避免极端权重。
+    top_ret = float(ret[top].mean())
+    base_ret = float(ret.mean())
+    top_win = float(win[top].mean())
+    base_win = float(win.mean())
+    top_dd = float(dd[top].mean())
+    base_dd = float(dd.mean())
+    spread = (top_ret - base_ret) * 100.0 + (top_win - base_win) * 1.5 - max(0.0, top_dd - base_dd) * 25.0
+    stability = float(util.std())
+    penalty = 0.03 * abs(wr - 1.0) + 0.8 * abs(ww - 0.018) + 0.08 * abs(wd - 0.65)
+    return spread + min(0.08, stability) - penalty
+
+
+def _v282_calibrate_utility_weights(ret, win, dd):
+    ret = pd.Series(ret).astype(float).fillna(0.0)
+    win = pd.Series(win).astype(float).fillna(0.0)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0)
+    n = int(len(ret))
+    if n < V282_MIN_UTILITY_CALIBRATION_SAMPLE:
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "insufficient_sample_default_weights",
+            "sample_count": n,
+            "objective": None,
+        }
+    best = None
+    for wr in V282_UTILITY_WEIGHT_GRID_RETURN:
+        for ww in V282_UTILITY_WEIGHT_GRID_WIN:
+            for wd in V282_UTILITY_WEIGHT_GRID_DRAWDOWN:
+                obj = _v282_walk_objective(ret, win, dd, wr, ww, wd)
+                if obj is None:
+                    continue
+                if best is None or obj > best[0]:
+                    best = (obj, wr, ww, wd)
+    if best is None:
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "calibration_failed_default_weights",
+            "sample_count": n,
+            "objective": None,
+        }
+    obj, wr, ww, wd = best
+    return {
+        "return_weight": float(wr),
+        "win_weight": float(ww),
+        "drawdown_weight": float(wd),
+        "status": "sample_calibrated",
+        "sample_count": n,
+        "objective": round(float(obj), 6),
+    }
+
+
+def _v281_make_utility_targets(work, ret_col, dd_col=None):
+    """V28.2：Utility权重由历史样本校准；样本不足才退回默认经验参数。"""
+    ret = pd.to_numeric(work[ret_col], errors="coerce").fillna(0.0)
+    win = (ret > 0).astype(float)
+    if dd_col and dd_col in work.columns:
+        dd = pd.to_numeric(work[dd_col], errors="coerce").abs().fillna(0.0)
+    else:
+        dd = pd.Series(np.zeros(len(work)), index=work.index, dtype=float)
+    weights = _v282_calibrate_utility_weights(ret, win, dd)
+    try:
+        V282_CALIBRATED_UTILITY_WEIGHTS.update(weights)
+    except Exception:
+        pass
+    wr = safe_float(weights.get('return_weight'), V281_UTILITY_RETURN_WEIGHT)
+    ww = safe_float(weights.get('win_weight'), V281_UTILITY_WIN_WEIGHT)
+    wd = safe_float(weights.get('drawdown_weight'), V281_UTILITY_DRAWDOWN_WEIGHT)
+    utility = wr * ret + ww * win - wd * dd
+    return ret.values.astype(float), win.values.astype(float), dd.values.astype(float), utility.values.astype(float)
+
+
+_v281_attach_decision_models_before_v282 = _v281_attach_decision_models
+
+
+def _v281_attach_decision_models(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test):
+    model = _v281_attach_decision_models_before_v282(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test)
+    try:
+        dm = model.setdefault('decision_models', {})
+        dm['utility_weights'] = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        model['utility_formula'] = "utility = return*%.3f + win*%.3f - abs(drawdown)*%.3f" % (
+            safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get('return_weight'), V281_UTILITY_RETURN_WEIGHT),
+            safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get('win_weight'), V281_UTILITY_WIN_WEIGHT),
+            safe_float(V282_CALIBRATED_UTILITY_WEIGHTS.get('drawdown_weight'), V281_UTILITY_DRAWDOWN_WEIGHT),
+        )
+    except Exception:
+        pass
+    return model
+
+
+_v28_predictive_pricing_score_before_v282 = _v28_predictive_pricing_score
+
+
+def _v28_predictive_pricing_score(factors, cal, market_context):
+    score, out = _v28_predictive_pricing_score_before_v282(factors, cal, market_context)
+    try:
+        out = dict(out) if isinstance(out, dict) else {}
+        dms = None
+        model, mode, note = _v28_select_pricing_model(cal, market_context)
+        if isinstance(model, dict):
+            dms = model.get('decision_models') if isinstance(model.get('decision_models'), dict) else {}
+        weights = (dms or {}).get('utility_weights') if isinstance(dms, dict) else None
+        if not isinstance(weights, dict):
+            weights = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        out['v282_model_version'] = V282_MODEL_VERSION
+        out['v282_utility_weights'] = weights
+        out['v282_require_utility_for_formal'] = V281_REQUIRE_UTILITY_FOR_FORMAL
+        if str(weights.get('status','')).startswith('insufficient') or str(weights.get('status','')).startswith('calibration_failed'):
+            out['v28_model_note'] = str(out.get('v28_model_note','')) + '｜V28.2 Utility权重样本不足/校准失败，正式池需谨慎降级'
+    except Exception:
+        pass
+    return score, out
+
+
+_v281_decision_engine_before_v282 = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    r = _v281_decision_engine_before_v282(row)
+    try:
+        mode = str(r.get('v28_pricing_mode', ''))
+        weights = r.get('v282_utility_weights') if isinstance(r.get('v282_utility_weights'), dict) else {}
+        utility_ok = ('utility' in mode) and r.get('v281_predicted_utility') is not None
+        if V281_REQUIRE_UTILITY_FOR_FORMAL == '1' and (not utility_ok) and r.get('v27_buy_eligible'):
+            r['v27_buy_eligible'] = False
+            r['v27_pool'] = 'V28观察池'
+            obs = list(r.get('v27_observe_reasons', []))
+            obs.append('V28.2正式池强制Utility确认：未命中有效utility预测，降级观察')
+            r['v27_observe_reasons'] = obs
+        # 如果权重仍是默认/样本不足，允许作为观察排序，但不作为强科学买入池。
+        if str(weights.get('status','')).startswith(('insufficient','calibration_failed')) and r.get('v27_buy_eligible'):
+            r['v27_buy_eligible'] = False
+            r['v27_pool'] = 'V28观察池'
+            obs = list(r.get('v27_observe_reasons', []))
+            obs.append('V28.2 Utility权重尚未完成样本校准，正式池降级观察')
+            r['v27_observe_reasons'] = obs
+        if isinstance(r.get('v27_factor_reasons'), dict):
+            r['v27_factor_reasons'].setdefault('V28.2校准/正式池约束', [])
+            r['v27_factor_reasons']['V28.2校准/正式池约束'].append({
+                '正式池强制Utility': V281_REQUIRE_UTILITY_FOR_FORMAL,
+                'Utility有效': bool(utility_ok),
+                'Utility权重': weights,
+                '市场缓存生成器': 'refresh_market_context_cache() 可显式调用；主流程默认不联网不逐票扫描',
+            })
+    except Exception:
+        pass
+    return r
+
+
+
+# ============================================================================
+# V28.3 增量补丁：严格 Walk-Forward Utility 权重校准
+# 目标：修复 V28.2 仅在全历史样本上网格搜索 Utility 权重的问题。
+# 原则：过去训练 -> 未来验证 -> 滚动窗口反复验证；只有 OOS 合格的 Utility 权重才允许正式池接管。
+# 注意：仅属于选股逻辑/校准层增量，不触碰 workflow / PAT / Telegram / BaoStock / cache 主链路。
+# ============================================================================
+
+V283_MODEL_VERSION = "v28_3_strict_walkforward_utility"
+V283_UTILITY_TRAIN_WINDOW = int(os.getenv("V283_UTILITY_TRAIN_WINDOW", "180"))
+V283_UTILITY_TEST_WINDOW = int(os.getenv("V283_UTILITY_TEST_WINDOW", "30"))
+V283_UTILITY_STEP_WINDOW = int(os.getenv("V283_UTILITY_STEP_WINDOW", str(V283_UTILITY_TEST_WINDOW)))
+V283_MIN_UTILITY_WF_SPLITS = int(os.getenv("V283_MIN_UTILITY_WF_SPLITS", "3"))
+V283_MIN_UTILITY_TRAIN_SAMPLE = int(os.getenv("V283_MIN_UTILITY_TRAIN_SAMPLE", "120"))
+V283_MIN_UTILITY_TEST_SAMPLE = int(os.getenv("V283_MIN_UTILITY_TEST_SAMPLE", "20"))
+V283_MIN_OOS_RETURN_SPREAD = float(os.getenv("V283_MIN_OOS_RETURN_SPREAD", "0.0005"))
+V283_MIN_OOS_WIN_SPREAD = float(os.getenv("V283_MIN_OOS_WIN_SPREAD", "0.0"))
+V283_MAX_OOS_DD_SPREAD = float(os.getenv("V283_MAX_OOS_DD_SPREAD", "0.02"))
+V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL = os.getenv("V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL", "1")
+
+
+def _v283_weight_grid():
+    """兼容 V28.2 的三组网格；不存在时用稳健默认网格。"""
+    try:
+        wr_grid = list(V282_UTILITY_WEIGHT_GRID_RETURN)
+    except Exception:
+        wr_grid = [0.6, 0.8, 1.0, 1.2, 1.5]
+    try:
+        ww_grid = list(V282_UTILITY_WEIGHT_GRID_WIN)
+    except Exception:
+        ww_grid = [0.006, 0.012, 0.018, 0.024, 0.030]
+    try:
+        wd_grid = list(V282_UTILITY_WEIGHT_GRID_DRAWDOWN)
+    except Exception:
+        wd_grid = [0.35, 0.50, 0.65, 0.80, 1.00]
+    return [(float(wr), float(ww), float(wd)) for wr in wr_grid for ww in ww_grid for wd in wd_grid]
+
+
+def _v283_utility_vector(ret, win, dd, wr, ww, wd):
+    ret = pd.Series(ret).astype(float).fillna(0.0)
+    win = pd.Series(win).astype(float).fillna(0.0)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0)
+    return wr * ret + ww * win - wd * dd
+
+
+def _v283_eval_weight_on_sample(ret, win, dd, wr, ww, wd):
+    """
+    在给定样本上评估一组 Utility 权重。
+    评价方式：只看按 Utility 排序后的 Top25% 是否在未来样本中真实更好。
+    """
+    ret = pd.Series(ret).astype(float).fillna(0.0).reset_index(drop=True)
+    win = pd.Series(win).astype(float).fillna(0.0).reset_index(drop=True)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0).reset_index(drop=True)
+    n = int(len(ret))
+    if n < 8:
+        return None
+    util = _v283_utility_vector(ret, win, dd, wr, ww, wd).reset_index(drop=True)
+    top_n = max(3, int(round(n * 0.25)))
+    if top_n >= n:
+        top_n = max(1, n // 3)
+    order = util.sort_values(ascending=False).index[:top_n]
+    top_ret = float(ret.iloc[order].mean())
+    base_ret = float(ret.mean())
+    top_win = float(win.iloc[order].mean())
+    base_win = float(win.mean())
+    top_dd = float(dd.iloc[order].mean())
+    base_dd = float(dd.mean())
+    ret_spread = top_ret - base_ret
+    win_spread = top_win - base_win
+    dd_spread = top_dd - base_dd
+    objective = ret_spread * 100.0 + win_spread * 1.5 - max(0.0, dd_spread) * 25.0
+    # 约束极端权重，防止样本噪声把权重推到不稳定角落。
+    objective -= 0.03 * abs(wr - 1.0) + 0.8 * abs(ww - 0.018) + 0.08 * abs(wd - 0.65)
+    return {
+        "sample_count": n,
+        "top_count": int(top_n),
+        "top_ret": top_ret,
+        "base_ret": base_ret,
+        "ret_spread": ret_spread,
+        "top_win": top_win,
+        "base_win": base_win,
+        "win_spread": win_spread,
+        "top_dd": top_dd,
+        "base_dd": base_dd,
+        "dd_spread": dd_spread,
+        "objective": float(objective),
+    }
+
+
+def _v283_train_best_utility_weight(ret, win, dd):
+    best = None
+    for wr, ww, wd in _v283_weight_grid():
+        stat = _v283_eval_weight_on_sample(ret, win, dd, wr, ww, wd)
+        if not stat:
+            continue
+        obj = safe_float(stat.get("objective"), -1e9)
+        if best is None or obj > best[0]:
+            best = (obj, wr, ww, wd, stat)
+    return best
+
+
+def _v283_make_splits(n):
+    """生成严格的 train -> future test 滚动切片。"""
+    n = int(n)
+    train_w = max(int(V283_UTILITY_TRAIN_WINDOW), int(V283_MIN_UTILITY_TRAIN_SAMPLE))
+    test_w = max(int(V283_UTILITY_TEST_WINDOW), int(V283_MIN_UTILITY_TEST_SAMPLE))
+    step_w = max(1, int(V283_UTILITY_STEP_WINDOW))
+    if n < train_w + test_w:
+        # 小样本时用 expanding window，但仍必须满足训练和未来验证分离。
+        train_w = max(int(V283_MIN_UTILITY_TRAIN_SAMPLE), min(train_w, int(n * 0.65)))
+        test_w = max(int(V283_MIN_UTILITY_TEST_SAMPLE), min(test_w, int(n * 0.20)))
+    splits = []
+    start = 0
+    train_end = train_w
+    while train_end + test_w <= n:
+        splits.append((start, train_end, train_end, train_end + test_w))
+        train_end += step_w
+    # 若样本较少但足够做一次未来验证，补一个 expanding split。
+    if not splits and n >= int(V283_MIN_UTILITY_TRAIN_SAMPLE) + int(V283_MIN_UTILITY_TEST_SAMPLE):
+        te = n - int(V283_MIN_UTILITY_TEST_SAMPLE)
+        splits.append((0, te, te, n))
+    return splits
+
+
+def _v282_calibrate_utility_weights(ret, win, dd):
+    """
+    V28.3 覆盖 V28.2：严格 Walk-Forward Utility 权重校准。
+    - 每个切片只用过去训练样本挑权重；
+    - 只在未来测试样本验证；
+    - OOS 不合格时不返回可正式接管的权重。
+    """
+    ret = pd.Series(ret).astype(float).fillna(0.0).reset_index(drop=True)
+    win = pd.Series(win).astype(float).fillna(0.0).reset_index(drop=True)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0).reset_index(drop=True)
+    n = int(len(ret))
+    if n < int(V283_MIN_UTILITY_TRAIN_SAMPLE) + int(V283_MIN_UTILITY_TEST_SAMPLE):
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "insufficient_sample_default_weights",
+            "sample_count": n,
+            "method": "v28_3_strict_walk_forward_utility",
+            "wf_split_count": 0,
+            "objective": None,
+            "oos_valid": False,
+            "note": "样本不足，无法进行过去训练->未来验证的严格Utility walk-forward校准",
+        }
+    splits = _v283_make_splits(n)
+    records = []
+    chosen = []
+    for i, (tr0, tr1, te0, te1) in enumerate(splits, 1):
+        train_best = _v283_train_best_utility_weight(ret.iloc[tr0:tr1], win.iloc[tr0:tr1], dd.iloc[tr0:tr1])
+        if not train_best:
+            continue
+        _, wr, ww, wd, train_stat = train_best
+        test_stat = _v283_eval_weight_on_sample(ret.iloc[te0:te1], win.iloc[te0:te1], dd.iloc[te0:te1], wr, ww, wd)
+        if not test_stat:
+            continue
+        rec = {
+            "split": int(i),
+            "train_range": [int(tr0), int(tr1)],
+            "test_range": [int(te0), int(te1)],
+            "return_weight": float(wr),
+            "win_weight": float(ww),
+            "drawdown_weight": float(wd),
+            "train_objective": round(float(train_stat.get("objective", 0.0)), 6),
+            "test_objective": round(float(test_stat.get("objective", 0.0)), 6),
+            "test_ret_spread": round(float(test_stat.get("ret_spread", 0.0)), 6),
+            "test_win_spread": round(float(test_stat.get("win_spread", 0.0)), 6),
+            "test_dd_spread": round(float(test_stat.get("dd_spread", 0.0)), 6),
+            "test_top_ret": round(float(test_stat.get("top_ret", 0.0)), 6),
+            "test_base_ret": round(float(test_stat.get("base_ret", 0.0)), 6),
+            "test_top_win": round(float(test_stat.get("top_win", 0.0)), 6),
+            "test_base_win": round(float(test_stat.get("base_win", 0.0)), 6),
+        }
+        records.append(rec)
+        chosen.append((wr, ww, wd))
+    if len(records) < int(V283_MIN_UTILITY_WF_SPLITS):
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "insufficient_walk_forward_splits_default_weights",
+            "sample_count": n,
+            "method": "v28_3_strict_walk_forward_utility",
+            "wf_split_count": int(len(records)),
+            "objective": None,
+            "oos_valid": False,
+            "oos_records": records[-8:],
+            "note": "严格walk-forward有效切片不足，Utility不能作为正式池科学确认",
+        }
+    ret_spread = float(np.mean([safe_float(r.get("test_ret_spread"), 0.0) for r in records]))
+    win_spread = float(np.mean([safe_float(r.get("test_win_spread"), 0.0) for r in records]))
+    dd_spread = float(np.mean([safe_float(r.get("test_dd_spread"), 0.0) for r in records]))
+    objective = float(np.mean([safe_float(r.get("test_objective"), 0.0) for r in records]))
+    pass_rate = float(np.mean([
+        1.0 if (safe_float(r.get("test_ret_spread"), 0.0) >= V283_MIN_OOS_RETURN_SPREAD and
+                safe_float(r.get("test_win_spread"), 0.0) >= V283_MIN_OOS_WIN_SPREAD and
+                safe_float(r.get("test_dd_spread"), 0.0) <= V283_MAX_OOS_DD_SPREAD) else 0.0
+        for r in records
+    ]))
+    oos_valid = bool(
+        ret_spread >= V283_MIN_OOS_RETURN_SPREAD and
+        win_spread >= V283_MIN_OOS_WIN_SPREAD and
+        dd_spread <= V283_MAX_OOS_DD_SPREAD and
+        pass_rate >= 0.50
+    )
+    if chosen:
+        arr = np.array(chosen, dtype=float)
+        # 用中位数聚合滚动窗口中被未来验证过的权重，降低单一窗口过拟合。
+        wr, ww, wd = np.median(arr, axis=0).tolist()
+    else:
+        wr, ww, wd = V281_UTILITY_RETURN_WEIGHT, V281_UTILITY_WIN_WEIGHT, V281_UTILITY_DRAWDOWN_WEIGHT
+    status = "v283_walk_forward_calibrated" if oos_valid else "weak_oos_default_weights"
+    if not oos_valid:
+        wr, ww, wd = V281_UTILITY_RETURN_WEIGHT, V281_UTILITY_WIN_WEIGHT, V281_UTILITY_DRAWDOWN_WEIGHT
+    return {
+        "return_weight": float(wr),
+        "win_weight": float(ww),
+        "drawdown_weight": float(wd),
+        "status": status,
+        "sample_count": n,
+        "method": "v28_3_strict_walk_forward_utility",
+        "wf_split_count": int(len(records)),
+        "objective": round(float(objective), 6),
+        "oos_valid": bool(oos_valid),
+        "oos_ret_spread_mean": round(float(ret_spread), 6),
+        "oos_win_spread_mean": round(float(win_spread), 6),
+        "oos_dd_spread_mean": round(float(dd_spread), 6),
+        "oos_pass_rate": round(float(pass_rate), 4),
+        "oos_thresholds": {
+            "min_ret_spread": V283_MIN_OOS_RETURN_SPREAD,
+            "min_win_spread": V283_MIN_OOS_WIN_SPREAD,
+            "max_dd_spread": V283_MAX_OOS_DD_SPREAD,
+            "min_splits": V283_MIN_UTILITY_WF_SPLITS,
+        },
+        "oos_records_tail": records[-8:],
+        "note": "严格walk-forward：每个切片仅用过去训练挑权重，再用未来验证；OOS合格才允许Utility进入正式池确认。",
+    }
+
+
+_v281_attach_decision_models_before_v283 = _v281_attach_decision_models
+
+
+def _v281_attach_decision_models(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test):
+    model = _v281_attach_decision_models_before_v283(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test)
+    try:
+        dm = model.setdefault("decision_models", {})
+        uw = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        dm["utility_weights"] = uw
+        dm["utility_walk_forward"] = {
+            "version": V283_MODEL_VERSION,
+            "strict_required_for_formal": V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL,
+            "status": uw.get("status"),
+            "oos_valid": uw.get("oos_valid"),
+            "wf_split_count": uw.get("wf_split_count"),
+            "oos_ret_spread_mean": uw.get("oos_ret_spread_mean"),
+            "oos_win_spread_mean": uw.get("oos_win_spread_mean"),
+            "oos_dd_spread_mean": uw.get("oos_dd_spread_mean"),
+        }
+        model["utility_formula"] = "utility = return*%.3f + win*%.3f - abs(drawdown)*%.3f" % (
+            safe_float(uw.get("return_weight"), V281_UTILITY_RETURN_WEIGHT),
+            safe_float(uw.get("win_weight"), V281_UTILITY_WIN_WEIGHT),
+            safe_float(uw.get("drawdown_weight"), V281_UTILITY_DRAWDOWN_WEIGHT),
+        )
+    except Exception:
+        pass
+    return model
+
+
+_v28_predictive_pricing_score_before_v283 = _v28_predictive_pricing_score
+
+
+def _v28_predictive_pricing_score(factors, cal, market_context):
+    score, out = _v28_predictive_pricing_score_before_v283(factors, cal, market_context)
+    try:
+        out = dict(out) if isinstance(out, dict) else {}
+        dms = None
+        model, mode, note = _v28_select_pricing_model(cal, market_context)
+        if isinstance(model, dict):
+            dms = model.get("decision_models") if isinstance(model.get("decision_models"), dict) else {}
+        uw = (dms or {}).get("utility_weights") if isinstance(dms, dict) else None
+        if not isinstance(uw, dict):
+            uw = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        out["v283_model_version"] = V283_MODEL_VERSION
+        out["v283_strict_utility_status"] = uw.get("status")
+        out["v283_strict_utility_oos_valid"] = bool(uw.get("oos_valid"))
+        out["v283_strict_utility_wf_split_count"] = uw.get("wf_split_count")
+        out["v283_require_strict_wf_utility_for_formal"] = V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL
+        if uw.get("status") not in ("v283_walk_forward_calibrated", "v284_chronological_walk_forward_calibrated"):
+            out["v28_model_note"] = str(out.get("v28_model_note", "")) + "｜V28.3严格Utility walk-forward未通过，正式池降级观察"
+    except Exception:
+        pass
+    return score, out
+
+
+_v27_wallstreet_decision_engine_before_v283 = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    r = _v27_wallstreet_decision_engine_before_v283(row)
+    try:
+        weights = r.get("v282_utility_weights") if isinstance(r.get("v282_utility_weights"), dict) else {}
+        strict_ok = weights.get("status") in ("v283_walk_forward_calibrated", "v284_chronological_walk_forward_calibrated") and bool(weights.get("oos_valid"))
+        if V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL == "1" and (not strict_ok) and r.get("v27_buy_eligible"):
+            r["v27_buy_eligible"] = False
+            r["v27_pool"] = "V28观察池"
+            obs = list(r.get("v27_observe_reasons", []))
+            obs.append("V28.3正式池强制严格walk-forward Utility确认：OOS未通过/切片不足，降级观察")
+            r["v27_observe_reasons"] = obs
+        if isinstance(r.get("v27_factor_reasons"), dict):
+            r["v27_factor_reasons"].setdefault("V28.3严格Walk-Forward Utility", [])
+            r["v27_factor_reasons"]["V28.3严格Walk-Forward Utility"].append({
+                "严格WF状态": weights.get("status"),
+                "OOS有效": bool(weights.get("oos_valid")),
+                "WF切片数": weights.get("wf_split_count"),
+                "OOS收益优势均值": weights.get("oos_ret_spread_mean"),
+                "OOS胜率优势均值": weights.get("oos_win_spread_mean"),
+                "OOS回撤劣势均值": weights.get("oos_dd_spread_mean"),
+                "正式池强制严格WF": V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL,
+            })
+    except Exception:
+        pass
+    return r
+
+
+
+# ============================================================================
+# V28.4 增量补丁：交易日期排序 + 日期分块 Walk-Forward，防止乱序/同日泄露
+# ============================================================================
+# 目标：修复 V28.3 严格 walk-forward 的前置假设：样本必须按交易日期排序。
+# 原则：
+#   1）没有可解析交易日期，不允许生成可正式接管的 Utility 权重；
+#   2）先按交易日期升序排序，再做过去训练 -> 未来验证；
+#   3）同一交易日的多只股票必须作为一个日期块，不允许部分进训练、部分进测试；
+#   4）只属于选股逻辑/校准层增量，不触碰 workflow / PAT / Telegram / BaoStock / cache 主链路。
+# ============================================================================
+
+V284_MODEL_VERSION = "v28_4_chronological_walkforward"
+V284_REQUIRE_DATE_FOR_WF = os.getenv("V284_REQUIRE_DATE_FOR_WF", "1")
+V284_MAX_INVALID_DATE_RATIO = float(os.getenv("V284_MAX_INVALID_DATE_RATIO", "0.02"))
+V284_MIN_UNIQUE_TRADE_DAYS = int(os.getenv("V284_MIN_UNIQUE_TRADE_DAYS", "80"))
+V284_CURRENT_WF_DATES = None
+V284_LAST_CHRONOLOGY_AUDIT = {}
+
+
+def _v284_normalize_dates_for_wf(dates, n):
+    """把样本日期标准化为按行对应的交易日序列；失败时返回 None 与审计信息。"""
+    audit = {
+        "version": V284_MODEL_VERSION,
+        "date_required": V284_REQUIRE_DATE_FOR_WF,
+        "sample_count": int(n),
+        "chronology_valid": False,
+    }
+    if dates is None:
+        audit.update({"status": "missing_date_vector", "note": "未向Utility校准器传入交易日期，禁止严格walk-forward正式接管"})
+        return None, audit
+    ds = pd.Series(dates).reset_index(drop=True)
+    if len(ds) != int(n):
+        audit.update({"status": "date_length_mismatch", "date_count": int(len(ds)), "note": "日期数量与样本数量不一致，禁止严格walk-forward"})
+        return None, audit
+    dt = pd.to_datetime(ds, errors="coerce")
+    invalid = int(dt.isna().sum())
+    invalid_ratio = float(invalid / max(1, int(n)))
+    audit["invalid_date_count"] = invalid
+    audit["invalid_date_ratio"] = round(invalid_ratio, 6)
+    if invalid_ratio > V284_MAX_INVALID_DATE_RATIO:
+        audit.update({"status": "too_many_invalid_dates", "note": "不可解析交易日期比例过高，禁止严格walk-forward"})
+        return None, audit
+    if invalid > 0:
+        # 极少数无效日期不直接删除数组，防止 X/y 长度错位；改为判定校准不可正式接管。
+        audit.update({"status": "invalid_dates_present", "note": "存在不可解析交易日期；为避免样本错位，Utility不允许正式接管"})
+        return None, audit
+    day = dt.dt.strftime("%Y-%m-%d")
+    unique_days = list(pd.Series(day).drop_duplicates())
+    audit["unique_trade_days"] = int(len(unique_days))
+    audit["date_min"] = str(day.iloc[0]) if len(day) else None
+    audit["date_max"] = str(day.iloc[-1]) if len(day) else None
+    is_sorted = bool(pd.Series(dt).is_monotonic_increasing)
+    audit["input_was_sorted"] = is_sorted
+    if len(unique_days) < int(V284_MIN_UNIQUE_TRADE_DAYS):
+        audit.update({"status": "insufficient_unique_trade_days", "note": "有效交易日数量不足，无法做稳定日期分块walk-forward"})
+        return None, audit
+    audit.update({"status": "chronology_ready", "chronology_valid": True, "note": "样本日期已可用于日期分块walk-forward"})
+    return day.reset_index(drop=True), audit
+
+
+def _v284_date_block_splits(date_days):
+    """按交易日块生成 train -> future test 切片，避免同一交易日横截面泄露。"""
+    if date_days is None:
+        return []
+    day = pd.Series(date_days).reset_index(drop=True)
+    unique_days = list(pd.Series(day).drop_duplicates())
+    total_days = len(unique_days)
+    train_days = max(int(V283_UTILITY_TRAIN_WINDOW), 1)
+    test_days = max(int(V283_UTILITY_TEST_WINDOW), 1)
+    step_days = max(int(V283_UTILITY_STEP_WINDOW), 1)
+    # 若样本交易日不多，允许压缩训练/测试天数，但仍保持过去/未来日期分离。
+    if total_days < train_days + test_days:
+        train_days = max(20, int(total_days * 0.65))
+        test_days = max(5, int(total_days * 0.20))
+    splits = []
+    train_end_day = train_days
+    while train_end_day + test_days <= total_days:
+        train_set = set(unique_days[:train_end_day])
+        test_set = set(unique_days[train_end_day:train_end_day + test_days])
+        train_idx = day[day.isin(train_set)].index.to_list()
+        test_idx = day[day.isin(test_set)].index.to_list()
+        if len(train_idx) >= int(V283_MIN_UTILITY_TRAIN_SAMPLE) and len(test_idx) >= int(V283_MIN_UTILITY_TEST_SAMPLE):
+            splits.append((train_idx, test_idx, unique_days[0], unique_days[train_end_day-1], unique_days[train_end_day], unique_days[train_end_day + test_days - 1]))
+        train_end_day += step_days
+    if not splits and total_days >= 30:
+        # 最低限度 expanding split：最后一段交易日做未来验证。
+        test_days2 = min(max(5, int(total_days * 0.20)), max(1, total_days - 1))
+        train_days2 = total_days - test_days2
+        train_set = set(unique_days[:train_days2])
+        test_set = set(unique_days[train_days2:])
+        train_idx = day[day.isin(train_set)].index.to_list()
+        test_idx = day[day.isin(test_set)].index.to_list()
+        if len(train_idx) >= int(V283_MIN_UTILITY_TRAIN_SAMPLE) and len(test_idx) >= int(V283_MIN_UTILITY_TEST_SAMPLE):
+            splits.append((train_idx, test_idx, unique_days[0], unique_days[train_days2-1], unique_days[train_days2], unique_days[-1]))
+    return splits
+
+
+def _v281_make_utility_targets(work, ret_col, dd_col=None):
+    """V28.4：Utility目标生成时同步登记交易日期，供严格日期分块WF使用。"""
+    global V284_CURRENT_WF_DATES, V284_LAST_CHRONOLOGY_AUDIT
+    ret = pd.to_numeric(work[ret_col], errors="coerce").fillna(0.0)
+    win = (ret > 0).astype(float)
+    if dd_col and dd_col in work.columns:
+        dd = pd.to_numeric(work[dd_col], errors="coerce").abs().fillna(0.0)
+    else:
+        dd = pd.Series(np.zeros(len(work)), index=work.index, dtype=float)
+    V284_CURRENT_WF_DATES = work["_date"].copy() if isinstance(work, pd.DataFrame) and "_date" in work.columns else None
+    weights = _v282_calibrate_utility_weights(ret, win, dd)
+    try:
+        V282_CALIBRATED_UTILITY_WEIGHTS.clear()
+        V282_CALIBRATED_UTILITY_WEIGHTS.update(weights)
+        V284_LAST_CHRONOLOGY_AUDIT = dict(weights.get("chronology_audit", {})) if isinstance(weights, dict) else {}
+    except Exception:
+        pass
+    wr = safe_float(weights.get("return_weight"), V281_UTILITY_RETURN_WEIGHT)
+    ww = safe_float(weights.get("win_weight"), V281_UTILITY_WIN_WEIGHT)
+    wd = safe_float(weights.get("drawdown_weight"), V281_UTILITY_DRAWDOWN_WEIGHT)
+    utility = wr * ret + ww * win - wd * dd
+    return ret.values.astype(float), win.values.astype(float), dd.values.astype(float), utility.values.astype(float)
+
+
+def _v282_calibrate_utility_weights(ret, win, dd):
+    """
+    V28.4 覆盖 V28.3：严格日期排序 + 交易日分块 Walk-Forward Utility 权重校准。
+    只有 chronology_valid + OOS_valid 同时成立，才返回可正式池接管的权重。
+    """
+    ret = pd.Series(ret).astype(float).fillna(0.0).reset_index(drop=True)
+    win = pd.Series(win).astype(float).fillna(0.0).reset_index(drop=True)
+    dd = pd.Series(dd).astype(float).abs().fillna(0.0).reset_index(drop=True)
+    n = int(len(ret))
+    date_days, audit = _v284_normalize_dates_for_wf(V284_CURRENT_WF_DATES, n)
+    if V284_REQUIRE_DATE_FOR_WF == "1" and not audit.get("chronology_valid"):
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "chronology_invalid_default_weights",
+            "sample_count": n,
+            "method": "v28_4_chronological_walk_forward_utility",
+            "wf_split_count": 0,
+            "objective": None,
+            "oos_valid": False,
+            "chronology_valid": False,
+            "chronology_audit": audit,
+            "note": "缺少严格交易日期排序/校验，禁止Utility正式池接管",
+        }
+    if n < int(V283_MIN_UTILITY_TRAIN_SAMPLE) + int(V283_MIN_UTILITY_TEST_SAMPLE):
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "insufficient_sample_default_weights",
+            "sample_count": n,
+            "method": "v28_4_chronological_walk_forward_utility",
+            "wf_split_count": 0,
+            "objective": None,
+            "oos_valid": False,
+            "chronology_valid": bool(audit.get("chronology_valid")),
+            "chronology_audit": audit,
+            "note": "样本不足，无法进行日期分块严格Utility walk-forward校准",
+        }
+    splits = _v284_date_block_splits(date_days)
+    records = []
+    chosen = []
+    for i, split in enumerate(splits, 1):
+        train_idx, test_idx, train_start, train_end, test_start, test_end = split
+        train_best = _v283_train_best_utility_weight(ret.iloc[train_idx], win.iloc[train_idx], dd.iloc[train_idx])
+        if not train_best:
+            continue
+        _, wr, ww, wd, train_stat = train_best
+        test_stat = _v283_eval_weight_on_sample(ret.iloc[test_idx], win.iloc[test_idx], dd.iloc[test_idx], wr, ww, wd)
+        if not test_stat:
+            continue
+        rec = {
+            "split": int(i),
+            "train_date_range": [str(train_start), str(train_end)],
+            "test_date_range": [str(test_start), str(test_end)],
+            "train_sample_count": int(len(train_idx)),
+            "test_sample_count": int(len(test_idx)),
+            "return_weight": float(wr),
+            "win_weight": float(ww),
+            "drawdown_weight": float(wd),
+            "train_objective": round(float(train_stat.get("objective", 0.0)), 6),
+            "test_objective": round(float(test_stat.get("objective", 0.0)), 6),
+            "test_ret_spread": round(float(test_stat.get("ret_spread", 0.0)), 6),
+            "test_win_spread": round(float(test_stat.get("win_spread", 0.0)), 6),
+            "test_dd_spread": round(float(test_stat.get("dd_spread", 0.0)), 6),
+            "test_top_ret": round(float(test_stat.get("top_ret", 0.0)), 6),
+            "test_base_ret": round(float(test_stat.get("base_ret", 0.0)), 6),
+            "test_top_win": round(float(test_stat.get("top_win", 0.0)), 6),
+            "test_base_win": round(float(test_stat.get("base_win", 0.0)), 6),
+        }
+        records.append(rec)
+        chosen.append((wr, ww, wd))
+    if len(records) < int(V283_MIN_UTILITY_WF_SPLITS):
+        return {
+            "return_weight": V281_UTILITY_RETURN_WEIGHT,
+            "win_weight": V281_UTILITY_WIN_WEIGHT,
+            "drawdown_weight": V281_UTILITY_DRAWDOWN_WEIGHT,
+            "status": "insufficient_date_block_wf_splits_default_weights",
+            "sample_count": n,
+            "method": "v28_4_chronological_walk_forward_utility",
+            "wf_split_count": int(len(records)),
+            "objective": None,
+            "oos_valid": False,
+            "chronology_valid": bool(audit.get("chronology_valid")),
+            "chronology_audit": audit,
+            "oos_records_tail": records[-8:],
+            "note": "日期分块walk-forward有效切片不足，Utility不能作为正式池科学确认",
+        }
+    ret_spread = float(np.mean([safe_float(r.get("test_ret_spread"), 0.0) for r in records]))
+    win_spread = float(np.mean([safe_float(r.get("test_win_spread"), 0.0) for r in records]))
+    dd_spread = float(np.mean([safe_float(r.get("test_dd_spread"), 0.0) for r in records]))
+    objective = float(np.mean([safe_float(r.get("test_objective"), 0.0) for r in records]))
+    pass_rate = float(np.mean([
+        1.0 if (safe_float(r.get("test_ret_spread"), 0.0) >= V283_MIN_OOS_RETURN_SPREAD and
+                safe_float(r.get("test_win_spread"), 0.0) >= V283_MIN_OOS_WIN_SPREAD and
+                safe_float(r.get("test_dd_spread"), 0.0) <= V283_MAX_OOS_DD_SPREAD) else 0.0
+        for r in records
+    ]))
+    oos_valid = bool(
+        audit.get("chronology_valid") and
+        ret_spread >= V283_MIN_OOS_RETURN_SPREAD and
+        win_spread >= V283_MIN_OOS_WIN_SPREAD and
+        dd_spread <= V283_MAX_OOS_DD_SPREAD and
+        pass_rate >= 0.50
+    )
+    if chosen:
+        arr = np.array(chosen, dtype=float)
+        wr, ww, wd = np.median(arr, axis=0).tolist()
+    else:
+        wr, ww, wd = V281_UTILITY_RETURN_WEIGHT, V281_UTILITY_WIN_WEIGHT, V281_UTILITY_DRAWDOWN_WEIGHT
+    status = "v284_chronological_walk_forward_calibrated" if oos_valid else "weak_oos_default_weights"
+    if not oos_valid:
+        wr, ww, wd = V281_UTILITY_RETURN_WEIGHT, V281_UTILITY_WIN_WEIGHT, V281_UTILITY_DRAWDOWN_WEIGHT
+    return {
+        "return_weight": float(wr),
+        "win_weight": float(ww),
+        "drawdown_weight": float(wd),
+        "status": status,
+        "sample_count": n,
+        "method": "v28_4_chronological_walk_forward_utility",
+        "wf_split_count": int(len(records)),
+        "objective": round(float(objective), 6),
+        "oos_valid": bool(oos_valid),
+        "chronology_valid": bool(audit.get("chronology_valid")),
+        "chronology_audit": audit,
+        "oos_ret_spread_mean": round(float(ret_spread), 6),
+        "oos_win_spread_mean": round(float(win_spread), 6),
+        "oos_dd_spread_mean": round(float(dd_spread), 6),
+        "oos_pass_rate": round(float(pass_rate), 4),
+        "oos_thresholds": {
+            "min_ret_spread": V283_MIN_OOS_RETURN_SPREAD,
+            "min_win_spread": V283_MIN_OOS_WIN_SPREAD,
+            "max_dd_spread": V283_MAX_OOS_DD_SPREAD,
+            "min_splits": V283_MIN_UTILITY_WF_SPLITS,
+            "min_unique_trade_days": V284_MIN_UNIQUE_TRADE_DAYS,
+        },
+        "oos_records_tail": records[-8:],
+        "note": "V28.4严格日期分块walk-forward：先校验交易日期并按日期排序；同一交易日样本不跨训练/测试；OOS合格才允许Utility进入正式池确认。",
+    }
+
+
+# 让报告/决策层能识别 V28.4 状态与日期审计字段。
+_v281_attach_decision_models_before_v284 = _v281_attach_decision_models
+
+
+def _v281_attach_decision_models(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test):
+    model = _v281_attach_decision_models_before_v284(base_model, X, y_ret, y_win, y_dd, y_util, keys, min_test)
+    try:
+        dm = model.setdefault("decision_models", {})
+        uw = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        dm["utility_weights"] = uw
+        dm["utility_chronology_audit"] = uw.get("chronology_audit", {})
+        dm["utility_walk_forward"] = {
+            "version": V284_MODEL_VERSION,
+            "strict_required_for_formal": V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL,
+            "status": uw.get("status"),
+            "oos_valid": uw.get("oos_valid"),
+            "chronology_valid": uw.get("chronology_valid"),
+            "wf_split_count": uw.get("wf_split_count"),
+            "date_min": (uw.get("chronology_audit") or {}).get("date_min") if isinstance(uw.get("chronology_audit"), dict) else None,
+            "date_max": (uw.get("chronology_audit") or {}).get("date_max") if isinstance(uw.get("chronology_audit"), dict) else None,
+            "unique_trade_days": (uw.get("chronology_audit") or {}).get("unique_trade_days") if isinstance(uw.get("chronology_audit"), dict) else None,
+        }
+    except Exception:
+        pass
+    return model
+
+
+_v28_predictive_pricing_score_before_v284 = _v28_predictive_pricing_score
+
+
+def _v28_predictive_pricing_score(factors, cal, market_context):
+    score, out = _v28_predictive_pricing_score_before_v284(factors, cal, market_context)
+    try:
+        out = dict(out) if isinstance(out, dict) else {}
+        dms = None
+        model, mode, note = _v28_select_pricing_model(cal, market_context)
+        if isinstance(model, dict):
+            dms = model.get("decision_models") if isinstance(model.get("decision_models"), dict) else {}
+        uw = (dms or {}).get("utility_weights") if isinstance(dms, dict) else None
+        if not isinstance(uw, dict):
+            uw = dict(V282_CALIBRATED_UTILITY_WEIGHTS)
+        audit = uw.get("chronology_audit") if isinstance(uw.get("chronology_audit"), dict) else {}
+        out["v284_model_version"] = V284_MODEL_VERSION
+        out["v284_chronology_valid"] = bool(uw.get("chronology_valid"))
+        out["v284_date_min"] = audit.get("date_min")
+        out["v284_date_max"] = audit.get("date_max")
+        out["v284_unique_trade_days"] = audit.get("unique_trade_days")
+        out["v284_date_block_wf_status"] = uw.get("status")
+        if uw.get("status") != "v284_chronological_walk_forward_calibrated":
+            out["v28_model_note"] = str(out.get("v28_model_note", "")) + "｜V28.4日期分块WF未通过，正式池降级观察"
+    except Exception:
+        pass
+    return score, out
+
+
+_v27_wallstreet_decision_engine_before_v284 = v27_wallstreet_decision_engine
+
+
+def v27_wallstreet_decision_engine(row):
+    r = _v27_wallstreet_decision_engine_before_v284(row)
+    try:
+        weights = r.get("v282_utility_weights") if isinstance(r.get("v282_utility_weights"), dict) else {}
+        status_ok = weights.get("status") == "v284_chronological_walk_forward_calibrated"
+        strict_ok = bool(status_ok and weights.get("oos_valid") and weights.get("chronology_valid"))
+        if V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL == "1" and (not strict_ok) and r.get("v27_buy_eligible"):
+            r["v27_buy_eligible"] = False
+            r["v27_pool"] = "V28观察池"
+            obs = list(r.get("v27_observe_reasons", []))
+            obs.append("V28.4正式池强制日期分块walk-forward Utility确认：日期排序/OOS/切片未通过，降级观察")
+            r["v27_observe_reasons"] = obs
+        if isinstance(r.get("v27_factor_reasons"), dict):
+            audit = weights.get("chronology_audit") if isinstance(weights.get("chronology_audit"), dict) else {}
+            r["v27_factor_reasons"].setdefault("V28.4日期分块Walk-Forward", [])
+            r["v27_factor_reasons"]["V28.4日期分块Walk-Forward"].append({
+                "日期有效": bool(weights.get("chronology_valid")),
+                "日期范围": [audit.get("date_min"), audit.get("date_max")],
+                "有效交易日数": audit.get("unique_trade_days"),
+                "WF状态": weights.get("status"),
+                "OOS有效": bool(weights.get("oos_valid")),
+                "WF切片数": weights.get("wf_split_count"),
+                "正式池强制日期WF": V283_REQUIRE_STRICT_WF_UTILITY_FOR_FORMAL,
+            })
+    except Exception:
+        pass
+    return r
 
 
 if __name__ == "__main__":
