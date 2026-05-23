@@ -17,6 +17,8 @@ run-name: 五号员工
   issues:
     types:
       - edited
+      - labeled
+      - unlabeled
 
 concurrency:
   group: fifth-employee-singleton-main
