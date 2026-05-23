@@ -172,7 +172,6 @@ def safe_source_call(fn_name: str, *args, **kwargs) -> pd.DataFrame:
 def fetch_raw_pools(target_date: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
     parts: List[pd.DataFrame] = []
     source_counts: Dict[str, int] = {}
-
     source_defs = [
         ("zt_pool", "stock_zt_pool_em", {"date": target_date}),
         ("zt_st_pool", "stock_zt_pool_st_em", {"date": target_date}),
@@ -180,17 +179,14 @@ def fetch_raw_pools(target_date: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
         ("a_spot", "stock_zh_a_spot_em", {}),
         ("bj_spot", "stock_bj_a_spot_em", {}),
     ]
-
     for source, fn_name, kwargs in source_defs:
         raw = safe_source_call(fn_name, **kwargs)
         norm = normalize_pool(raw, source)
         source_counts[source] = 0 if norm is None or norm.empty else len(norm)
         if norm is not None and not norm.empty:
             parts.append(norm)
-
     if not parts:
         return pd.DataFrame(columns=["code", "name", "pct_chg", "close", "source"]), source_counts
-
     raw_pool = pd.concat(parts, ignore_index=True)
     raw_pool["source_rank"] = raw_pool["source"].map({"zt_pool": 1, "zt_st_pool": 2, "zt_previous_pool": 3, "bj_spot": 4, "a_spot": 5}).fillna(9)
     raw_pool = raw_pool.sort_values(["source_rank", "pct_chg"], ascending=[True, False])
@@ -202,21 +198,16 @@ def fetch_limit_pool(target_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     raw_pool, source_counts = fetch_raw_pools(target_date)
     if raw_pool.empty:
         return pd.DataFrame(columns=["code", "name", "pct_chg", "close", "board", "limit_pct"]), {"source_counts": source_counts}
-
     boards = raw_pool.apply(lambda r: board_limit(r["code"], r["name"]), axis=1)
     raw_pool["board"] = [x[0] for x in boards]
     raw_pool["limit_pct"] = [x[1] for x in boards]
     raw_pool["is_limit_up"] = raw_pool.apply(lambda r: is_limit_up(sf(r["pct_chg"]), sf(r["limit_pct"])), axis=1)
-
     limit_pool = raw_pool[raw_pool["is_limit_up"]].copy()
     limit_pool = limit_pool.sort_values(["limit_pct", "pct_chg", "code"], ascending=[False, False, True]).reset_index(drop=True)
-
-    board_counts = limit_pool["board"].value_counts().to_dict() if not limit_pool.empty else {}
-    source_limit_counts = limit_pool["source"].value_counts().to_dict() if not limit_pool.empty else {}
     diagnostics = {
         "source_counts": source_counts,
-        "source_limit_counts": source_limit_counts,
-        "board_counts": board_counts,
+        "source_limit_counts": limit_pool["source"].value_counts().to_dict() if not limit_pool.empty else {},
+        "board_counts": limit_pool["board"].value_counts().to_dict() if not limit_pool.empty else {},
         "total_limit_up_identified": int(len(limit_pool)),
         "max_deep_analyze": int(MAX_DEEP_ANALYZE),
         "not_deep_analyzed_count": int(max(0, len(limit_pool) - MAX_DEEP_ANALYZE)),
@@ -262,13 +253,25 @@ def ma_report(df: pd.DataFrame) -> Dict[str, Any]:
         if ma <= 0:
             out[f"ma{p}"] = {"available": False}
             continue
-        out[f"ma{p}"] = {"available": True, "value": round(ma, 3), "distance_pct": round((close / ma - 1) * 100, 2), "above": close >= ma, "reclaimed_today": bool(close >= ma and pma > 0 and prev_close < pma)}
+        out[f"ma{p}"] = {
+            "available": True,
+            "value": round(ma, 3),
+            "distance_pct": round((close / ma - 1) * 100, 2),
+            "above": close >= ma,
+            "reclaimed_today": bool(close >= ma and pma > 0 and prev_close < pma),
+            "slope_pct": round((ma / pma - 1) * 100, 3) if pma > 0 else 0.0,
+        }
     return out
 
 
 def prev_high(df: pd.DataFrame, n: int) -> float:
     sub = df.iloc[max(0, len(df) - n - 1):len(df) - 1] if len(df) > 1 else pd.DataFrame()
     return sf(sub["high"].max()) if not sub.empty else 0.0
+
+
+def prev_low(df: pd.DataFrame, n: int) -> float:
+    sub = df.iloc[max(0, len(df) - n - 1):len(df) - 1] if len(df) > 1 else pd.DataFrame()
+    return sf(sub["low"].min()) if not sub.empty else 0.0
 
 
 def volume_report(df: pd.DataFrame) -> Dict[str, Any]:
@@ -278,6 +281,40 @@ def volume_report(df: pd.DataFrame) -> Dict[str, Any]:
         avg = sf(df.iloc[-p-1:-1]["volume"].mean()) if len(df) > p else 0.0
         out[f"vol_ratio_{p}"] = round(vol / avg, 2) if avg > 0 else 0.0
     return out
+
+
+def candle_report(df: pd.DataFrame) -> Dict[str, Any]:
+    last = df.iloc[-1]
+    op, hi, lo, cl = sf(last.get("open")), sf(last.get("high")), sf(last.get("low")), sf(last.get("close"))
+    rng = max(hi - lo, 1e-6)
+    body = abs(cl - op)
+    upper = max(hi - max(op, cl), 0.0)
+    lower = max(min(op, cl) - lo, 0.0)
+    return {
+        "entity_pct": round((cl / op - 1) * 100, 2) if op > 0 else 0.0,
+        "body_ratio": round(body / rng, 3),
+        "close_position": round((cl - lo) / rng, 3),
+        "upper_shadow_ratio": round(upper / rng, 3),
+        "lower_shadow_ratio": round(lower / rng, 3),
+    }
+
+
+def position_report(df: pd.DataFrame, ma: Dict[str, Any]) -> Dict[str, Any]:
+    close = sf(df.iloc[-1]["close"])
+    h250, l250 = prev_high(df, 250), prev_low(df, 250)
+    h100, l100 = prev_high(df, 100), prev_low(df, 100)
+    pos250 = round((close - l250) / (h250 - l250), 3) if h250 > l250 > 0 else None
+    pos100 = round((close - l100) / (h100 - l100), 3) if h100 > l100 > 0 else None
+    dist_ma5 = sf(ma.get("ma5", {}).get("distance_pct"))
+    dist_ma10 = sf(ma.get("ma10", {}).get("distance_pct"))
+    return {
+        "pos_250d": pos250,
+        "pos_100d": pos100,
+        "dist_ma5_pct": dist_ma5,
+        "dist_ma10_pct": dist_ma10,
+        "is_low_mid_position": bool((pos250 is not None and pos250 <= 0.65) or (pos100 is not None and pos100 <= 0.65)),
+        "overheat": bool(dist_ma5 >= 18 or dist_ma10 >= 28 or (pos250 is not None and pos250 >= 0.92)),
+    }
 
 
 def consecutive_limit_up(df: pd.DataFrame, code: str, name: str) -> int:
@@ -310,6 +347,81 @@ def structure_tags(df: pd.DataFrame, ma: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(tags))
 
 
+def score_attribution(df: pd.DataFrame, code: str, name: str, board: str, ma: Dict[str, Any], vol: Dict[str, Any], candle: Dict[str, Any], pos: Dict[str, Any], tags: List[str], czt: int) -> Dict[str, Any]:
+    score = 0.0
+    add, deduct, risk = [], [], []
+
+    if czt >= 3:
+        score += 16; add.append(f"{czt}连板，市场辨识度高")
+    elif czt == 2:
+        score += 11; add.append("二连板，强度延续")
+    else:
+        score += 4; add.append("首板样本，需看左侧结构质量")
+
+    if any("250日" in t or "年线" in t for t in tags):
+        score += 18; add.append("大周期压力/年线相关突破或修复")
+    if any("100日" in t for t in tags):
+        score += 12; add.append("100日周期修复或突破")
+    if any("60日" in t for t in tags):
+        score += 8; add.append("60日结构突破")
+    if any("20日" in t for t in tags):
+        score += 5; add.append("短周期平台/前高突破")
+    if len(tags) >= 3:
+        score += 8; add.append("多结构共振")
+
+    if pos.get("is_low_mid_position"):
+        score += 10; add.append("位置处于低位/中低位，更像启动或修复")
+    else:
+        deduct.append("位置不低，需警惕高位加速")
+
+    vr20, vr60 = sf(vol.get("vol_ratio_20")), sf(vol.get("vol_ratio_60"))
+    if 1.6 <= vr20 <= 4.5:
+        score += 14; add.append(f"20日量比{vr20}，放量健康")
+    elif 0 < vr20 < 1.1:
+        score += 4; add.append(f"20日量比{vr20}，可能是快速板/惜售板，需看承接")
+    elif vr20 > 6:
+        score -= 8; deduct.append(f"20日量比{vr20}过大，可能分歧过热")
+    if 1.2 <= vr60 <= 5.5:
+        score += 6; add.append(f"60日量比{vr60}支持资金活跃")
+
+    if candle.get("close_position", 0) >= 0.9 and candle.get("upper_shadow_ratio", 1) <= 0.12:
+        score += 10; add.append("收盘强、上影短，封板/攻击质量较好")
+    elif candle.get("upper_shadow_ratio", 0) >= 0.35:
+        score -= 10; deduct.append("上影较长，涨停质量/封板稳定性存疑")
+    if candle.get("body_ratio", 0) >= 0.55:
+        score += 6; add.append("实体占比高，K线攻击效率好")
+
+    if board == "北交所":
+        risk.append("北交所30cm波动大，归因需单独看流动性和次日承接")
+        if vr20 <= 0 or sf(vol.get("today_volume")) <= 0:
+            score -= 8; deduct.append("北交所样本量能数据不足，降级观察")
+    if "ST" in name.upper() or board == "ST":
+        score -= 12; deduct.append("ST涨停按特殊风险样本处理")
+        risk.append("ST样本不能与普通涨停同权重")
+
+    if pos.get("overheat"):
+        score -= 18; deduct.append("远离MA5/MA10或接近长期区间高位，追高风险大")
+        risk.append("高位过热，不能直接转化为战法正样本")
+
+    if score >= 75:
+        grade = "S"
+        label = "高质量强势样本"
+    elif score >= 60:
+        grade = "A"
+        label = "较高质量强势样本"
+    elif score >= 43:
+        grade = "B"
+        label = "有效涨停样本"
+    elif score >= 25:
+        grade = "C"
+        label = "普通涨停样本"
+    else:
+        grade = "D"
+        label = "噪音/高风险涨停样本"
+
+    return {"score": round(score, 1), "grade": grade, "grade_label": label, "add_reasons": add, "deduct_reasons": deduct, "risk_flags": risk}
+
+
 def analyze_stock(row: pd.Series, target_date: str) -> Dict[str, Any]:
     code, name = ss(row.get("code")), ss(row.get("name"))
     board, limit_pct = board_limit(code, name)
@@ -320,13 +432,20 @@ def analyze_stock(row: pd.Series, target_date: str) -> Dict[str, Any]:
     df = add_ma(df)
     ma = ma_report(df)
     vol = volume_report(df)
+    candle = candle_report(df)
+    pos = position_report(df, ma)
     tags = structure_tags(df, ma)
     czt = consecutive_limit_up(df, code, name)
-    grade_score = czt * 10 + len(tags) * 7 + (12 if 1.8 <= sf(vol.get("vol_ratio_20")) <= 4.0 else 0)
-    grade = "S" if grade_score >= 70 else "A" if grade_score >= 52 else "B" if grade_score >= 35 else "C"
+    score_pack = score_attribution(df, code, name, board, ma, vol, candle, pos, tags, czt)
     last = df.iloc[-1]
-    reasons = [f"{czt}连板" if czt >= 2 else "首板样本"] + tags[:8] + [f"20日量比{vol.get('vol_ratio_20')}"]
-    return {"code": code, "name": name, "board": board, "source": ss(row.get("source")), "limit_pct": limit_pct, "close": round(sf(last.get("close")), 3), "pct_chg": round(sf(last.get("pct_chg")), 2), "consecutive_limit_up": czt, "grade": grade, "ma_lines": ma, "volume": vol, "tags": tags, "reasons": reasons}
+    reasons = score_pack["add_reasons"][:5]
+    return {
+        "code": code, "name": name, "board": board, "source": ss(row.get("source")), "limit_pct": limit_pct,
+        "close": round(sf(last.get("close")), 3), "pct_chg": round(sf(last.get("pct_chg")), 2),
+        "consecutive_limit_up": czt, "grade": score_pack["grade"], "grade_label": score_pack["grade_label"], "attribution_score": score_pack["score"],
+        "ma_lines": ma, "volume": vol, "candle": candle, "position": pos, "tags": tags,
+        "add_reasons": score_pack["add_reasons"], "deduct_reasons": score_pack["deduct_reasons"], "risk_flags": score_pack["risk_flags"], "reasons": reasons,
+    }
 
 
 def build_outputs(target_date: str, full_pool: pd.DataFrame, analyzed_pool: pd.DataFrame, results: List[Dict[str, Any]], diagnostics: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -338,9 +457,8 @@ def build_outputs(target_date: str, full_pool: pd.DataFrame, analyzed_pool: pd.D
         for t in r.get("tags", []):
             tag_count[t] = tag_count.get(t, 0) + 1
     top_tags = sorted(tag_count.items(), key=lambda x: x[1], reverse=True)[:10]
-    top = sorted(valid, key=lambda x: ("SABC".find(x.get("grade", "C")), -x.get("consecutive_limit_up", 0)))[:8]
+    top = sorted(valid, key=lambda x: (-sf(x.get("attribution_score")), -x.get("consecutive_limit_up", 0)))[:8]
     missed = diagnostics.get("not_deep_analyzed", [])
-
     lines = [
         "🧬【五号员工-涨停板归因】",
         f"日期：{target_date}",
@@ -351,18 +469,19 @@ def build_outputs(target_date: str, full_pool: pd.DataFrame, analyzed_pool: pd.D
         f"来源分布：{json.dumps(diagnostics.get('source_limit_counts', {}), ensure_ascii=False)}",
         f"等级分布：{json.dumps(grade_count, ensure_ascii=False)}",
     ]
-    if missed:
-        lines.append("\n未深度归因名单：")
-        for x in missed[:30]:
-            lines.append(f"- {x.get('name')}({x.get('code')}) {x.get('pct_chg')}% {x.get('board')} {x.get('source')}")
     if top_tags:
         lines.append("\n高频强势结构：")
         for tag, cnt in top_tags[:5]:
             lines.append(f"- {tag}：{cnt}只")
     lines.append("\n重点样本：")
     for r in top:
-        lines.append(f"{r['name']}({r['code']}) {r['grade']}级 {r['consecutive_limit_up']}连板：" + "；".join(r.get("reasons", [])[:3]))
-
+        plus = "；".join(r.get("add_reasons", [])[:3])
+        minus = "；".join(r.get("deduct_reasons", [])[:2])
+        lines.append(f"{r['name']}({r['code']}) {r['grade']}级/{r.get('attribution_score')}分 {r['consecutive_limit_up']}连板：{plus}" + (f"｜扣分：{minus}" if minus else ""))
+    if missed:
+        lines.append("\n未深度归因名单：")
+        for x in missed[:20]:
+            lines.append(f"- {x.get('name')}({x.get('code')}) {x.get('pct_chg')}% {x.get('board')} {x.get('source')}")
     data = {
         "target_date": target_date,
         "limit_up_count_total": len(full_pool),
@@ -390,7 +509,6 @@ def main() -> None:
         print(msg)
         send_tg(msg)
         return
-
     analyzed_pool = full_pool.head(MAX_DEEP_ANALYZE).copy()
     results = []
     for i, (_, row) in enumerate(analyzed_pool.iterrows(), 1):
