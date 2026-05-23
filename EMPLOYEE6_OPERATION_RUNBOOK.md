@@ -4,9 +4,9 @@
 
 ## 1. 身份定位
 
-六号员工不负责选股、不负责交易、不负责预测。
+六号员工不负责选股、不负责交易、不负责预测，不负责判断代码是不是猴子代码。
 
-六号员工只负责让后续 AI 工程师知道：
+六号员工负责让后续 AI 工程师知道：
 
 - 最近改了什么代码。
 - 修改路径在哪里。
@@ -14,20 +14,68 @@
 - 哪些规则最终定下来了。
 - 哪些成功经验已经落地。
 - 哪些员工手册需要同步更新。
+- 每个员工自己的变更档案在哪里。
 
-## 2. 是否自动运行
+## 2. 六号员工与零号员工分工
 
-六号员工应该自动运行，但不能像交易员工那样频繁推送 Telegram。
+正确流程不是让六号员工同时当裁判和档案员。
 
-推荐运行方式：
+最终分工：
 
-1. `push` 后自动运行，记录本次代码/文档/workflow 改动。
-2. `workflow_run` 后自动运行，记录五号员工等关键 workflow 的运行结果。
-3. `workflow_dispatch` 保留手动补跑入口。
+```text
+任意员工 push / workflow 运行
+  ↓
+零号员工：审计代码质量、猴子代码、生产链路风险
+  ↓
+六号员工：记录改动路径、运行结果、零号审计结果、成功经验和员工档案
+```
 
-六号员工默认只更新文档和 artifact，不主动推送 Telegram，避免每次代码提交都打扰用户。
+零号员工负责审计风险；六号员工负责沉淀文档。
 
-## 3. 新员工/新战法时的文档生成规则
+## 3. 是否自动运行
+
+六号员工必须自动运行，但不能推送 Telegram 打扰用户。
+
+当前运行方式：
+
+1. `push` 后自动运行，记录所有员工代码、文档、workflow 改动。
+2. `workflow_run` 后自动运行，记录零号、一号、二号、三号、四号、五号员工 workflow 的运行结果。
+3. 每 5 分钟定时补跑，作为 GitHub connector / Actions 偶发不触发时的防漏兜底。
+4. `workflow_dispatch` 保留手动补跑入口。
+
+六号员工每次运行都要回扫最近 commit，已经记录过的 marker 不重复写，漏掉的自动补上。
+
+## 4. 分员工档案规则
+
+六号员工不是只记五号员工。所有员工有动作，都必须记。
+
+总账：
+
+```text
+AI_ENGINEER_CHANGE_LOG.md
+AI_ENGINEER_SUCCESS_LEDGER.md
+AI_ENGINEER_FINAL_RULES_INDEX.md
+AI_ENGINEER_DOCUMENT_MAP.md
+AI_ENGINEER_STRATEGY_REGISTRY.md
+```
+
+分员工档案：
+
+```text
+EMPLOYEE0_CHANGE_LOG.md
+EMPLOYEE1_CHANGE_LOG.md
+EMPLOYEE2_CHANGE_LOG.md
+EMPLOYEE3_CHANGE_LOG.md
+EMPLOYEE4_CHANGE_LOG.md
+EMPLOYEE5_CHANGE_LOG.md
+EMPLOYEE6_CHANGE_LOG.md
+EMPLOYEE7_CHANGE_LOG.md
+...
+```
+
+如果某次 commit 触碰多个员工，六号员工必须分别写入多个员工档案。
+
+## 5. 新员工/新战法时的文档生成规则
 
 以后如果新建员工或新建战法，六号员工必须自动生成或补充对应文档入口。
 
@@ -47,6 +95,7 @@ EMPLOYEE7_*.md
 ```text
 EMPLOYEE7_OPERATION_RUNBOOK.md
 EMPLOYEE7_REPORT_SPEC.md
+EMPLOYEE7_CHANGE_LOG.md
 ```
 
 同时更新：
@@ -78,9 +127,9 @@ Event/Context/Confirmation
 - 待复盘验证规则；
 - 用户确认后升级为最终成功经验。
 
-## 4. 三本账
+## 6. 三本账
 
-### 4.1 改动流水账
+### 6.1 改动流水账
 
 文件：`AI_ENGINEER_CHANGE_LOG.md`
 
@@ -93,7 +142,7 @@ Event/Context/Confirmation
 - commit message
 - workflow 结果
 
-### 4.2 成功经验账
+### 6.2 成功经验账
 
 文件：`AI_ENGINEER_SUCCESS_LEDGER.md`
 
@@ -101,13 +150,13 @@ Event/Context/Confirmation
 
 如果经验后来被用户否定，六号员工必须更正。
 
-### 4.3 最终规则索引
+### 6.3 最终规则索引
 
 文件：`AI_ENGINEER_FINAL_RULES_INDEX.md`
 
 维护当前已经定下来的全局规则和员工规则入口。
 
-## 5. 文档地图
+## 7. 文档地图
 
 文件：`AI_ENGINEER_DOCUMENT_MAP.md`
 
@@ -121,8 +170,9 @@ Event/Context/Confirmation
 - 数据源规则。
 - 成功经验库。
 - 改动流水账。
+- 分员工变更档案。
 
-## 6. 自动判断边界
+## 8. 自动判断边界
 
 六号员工可以自动记录全部代码修改和运行结果。
 
@@ -131,8 +181,9 @@ Event/Context/Confirmation
 - 用户明确认可的，可以进入成功经验账。
 - 已经落地且没有被用户拒绝的稳定工程规则，可以作为已落地经验记录。
 - 新战法、新模型如果没经过复盘验证，只能写成待验证规则，不能写成最终成功。
+- 代码质量、猴子代码、生产链路风险由零号员工审计，六号员工只负责归档审计结果。
 
-## 7. 禁止事项
+## 9. 禁止事项
 
 - 不要把失败尝试包装成成功经验。
 - 不要把未验证战法写成最终规则。
@@ -140,9 +191,10 @@ Event/Context/Confirmation
 - 不要频繁推送 Telegram。
 - 不要覆盖用户已经定下来的员工职责。
 - 不要只改代码不记文档。
+- 不要只写总账不写分员工档案。
 
-## 8. 一句话总结
+## 10. 一句话总结
 
 ```text
-六号员工负责把所有代码改动、路径、运行结果和最终成功经验沉淀成文档，让后续 AI 工程师直接继承最终定下来的思路，而不是每次重新踩坑。
+零号员工负责抓代码风险，六号员工负责把所有员工的代码动作、路径、运行结果和最终成功经验实时沉淀成总账与分员工档案，让后续 AI 工程师直接继承最终定下来的思路，而不是每次重新踩坑。
 ```
