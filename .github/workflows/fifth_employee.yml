@@ -13,9 +13,13 @@ name: 五号员工
         default: "120"
   schedule:
     - cron: '45 12 * * 1-5'
+  issues:
+    types:
+      - opened
+      - edited
 
 concurrency:
-  group: 五号员工-${{ github.ref }}
+  group: 五号员工-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:
