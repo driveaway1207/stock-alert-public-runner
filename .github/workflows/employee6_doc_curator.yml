@@ -9,6 +9,8 @@ on:
       - 'AI_ENGINEER_CHANGE_LOG.md'
       - 'AI_ENGINEER_SUCCESS_LEDGER.md'
       - 'AI_ENGINEER_FINAL_RULES_INDEX.md'
+      - 'AI_ENGINEER_DOCUMENT_MAP.md'
+      - 'AI_ENGINEER_STRATEGY_REGISTRY.md'
   workflow_run:
     workflows: ['五号员工']
     types: [completed]
@@ -38,9 +40,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
       - run: python -u employee6_doc_curator.py
+      - run: python -u employee6_auto_templates.py
       - uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: '[employee6-skip] 六号员工自动更新文档账本'
-          file_pattern: 'AI_ENGINEER_CHANGE_LOG.md AI_ENGINEER_SUCCESS_LEDGER.md AI_ENGINEER_FINAL_RULES_INDEX.md AI_ENGINEER_DOCUMENT_MAP.md EMPLOYEE6_OPERATION_RUNBOOK.md'
-          commit_user_name: employee6-doc-curator
-          commit_user_email: employee6-doc-curator@users.noreply.github.com
+          file_pattern: 'AI_ENGINEER_CHANGE_LOG.md AI_ENGINEER_SUCCESS_LEDGER.md AI_ENGINEER_FINAL_RULES_INDEX.md AI_ENGINEER_DOCUMENT_MAP.md AI_ENGINEER_STRATEGY_REGISTRY.md EMPLOYEE1_OPERATION_RUNBOOK.md EMPLOYEE1_REPORT_SPEC.md EMPLOYEE2_OPERATION_RUNBOOK.md EMPLOYEE2_REPORT_SPEC.md EMPLOYEE3_OPERATION_RUNBOOK.md EMPLOYEE3_REPORT_SPEC.md EMPLOYEE4_OPERATION_RUNBOOK.md EMPLOYEE4_REPORT_SPEC.md EMPLOYEE5_OPERATION_RUNBOOK.md EMPLOYEE5_REPORT_SPEC.md EMPLOYEE6_OPERATION_RUNBOOK.md EMPLOYEE6_REPORT_SPEC.md EMPLOYEE7_OPERATION_RUNBOOK.md EMPLOYEE7_REPORT_SPEC.md EMPLOYEE8_OPERATION_RUNBOOK.md EMPLOYEE8_REPORT_SPEC.md EMPLOYEE9_OPERATION_RUNBOOK.md EMPLOYEE9_REPORT_SPEC.md EMPLOYEE10_OPERATION_RUNBOOK.md EMPLOYEE10_REPORT_SPEC.md'
