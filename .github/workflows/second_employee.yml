@@ -1,0 +1,301 @@
+name: 二号员工
+
+on:
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: "Optional trade date, format YYYY-MM-DD or YYYYMMDD. Leave empty to use latest date in cache."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: second-employee-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  second-employee:
+    name: 二号员工
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PYTHONUNBUFFERED: '1'
+      MODEL_FILE: 'second_employee_wallstreet_v12_0.py'
+      FULL_HISTORY_CACHE_DIR: 'kline_cache'
+
+    steps:
+      - name: 下载仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装运行依赖
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyarrow openpyxl
+
+      - name: 恢复一号员工K线缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-second-employee-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+
+      - name: 检查二号员工主程序
+        shell: bash
+        run: |
+          if [ ! -f "$MODEL_FILE" ]; then
+            echo "❌ 没找到二号员工主程序：$MODEL_FILE"
+            exit 1
+          fi
+          python -m py_compile "$MODEL_FILE"
+          echo "✅ 二号员工语法检查通过"
+
+      - name: 检查一号员工K线缓存
+        shell: bash
+        run: |
+          echo "缓存目录：$FULL_HISTORY_CACHE_DIR"
+          if [ ! -d "$FULL_HISTORY_CACHE_DIR" ]; then
+            echo "❌ 没找到一号员工缓存目录：$FULL_HISTORY_CACHE_DIR"
+            echo "请先运行一号员工 cache_only 或 daily，让 kline_cache 写入 GitHub cache。"
+            exit 1
+          fi
+
+          COUNT=$(find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | wc -l)
+          echo "K线CSV数量：$COUNT"
+
+          if [ "$COUNT" -lt 1000 ]; then
+            echo "❌ K线缓存CSV数量过少，不允许交给二号员工。"
+            echo "请先运行一号员工 cache_only 或 daily 完成缓存。"
+            exit 1
+          fi
+
+          echo "展示前20个缓存文件："
+          find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | head -20
+
+      - name: 构建二号员工本地输入表
+        shell: bash
+        env:
+          INPUT_TRADE_DATE: ${{ github.event.inputs.trade_date }}
+        run: |
+          mkdir -p second_employee_input second_employee_output
+
+          python - <<'PY'
+          import os
+          import re
+          import json
+          from pathlib import Path
+          import pandas as pd
+
+          cache_dir = Path("kline_cache")
+          out_dir = Path("second_employee_input")
+          out_dir.mkdir(exist_ok=True)
+
+          target_raw = str(os.environ.get("INPUT_TRADE_DATE", "") or "").strip()
+
+          def norm_date(x):
+              s = str(x or "").strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10].replace("-", "")
+              digits = re.sub(r"\D", "", s)
+              return digits[:8] if len(digits) >= 8 else ""
+
+          target = norm_date(target_raw)
+
+          def pick_col(cols, names):
+              lower = {str(c).strip().lower(): c for c in cols}
+              for n in names:
+                  key = str(n).strip().lower()
+                  if key in lower:
+                      return lower[key]
+              return None
+
+          rows = []
+          files = [p for p in cache_dir.rglob("*.csv") if not p.name.startswith("_")]
+
+          if len(files) < 1000:
+              raise SystemExit(f"缓存CSV数量过少：{len(files)}")
+
+          for p in files:
+              try:
+                  df = pd.read_csv(p, dtype=str, encoding="utf-8-sig")
+              except UnicodeDecodeError:
+                  df = pd.read_csv(p, dtype=str, encoding="gbk")
+              except Exception as e:
+                  print(f"跳过不可读文件 {p}: {e}")
+                  continue
+
+              if df.empty:
+                  continue
+
+              cols = list(df.columns)
+
+              date_col = pick_col(cols, ["trade_date", "date", "日期", "交易日期"])
+              code_col = pick_col(cols, ["stock_code", "code", "代码", "证券代码"])
+              name_col = pick_col(cols, ["stock_name", "name", "名称", "证券简称"])
+              open_col = pick_col(cols, ["open", "开盘", "开盘价"])
+              high_col = pick_col(cols, ["high", "最高", "最高价"])
+              low_col = pick_col(cols, ["low", "最低", "最低价"])
+              close_col = pick_col(cols, ["close", "收盘", "收盘价"])
+              volume_col = pick_col(cols, ["volume", "vol", "成交量"])
+              amount_col = pick_col(cols, ["amount", "成交额", "成交金额"])
+              is_st_col = pick_col(cols, ["is_st", "isst", "isST", "是否ST"])
+              sector_col = pick_col(cols, ["sector_code", "industry", "行业", "板块"])
+
+              needed = [date_col, open_col, high_col, low_col, close_col, volume_col]
+              if any(c is None for c in needed):
+                  continue
+
+              sub = pd.DataFrame()
+              sub["trade_date"] = df[date_col].map(norm_date)
+              sub["open"] = pd.to_numeric(df[open_col], errors="coerce")
+              sub["high"] = pd.to_numeric(df[high_col], errors="coerce")
+              sub["low"] = pd.to_numeric(df[low_col], errors="coerce")
+              sub["close"] = pd.to_numeric(df[close_col], errors="coerce")
+              sub["volume"] = pd.to_numeric(df[volume_col], errors="coerce")
+
+              if amount_col is not None:
+                  sub["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
+              else:
+                  sub["amount"] = sub["close"] * sub["volume"]
+
+              if code_col is not None:
+                  sub["stock_code"] = df[code_col].astype(str)
+              else:
+                  stem = p.stem
+                  m = re.search(r"(\d{6})", stem)
+                  sub["stock_code"] = m.group(1) if m else stem
+
+              if name_col is not None:
+                  sub["stock_name"] = df[name_col].astype(str)
+              else:
+                  sub["stock_name"] = sub["stock_code"]
+
+              if sector_col is not None:
+                  sub["sector_code"] = df[sector_col].astype(str)
+              else:
+                  sub["sector_code"] = "UNKNOWN"
+
+              if is_st_col is not None:
+                  sub["is_st"] = df[is_st_col].astype(str)
+              else:
+                  sub["is_st"] = False
+
+              sub["is_suspended"] = False
+              sub["listed_days"] = 9999
+
+              sub = sub.dropna(subset=["trade_date", "open", "high", "low", "close", "volume", "amount"])
+              sub = sub[sub["trade_date"].astype(str).str.len() == 8]
+              sub = sub[
+                  (sub["high"] >= sub[["open", "close"]].max(axis=1)) &
+                  (sub["low"] <= sub[["open", "close"]].min(axis=1))
+              ]
+
+              if not sub.empty:
+                  rows.append(sub)
+
+          if not rows:
+              raise SystemExit("未能从一号员工缓存构建二号员工输入。")
+
+          all_df = pd.concat(rows, ignore_index=True)
+          all_df = all_df.drop_duplicates(["stock_code", "trade_date"], keep="last")
+          all_df = all_df.sort_values(["stock_code", "trade_date"])
+
+          available_dates = sorted(all_df["trade_date"].unique())
+
+          if target:
+              if target not in set(available_dates):
+                  prior = [d for d in available_dates if d <= target]
+                  if prior:
+                      print(f"⚠️ 指定日期 {target} 不在缓存中，自动使用最近可用日期 {prior[-1]}")
+                      target = prior[-1]
+                  else:
+                      raise SystemExit(f"指定日期 {target} 之前没有可用缓存。")
+              selected_date = target
+          else:
+              selected_date = str(all_df["trade_date"].max())
+
+          stock_count = all_df[all_df["trade_date"] == selected_date]["stock_code"].nunique()
+
+          if stock_count < 1000:
+              raise SystemExit(f"目标日期 {selected_date} 股票数量过少：{stock_count}")
+
+          out_path = out_dir / "daily_kline.csv"
+          all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+          (out_dir / "selected_trade_date.txt").write_text(selected_date, encoding="utf-8")
+
+          report = {
+              "input_files": len(files),
+              "rows": int(len(all_df)),
+              "stocks": int(all_df["stock_code"].nunique()),
+              "selected_trade_date": selected_date,
+              "selected_stock_count": int(stock_count),
+              "output": str(out_path),
+              "cache_source": "restored_from_a_kline_cache_read_only"
+          }
+
+          Path("second_employee_output/cache_input_report.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding="utf-8"
+          )
+
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+      - name: 二号员工自检
+        shell: bash
+        run: |
+          python "$MODEL_FILE" selfcheck
+
+      - name: 运行二号员工
+        shell: bash
+        run: |
+          SELECTED_DATE=$(cat second_employee_input/selected_trade_date.txt)
+          echo "二号员工最终使用交易日：$SELECTED_DATE"
+
+          python "$MODEL_FILE" run \
+            --input second_employee_input/daily_kline.csv \
+            --output-dir second_employee_output \
+            --trade-date "$SELECTED_DATE"
+
+      - name: 展示二号员工结果摘要
+        if: always()
+        shell: bash
+        run: |
+          echo "二号员工输出文件："
+          find second_employee_output -maxdepth 2 -type f -print || true
+
+          echo "报告预览："
+          sed -n '1,220p' second_employee_output/second_employee_report.md || true
+
+          echo "缓存输入报告："
+          cat second_employee_output/cache_input_report.json || true
+
+      - name: 上传二号员工运行结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 二号员工运行结果
+          path: |
+            second_employee_output/**
+            second_employee_input/**
+          if-no-files-found: warn
+          retention-days: 14
