@@ -16,9 +16,7 @@ run-name: 五号员工
     - cron: '45 12 * * 1-5'
   issues:
     types:
-      - edited
       - labeled
-      - unlabeled
 
 concurrency:
   group: fifth-employee-singleton-main
