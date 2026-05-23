@@ -1,15 +1,15 @@
 name: 二号员工
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       trade_date:
-        description: "Optional trade date, format YYYY-MM-DD or YYYYMMDD. Leave empty to use latest available date."
+        description: "交易日期，可留空。格式：YYYY-MM-DD 或 YYYYMMDD；留空则自动使用应运行日期。"
         required: false
         default: ""
 
       cache_strategy:
-        description: "缓存策略：auto=缺/旧才补；force_refresh=强制补；use_existing=只用现有缓存"
+        description: "缓存策略：auto=自动检查，缺失或过旧才补；force_refresh=强制刷新；use_existing=只使用现有缓存"
         required: true
         default: "auto"
         type: choice
@@ -19,7 +19,7 @@ on:
           - use_existing
 
       full_rebuild:
-        description: "缓存过少时是否允许从0全量建立：0=不允许，1=允许"
+        description: "是否允许从零全量建立缓存：0=不允许；1=允许。日常保持0。"
         required: true
         default: "0"
         type: choice
@@ -28,7 +28,7 @@ on:
           - "1"
 
       min_cache_files_required:
-        description: "非从0重建时，至少需要多少个缓存CSV才允许保存"
+        description: "允许保存共享缓存的最低股票CSV数量。日常保持3000。"
         required: false
         default: "3000"
 
@@ -130,8 +130,8 @@ jobs:
           echo "二号员工目标日期：${{ steps.prepare.outputs.target_trade_date }}"
           echo "目标日期原因：${{ steps.prepare.outputs.target_reason }}"
           echo "缓存策略：$CACHE_STRATEGY"
-          echo "FULL_REBUILD：$FULL_REBUILD"
-          echo "MIN_CACHE_FILES_REQUIRED：$MIN_CACHE_FILES_REQUIRED"
+          echo "是否允许从零全量建立缓存：$FULL_REBUILD"
+          echo "允许保存共享缓存的最低股票CSV数量：$MIN_CACHE_FILES_REQUIRED"
 
       - name: 恢复共享K线缓存
         uses: actions/cache/restore@v4
@@ -354,8 +354,8 @@ jobs:
         shell: bash
         run: |
           echo "❌ 二号员工共享K线缓存验收失败。"
-          echo "如果 cache_strategy=use_existing，说明现有缓存不够新或不完整。"
-          echo "如果 cache_strategy=auto/force_refresh，说明补拉后仍未达到验收标准。"
+          echo "如果缓存策略为 use_existing，说明现有缓存不够新或不完整。"
+          echo "如果缓存策略为 auto 或 force_refresh，说明补拉后仍未达到验收标准。"
           exit 1
 
       - name: 判断是否允许保存共享K线缓存
@@ -367,7 +367,7 @@ jobs:
 
           if [ "$FULL_REBUILD" = "1" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
-            echo "FULL_REBUILD=1，且第二次验收已通过，允许保存共享缓存。"
+            echo "允许从零全量建立缓存，且第二次验收已通过，允许保存共享缓存。"
           elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
             echo "save_cache=true" >> "$GITHUB_OUTPUT"
             echo "缓存数量 $COUNT >= $MIN_CACHE_FILES_REQUIRED，且第二次验收已通过，允许保存共享缓存。"
@@ -396,6 +396,8 @@ jobs:
 
       - name: 构建二号员工本地输入表
         shell: bash
+        env:
+          WORKFLOW_TARGET_DATE: ${{ steps.prepare.outputs.target_trade_date }}
         run: |
           mkdir -p second_employee_input second_employee_output
 
@@ -410,7 +412,7 @@ jobs:
           out_dir = Path("second_employee_input")
           out_dir.mkdir(exist_ok=True)
 
-          target_raw = str(os.environ.get("INPUT_TRADE_DATE", "") or "").strip()
+          target_raw = str(os.environ.get("WORKFLOW_TARGET_DATE", "") or "").strip()
 
           def norm_date(x):
               s = str(x or "").strip().replace("/", "-")
@@ -528,10 +530,10 @@ jobs:
               if target not in set(available_dates):
                   prior = [d for d in available_dates if d <= target]
                   if prior:
-                      print(f"⚠️ 指定日期 {target} 不在缓存中，自动使用最近可用日期 {prior[-1]}")
+                      print(f"⚠️ 目标日期 {target} 不在缓存中，自动使用最近可用日期 {prior[-1]}")
                       target = prior[-1]
                   else:
-                      raise SystemExit(f"指定日期 {target} 之前没有可用缓存。")
+                      raise SystemExit(f"目标日期 {target} 之前没有可用缓存。")
               selected_date = target
           else:
               selected_date = str(all_df["trade_date"].max())
