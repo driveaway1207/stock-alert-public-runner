@@ -3,21 +3,15 @@ run-name: 六号员工
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'AI_ENGINEER_CHANGE_LOG.md'
-      - 'AI_ENGINEER_SUCCESS_LEDGER.md'
-      - 'AI_ENGINEER_FINAL_RULES_INDEX.md'
-      - 'AI_ENGINEER_DOCUMENT_MAP.md'
-      - 'AI_ENGINEER_STRATEGY_REGISTRY.md'
+  schedule:
+    - cron: '30 15 * * *'
   workflow_run:
     workflows: ['五号员工']
     types: [completed]
 
 concurrency:
   group: employee6-doc-curator
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -26,13 +20,13 @@ permissions:
 jobs:
   curate-docs:
     name: 六号员工-文档审计与经验沉淀
-    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[employee6-skip]') }}
+    if: ${{ github.event_name != 'push' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 20
+          fetch-depth: 50
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
