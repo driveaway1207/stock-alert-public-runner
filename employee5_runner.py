@@ -177,7 +177,8 @@ def fetch_raw_pools(target_date: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
         ("zt_pool", "stock_zt_pool_em", {"date": target_date}),
         ("zt_st_pool", "stock_zt_pool_st_em", {"date": target_date}),
         ("zt_previous_pool", "stock_zt_pool_previous_em", {"date": target_date}),
-        ("spot", "stock_zh_a_spot_em", {}),
+        ("a_spot", "stock_zh_a_spot_em", {}),
+        ("bj_spot", "stock_bj_a_spot_em", {}),
     ]
 
     for source, fn_name, kwargs in source_defs:
@@ -191,8 +192,9 @@ def fetch_raw_pools(target_date: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
         return pd.DataFrame(columns=["code", "name", "pct_chg", "close", "source"]), source_counts
 
     raw_pool = pd.concat(parts, ignore_index=True)
-    raw_pool = raw_pool.sort_values(["source", "pct_chg"], ascending=[True, False])
-    raw_pool = raw_pool.drop_duplicates("code", keep="first").reset_index(drop=True)
+    raw_pool["source_rank"] = raw_pool["source"].map({"zt_pool": 1, "zt_st_pool": 2, "zt_previous_pool": 3, "bj_spot": 4, "a_spot": 5}).fillna(9)
+    raw_pool = raw_pool.sort_values(["source_rank", "pct_chg"], ascending=[True, False])
+    raw_pool = raw_pool.drop_duplicates("code", keep="first").drop(columns=["source_rank"]).reset_index(drop=True)
     return raw_pool, source_counts
 
 
