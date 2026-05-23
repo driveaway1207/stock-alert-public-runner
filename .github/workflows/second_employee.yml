@@ -4,9 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       trade_date:
-        description: "Optional trade date, format YYYY-MM-DD or YYYYMMDD. Leave empty to use latest date in cache."
+        description: "Optional trade date, format YYYY-MM-DD or YYYYMMDD. Leave empty to use latest available date."
         required: false
         default: ""
+
+      cache_strategy:
+        description: "缓存策略：auto=缺/旧才补；force_refresh=强制补；use_existing=只用现有缓存"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - force_refresh
+          - use_existing
+
+      full_rebuild:
+        description: "缓存过少时是否允许从0全量建立：0=不允许，1=允许"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+
+      min_cache_files_required:
+        description: "非从0重建时，至少需要多少个缓存CSV才允许保存"
+        required: false
+        default: "3000"
 
 permissions:
   contents: read
@@ -20,12 +44,16 @@ jobs:
   second-employee:
     name: 二号员工
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     env:
-      PYTHONUNBUFFERED: '1'
-      MODEL_FILE: 'second_employee_wallstreet_v12_0.py'
-      FULL_HISTORY_CACHE_DIR: 'kline_cache'
+      PYTHONUNBUFFERED: "1"
+      MODEL_FILE: "second_employee_wallstreet_v12_0.py"
+      FULL_HISTORY_CACHE_DIR: "kline_cache"
+      INPUT_TRADE_DATE: ${{ github.event.inputs.trade_date }}
+      CACHE_STRATEGY: ${{ github.event.inputs.cache_strategy }}
+      FULL_REBUILD: ${{ github.event.inputs.full_rebuild }}
+      MIN_CACHE_FILES_REQUIRED: ${{ github.event.inputs.min_cache_files_required }}
 
     steps:
       - name: 下载仓库代码
@@ -36,26 +64,324 @@ jobs:
       - name: 设置Python环境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: 安装运行依赖
+      - name: 安装基础运行依赖
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy pyarrow openpyxl
 
-      - name: 恢复一号员工K线缓存
+      - name: 计算二号员工目标日期
+        id: prepare
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          from datetime import datetime, timedelta, timezone
+
+          def norm_date(x):
+              s = str(x or "").strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10]
+              digits = re.sub(r"\D", "", s)
+              if len(digits) >= 8:
+                  return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+              return ""
+
+          manual = norm_date(os.environ.get("INPUT_TRADE_DATE"))
+          now = datetime.now(timezone(timedelta(hours=8)))
+          today = now.date()
+
+          def prev_workday(d):
+              d = d - timedelta(days=1)
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              return d
+
+          if manual:
+              target = manual
+              reason = "manual_input"
+          else:
+              if today.weekday() >= 5:
+                  d = today
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  target = d.isoformat()
+                  reason = "weekend_use_previous_workday"
+              elif now.hour > 20 or (now.hour == 20 and now.minute >= 35):
+                  target = today.isoformat()
+                  reason = "after_2035_use_today"
+              else:
+                  target = prev_workday(today).isoformat()
+                  reason = "before_2035_use_previous_workday"
+
+          print(f"target_trade_date={target}")
+          print(f"target_reason={reason}")
+          PY
+
+      - name: 显示二号员工运行参数
+        shell: bash
+        run: |
+          echo "二号员工目标日期：${{ steps.prepare.outputs.target_trade_date }}"
+          echo "目标日期原因：${{ steps.prepare.outputs.target_reason }}"
+          echo "缓存策略：$CACHE_STRATEGY"
+          echo "FULL_REBUILD：$FULL_REBUILD"
+          echo "MIN_CACHE_FILES_REQUIRED：$MIN_CACHE_FILES_REQUIRED"
+
+      - name: 恢复共享K线缓存
         uses: actions/cache/restore@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-second-employee-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-second-employee-restore-${{ github.run_id }}
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
             full-kline-cache-${{ runner.os }}-
             full-kline-cache-
+
+      - name: 第一次验收共享K线缓存
+        id: cache_audit_before
+        shell: bash
+        env:
+          REQUIRED_CACHE_DATE: ${{ steps.prepare.outputs.target_trade_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import csv
+          import os
+          from pathlib import Path
+          from collections import Counter
+
+          def norm_date(x):
+              s = str(x or "").strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10]
+              if len(s) >= 8 and s[:8].isdigit():
+                  return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+              return s[:10]
+
+          required = norm_date(os.environ.get("REQUIRED_CACHE_DATE"))
+          cache_dir = Path("kline_cache")
+          files = [f for f in cache_dir.rglob("*.csv") if not f.name.startswith("_")] if cache_dir.exists() else []
+          dates = []
+
+          for f in files:
+              try:
+                  with open(f, "r", encoding="utf-8-sig", newline="") as fh:
+                      reader = csv.reader(fh)
+                      header = next(reader, [])
+                      rows = list(reader)
+                  if not rows:
+                      continue
+
+                  idx = 0
+                  header_lower = [str(h).strip().lower() for h in header]
+                  for name in ("date", "日期", "trade_date", "交易日期"):
+                      if name.lower() in header_lower:
+                          idx = header_lower.index(name.lower())
+                          break
+
+                  last = ""
+                  for row in reversed(rows):
+                      if row and len(row) > idx and str(row[idx]).strip():
+                          last = norm_date(row[idx])
+                          break
+                  if last:
+                      dates.append(last)
+              except Exception:
+                  pass
+
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ""
+          count = len(files)
+          with_date = len(dates)
+          ok = bool(count >= 1000 and with_date >= 1000 and majority and (not required or majority >= required))
+
+          print(f"cache_ok={str(ok).lower()}")
+          print(f"cache_count={count}")
+          print(f"cache_with_date_count={with_date}")
+          print(f"cache_majority_date={majority}")
+          PY
+
+      - name: 显示第一次缓存验收结果
+        shell: bash
+        run: |
+          echo "第一次验收是否通过：${{ steps.cache_audit_before.outputs.cache_ok }}"
+          echo "缓存CSV数量：${{ steps.cache_audit_before.outputs.cache_count }}"
+          echo "可读日期CSV数量：${{ steps.cache_audit_before.outputs.cache_with_date_count }}"
+          echo "缓存众数日期：${{ steps.cache_audit_before.outputs.cache_majority_date }}"
+          echo "要求覆盖到：${{ steps.prepare.outputs.target_trade_date }}"
+
+      - name: 判断是否需要二号员工补拉缓存
+        id: backfill_decision
+        shell: bash
+        run: |
+          NEED_BACKFILL="false"
+
+          if [ "$CACHE_STRATEGY" = "force_refresh" ]; then
+            NEED_BACKFILL="true"
+          elif [ "$CACHE_STRATEGY" = "auto" ] && [ "${{ steps.cache_audit_before.outputs.cache_ok }}" != "true" ]; then
+            NEED_BACKFILL="true"
+          elif [ "$CACHE_STRATEGY" = "use_existing" ]; then
+            NEED_BACKFILL="false"
+          fi
+
+          echo "need_backfill=$NEED_BACKFILL" >> "$GITHUB_OUTPUT"
+          echo "二号员工是否需要补拉缓存：$NEED_BACKFILL"
+
+      - name: 安装缓存补拉依赖
+        if: ${{ steps.backfill_decision.outputs.need_backfill == 'true' }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
+
+      - name: 二号员工补拉共享K线缓存
+        if: ${{ steps.backfill_decision.outputs.need_backfill == 'true' }}
+        shell: bash
+        env:
+          TARGET_TRADE_DATE: ${{ steps.prepare.outputs.target_trade_date }}
+          EXPECTED_KLINE_DATE: ${{ steps.prepare.outputs.target_trade_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.prepare.outputs.target_trade_date }}
+          RUN_ROUND: "1"
+          MAX_AUTO_ROUNDS: "1"
+          AUTO_CONTINUE: "0"
+          SOFT_STOP_BUFFER_MINUTES: "20"
+          EASTMONEY_TIMEOUT: "20"
+          AKSHARE_TIMEOUT: "35"
+          BAOSTOCK_TIMEOUT: "45"
+          SOURCE_FAIL_THRESHOLD: "5"
+          SOURCE_COOLDOWN_SECONDS: "900"
+        run: |
+          mkdir -p outputs kline_cache
+
+          echo "二号员工开始补拉共享K线缓存"
+          echo "缓存目标日期：$TARGET_TRADE_DATE"
+          echo "补拉前CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l)"
+
+          if [ ! -f tools/export_neckline_candidates.py ]; then
+            echo "❌ 没找到一号员工缓存补拉脚本 tools/export_neckline_candidates.py"
+            exit 1
+          fi
+
+          python -u tools/export_neckline_candidates.py
+
+          echo "补拉后CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l)"
+
+      - name: 第二次验收共享K线缓存
+        id: cache_audit_after
+        shell: bash
+        env:
+          REQUIRED_CACHE_DATE: ${{ steps.prepare.outputs.target_trade_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import csv
+          import os
+          from pathlib import Path
+          from collections import Counter
+
+          def norm_date(x):
+              s = str(x or "").strip().replace("/", "-")
+              if not s:
+                  return ""
+              if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+                  return s[:10]
+              if len(s) >= 8 and s[:8].isdigit():
+                  return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+              return s[:10]
+
+          required = norm_date(os.environ.get("REQUIRED_CACHE_DATE"))
+          cache_dir = Path("kline_cache")
+          files = [f for f in cache_dir.rglob("*.csv") if not f.name.startswith("_")] if cache_dir.exists() else []
+          dates = []
+
+          for f in files:
+              try:
+                  with open(f, "r", encoding="utf-8-sig", newline="") as fh:
+                      reader = csv.reader(fh)
+                      header = next(reader, [])
+                      rows = list(reader)
+                  if not rows:
+                      continue
+
+                  idx = 0
+                  header_lower = [str(h).strip().lower() for h in header]
+                  for name in ("date", "日期", "trade_date", "交易日期"):
+                      if name.lower() in header_lower:
+                          idx = header_lower.index(name.lower())
+                          break
+
+                  last = ""
+                  for row in reversed(rows):
+                      if row and len(row) > idx and str(row[idx]).strip():
+                          last = norm_date(row[idx])
+                          break
+                  if last:
+                      dates.append(last)
+              except Exception:
+                  pass
+
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ""
+          count = len(files)
+          with_date = len(dates)
+          ok = bool(count >= 1000 and with_date >= 1000 and majority and (not required or majority >= required))
+
+          print(f"cache_ok={str(ok).lower()}")
+          print(f"cache_count={count}")
+          print(f"cache_with_date_count={with_date}")
+          print(f"cache_majority_date={majority}")
+          PY
+
+      - name: 显示第二次缓存验收结果
+        shell: bash
+        run: |
+          echo "第二次验收是否通过：${{ steps.cache_audit_after.outputs.cache_ok }}"
+          echo "缓存CSV数量：${{ steps.cache_audit_after.outputs.cache_count }}"
+          echo "可读日期CSV数量：${{ steps.cache_audit_after.outputs.cache_with_date_count }}"
+          echo "缓存众数日期：${{ steps.cache_audit_after.outputs.cache_majority_date }}"
+          echo "要求覆盖到：${{ steps.prepare.outputs.target_trade_date }}"
+
+      - name: 缓存验收失败则停止
+        if: ${{ steps.cache_audit_after.outputs.cache_ok != 'true' }}
+        shell: bash
+        run: |
+          echo "❌ 二号员工共享K线缓存验收失败。"
+          echo "如果 cache_strategy=use_existing，说明现有缓存不够新或不完整。"
+          echo "如果 cache_strategy=auto/force_refresh，说明补拉后仍未达到验收标准。"
+          exit 1
+
+      - name: 判断是否允许保存共享K线缓存
+        id: cache_save_gate
+        if: ${{ steps.backfill_decision.outputs.need_backfill == 'true' }}
+        shell: bash
+        run: |
+          COUNT="${{ steps.cache_audit_after.outputs.cache_count }}"
+
+          if [ "$FULL_REBUILD" = "1" ]; then
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "FULL_REBUILD=1，且第二次验收已通过，允许保存共享缓存。"
+          elif [ "$COUNT" -ge "$MIN_CACHE_FILES_REQUIRED" ]; then
+            echo "save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "缓存数量 $COUNT >= $MIN_CACHE_FILES_REQUIRED，且第二次验收已通过，允许保存共享缓存。"
+          else
+            echo "save_cache=false" >> "$GITHUB_OUTPUT"
+            echo "缓存数量 $COUNT < $MIN_CACHE_FILES_REQUIRED，不保存，避免污染共享缓存。"
+          fi
+
+      - name: 保存共享K线缓存
+        if: ${{ steps.backfill_decision.outputs.need_backfill == 'true' && steps.cache_save_gate.outputs.save_cache == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-second-employee-${{ github.run_id }}
 
       - name: 检查二号员工主程序
         shell: bash
@@ -64,38 +390,12 @@ jobs:
             echo "❌ 没找到二号员工主程序：$MODEL_FILE"
             exit 1
           fi
+
           python -m py_compile "$MODEL_FILE"
           echo "✅ 二号员工语法检查通过"
 
-      - name: 检查一号员工K线缓存
-        shell: bash
-        run: |
-          echo "缓存目录：$FULL_HISTORY_CACHE_DIR"
-
-          if [ ! -d "$FULL_HISTORY_CACHE_DIR" ]; then
-            echo "❌ 没找到一号员工缓存目录：$FULL_HISTORY_CACHE_DIR"
-            echo "请先运行一号员工 cache_only 或 daily，让 kline_cache 写入 GitHub cache。"
-            exit 1
-          fi
-
-          find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | sort > /tmp/second_employee_kline_files.txt
-
-          COUNT=$(wc -l < /tmp/second_employee_kline_files.txt | tr -d ' ')
-          echo "K线CSV数量：$COUNT"
-
-          if [ "$COUNT" -lt 1000 ]; then
-            echo "❌ K线缓存CSV数量过少，不允许交给二号员工。"
-            echo "请先运行一号员工 cache_only 或 daily 完成缓存。"
-            exit 1
-          fi
-
-          echo "展示前20个缓存文件："
-          head -20 /tmp/second_employee_kline_files.txt
-
       - name: 构建二号员工本地输入表
         shell: bash
-        env:
-          INPUT_TRADE_DATE: ${{ github.event.inputs.trade_date }}
         run: |
           mkdir -p second_employee_input second_employee_output
 
@@ -216,7 +516,7 @@ jobs:
                   rows.append(sub)
 
           if not rows:
-              raise SystemExit("未能从一号员工缓存构建二号员工输入。")
+              raise SystemExit("未能从共享K线缓存构建二号员工输入。")
 
           all_df = pd.concat(rows, ignore_index=True)
           all_df = all_df.drop_duplicates(["stock_code", "trade_date"], keep="last")
@@ -252,7 +552,7 @@ jobs:
               "selected_trade_date": selected_date,
               "selected_stock_count": int(stock_count),
               "output": str(out_path),
-              "cache_source": "restored_from_a_kline_cache_read_only"
+              "cache_source": "shared_a_kline_cache_read_or_backfilled_by_second_employee"
           }
 
           Path("second_employee_output/cache_input_report.json").write_text(
@@ -300,5 +600,15 @@ jobs:
           path: |
             second_employee_output/**
             second_employee_input/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 上传二号员工缓存补拉报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 二号员工缓存补拉报告
+          path: |
+            outputs/**
           if-no-files-found: warn
           retention-days: 14
