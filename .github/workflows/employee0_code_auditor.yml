@@ -1,0 +1,39 @@
+name: 零号员工
+run-name: 零号员工
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '10 15 * * *'
+
+concurrency:
+  group: employee0-code-auditor
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit-code:
+    name: 零号员工-代码审计
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[employee6-skip]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -u employee0_code_auditor.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: employee0-audit-report
+          path: employee0_reports/
+          if-no-files-found: warn
+          retention-days: 30
