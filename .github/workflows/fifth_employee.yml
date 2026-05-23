@@ -10,13 +10,16 @@ name: 五号员工
       max_stocks:
         description: "最多分析涨停样本数量"
         required: false
-        default: "120"
+        default: "300"
   schedule:
     - cron: '45 12 * * 1-5'
   issues:
     types:
       - opened
       - edited
+  issue_comment:
+    types:
+      - created
 
 concurrency:
   group: 五号员工-${{ github.ref }}-${{ github.event_name }}
@@ -53,7 +56,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
-          EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '120' }}
+          EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
           EMPLOYEE5_AK_TIMEOUT_SECONDS: "18"
           EMPLOYEE5_REQUEST_SLEEP: "0.15"
         run: python -u employee5_runner.py
