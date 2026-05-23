@@ -1,0 +1,23 @@
+name: Run Second Employee Helper
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - run_second_employee.flag
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Start second employee workflow
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh workflow run second_employee.yml --repo "$REPO" -f mode=daily -f selection_trade_date='' -f cache_target_date='' -f cache_strategy=auto -f baostock_ready_policy=auto -f full_rebuild=0 -f min_cache_files_required=3000 -f max_runtime_minutes=270
