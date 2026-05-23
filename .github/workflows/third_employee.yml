@@ -1,0 +1,50 @@
+name: 三号员工
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: '10 13 * * 1-5'
+
+concurrency:
+  group: 三号员工-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  employee3:
+    name: 三号员工最终交易调度
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run third employee
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u employee3_final_decision.py
+
+      - name: Upload third employee reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: employee3-reports
+          path: employee3_reports/
+          if-no-files-found: warn
+          retention-days: 30
