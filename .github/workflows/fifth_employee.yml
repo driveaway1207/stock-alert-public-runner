@@ -15,15 +15,11 @@ name: 五号员工
     - cron: '45 12 * * 1-5'
   issues:
     types:
-      - opened
       - edited
-  issue_comment:
-    types:
-      - created
 
 concurrency:
-  group: 五号员工-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: false
+  group: fifth-employee-singleton-main
+  cancel-in-progress: true
 
 permissions:
   contents: read
