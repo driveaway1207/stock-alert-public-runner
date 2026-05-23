@@ -16,6 +16,11 @@ import akshare as ak
 import pandas as pd
 import requests
 
+try:
+    import baostock as bs
+except Exception:
+    bs = None
+
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 TARGET_DATE_ENV = os.getenv("EMPLOYEE5_TARGET_DATE", "").strip()
@@ -34,6 +39,8 @@ PERIOD_MEANING = {
     100: "100日线≈100根日K聚合，可理解为中期修复窗口",
     250: "250日线≈250根日K聚合，可理解为年线观察窗口",
 }
+HIST_FAILURE_SAMPLES: List[Dict[str, str]] = []
+BAOSTOCK_LOGGED_IN = False
 
 
 def env_by_codes(codes: List[int]) -> str:
@@ -42,7 +49,6 @@ def env_by_codes(codes: List[int]) -> str:
 
 _KEY = env_by_codes([84,69,76,69,71,82,65,77,95,66,79,84,95,84,79,75,69,78]) or env_by_codes([84,69,76,69,71,82,65,77,95,84,79,75,69,78])
 _DEST = env_by_codes([84,69,76,69,71,82,65,77,95,67,72,65,84,95,73,68])
-HIST_FAILURE_SAMPLES: List[Dict[str, str]] = []
 
 
 class AkTimeout(Exception):
@@ -91,10 +97,12 @@ def pct(a: Any, b: Any) -> float:
 
 
 def first_col(df: pd.DataFrame, cols: Iterable[str]) -> Optional[str]:
-    for c in cols:
-        if c in df.columns:
-            return c
-    return None
+    return next((c for c in cols if c in df.columns), None)
+
+
+def ymd_to_dash(x: str) -> str:
+    x = x.replace("-", "")
+    return f"{x[:4]}-{x[4:6]}-{x[6:8]}" if len(x) == 8 else x
 
 
 def fmt_seconds(seconds: float) -> str:
@@ -323,10 +331,102 @@ def normalize_hist(raw: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def is_beijing_code(code: str) -> bool:
+    code = str(code).zfill(6)
+    return code.startswith(("920", "8", "4"))
+
+
+def baostock_symbol(code: str) -> Optional[str]:
+    code = str(code).zfill(6)
+    if is_beijing_code(code):
+        return None
+    if code.startswith(("6", "9")):
+        return f"sh.{code}"
+    if code.startswith(("0", "2", "3")):
+        return f"sz.{code}"
+    return None
+
+
+def ensure_baostock_login() -> bool:
+    global BAOSTOCK_LOGGED_IN
+    if bs is None:
+        return False
+    if BAOSTOCK_LOGGED_IN:
+        return True
+    try:
+        lg = bs.login()
+        BAOSTOCK_LOGGED_IN = getattr(lg, "error_code", "1") == "0"
+        return BAOSTOCK_LOGGED_IN
+    except Exception:
+        return False
+
+
+def logout_baostock() -> None:
+    global BAOSTOCK_LOGGED_IN
+    if bs is not None and BAOSTOCK_LOGGED_IN:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+    BAOSTOCK_LOGGED_IN = False
+
+
+def fetch_hist_baostock(code: str, target_date: str) -> pd.DataFrame:
+    symbol = baostock_symbol(code)
+    if not symbol or not ensure_baostock_login():
+        return pd.DataFrame()
+    try:
+        fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,isST"
+        rs = bs.query_history_k_data_plus(symbol, fields, start_date="2018-01-01", end_date=ymd_to_dash(target_date), frequency="d", adjustflag="2")
+        if getattr(rs, "error_code", "1") != "0":
+            if len(HIST_FAILURE_SAMPLES) < 12:
+                HIST_FAILURE_SAMPLES.append({"code": code, "source": "baostock", "reason": getattr(rs, "error_msg", "query error")})
+            return pd.DataFrame()
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+        df = pd.DataFrame(rows, columns=rs.fields)
+        if df.empty:
+            return pd.DataFrame()
+        out = pd.DataFrame({
+            "date": df["date"],
+            "open": df["open"].apply(sf),
+            "close": df["close"].apply(sf),
+            "high": df["high"].apply(sf),
+            "low": df["low"].apply(sf),
+            "volume": df["volume"].apply(sf),
+            "amount": df["amount"].apply(sf),
+            "pct_chg": df["pctChg"].apply(sf),
+            "turnover": df["turn"].apply(sf),
+            "hist_source": "baostock",
+        })
+        return normalize_hist(out)
+    except Exception as e:
+        if len(HIST_FAILURE_SAMPLES) < 12:
+            HIST_FAILURE_SAMPLES.append({"code": code, "source": "baostock", "reason": type(e).__name__})
+        return pd.DataFrame()
+
+
+def fetch_hist_akshare(code: str, target_date: str) -> pd.DataFrame:
+    calls = [
+        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date, "adjust": "qfq"}),
+        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date, "adjust": ""}),
+        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date}),
+    ]
+    for fn_name, kwargs in calls:
+        df = normalize_hist(safe_source_call(fn_name, **kwargs))
+        if len(df) >= 30:
+            df["hist_source"] = "akshare"
+            return df
+    return pd.DataFrame()
+
+
 def market_ids_for_code(code: str) -> List[int]:
     code = str(code).zfill(6)
     if code.startswith(("6", "688", "689")):
         return [1]
+    if is_beijing_code(code):
+        return [0, 1]
     return [0, 1]
 
 
@@ -348,39 +448,29 @@ def fetch_hist_eastmoney(code: str, target_date: str) -> pd.DataFrame:
                 parts = str(line).split(",")
                 if len(parts) < 11:
                     continue
-                rows.append({
-                    "date": parts[0],
-                    "open": sf(parts[1]),
-                    "close": sf(parts[2]),
-                    "high": sf(parts[3]),
-                    "low": sf(parts[4]),
-                    "volume": sf(parts[5]),
-                    "amount": sf(parts[6]),
-                    "pct_chg": sf(parts[8]),
-                    "turnover": sf(parts[10]),
-                })
+                rows.append({"date": parts[0], "open": sf(parts[1]), "close": sf(parts[2]), "high": sf(parts[3]), "low": sf(parts[4]), "volume": sf(parts[5]), "amount": sf(parts[6]), "pct_chg": sf(parts[8]), "turnover": sf(parts[10])})
             df = normalize_hist(pd.DataFrame(rows))
             if len(df) >= 30:
+                df["hist_source"] = "eastmoney_last_fallback"
                 return df
             last_error = f"eastmoney market={market} rows={len(df)}"
         except Exception as e:
             last_error = f"eastmoney market={market} {type(e).__name__}"
     if len(HIST_FAILURE_SAMPLES) < 12:
-        HIST_FAILURE_SAMPLES.append({"code": code, "reason": last_error or "eastmoney empty"})
+        HIST_FAILURE_SAMPLES.append({"code": code, "source": "eastmoney", "reason": last_error or "empty"})
     return pd.DataFrame()
 
 
 def fetch_hist(code: str, target_date: str) -> pd.DataFrame:
     code = str(code).zfill(6)
-    calls = [
-        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date, "adjust": "qfq"}),
-        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date, "adjust": ""}),
-        ("stock_zh_a_hist", {"symbol": code, "period": "daily", "start_date": "20180101", "end_date": target_date}),
-    ]
-    for fn_name, kwargs in calls:
-        df = normalize_hist(safe_source_call(fn_name, **kwargs))
+    # 最终定下来的口径：历史K线 BaoStock 优先，AKShare 辅助，东方财富最后兜底；北交所因 BaoStock 覆盖不稳定，直接走 AKShare/东方财富兜底链。
+    if not is_beijing_code(code):
+        df = fetch_hist_baostock(code, target_date)
         if len(df) >= 30:
             return df
+    df = fetch_hist_akshare(code, target_date)
+    if len(df) >= 30:
+        return df
     return fetch_hist_eastmoney(code, target_date)
 
 
@@ -664,10 +754,6 @@ def build_30_dimensions(code: str, name: str, board: str, hist: pd.DataFrame) ->
     return dims
 
 
-def sample_rank_score(hist: pd.DataFrame) -> float:
-    return ret_pct(add_indicators(hist), 20) if not hist.empty else -9999
-
-
 def summarize_dimension_hits(deep: List[Dict[str, Any]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for item in deep:
@@ -677,7 +763,7 @@ def summarize_dimension_hits(deep: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
-def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, Any], enriched: List[Dict[str, Any]], deep: List[Dict[str, Any]], hist_attempts: int, hist_fail_count: int, total_elapsed: float) -> Tuple[str, Dict[str, Any]]:
+def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, Any], enriched: List[Dict[str, Any]], deep: List[Dict[str, Any]], hist_attempts: int, hist_fail_count: int, total_elapsed: float, hist_source_count: Dict[str, int]) -> Tuple[str, Dict[str, Any]]:
     type_count: Dict[str, int] = {}
     for item in enriched:
         for t in item.get("tags", []):
@@ -691,7 +777,9 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
         f"板块分布：{json.dumps(diagnostics.get('board_counts', {}), ensure_ascii=False)}",
         f"涨停制度分布：{json.dumps(diagnostics.get('limit_style_counts', {}), ensure_ascii=False)}",
         f"北交所识别：{diagnostics.get('beijing_count', 0)}只",
-        f"深度样本选择：按全涨停池成功取得K线样本的20日/月线窗口涨幅排序，取前三名",
+        "历史K线优先级：BaoStock/Bostock优先，AKShare辅助，东方财富最后兜底；北交所保留AKShare/东方财富兜底",
+        f"历史K线来源：{json.dumps(hist_source_count, ensure_ascii=False)}",
+        "深度样本选择：按全涨停池成功取得K线样本的20日/月线窗口涨幅排序，取前三名",
         f"深度样本K线拉取：尝试{hist_attempts}只，失败{hist_fail_count}只",
         "",
         "一、全市场涨停大类统计：",
@@ -708,7 +796,7 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
     if not deep:
         lines.append("未生成。原因：深度候选历史K线未成功获取到可分析样本，五号员工禁止用空数据伪造深度归因。")
     for i, item in enumerate(deep, 1):
-        lines.append(f"\n【深度样本{i}】{item['name']}({item['code']}) {item['board']}｜20日/月线涨幅{item['returns'].get('20d')}%")
+        lines.append(f"\n【深度样本{i}】{item['name']}({item['code']}) {item['board']}｜20日/月线涨幅{item['returns'].get('20d')}%｜K线源={item.get('hist_source')}")
         lines.append(f"5/20/60/100/250日涨幅：{json.dumps(item['returns'], ensure_ascii=False)}")
         lines.append("30+战法/华尔街维度归因：")
         for d in item.get("dimensions", []):
@@ -717,6 +805,8 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
         "target_date": target_date,
         "run_elapsed_seconds": round(total_elapsed, 2),
         "run_elapsed_text": fmt_seconds(total_elapsed),
+        "hist_priority": ["baostock", "akshare", "eastmoney_last_fallback"],
+        "hist_source_count": hist_source_count,
         "selection_rule": "deep samples are top 3 by 20-day/month-window return among limit-up stocks with valid kline history",
         "period_meaning": PERIOD_MEANING,
         "diagnostics": diagnostics,
@@ -758,7 +848,8 @@ def main() -> None:
     candidates: List[Tuple[float, Dict[str, Any], pd.DataFrame]] = []
     hist_attempts = 0
     hist_fail_count = 0
-    write_progress("④ 全涨停池K线拉取并计算20日涨幅", 0, len(scan_pool), run_start, "深度样本按20日/月线涨幅前三选取")
+    hist_source_count: Dict[str, int] = {}
+    write_progress("④ 全涨停池K线拉取并计算20日涨幅", 0, len(scan_pool), run_start, "K线源优先级=BaoStock→AKShare→东方财富")
     for idx, (_, row) in enumerate(scan_pool.iterrows(), 1):
         code, name, board = ss(row.get("code")), ss(row.get("name")), ss(row.get("board"))
         hist_attempts += 1
@@ -769,10 +860,12 @@ def main() -> None:
             extra = f"失败={hist_fail_count} 有效={len(candidates)} 当前={name}({code})"
         else:
             df = add_indicators(hist)
+            source = ss(hist.get("hist_source", pd.Series(["unknown"])).iloc[-1]) if "hist_source" in hist.columns else "unknown"
+            hist_source_count[source] = hist_source_count.get(source, 0) + 1
             returns = {f"{n}d": ret_pct(df, n) for n in RET_WINDOWS}
-            item = {"code": code, "name": name, "board": board, "pct_chg": sf(row.get("pct_chg")), "tags": structure_tags(df), "returns": returns}
+            item = {"code": code, "name": name, "board": board, "pct_chg": sf(row.get("pct_chg")), "tags": structure_tags(df), "returns": returns, "hist_source": source}
             candidates.append((sf(returns.get("20d")), item, hist))
-            extra = f"有效={len(candidates)} 20日涨幅={returns.get('20d')}% 当前={name}({code})"
+            extra = f"有效={len(candidates)} 20日涨幅={returns.get('20d')}% K线源={source} 当前={name}({code})"
         if idx == 1 or idx == len(scan_pool) or idx % max(PROGRESS_EVERY, 1) == 0:
             write_progress("④ 全涨停池K线拉取并计算20日涨幅", idx, len(scan_pool), run_start, extra)
 
@@ -787,7 +880,7 @@ def main() -> None:
 
     total_elapsed = time.time() - run_start
     write_progress("⑥ 报告生成", 0, 1, run_start, "写入 md/json/artifact")
-    text, data = build_report(target_date, pool, diagnostics, enriched, deep, hist_attempts, hist_fail_count, total_elapsed)
+    text, data = build_report(target_date, pool, diagnostics, enriched, deep, hist_attempts, hist_fail_count, total_elapsed, hist_source_count)
     (REPORT_DIR / "limit_up_research_report.md").write_text(text, encoding="utf-8")
     (REPORT_DIR / "limit_up_research_report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     (REPORT_DIR / "limit_up_deep_samples.json").write_text(json.dumps(deep, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -806,3 +899,5 @@ if __name__ == "__main__":
         print(err, flush=True)
         send_msg(err)
         raise
+    finally:
+        logout_baostock()
