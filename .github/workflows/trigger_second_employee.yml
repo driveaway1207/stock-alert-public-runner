@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - .github/second_employee_trigger.txt
+      - second_employee_trigger.txt
 
 permissions:
   contents: read
