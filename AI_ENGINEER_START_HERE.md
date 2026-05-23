@@ -75,7 +75,10 @@ workflow：`.github/workflows/fifth_employee.yml`
 - 深度样本不能因为前70只K线失败就输出0只。应尽可能对全涨停池可取得K线的股票计算20日/月线窗口涨幅，再取前三名。
 - 五号员工深度样本最终定下来的主排序：全涨停池中，成功取得K线的股票，按20日/月线窗口涨幅从高到低取前三名。
 - 20日窗口必须写成“20日/月线窗口”，60日写成“60日/季线窗口”，250日写成“250日/年线窗口”。周期口径见 `AI_ENGINEER_KLINE_PERIOD_RULES.md`。
-- K线历史数据必须有兜底数据源。AKShare `stock_zh_a_hist` 失败时，应使用东方财富K线接口兜底，不能让深度样本直接归零。
+- 历史K线最终定下来的数据源优先级：**BaoStock / Bostock 优先，AKShare 辅助，东方财富接口只作为最后兜底**。
+- BaoStock 适合作为常规 A 股历史日K主线；北交所覆盖可能不稳定，所以北交所必须保留 AKShare / 东方财富兜底，不能因为 BaoStock 优先而漏掉北交所。
+- workflow 依赖必须安装 `baostock akshare pandas requests`，否则 BaoStock 优先逻辑不会真正生效。
+- 报告和 artifact 必须输出历史K线来源统计，例如 `baostock / akshare / eastmoney_last_fallback`，方便判断到底用了哪个数据源。
 - VBP/筹码类分析优先用成交量，不优先用成交额，因为成交额受价格高低影响，会扭曲不同价格区间的筹码比较。
 
 ## 成功标准
@@ -106,3 +109,4 @@ workflow：`.github/workflows/fifth_employee.yml`
 - 不要只改代码不更新文档；凡是代码改动形成的最终正确思路都必须同步记录。
 - 不要在同一轮修改中多次触发五号员工；避免重复推送多个报告。
 - 不要把 AI 工程师自己知道的成功经验留在脑子里或只留在代码里；必须写进文档。
+- 不要把东方财富接口写成主线历史K线数据源；它只能是最后兜底。
