@@ -71,13 +71,16 @@ jobs:
         shell: bash
         run: |
           echo "缓存目录：$FULL_HISTORY_CACHE_DIR"
+
           if [ ! -d "$FULL_HISTORY_CACHE_DIR" ]; then
             echo "❌ 没找到一号员工缓存目录：$FULL_HISTORY_CACHE_DIR"
             echo "请先运行一号员工 cache_only 或 daily，让 kline_cache 写入 GitHub cache。"
             exit 1
           fi
 
-          COUNT=$(find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | wc -l)
+          find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | sort > /tmp/second_employee_kline_files.txt
+
+          COUNT=$(wc -l < /tmp/second_employee_kline_files.txt | tr -d ' ')
           echo "K线CSV数量：$COUNT"
 
           if [ "$COUNT" -lt 1000 ]; then
@@ -87,7 +90,7 @@ jobs:
           fi
 
           echo "展示前20个缓存文件："
-          find "$FULL_HISTORY_CACHE_DIR" -type f -name '*.csv' ! -name '_*.csv' | head -20
+          head -20 /tmp/second_employee_kline_files.txt
 
       - name: 构建二号员工本地输入表
         shell: bash
