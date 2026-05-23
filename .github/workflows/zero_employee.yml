@@ -1,0 +1,29 @@
+name: 零号员工
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: '30 13 * * 1-5'
+
+jobs:
+  zero:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install requests
+      - env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u zero_employee_auditor.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-employee-reports
+          path: zero_employee_reports/
+          if-no-files-found: warn
+          retention-days: 30
