@@ -24,6 +24,7 @@ DEEP_SAMPLE_COUNT = int(os.getenv("EMPLOYEE5_DEEP_SAMPLE_COUNT", "3"))
 DEEP_HIST_SCAN_LIMIT = int(os.getenv("EMPLOYEE5_DEEP_HIST_SCAN_LIMIT", "70"))
 AK_TIMEOUT_SECONDS = int(os.getenv("EMPLOYEE5_AK_TIMEOUT_SECONDS", "28"))
 REQUEST_SLEEP = float(os.getenv("EMPLOYEE5_REQUEST_SLEEP", "0.08"))
+PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_PROGRESS_EVERY", "1"))
 MA_PERIODS = [5, 10, 20, 30, 60, 100, 250]
 RET_WINDOWS = [20, 30, 60, 100]
 
@@ -58,9 +59,7 @@ def sf(x: Any, default: float = 0.0) -> float:
         if x is None or pd.isna(x):
             return default
         v = float(str(x).replace("%", "").replace(",", ""))
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
+        return default if math.isnan(v) or math.isinf(v) else v
     except Exception:
         return default
 
@@ -90,6 +89,62 @@ def first_col(df: pd.DataFrame, cols: Iterable[str]) -> Optional[str]:
     return None
 
 
+def fmt_seconds(seconds: float) -> str:
+    try:
+        seconds = int(max(0, seconds))
+    except Exception:
+        return "未知"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}小时{m}分{s}秒"
+    if m:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
+def progress_bar(done: int, total: int, width: int = 22) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = int(width * min(max(done / total, 0), 1))
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+def write_progress(stage: str, done: int, total: int, start_ts: float, extra: str = "") -> None:
+    elapsed = time.time() - start_ts
+    speed = done / elapsed if elapsed > 0 and done > 0 else 0.0
+    eta = (total - done) / speed if speed > 0 and total >= done else 0.0
+    pct_done = done / total * 100 if total else 0.0
+    line = (
+        f"【五号员工进度】{stage} {progress_bar(done, total)} "
+        f"{done}/{total} ({pct_done:.1f}%) | 已耗时 {fmt_seconds(elapsed)} | "
+        f"预计剩余 {fmt_seconds(eta)}"
+    )
+    if speed:
+        line += f" | 速度 {speed:.2f}/秒"
+    if extra:
+        line += f" | {extra}"
+    print(line, flush=True)
+    try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "stage": stage,
+            "done": done,
+            "total": total,
+            "percent": round(pct_done, 2),
+            "elapsed_seconds": round(elapsed, 2),
+            "elapsed_text": fmt_seconds(elapsed),
+            "eta_seconds": round(eta, 2),
+            "eta_text": fmt_seconds(eta),
+            "speed_per_second": round(speed, 4),
+            "extra": extra,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        (REPORT_DIR / "employee5_progress.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def latest_weekday(today: datetime) -> str:
     d = today
     while d.weekday() >= 5:
@@ -109,7 +164,7 @@ def latest_trade_date() -> str:
             if values:
                 return max(values).replace("-", "")
     except Exception as e:
-        print(f"trade calendar failed: {type(e).__name__}")
+        print(f"trade calendar failed: {type(e).__name__}", flush=True)
     return latest_weekday(today)
 
 
@@ -164,12 +219,12 @@ def split_text(text: str, limit: int = 3500) -> List[str]:
 
 def send_msg(text: str) -> None:
     if not _KEY or not _DEST:
-        print("message channel missing; skip")
+        print("message channel missing; skip", flush=True)
         return
     url = "https://api." + "tele" + "gram.org/bot" + _KEY + "/sendMessage"
     for i, chunk in enumerate(split_text(text), 1):
         r = requests.post(url, json={"chat_id": _DEST, "text": chunk, "disable_web_page_preview": True}, timeout=30)
-        print(f"message chunk {i} status:", r.status_code, r.text[:200])
+        print(f"message chunk {i} status: {r.status_code} {r.text[:200]}", flush=True)
         time.sleep(0.35)
 
 
@@ -209,7 +264,7 @@ def safe_source_call(fn_name: str, **kwargs) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def fetch_limit_pool(target_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def fetch_limit_pool(target_date: str, start_ts: Optional[float] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     source_defs = [
         ("zt_pool", "stock_zt_pool_em", {"date": target_date}),
         ("zt_st_pool", "stock_zt_pool_st_em", {"date": target_date}),
@@ -218,12 +273,14 @@ def fetch_limit_pool(target_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         ("bj_spot_alt", "stock_zh_bj_a_spot", {}),
         ("a_spot", "stock_zh_a_spot_em", {}),
     ]
+    stage_start = start_ts or time.time()
     parts, source_counts = [], {}
-    for source, fn_name, kwargs in source_defs:
+    for i, (source, fn_name, kwargs) in enumerate(source_defs, 1):
         norm = normalize_pool(safe_source_call(fn_name, **kwargs), source)
         source_counts[source] = int(len(norm)) if norm is not None and not norm.empty else 0
         if norm is not None and not norm.empty:
             parts.append(norm)
+        write_progress("① 涨停源采集", i, len(source_defs), stage_start, f"source={source} rows={source_counts[source]}")
     if not parts:
         return pd.DataFrame(), {"source_counts": source_counts}
     raw_pool = pd.concat(parts, ignore_index=True)
@@ -513,7 +570,7 @@ def build_30_dimensions(code: str, name: str, board: str, hist: pd.DataFrame) ->
     else:
         dims.append(D(16, "黄金二倍凹口维度", "近260日未识别到合格首次标准倍量锚点，不能强行套黄金二倍凹口。"))
     dims.append(D(17, "量能-标准/健康放量", f"5/20/60日量比={vr5}/{vr20}/{vr60}，判断是健康放量、爆量分歧还是缩量快速板。"))
-    pair = False; pair_text = "未识别完整倍量后平量链"
+    pair_text = "未识别完整倍量后平量链"
     for i in range(max(21, len(df)-80), len(df)-3):
         r1, r2 = df.iloc[i], df.iloc[i+1]
         vr = div(r1.volume, df.iloc[i-20:i].volume.mean())
@@ -521,7 +578,6 @@ def build_30_dimensions(code: str, name: str, board: str, hist: pd.DataFrame) ->
         floor = min(sf(r2.open), sf(r2.close))
         hold = all(sf(x) >= floor for x in df.iloc[i+2:min(len(df), i+5)].close.tolist())
         if vr >= 1.6 and flat and hold:
-            pair = True
             pair_text = f"{ss(r1.get('date'))}倍量后{ss(r2.get('date'))}平量，平量实底={rd(floor)}，后三日承接={hold}"
     dims.append(D(18, "资金-倍量后平量承接", pair_text))
     if len(df) >= 90:
@@ -587,7 +643,7 @@ def summarize_dimension_hits(deep: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
-def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, Any], enriched: List[Dict[str, Any]], deep: List[Dict[str, Any]], hist_attempts: int, hist_fail_count: int) -> Tuple[str, Dict[str, Any]]:
+def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, Any], enriched: List[Dict[str, Any]], deep: List[Dict[str, Any]], hist_attempts: int, hist_fail_count: int, total_elapsed: float) -> Tuple[str, Dict[str, Any]]:
     type_count: Dict[str, int] = {}
     for item in enriched:
         for t in item.get("tags", []):
@@ -596,6 +652,7 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
     lines = [
         "🧬【五号员工-涨停板归因】",
         f"日期：{target_date}",
+        f"运行耗时：{fmt_seconds(total_elapsed)}",
         f"涨停总识别：{len(pool)}只",
         f"板块分布：{json.dumps(diagnostics.get('board_counts', {}), ensure_ascii=False)}",
         f"涨停制度分布：{json.dumps(diagnostics.get('limit_style_counts', {}), ensure_ascii=False)}",
@@ -623,6 +680,8 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
             lines.append(f"D{int(d['no']):02d}. 【{d['name']}】{d['evidence']}")
     data = {
         "target_date": target_date,
+        "run_elapsed_seconds": round(total_elapsed, 2),
+        "run_elapsed_text": fmt_seconds(total_elapsed),
         "diagnostics": diagnostics,
         "summary_type_count": type_count,
         "dimension_type_count": dim_count,
@@ -635,53 +694,82 @@ def build_report(target_date: str, pool: pd.DataFrame, diagnostics: Dict[str, An
 
 
 def main() -> None:
+    run_start = time.time()
     target_date = latest_trade_date()
-    print(f"employee5 target date: {target_date}")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    pool, diagnostics = fetch_limit_pool(target_date)
+    print(f"employee5 target date: {target_date}", flush=True)
+    write_progress("启动", 0, 100, run_start, f"target_date={target_date}")
+
+    pool, diagnostics = fetch_limit_pool(target_date, run_start)
     if pool.empty:
         msg = f"🧬【五号员工-涨停板归因】\n日期：{target_date}\n未识别到涨停样本。"
+        write_progress("结束", 100, 100, run_start, "未识别到涨停样本")
         send_msg(msg)
         return
+
     pool = pool.head(MAX_POOL_SCAN).copy()
+    write_progress("② 涨停池整理", 1, 1, run_start, f"涨停总数={len(pool)} 北交所={diagnostics.get('beijing_count', 0)}")
+
     enriched: List[Dict[str, Any]] = []
-    for _, row in pool.iterrows():
+    total_enrich = len(pool)
+    for idx, (_, row) in enumerate(pool.iterrows(), 1):
         enriched.append({"code": ss(row.get("code")), "name": ss(row.get("name")), "board": ss(row.get("board")), "pct_chg": sf(row.get("pct_chg")), "tags": fallback_tags(row), "returns": {}})
+        if idx == 1 or idx == total_enrich or idx % max(PROGRESS_EVERY, 1) == 0:
+            write_progress("③ 普通样本大类统计", idx, total_enrich, run_start, f"当前={ss(row.get('name'))}({ss(row.get('code'))})")
+
     scan_pool = pool.sort_values(["limit_pct", "pct_chg", "code"], ascending=[False, False, True]).head(DEEP_HIST_SCAN_LIMIT)
+    scan_total = len(scan_pool)
     candidates: List[Tuple[float, Dict[str, Any], pd.DataFrame]] = []
     hist_attempts = 0
     hist_fail_count = 0
-    for _, row in scan_pool.iterrows():
+    write_progress("④ 深度候选K线拉取", 0, scan_total, run_start, f"目标深度样本={DEEP_SAMPLE_COUNT} 候选上限={scan_total}")
+    for idx, (_, row) in enumerate(scan_pool.iterrows(), 1):
         code, name, board = ss(row.get("code")), ss(row.get("name")), ss(row.get("board"))
         hist_attempts += 1
         hist = fetch_hist(code, target_date)
         time.sleep(REQUEST_SLEEP)
         if hist.empty or len(hist) < 30:
             hist_fail_count += 1
-            continue
-        df = add_indicators(hist)
-        item = {
-            "code": code,
-            "name": name,
-            "board": board,
-            "pct_chg": sf(row.get("pct_chg")),
-            "tags": structure_tags(df),
-            "returns": {f"{n}d": ret_pct(df, n) for n in RET_WINDOWS},
-        }
-        candidates.append((sample_score(hist), item, hist))
+            extra = f"失败={hist_fail_count} 候选={len(candidates)} 当前={name}({code})"
+        else:
+            df = add_indicators(hist)
+            item = {
+                "code": code,
+                "name": name,
+                "board": board,
+                "pct_chg": sf(row.get("pct_chg")),
+                "tags": structure_tags(df),
+                "returns": {f"{n}d": ret_pct(df, n) for n in RET_WINDOWS},
+            }
+            candidates.append((sample_score(hist), item, hist))
+            extra = f"成功候选={len(candidates)} 失败={hist_fail_count} 当前={name}({code})"
+        if idx == 1 or idx == scan_total or idx % max(PROGRESS_EVERY, 1) == 0:
+            write_progress("④ 深度候选K线拉取", idx, scan_total, run_start, extra)
         if len(candidates) >= max(12, DEEP_SAMPLE_COUNT * 4):
+            write_progress("④ 深度候选K线拉取", idx, scan_total, run_start, f"候选已达{len(candidates)}只，提前进入深度归因")
             break
+
     deep: List[Dict[str, Any]] = []
-    for _, item, hist in sorted(candidates, key=lambda x: x[0], reverse=True)[:DEEP_SAMPLE_COUNT]:
+    selected = sorted(candidates, key=lambda x: x[0], reverse=True)[:DEEP_SAMPLE_COUNT]
+    deep_total = max(len(selected), 1)
+    write_progress("⑤ 30维深度归因", 0, deep_total, run_start, f"待归因={len(selected)}只")
+    for idx, (_, item, hist) in enumerate(selected, 1):
         item = dict(item)
         item["dimensions"] = build_30_dimensions(item["code"], item["name"], item["board"], hist)
         deep.append(item)
-    text, data = build_report(target_date, pool, diagnostics, enriched, deep, hist_attempts, hist_fail_count)
+        write_progress("⑤ 30维深度归因", idx, deep_total, run_start, f"完成={item['name']}({item['code']}) 维度={len(item['dimensions'])}")
+
+    write_progress("⑥ 报告生成", 0, 1, run_start, "写入 md/json/artifact")
+    total_elapsed = time.time() - run_start
+    text, data = build_report(target_date, pool, diagnostics, enriched, deep, hist_attempts, hist_fail_count, total_elapsed)
     (REPORT_DIR / "limit_up_research_report.md").write_text(text, encoding="utf-8")
     (REPORT_DIR / "limit_up_research_report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     (REPORT_DIR / "limit_up_deep_samples.json").write_text(json.dumps(deep, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(text)
+    write_progress("⑥ 报告生成", 1, 1, run_start, f"报告完成 深度样本={len(deep)}")
+    print(text, flush=True)
+    write_progress("⑦ Telegram推送", 0, 1, run_start, "开始分段发送")
     send_msg(text)
+    write_progress("完成", 100, 100, run_start, f"总耗时={fmt_seconds(time.time() - run_start)}")
 
 
 if __name__ == "__main__":
@@ -689,6 +777,6 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         err = "❌ 五号员工运行失败\n" + str(e) + "\n" + traceback.format_exc()
-        print(err)
+        print(err, flush=True)
         send_msg(err)
         raise
