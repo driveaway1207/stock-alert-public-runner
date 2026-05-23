@@ -1,5 +1,34 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:f464cfc3f0c4 -->
+## 2026-05-23 20:41:14 UTC｜自动沉淀：`f464cfc3f0c4`
+
+- 状态：已落地代码/文档经验，后续若用户否定，六号员工必须更正或移出成功经验库。
+- commit message：[employee6-skip] 六号员工自动更新文档账本
+- 经验归纳：员工体系更新：可能涉及新员工、员工手册、workflow或报告规范。
+- 影响范围：{"employee6_docs": 7, "employee5": 1}
+- 对应路径：
+- `AI_ENGINEER_CHANGE_LOG.md`
+- `AI_ENGINEER_DOCUMENT_MAP.md`
+- `AI_ENGINEER_FINAL_RULES_INDEX.md`
+- `AI_ENGINEER_STRATEGY_REGISTRY.md`
+- `AI_ENGINEER_SUCCESS_LEDGER.md`
+- `EMPLOYEE5_CHANGE_LOG.md`
+- `EMPLOYEE6_CHANGE_LOG.md`
+- `EMPLOYEE6_REPORT_SPEC.md`
+
+
+<!-- employee6-ledger:9416cb6d93a6 -->
+## 2026-05-23 20:41:14 UTC｜自动沉淀：`9416cb6d93a6`
+
+- 状态：已落地代码/文档经验，后续若用户否定，六号员工必须更正或移出成功经验库。
+- commit message：Add zero employee operation runbook
+- 经验归纳：员工体系更新：可能涉及新员工、员工手册、workflow或报告规范。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `EMPLOYEE0_OPERATION_RUNBOOK.md`
+
+
 <!-- employee6-ledger:c51f76afbbda -->
 ## 2026-05-23 20:40:34 UTC｜自动沉淀：`c51f76afbbda`
 
