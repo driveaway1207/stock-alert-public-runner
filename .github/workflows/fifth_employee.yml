@@ -1,4 +1,5 @@
 name: 五号员工
+run-name: 五号员工
 
 "on":
   workflow_dispatch:
@@ -27,25 +28,25 @@ permissions:
 
 jobs:
   employee5:
-    name: 五号员工涨停归因
+    name: 五号员工
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Checkout code
+      - name: checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: setup python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install akshare pandas requests
 
-      - name: Run fifth employee limit-up researcher
+      - name: run employee5
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -57,7 +58,7 @@ jobs:
           EMPLOYEE5_REQUEST_SLEEP: "0.15"
         run: python -u employee5_runner.py
 
-      - name: Upload fifth employee reports
+      - name: upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
