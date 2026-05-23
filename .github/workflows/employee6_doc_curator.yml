@@ -6,9 +6,9 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '30 15 * * *'
+    - cron: '*/5 * * * *'
   workflow_run:
-    workflows: ['一号员工', '二号员工', '三号员工', '四号员工', '五号员工']
+    workflows: ['零号员工', '一号员工', '二号员工', '三号员工', '四号员工', '五号员工']
     types: [completed]
 
 concurrency:
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 50
+          fetch-depth: 80
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
