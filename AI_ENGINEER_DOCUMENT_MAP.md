@@ -22,6 +22,7 @@
 
 ## 员工报告规范
 
+- `EMPLOYEE5_REPORT_SPEC.md`
 - `EMPLOYEE6_REPORT_SPEC.md`
 
 ## 成功经验和改动流水账
