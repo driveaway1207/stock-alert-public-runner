@@ -29,6 +29,7 @@ permissions:
 jobs:
   employee5:
     name: 五号员工
+    if: ${{ github.event_name != 'issues' || (github.event.issue.number == 2 && github.event.label.name == 'run-employee5') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
