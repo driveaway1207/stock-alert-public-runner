@@ -56,6 +56,14 @@ workflow：`.github/workflows/fifth_employee.yml`
 
 触发流程：先移除标签，再重新添加标签。
 
+## 触发成功经验
+
+- 只有固定 Issue #2 加上 `run-employee5` 标签才应触发五号员工。
+- workflow 必须同时保留 `issues.labeled` 和 job 级防误触发条件：`github.event_name != 'issues' || (github.event.issue.number == 2 && github.event.label.name == 'run-employee5')`。
+- 同一轮修改不要反复触发。先集中完成代码修改和文档记录，最后只执行一次“移除标签 → 添加标签”。
+- `concurrency.cancel-in-progress` 只能取消仍在排队或运行中的旧任务，不能取消已经跑完并已推送 Telegram 的旧任务。因此连续触发两次，就可能收到两个报告。
+- 修改代码后必须先把最终定下来的思路写进文档，再做最后一次正式触发。
+
 ## 成功标准
 
 - 涨停数量尽量全量，不能漏北交所。
@@ -81,3 +89,4 @@ workflow：`.github/workflows/fifth_employee.yml`
 - 不要把错误尝试、临时猜测、失败方案写进成功经验库。
 - 不要用“后续观察”“可能怎么样”替代真实维度。
 - 不要只改代码不更新文档；凡是代码改动形成的最终正确思路都必须同步记录。
+- 不要在同一轮修改中多次触发五号员工；避免重复推送多个报告。
