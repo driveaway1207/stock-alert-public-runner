@@ -1,5 +1,38 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:workflow-____-5-success -->
+## 2026-05-23 20:43:49 UTC｜workflow运行结果：`零号员工` #5
+
+- 状态：status=`completed`，conclusion=`success`
+- 链接：https://github.com/driveaway1207/stock-alert-public-runner/actions/runs/26343089323
+- 经验归纳：六号员工必须记录关键 workflow 结果；如果运行失败，进入变更流水账，不能伪装成成功。
+
+
+<!-- employee6-ledger:24deea3400ef -->
+## 2026-05-23 20:43:49 UTC｜自动沉淀：`24deea3400ef`
+
+- 状态：已落地代码/文档经验，后续若用户否定，六号员工必须更正或移出成功经验库。
+- commit message：[employee6-skip] 六号员工自动更新文档账本
+- 经验归纳：员工体系更新：可能涉及新员工、员工手册、workflow或报告规范。
+- 影响范围：{"employee6_docs": 3, "employee5": 1}
+- 对应路径：
+- `AI_ENGINEER_CHANGE_LOG.md`
+- `AI_ENGINEER_SUCCESS_LEDGER.md`
+- `EMPLOYEE5_CHANGE_LOG.md`
+- `EMPLOYEE6_CHANGE_LOG.md`
+
+
+<!-- employee6-ledger:295748e49bb6 -->
+## 2026-05-23 20:43:49 UTC｜自动沉淀：`295748e49bb6`
+
+- 状态：已落地代码/文档经验，后续若用户否定，六号员工必须更正或移出成功经验库。
+- commit message：Separate zero audit trigger from employee6 archive trigger
+- 经验归纳：自动触发/运行链路：workflow、固定Issue标签、并发锁或依赖安装。
+- 影响范围：{"workflow": 1}
+- 对应路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
 <!-- employee6-ledger:workflow-____-4-success -->
 ## 2026-05-23 20:41:59 UTC｜workflow运行结果：`零号员工` #4
 
