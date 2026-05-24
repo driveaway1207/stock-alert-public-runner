@@ -47,7 +47,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install baostock akshare pandas requests
 
-      - name: run employee5
+      - name: build employee5 base data without telegram
+        env:
+          PYTHONUNBUFFERED: 1
+          EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
+          EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
+          EMPLOYEE5_AK_TIMEOUT_SECONDS: "18"
+          EMPLOYEE5_REQUEST_SLEEP: "0.15"
+        run: python -u employee5_runner.py
+
+      - name: run employee5 structural archetype report
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -57,7 +66,7 @@ jobs:
           EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
           EMPLOYEE5_AK_TIMEOUT_SECONDS: "18"
           EMPLOYEE5_REQUEST_SLEEP: "0.15"
-        run: python -u employee5_runner.py
+        run: python -u employee5_structural_report.py
 
       - name: upload reports
         if: always()
