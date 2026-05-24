@@ -1,5 +1,24 @@
 # stock-alert-public-runner
 
+## Public runner repository / 新 AI 工程师第一入口
+
+本仓库 `driveaway1207/stock-alert-public-runner` 是当前给后续 AI 工程师使用的 **public runner 仓库**。
+
+后续任何新的 AI 工程师、Claude Cowork、ChatGPT/Codex 或人工维护者，接到用户关于员工系统、公共运行链路、五号员工、workflow、报告、runner、操作说明书的需求时，默认应先进入本公共仓库，而不是去其它同名或相近私有仓库里乱找。
+
+必须牢记：
+
+- public runner 仓库：`driveaway1207/stock-alert-public-runner`
+- 默认分支：`main`
+- 第一入口文档：`README.md`
+- 第二入口文档：`AI_ENGINEER_START_HERE.md`
+- 总规则索引：`AI_ENGINEER_FINAL_RULES_INDEX.md`
+- 文档地图：`AI_ENGINEER_DOCUMENT_MAP.md`
+
+不要把其它仓库里的旧文档、旧命名、旧员工分工、旧审计口径，直接当成本 public runner 仓库的当前事实。
+
+如确实需要跨仓库同步，必须先明确说明目标仓库、目标文件、是否触碰 workflow、凭证、生产链路，并取得用户单独确认。
+
 ## Start here
 
 后续任何 AI 工程师进入仓库，接到用户需求后的第一件事，必须先读文档，再动代码、workflow、报告或员工体系。
