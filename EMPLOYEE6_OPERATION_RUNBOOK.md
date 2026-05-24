@@ -217,3 +217,18 @@ AI_ENGINEER_STRATEGY_REGISTRY.md
 - 当前旧总账检查：
   - 无
 - 六号处理：只记录事实；不生成散文档；不判断成功经验。
+
+<!-- employee6-track:7c8bdfdabada -->
+### 2026-05-24 12:40:55 UTC｜push｜`7c8bdfdabada`
+
+- 运行：`79`｜触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- workflow结果：无，本次不是 workflow_run 事件。
+- commit message：Refactor employee5 structural report into cause-pool attribution
+- 文件归类：{"code": 1}
+- 修改路径：
+  - `employee5_structural_report.py`
+- 当前散文档检查：
+  - 无
+- 当前旧总账检查：
+  - 无
+- 六号处理：只记录事实；不生成散文档；不判断成功经验。
