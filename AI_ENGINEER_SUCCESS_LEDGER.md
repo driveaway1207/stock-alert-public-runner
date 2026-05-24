@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:76910801102f -->
+## 2026-05-24 02:24:54 UTC｜自动沉淀候选：`76910801102f`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Record zero employee gate upgrade work
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `ENGINEERING_MAINTENANCE_MANUAL.md`
+
+
 <!-- employee6-ledger:eedc96da457b -->
 ## 2026-05-24 02:23:38 UTC｜自动沉淀候选：`eedc96da457b`
 
