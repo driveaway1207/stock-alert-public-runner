@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:bf6b396b1218 -->
+## 2026-05-24 02:04:36 UTC｜自动沉淀候选：`bf6b396b1218`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Add first-read implementation verification rule to README
+- 经验归纳：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `README.md`
+
+
 <!-- employee6-ledger:685ba59bcacb -->
 ## 2026-05-24 01:56:33 UTC｜自动沉淀候选：`685ba59bcacb`
 
