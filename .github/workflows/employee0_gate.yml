@@ -1,0 +1,31 @@
+name: 零号门禁
+run-name: 零号门禁
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: employee0-gate
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: 零号门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -u employee0_gate.py
+        env:
+          EMPLOYEE0_GATE_SCOPE: event
+          EMPLOYEE0_GATE_LIMIT: '10'
