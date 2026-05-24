@@ -1,236 +1,152 @@
 # 六号员工运行总手册
 
-六号员工是文档审计员、代码变更归档员、成功经验沉淀员、最终规则索引维护员。
+更新时间：2026-05-24
 
-六号员工相关说明统一合并到本文件；六号只保留本手册，避免 `REPORT_SPEC`、`CHANGE_LOG` 等散文件继续膨胀。
+六号员工已降级为：**手动文档清洁检查员**。
 
----
-
-## 1. 身份定位
-
-六号员工不负责选股、不负责交易、不负责预测，不负责判断代码是不是猴子代码。
-
-六号员工负责让后续 AI 工程师知道：
-
-- 最近改了什么代码。
-- 修改路径在哪里。
-- 哪些 workflow 跑过。
-- 哪些规则最终定下来了。
-- 哪些成功经验已经落地。
-- 哪些员工手册需要同步更新。
-- 哪些失败经验不能再重复。
+六号不再是自动归档员工，不再自动写总账，不再自动生成员工文档，不再自动判断成功经验。
 
 ---
 
-## 2. 六号员工与零号员工分工
+## 1. 新身份定位
 
-正确流程不是让六号员工同时当裁判和档案员。
+六号员工现在只做一件事：
 
 ```text
-任意员工 push / workflow 运行
-  ↓
-零号员工：审计代码质量、猴子代码、生产链路风险
-  ↓
-六号员工：记录改动路径、运行结果、零号审计结果、成功经验和员工档案
+手动检查仓库里是否出现散乱文档、重复文档、自动生成垃圾文档，并在用户要求时协助清理。
 ```
 
-零号员工负责审计风险；六号员工负责沉淀文档。
+六号不负责：
+
+- 自动归档每个 commit。
+- 自动生成 `CHANGE_LOG`。
+- 自动生成 `REPORT_SPEC`。
+- 自动生成 `DIMENSION_SPEC`。
+- 自动生成 `STRUCTURE_SPEC`。
+- 自动写 `AI_ENGINEER_CHANGE_LOG`。
+- 自动写 `AI_ENGINEER_SUCCESS_LEDGER`。
+- 自动写 `AI_ENGINEER_FINAL_RULES_INDEX`。
+- 自动写 `AI_ENGINEER_DOCUMENT_MAP`。
+- 自动判断某次尝试是不是成功经验。
 
 ---
 
-## 3. 自动运行频率原则
+## 2. 为什么降级
 
-六号员工必须自动运行，但不能高频占用 runner，不能影响一号到五号员工的正式工作。
+旧六号员工的问题：
 
-原则：
+1. 记录太碎，生成大量没有阅读价值的散文件。
+2. 把“写文档”误当成“完成工作”。
+3. 会把被删除的 `CHANGE_LOG / REPORT_SPEC` 自动生成回来，形成二次污染。
+4. 容易让 AI 误以为“记录了就算成功”。
+5. 高频自动运行会占用 runner，也会持续制造噪音。
 
-1. 主触发：`workflow_run`，在零号、一号、二号、三号、四号、五号员工完成后归档。
-2. 辅助触发：`workflow_dispatch`，必要时手动补跑。
-3. 兜底触发：只能低频定时补扫，建议每天一次，不允许每 5 分钟跑一次。
-4. 六号员工不推送 Telegram，只写文档账本和员工手册。
-5. 六号员工每次运行都回扫最近 commit，已记录 marker 不重复写，漏掉的自动补上。
-
----
-
-## 4. 文档合并原则
-
-用户要求：文件不要越建越多。每个员工尽量只保留一个主运行手册。
-
-六号必须执行：
-
-- 五号相关说明合并进 `EMPLOYEE5_OPERATION_RUNBOOK.md`。
-- 六号相关说明合并进 `EMPLOYEE6_OPERATION_RUNBOOK.md`。
-- `*_REPORT_SPEC.md`、`*_DIMENSION_SPEC.md`、`*_STRUCTURE_*SPEC.md`、`*_CHANGE_LOG.md` 等散文件，如果内容已并入主手册，就删除。
-- 只有当某文件是代码、workflow 或真实产物，不是说明文档，才保留。
-
-六号禁止因为自动归档而不断新建散文档。
+结论：旧六号自动归档模式是负价值，已经废止。
 
 ---
 
-## 5. 报告/归档规范
+## 3. 当前保留内容
 
-六号员工报告是文档审计/归档报告，不是研究报告、推荐报告或交易报告。
-
-必须包含：
-
-- 日期 / 运行时间。
-- 归档对象。
-- 修改文件。
-- commit sha。
-- 运行结果。
-- 是否已写入对应员工主手册。
-- 是否有失败尝试被误写成成功经验。
-- 是否需要删除或合并散文档。
-
-禁止写法：
-
-- 不要用空话凑维度。
-- 不要把未验证内容写成最终结论。
-- 不要输出与员工定位无关的内容。
-- 不要把失败尝试包装成成功经验。
-
----
-
-## 6. 三本账和入口
-
-总账可以保留，但员工自己的信息优先写入对应员工主手册。
-
-总账包括：
+六号现在只保留：
 
 ```text
+EMPLOYEE6_OPERATION_RUNBOOK.md
+employee6_doc_curator.py
+.github/workflows/employee6_doc_curator.yml
+```
+
+其中：
+
+- `EMPLOYEE6_OPERATION_RUNBOOK.md`：说明六号的新身份和禁止事项。
+- `employee6_doc_curator.py`：只读检查脚本，只打印散文档清单，不写文件。
+- `.github/workflows/employee6_doc_curator.yml`：只支持手动运行 `workflow_dispatch`，不再自动运行。
+
+---
+
+## 4. workflow 新规则
+
+六号 workflow 只允许手动触发：
+
+```yaml
+on:
+  workflow_dispatch:
+```
+
+不允许：
+
+- `push` 自动触发。
+- `workflow_run` 自动触发。
+- 高频 `schedule`。
+- 自动提交。
+- 自动修改文档。
+
+权限只读：
+
+```yaml
+permissions:
+  contents: read
+  actions: read
+```
+
+---
+
+## 5. 文档清洁规则
+
+仓库文档原则：
+
+```text
+每个员工默认只保留一个主手册：EMPLOYEEX_OPERATION_RUNBOOK.md
+```
+
+需要删除或合并的散文档类型：
+
+```text
+EMPLOYEE*_CHANGE_LOG.md
+EMPLOYEE*_REPORT_SPEC.md
+EMPLOYEE*_DIMENSION_SPEC.md
+EMPLOYEE*_STRUCTURE_*SPEC.md
 AI_ENGINEER_CHANGE_LOG.md
 AI_ENGINEER_SUCCESS_LEDGER.md
-AI_ENGINEER_FINAL_RULES_INDEX.md
 AI_ENGINEER_DOCUMENT_MAP.md
+AI_ENGINEER_FINAL_RULES_INDEX.md
 AI_ENGINEER_STRATEGY_REGISTRY.md
 ```
 
-员工主手册示例：
+例外：如果用户明确要求保留某份独立文档，才允许保留。
+
+---
+
+## 6. 六号运行后应该输出什么
+
+六号手动运行后，只打印检查结果：
 
 ```text
-EMPLOYEE0_OPERATION_RUNBOOK.md
-EMPLOYEE5_OPERATION_RUNBOOK.md
-EMPLOYEE6_OPERATION_RUNBOOK.md
+发现哪些散文档
+哪些总账类文档还存在
+当前员工主手册有哪些
+建议删除/合并哪些文件
 ```
 
-后续新员工不应自动生成三四个散文档；先生成一个 `EMPLOYEEX_OPERATION_RUNBOOK.md`，确需拆分时必须得到用户认可。
+六号不得自动删除，除非用户在聊天中明确要求清理。
 
 ---
 
-## 7. 成功经验写入标准
+## 7. 禁止事项
 
-只有满足以下条件，才能写入成功经验：
-
-1. 已有 GitHub 文件或代码落地。
-2. 已有 commit sha。
-3. 运行链路实际成功，或用户明确确认该规则正确。
-4. 未被用户否定。
-5. 写入位置是对应员工主手册或总成功账。
-
-失败尝试只能写入“踩坑复盘”，不能写成成功经验。
-
----
-
-## 8. 禁止事项
-
+- 不要自动创建文档。
+- 不要自动提交文档。
+- 不要自动写成功经验。
+- 不要自动写变更流水账。
+- 不要高频运行。
 - 不要把失败尝试包装成成功经验。
-- 不要把未验证战法写成最终规则。
-- 不要修改 PAT、secrets、Telegram token。
-- 不要频繁推送 Telegram。
-- 不要高频定时运行占用 runner。
-- 不要每 5 分钟补扫。
-- 不要覆盖用户已经定下来的员工职责。
-- 不要只改代码不记文档。
-- 不要新建大量散文档。
-- 不要只写总账不写对应员工主手册。
+- 不要制造 `CHANGE_LOG / REPORT_SPEC` 这类散文件。
+- 不要碰一号员工生产链路。
+- 不要碰 PAT、token、secrets、Telegram 凭证。
 
 ---
 
-## 9. 一句话总结
+## 8. 一句话总结
 
 ```text
-零号员工负责抓代码风险，六号员工负责把所有员工的代码动作、路径、运行结果和最终成功经验沉淀到总账与对应员工主手册；六号必须低频兜底、事件驱动归档，不能每 5 分钟抢占正式员工资源，也不能制造一堆散乱文档。
+六号员工从“自动归档员工”降级为“手动文档清洁检查员”：只读检查、少写慎写、不再自动生成任何文档；真正有用的信息应该写进对应员工主手册，而不是制造一堆散乱账本。
 ```
-
----
-
-## 自动归档记录
-
-本区由六号员工追加，记录该员工相关代码、文档、workflow、报告规范、运行链路改动。
-
-<!-- employee6-employee-6:0f47090ecdf3 -->
-### 2026-05-24 10:24:22 UTC｜Commit `0f47090ecdf3`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Stop employee6 from regenerating employee change logs
-- 自动归类：{"code": 1}
-- 归档判断：员工代码或文档常规更新。
-- 修改路径：
-  - `employee6_employee_archiver.py`
-
-<!-- employee6-employee-6:081eaffa5ddf -->
-### 2026-05-24 10:24:22 UTC｜Commit `081eaffa5ddf`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Stop employee6 from generating scattered employee docs
-- 自动归类：{"code": 1}
-- 归档判断：文档/操作手册/成功经验更新。
-- 修改路径：
-  - `employee6_auto_templates.py`
-
-<!-- employee6-employee-6:d756a301ae86 -->
-### 2026-05-24 10:24:22 UTC｜Commit `d756a301ae86`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Remove merged employee6 change log
-- 自动归类：{"docs": 1}
-- 归档判断：员工代码或文档常规更新。
-- 修改路径：
-  - `EMPLOYEE6_CHANGE_LOG.md`
-
-<!-- employee6-employee-6:d8277fb4ae96 -->
-### 2026-05-24 10:24:22 UTC｜Commit `d8277fb4ae96`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Remove merged employee6 report spec
-- 自动归类：{"docs": 1}
-- 归档判断：报告输出/格式更新。
-- 修改路径：
-  - `EMPLOYEE6_REPORT_SPEC.md`
-
-<!-- employee6-employee-6:2106daf6dea7 -->
-### 2026-05-24 10:24:22 UTC｜Commit `2106daf6dea7`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Consolidate employee6 docs into operation runbook
-- 自动归类：{"docs": 1}
-- 归档判断：文档/操作手册/成功经验更新。
-- 修改路径：
-  - `EMPLOYEE6_OPERATION_RUNBOOK.md`
-
-<!-- employee6-employee-6:0923f123a543 -->
-### 2026-05-24 10:24:22 UTC｜Commit `0923f123a543`
-
-- 事件：`workflow_run`｜运行：`66`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：docs: add global employee identity lock rule
-- 自动归类：{"docs": 1}
-- 归档判断：文档/操作手册/成功经验更新。
-- 修改路径：
-  - `AI_ENGINEER_FINAL_RULES_INDEX.md`
-
-<!-- employee6-employee-6:02e2c1bca273 -->
-### 2026-05-24 10:27:09 UTC｜Commit `02e2c1bca273`
-
-- 事件：`workflow_run`｜运行：`69`
-- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
-- commit message：Delete regenerated employee6 change log after disabling generator
-- 自动归类：{"docs": 1}
-- 归档判断：员工代码或文档常规更新。
-- 修改路径：
-  - `EMPLOYEE6_CHANGE_LOG.md`
