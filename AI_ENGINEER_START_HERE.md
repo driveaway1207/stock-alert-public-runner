@@ -2,6 +2,91 @@
 
 后续任何 AI 工程师进入本仓库，请先读本文件。
 
+## 新 AI 工程师固定操作顺序
+
+任何新的 AI 工程师、Claude Cowork、ChatGPT/Codex 或人工维护者，接到用户关于本项目的需求后，必须按下面顺序执行。
+
+### 第一步：先确认目标仓库
+
+默认目标仓库是 public runner 仓库：
+
+```text
+driveaway1207/stock-alert-public-runner
+```
+
+默认分支：
+
+```text
+main
+```
+
+不要一上来就去其它同名或相近仓库里搜索、修改、审计或下结论。其它仓库里的旧文档、旧命名、旧员工分工、旧审计口径，不能直接当成本 public runner 仓库的当前事实。
+
+### 第二步：先读总入口文档
+
+必须先读：
+
+1. `README.md`
+2. `AI_ENGINEER_START_HERE.md`
+3. `AI_ENGINEER_FINAL_RULES_INDEX.md`
+4. `AI_ENGINEER_DOCUMENT_MAP.md`
+5. `AI_ENGINEER_KLINE_PERIOD_RULES.md`
+6. `EMPLOYEE_SYSTEM_ROLES.md`
+
+读完这些入口文档后，才能继续读对应员工的运行手册、workflow 和主脚本。
+
+### 第三步：再定位具体员工或具体任务
+
+如果用户说五号员工，先读：
+
+- `EMPLOYEE5_OPERATION_RUNBOOK.md`
+- `.github/workflows/fifth_employee.yml`
+- `employee5_runner.py`
+
+如果用户说零号员工，先读：
+
+- `EMPLOYEE0_OPERATION_RUNBOOK.md`
+- 零号员工对应 workflow、脚本和 `employee0_reports/` 输出约定
+
+如果用户说六号员工，先读：
+
+- `EMPLOYEE6_OPERATION_RUNBOOK.md`
+- 六号员工对应 workflow、脚本和文档沉淀规则
+
+如果用户说“操作说明书总文档”“总规则”“大本营”，优先查看：
+
+- `README.md`
+- `AI_ENGINEER_START_HERE.md`
+- `AI_ENGINEER_FINAL_RULES_INDEX.md`
+- `AI_ENGINEER_DOCUMENT_MAP.md`
+- `AI_ENGINEER_SUCCESS_LEDGER.md`
+- `AI_ENGINEER_CHANGE_LOG.md`
+
+### 第四步：动手前先说明范围
+
+任何修改前，必须先明确：
+
+- 目标仓库是不是 `driveaway1207/stock-alert-public-runner`
+- 目标文件是什么
+- 是否涉及 workflow
+- 是否涉及生产链路
+- 是否涉及凭证或推送相关配置
+- 是否只是文档修改，还是会影响真实运行
+
+没有确认范围前，不要跨仓库乱改。
+
+### 第五步：落地后必须复查
+
+不能只在聊天里说“已经改好”。每次工程修改必须给出：
+
+- GitHub 返回的 commit sha
+- 重新读取目标文件后的复查结果
+- 如果是代码或 workflow 修改，还要给运行或静态检查证据
+
+如果没有 commit sha，不能说已经落地。
+
+---
+
 ## 先读顺序
 
 1. `AI_ENGINEER_START_HERE.md`：先读本入口，理解最终定下来的维护原则。
