@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:3fff1d7c8f5a -->
+## 2026-05-24 06:41:42 UTC｜自动沉淀候选：`3fff1d7c8f5a`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：docs: add employee identity drift audit rule
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee0": 1}
+- 对应路径：
+- `EMPLOYEE0_OPERATION_RUNBOOK.md`
+
+
 <!-- employee6-ledger:1a7605a3ba67 -->
 ## 2026-05-24 06:35:45 UTC｜自动沉淀候选：`1a7605a3ba67`
 
