@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:685ba59bcacb -->
+## 2026-05-24 01:56:33 UTC｜自动沉淀候选：`685ba59bcacb`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Prevent employee6 self-archive workflow loops
+- 经验归纳：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 影响范围：{"workflow": 1}
+- 对应路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
 <!-- employee6-ledger:52812a594e73 -->
 ## 2026-05-24 01:55:17 UTC｜自动沉淀候选：`52812a594e73`
 

@@ -400,3 +400,14 @@
 - 归档判断：员工代码或文档常规更新。
 - 修改路径：
   - `employee6_employee_archiver.py`
+
+<!-- employee6-employee-6:685ba59bcacb -->
+## 2026-05-24 01:56:34 UTC｜Commit `685ba59bcacb`
+
+- 事件：`workflow_run`｜运行：`25`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Prevent employee6 self-archive workflow loops
+- 自动归类：{"workflow": 1}
+- 归档判断：workflow/自动运行链路更新。
+- 修改路径：
+  - `.github/workflows/employee6_doc_curator.yml`
