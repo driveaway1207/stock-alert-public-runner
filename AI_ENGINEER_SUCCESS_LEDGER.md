@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:081eaffa5ddf -->
+## 2026-05-24 10:22:50 UTC｜自动沉淀候选：`081eaffa5ddf`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Stop employee6 from generating scattered employee docs
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee6_docs": 1}
+- 对应路径：
+- `employee6_auto_templates.py`
+
+
 <!-- employee6-ledger:de977f3c62fd -->
 ## 2026-05-24 10:20:49 UTC｜自动沉淀候选：`de977f3c62fd`
 
