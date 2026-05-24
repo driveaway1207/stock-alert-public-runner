@@ -1,5 +1,38 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:83aa72e4632c -->
+## 2026-05-24 10:06:54 UTC｜自动沉淀候选：`83aa72e4632c`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Remove merged employee5 dimension spec
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee5": 1}
+- 对应路径：
+- `EMPLOYEE5_DIMENSION_SPEC.md`
+
+
+<!-- employee6-ledger:091d1bbcc3e3 -->
+## 2026-05-24 10:06:54 UTC｜自动沉淀候选：`091d1bbcc3e3`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Remove merged employee5 report spec
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee5": 1}
+- 对应路径：
+- `EMPLOYEE5_REPORT_SPEC.md`
+
+
+<!-- employee6-ledger:751105943ee8 -->
+## 2026-05-24 10:06:54 UTC｜自动沉淀候选：`751105943ee8`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Remove merged employee5 structure spec
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee5": 1}
+- 对应路径：
+- `EMPLOYEE5_STRUCTURE_ARCHETYPE_SPEC.md`
+
+
 <!-- employee6-ledger:bd6d8b388aff -->
 ## 2026-05-24 10:01:09 UTC｜自动沉淀候选：`bd6d8b388aff`
 
