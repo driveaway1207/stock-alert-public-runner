@@ -3,42 +3,25 @@ run-name: 六号员工
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 16 * * *'
-  workflow_run:
-    workflows: ['零号员工', '一号员工', '二号员工', '三号员工', '四号员工', '五号员工']
-    types: [completed]
 
 concurrency:
   group: employee6-doc-curator
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
-  curate-docs:
-    name: 六号员工-文档审计与经验沉淀
-    if: ${{ github.event_name != 'workflow_run' || !startsWith(github.event.workflow_run.head_commit.message, '[employee6-skip]') }}
+  inspect-docs:
+    name: 六号员工-手动文档清洁检查
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 80
+          fetch-depth: 20
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: |
-          python -m pip install --upgrade pip
-          pip install requests
       - run: python -u employee6_doc_curator.py
-      - run: python -u employee6_auto_templates.py
-      - run: python -u employee6_employee_archiver.py
-      - uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: '[employee6-skip] 六号员工自动更新文档账本'
-          file_pattern: 'AI_ENGINEER_CHANGE_LOG.md AI_ENGINEER_SUCCESS_LEDGER.md AI_ENGINEER_FINAL_RULES_INDEX.md AI_ENGINEER_DOCUMENT_MAP.md AI_ENGINEER_STRATEGY_REGISTRY.md EMPLOYEE*_CHANGE_LOG.md EMPLOYEE*_OPERATION_RUNBOOK.md EMPLOYEE*_REPORT_SPEC.md'
-          commit_user_name: employee6-doc-curator
-          commit_user_email: employee6-doc-curator@users.noreply.github.com
