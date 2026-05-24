@@ -20,6 +20,7 @@ permissions:
 jobs:
   curate-docs:
     name: 六号员工-文档审计与经验沉淀
+    if: ${{ github.event_name != 'workflow_run' || !startsWith(github.event.workflow_run.head_commit.message, '[employee6-skip]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
