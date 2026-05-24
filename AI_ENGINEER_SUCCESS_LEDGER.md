@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:1a7605a3ba67 -->
+## 2026-05-24 06:35:45 UTC｜自动沉淀候选：`1a7605a3ba67`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：docs: add fixed AI engineer operating sequence
+- 经验归纳：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `AI_ENGINEER_START_HERE.md`
+
+
 <!-- employee6-ledger:e66df5017ef6 -->
 ## 2026-05-24 06:35:07 UTC｜自动沉淀候选：`e66df5017ef6`
 
