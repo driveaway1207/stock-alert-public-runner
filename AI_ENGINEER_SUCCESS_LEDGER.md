@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:f0f974830ec1 -->
+## 2026-05-24 03:03:02 UTC｜自动沉淀候选：`f0f974830ec1`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Clarify employee5 telegram report excludes backend diagnostics
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee5": 1}
+- 对应路径：
+- `EMPLOYEE5_REPORT_SPEC.md`
+
+
 <!-- employee6-ledger:2c55b9088225 -->
 ## 2026-05-24 02:56:01 UTC｜自动沉淀候选：`2c55b9088225`
 
