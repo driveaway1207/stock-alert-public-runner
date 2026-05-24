@@ -17,6 +17,10 @@ run-name: 五号员工
   issues:
     types:
       - labeled
+      - edited
+  issue_comment:
+    types:
+      - created
 
 concurrency:
   group: fifth-employee-singleton-main
@@ -29,7 +33,7 @@ permissions:
 jobs:
   employee5:
     name: 五号员工
-    if: ${{ github.event_name != 'issues' || (github.event.issue.number == 2 && github.event.label.name == 'run-employee5') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'issues' && github.event.issue.number == 2 && (contains(join(github.event.issue.labels.*.name, ','), 'run-employee5') || github.event.label.name == 'run-employee5')) || (github.event_name == 'issue_comment' && github.event.issue.number == 2 && contains(github.event.comment.body, 'run-employee5')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
