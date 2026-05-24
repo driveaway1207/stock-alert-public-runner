@@ -66,13 +66,13 @@
 - 用户需求：建立工程维护手册，记录每个工程师每次工作内容、落地状态、自检状态、猴子代码风险和失败尝试。
 - 本次实际修改：新增本文件，作为工程维护手册与工作记录总账。
 - 修改路径：`ENGINEERING_MAINTENANCE_MANUAL.md`
-- commit sha：待本次 GitHub 返回后由工程师在答复中说明，并由六号员工后续归档。
-- 已提交：执行中。
-- 已复查：待复查。
-- 已验证：workflow 运行待验证。
+- commit sha：`d325b48ede8373ce9fe5f8800a88cd05c3e7c093`
+- 已提交：是。
+- 已复查：是，已重新读取 `ENGINEERING_MAINTENANCE_MANUAL.md` 并确认内容真实存在。
+- 已验证：未验证 workflow；本次只新增文档，不涉及运行链路。
 - 是否涉及 workflow：否。
 - 是否涉及生产链路：否。
 - 猴子代码风险：低。本次仅新增工程记录手册，不改生产流程。
-- 自检结论：本文件必须成为后续工程师记录工作的固定入口。
-- 失败尝试：此前曾尝试新建更大范围的最高规则文件，但 GitHub 工具安全检查拦截，未落地；也曾尝试更新 AI_ENGINEER_START_HERE 和 AI_ENGINEER_FINAL_RULES_INDEX，被工具拦截，未落地。该失败必须记录，不能误认为已完成。
+- 自检结论：本文件必须成为后续工程师记录工作的固定入口；后续每次工程修改都要在这里写清已提交、已复查、已验证和失败尝试。
+- 失败尝试：此前曾尝试新建更大范围的最高规则文件 `AI_ENGINEER_IMPLEMENTATION_VERIFICATION_RULES.md`，但 GitHub 工具安全检查拦截，未落地；也曾尝试更新 `AI_ENGINEER_START_HERE.md` 和 `AI_ENGINEER_FINAL_RULES_INDEX.md`，被工具拦截，未落地。该失败已经记录，不能误认为已完成。
 - 后续工程师注意事项：凡是工具拦截、冲突、没有 commit sha 的动作，都必须记录为失败尝试；不能在聊天中说成已经落地。
