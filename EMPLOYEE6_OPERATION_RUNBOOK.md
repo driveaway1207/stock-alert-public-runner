@@ -150,3 +150,23 @@ AI_ENGINEER_STRATEGY_REGISTRY.md
 ```text
 六号员工从“自动归档员工”降级为“手动文档清洁检查员”：只读检查、少写慎写、不再自动生成任何文档；真正有用的信息应该写进对应员工主手册，而不是制造一堆散乱账本。
 ```
+
+---
+
+## 自动跟踪记录
+
+本区由六号员工自动追加，只记录关键事实：触发事件、commit、修改路径、是否发现散文档。六号不得在本区判断成功经验。
+
+<!-- employee6-track:3170171ace31 -->
+### 2026-05-24 10:44:01 UTC｜push｜`3170171ace31`
+
+- 运行：`73`｜触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Make employee6 record events into one runbook only
+- 文件归类：{"code": 1}
+- 修改路径：
+  - `employee6_doc_curator.py`
+- 当前散文档检查：
+  - 无
+- 当前旧总账检查：
+  - 无
+- 六号处理：只记录事实；不生成散文档；不判断成功经验。
