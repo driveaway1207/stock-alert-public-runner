@@ -1,29 +1,32 @@
 # AI_ENGINEER_START_HERE
 
-本文件是员工系统最高优先级入口文档。默认事实源是：
+This file is the top-level engineering entry point for the employee system.
+
+Default source of truth:
 
 ```text
 driveaway1207/stock-alert-public-runner
 ```
 
-私有仓库 `driveaway1207/stock-alert` 默认不作为当前事实源，除非用户明确点名要求。
+The private repository `driveaway1207/stock-alert` is not the default source of truth unless the user explicitly asks to work on it.
 
-## 强制读取顺序
+## Mandatory read order
 
-任何员工相关需求，必须先读：
+For any employee-system task, read in this order before changing code, workflow, docs, or reports:
 
 1. `README.md`
 2. `AI_ENGINEER_START_HERE.md`
 3. `EMPLOYEE_SYSTEM_ROLES.md`
-4. 对应 `EMPLOYEE*_OPERATION_RUNBOOK.md`
-5. 对应 runner 主脚本
-6. 对应 workflow
+4. The relevant `EMPLOYEE*_OPERATION_RUNBOOK.md`
+5. The relevant runner or report script
+6. The relevant workflow
+7. The relevant report or artifact directory
 
-## 文件治理硬规则
+## File hygiene rules
 
-仓库必须保持干净，规则集中，按一级、二级、三级分层管理。
+The repository must stay clean, centralized, and layered.
 
-一级总规则文件固定为：
+Top-level rule files are limited to:
 
 ```text
 README.md
@@ -31,7 +34,7 @@ AI_ENGINEER_START_HERE.md
 EMPLOYEE_SYSTEM_ROLES.md
 ```
 
-二级员工手册固定使用：
+Employee runbooks must use the existing pattern:
 
 ```text
 EMPLOYEE0_OPERATION_RUNBOOK.md
@@ -43,43 +46,51 @@ EMPLOYEE5_OPERATION_RUNBOOK.md
 EMPLOYEE6_OPERATION_RUNBOOK.md
 ```
 
-禁止乱建 `FINAL`、`V2`、`TEMP`、`PATCH`、`NOTE`、`CHANGE_LOG`、`DOCUMENT_MAP` 等散文件。长期规则必须写回一级总文档或对应员工 runbook，不能只在聊天里执行不入档。
+Do not create scattered files such as `FINAL`, `V2`, `TEMP`, `PATCH`, `NOTE`, `CHANGE_LOG`, or `DOCUMENT_MAP`. Long-term rules must be written back to the top-level docs or the relevant employee runbook.
 
-## 员工 Python 文件硬规则
+## Hard rule: no standalone Python file for a single employee feature
 
-硬性规则：任何已落地员工的新增功能、评分、报告、归因、审计、修复或增强逻辑，默认必须合并进该员工已有主脚本或已有报告脚本。
+For any already-landed employee, a new feature, score, report, attribution module, audit module, fix, patch, or enhancement must be merged into that employee's existing main script or existing report script by default.
 
-不允许为了单个功能单独新建新的 `.py` 文件。
+Do not create a new `.py` file for one standalone feature.
 
-例如：五号员工的归因命中分必须合并进既有五号脚本，不能单独新建 `employee5_reason_score.py`、`employee5_score.py`、`employee5_patch.py` 等散文件。
+Example: Employee 5 reason-hit scoring must be merged into the existing Employee 5 script/report script. Do not create files such as:
 
-只有用户明确单独批准，并同步更新 `EMPLOYEE_SYSTEM_ROLES.md`、对应员工 runbook、workflow 和验收说明后，才允许新增员工级 Python 文件。否则，新增散 PY 一律视为文件治理违规和猴子代码风险，必须立即删除并合并回既有脚本。
+```text
+employee5_reason_score.py
+employee5_score.py
+employee5_patch.py
+```
 
-## 工程验收规则
+A new employee-level Python file is allowed only when the user explicitly approves it, and only after updating `EMPLOYEE_SYSTEM_ROLES.md`, the relevant employee runbook, the workflow, and the validation notes.
 
-不能只在聊天里说已经改好。必须以 GitHub 实际文件、commit sha、复查结果和运行证据为准。
+If a standalone employee Python file is created without explicit approval, it is a file-governance violation and a monkey-code risk. It must be deleted and merged back into the existing employee script.
 
-回复用户时必须区分：
+## Validation rules
 
-- 已提交：GitHub 已返回 commit sha。
-- 已复查：重新读取 GitHub 文件，确认内容真实存在。
-- 已验证：workflow、artifact、日志或 Telegram 消息产生预期结果。
+Never say a change is done unless it is backed by GitHub evidence.
 
-如果工兛报错、被拦截、冲筁或没有返回 commit sha，必须明确说明没有落地，不能假装成功。
+Always distinguish:
 
-## 禁止事项
+- Submitted: GitHub returned a commit SHA or PR.
+- Rechecked: the GitHub file was read again and the content is actually present.
+- Verified: workflow, artifact, logs, or Telegram output confirms the expected result.
 
-- 禁止先搜私有仓库。
-- 禁止把私有仓库结果覆盖 public 仓库结果。
-- 禁止没读 runbook 就改 workflow。
-- 禁止只执行用户要求、不记录用户要求。
-- 禁止为员工单个功能、补丁、评分或报告增强单独新建 `.py` 文件；必须合并进既有员工脚本，除非用户明确批准。
-- 禁止没有 commit sha 却说已提交。
-- 禁止没有复查文件却说已复查。
-- 禁止没有 workflow、artifact、日志或消息证据却说已验证。
+If a tool errors, is blocked, conflicts, or does not return a commit SHA, say clearly that it did not land.
 
-## 一句话原则
+## Hard bans
 
-整个员工系统只有一个默认事实源：`driveaway1207/stock-alert-public-runner`。
+- Do not use the private repo as the default source.
+- Do not overwrite public-repo facts with private-repo facts.
+- Do not edit workflow before reading the relevant runbook.
+- Do not execute user requests without recording long-term rules in the proper docs.
+- Do not create a standalone `.py` file for a single employee feature unless the user explicitly approves it.
+- Do not claim submitted without a commit SHA or PR.
+- Do not claim rechecked without reading the file back.
+- Do not claim verified without workflow, artifact, logs, or Telegram evidence.
 
-仓库文件必须干净、集中、分层；不要乱建一堆文件，也不要为单个员工功能单独新建散乱 Python 文件。
+## One-line rule
+
+The employee system has one default source of truth: `driveaway1207/stock-alert-public-runner`.
+
+Keep files clean, centralized, and layered. Do not create scattered Python files for single employee features.
