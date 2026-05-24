@@ -262,3 +262,18 @@ AI_ENGINEER_STRATEGY_REGISTRY.md
 - 当前旧总账检查：
   - 无
 - 六号处理：只记录事实；不生成散文档；不判断成功经验。
+
+<!-- employee6-track:3d5d9b384db2 -->
+### 2026-05-24 13:00:38 UTC｜push｜`3d5d9b384db2`
+
+- 运行：`85`｜触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- workflow结果：无，本次不是 workflow_run 事件。
+- commit message：Update employee5 runbook with quantified cause-pool formulas
+- 文件归类：{"docs": 1}
+- 修改路径：
+  - `EMPLOYEE5_OPERATION_RUNBOOK.md`
+- 当前散文档检查：
+  - 无
+- 当前旧总账检查：
+  - 无
+- 六号处理：只记录事实；不生成散文档；不判断成功经验。
