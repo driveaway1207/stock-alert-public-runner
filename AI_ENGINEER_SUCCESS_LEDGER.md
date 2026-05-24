@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:0923f123a543 -->
+## 2026-05-24 06:53:32 UTC｜自动沉淀候选：`0923f123a543`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：docs: add global employee identity lock rule
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee6_docs": 1}
+- 对应路径：
+- `AI_ENGINEER_FINAL_RULES_INDEX.md`
+
+
 <!-- employee6-ledger:89dc430eeaab -->
 ## 2026-05-24 06:44:36 UTC｜自动沉淀候选：`89dc430eeaab`
 
