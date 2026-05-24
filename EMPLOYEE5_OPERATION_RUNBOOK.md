@@ -359,3 +359,119 @@ fifth_employee.yml        固定不动，只负责运行链路
 ## 13. 一句话总结
 
 五号员工的正确定位是：每天全量统计涨停样本，按 20 日/月线窗口涨幅挑选 3 只周期性大涨的强势样本，用多数据源 K 线链路做 30+ 跨维度历史路径归因，把“什么样的股票容易涨停”沉淀成可验证的经验库，服务一号、二号、三号和零号员工，而不是让用户第二天追涨。
+
+---
+
+## 自动归档记录
+
+本区由六号员工追加，记录该员工相关代码、文档、workflow、报告规范、运行链路改动。
+
+<!-- employee6-employee-5:de977f3c62fd -->
+### 2026-05-24 10:24:22 UTC｜Commit `de977f3c62fd`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Fix employee5 runbook retained-docs wording
+- 自动归类：{"docs": 1}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `EMPLOYEE5_OPERATION_RUNBOOK.md`
+
+<!-- employee6-employee-5:4f386a9cfeed -->
+### 2026-05-24 10:24:22 UTC｜Commit `4f386a9cfeed`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Remove merged employee5 change log
+- 自动归类：{"docs": 1}
+- 归档判断：员工代码或文档常规更新。
+- 修改路径：
+  - `EMPLOYEE5_CHANGE_LOG.md`
+
+<!-- employee6-employee-5:751105943ee8 -->
+### 2026-05-24 10:24:22 UTC｜Commit `751105943ee8`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Remove merged employee5 structure spec
+- 自动归类：{"docs": 1}
+- 归档判断：员工代码或文档常规更新。
+- 修改路径：
+  - `EMPLOYEE5_STRUCTURE_ARCHETYPE_SPEC.md`
+
+<!-- employee6-employee-5:091d1bbcc3e3 -->
+### 2026-05-24 10:24:22 UTC｜Commit `091d1bbcc3e3`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Remove merged employee5 report spec
+- 自动归类：{"docs": 1}
+- 归档判断：报告输出/格式更新。
+- 修改路径：
+  - `EMPLOYEE5_REPORT_SPEC.md`
+
+<!-- employee6-employee-5:83aa72e4632c -->
+### 2026-05-24 10:24:22 UTC｜Commit `83aa72e4632c`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Remove merged employee5 dimension spec
+- 自动归类：{"docs": 1}
+- 归档判断：员工代码或文档常规更新。
+- 修改路径：
+  - `EMPLOYEE5_DIMENSION_SPEC.md`
+
+<!-- employee6-employee-5:bd6d8b388aff -->
+### 2026-05-24 10:24:22 UTC｜Commit `bd6d8b388aff`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Consolidate employee5 docs into operation runbook
+- 自动归类：{"docs": 1}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `EMPLOYEE5_OPERATION_RUNBOOK.md`
+
+<!-- employee6-employee-5:dea8dfece3eb -->
+### 2026-05-24 10:24:22 UTC｜Commit `dea8dfece3eb`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Document employee5 user requirements difficulties and solutions
+- 自动归类：{"docs": 1}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `EMPLOYEE5_OPERATION_RUNBOOK.md`
+
+<!-- employee6-employee-5:59cf804a22ec -->
+### 2026-05-24 10:24:22 UTC｜Commit `59cf804a22ec`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Add issue comment trigger for employee5 structural report retry
+- 自动归类：{"workflow": 1}
+- 归档判断：workflow/自动运行链路更新。
+- 修改路径：
+  - `.github/workflows/fifth_employee.yml`
+
+<!-- employee6-employee-5:02b5be7262b4 -->
+### 2026-05-24 10:24:22 UTC｜Commit `02b5be7262b4`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Run employee5 structural archetype report after base data build
+- 自动归类：{"workflow": 1}
+- 归档判断：workflow/自动运行链路更新。
+- 修改路径：
+  - `.github/workflows/fifth_employee.yml`
+
+<!-- employee6-employee-5:b99566ef8f32 -->
+### 2026-05-24 10:24:22 UTC｜Commit `b99566ef8f32`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Add valid employee5 structural archetype report
+- 自动归类：{"code": 1}
+- 归档判断：报告输出/格式更新。
+- 修改路径：
+  - `employee5_structural_report.py`

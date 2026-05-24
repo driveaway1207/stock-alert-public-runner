@@ -93,3 +93,20 @@ employee0_reports/employee0_audit_report.json
 ```text
 零号员工负责抓代码风险、生产链路风险和员工身份漂移风险；六号员工负责把所有人的动作和经验记录进档案。
 ```
+
+---
+
+## 自动归档记录
+
+本区由六号员工追加，记录该员工相关代码、文档、workflow、报告规范、运行链路改动。
+
+<!-- employee6-employee-0:3fff1d7c8f5a -->
+### 2026-05-24 10:24:22 UTC｜Commit `3fff1d7c8f5a`
+
+- 事件：`workflow_run`｜运行：`66`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：docs: add employee identity drift audit rule
+- 自动归类：{"docs": 1}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `EMPLOYEE0_OPERATION_RUNBOOK.md`
