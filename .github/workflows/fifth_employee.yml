@@ -5,11 +5,11 @@ run-name: 五号员工
   workflow_dispatch:
     inputs:
       employee5_target_date:
-        description: "五号员工分析日/可示。格式为�YYY-MM-DD或YYYYMDDC��空=最近交文日"
+        description: "Employee5 target date, empty means latest trade day"
         required: false
         default: ""
       max_stocks:
-        description: "最多分析溫停栴本数里"
+        description: "Max limit-up samples to analyze"
         required: false
         default: "300"
   schedule:
