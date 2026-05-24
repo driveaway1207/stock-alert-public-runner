@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:838146d52aec -->
+## 2026-05-24 02:16:14 UTC｜自动沉淀候选：`838146d52aec`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Add production locked areas manual
+- 经验归纳：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `PRODUCTION_LOCKED_AREAS.md`
+
+
 <!-- employee6-ledger:529e0b6ae8b3 -->
 ## 2026-05-24 02:15:40 UTC｜自动沉淀候选：`529e0b6ae8b3`
 
