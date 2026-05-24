@@ -17,11 +17,14 @@ RUN_ID = os.getenv("GITHUB_RUN_ID", "")
 RUN_NUMBER = os.getenv("GITHUB_RUN_NUMBER", "")
 ACTOR = os.getenv("GITHUB_ACTOR", "")
 REPO = os.getenv("GITHUB_REPOSITORY", "driveaway1207/stock-alert-public-runner")
+AUTO_COMMIT_PREFIX = "[employee6-skip]"
 
-CN_NUM = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
-CN_TO_NUM = {v: k for k, v in CN_NUM.items()}
+CN_NUM = {0: "零", 1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 
 WORKFLOW_EMPLOYEE_HINTS = {
+    "employee0": 0,
+    "zero_employee": 0,
+    "code_auditor": 0,
     "stock_alert": 1,
     "one_employee": 1,
     "employee1": 1,
@@ -58,14 +61,7 @@ def read_event() -> Dict:
 def recent_shas(limit: int = 40) -> List[str]:
     event = read_event()
     shas: List[str] = []
-    if EVENT_NAME == "push":
-        for c in event.get("commits", []) or []:
-            s = c.get("id") or c.get("sha")
-            if s:
-                shas.append(str(s))
-        if SHA:
-            shas.append(SHA)
-    elif EVENT_NAME == "workflow_run":
+    if EVENT_NAME == "workflow_run":
         wr = event.get("workflow_run", {}) or {}
         if wr.get("head_sha"):
             shas.append(str(wr["head_sha"]))
@@ -73,7 +69,7 @@ def recent_shas(limit: int = 40) -> List[str]:
         shas.append(SHA)
     out = sh(["git", "log", f"-{limit}", "--pretty=%H"])
     shas.extend(x.strip() for x in out.splitlines() if x.strip())
-    return list(dict.fromkeys(x for x in shas if x))[:60]
+    return list(dict.fromkeys(x for x in shas if x))[:50]
 
 
 def commit_message(sha: str) -> str:
@@ -82,6 +78,10 @@ def commit_message(sha: str) -> str:
 
 def commit_files(sha: str) -> List[str]:
     return [x for x in sh(["git", "show", "--name-only", "--pretty=format:", sha]).splitlines() if x.strip()]
+
+
+def is_self_archive_commit(msg: str) -> bool:
+    return msg.strip().startswith(AUTO_COMMIT_PREFIX)
 
 
 def detect_employees_from_text(text: str) -> Set[int]:
@@ -95,7 +95,7 @@ def detect_employees_from_text(text: str) -> Set[int]:
     for n, cn in CN_NUM.items():
         if f"{cn}号员工" in text:
             ids.add(n)
-    return {x for x in ids if 1 <= x <= 30}
+    return {x for x in ids if 0 <= x <= 30}
 
 
 def detect_employees_from_files(files: List[str]) -> Set[int]:
@@ -109,11 +109,13 @@ def detect_employees_from_files(files: List[str]) -> Set[int]:
                     ids.add(n)
         if p == "stock_alert.py" or p.endswith("/stock_alert.py"):
             ids.add(1)
+        if p.startswith("employee0_reports/"):
+            ids.add(0)
         if p.startswith("employee5_reports/"):
             ids.add(5)
         if p in {"ai_engineer_change_log.md", "ai_engineer_success_ledger.md", "ai_engineer_final_rules_index.md", "ai_engineer_document_map.md", "ai_engineer_strategy_registry.md"}:
             ids.add(6)
-    return {x for x in ids if 1 <= x <= 30}
+    return {x for x in ids if 0 <= x <= 30}
 
 
 def classify_files(files: List[str]) -> Dict[str, int]:
@@ -159,16 +161,13 @@ def employee_file(employee_id: int) -> Path:
 
 def employee_header(employee_id: int) -> str:
     cn = CN_NUM.get(employee_id, str(employee_id))
-    return f"# {cn}号员工变更档案\n\n本文件由六号员工自动维护。凡是识别为 {cn}号员工 相关的代码、文档、workflow、报告规范、运行链路改动，都会实时记录到这里。\n"
+    return f"# {cn}号员工变更档案\n\n本文件由六号员工自动维护。凡是识别为 {cn}号员工 相关的代码、文档、workflow、报告规范、运行链路改动，都会记录到这里。\n"
 
 
 def append_entry(employee_id: int, sha: str, msg: str, files: List[str]) -> bool:
     path = employee_file(employee_id)
     header = employee_header(employee_id)
-    if path.exists():
-        text = path.read_text(encoding="utf-8")
-    else:
-        text = header
+    text = path.read_text(encoding="utf-8") if path.exists() else header
     mk = marker(employee_id, sha)
     if mk in text:
         return False
@@ -186,8 +185,7 @@ def append_entry(employee_id: int, sha: str, msg: str, files: List[str]) -> bool
         "\n".join(f"  - `{f}`" for f in files[:40]) if files else "  - 无",
         "",
     ])
-    text = text.rstrip() + "\n" + entry
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text.rstrip() + "\n" + entry, encoding="utf-8")
     return True
 
 
@@ -195,10 +193,10 @@ def main() -> None:
     changed = False
     for sha in recent_shas(40):
         msg = commit_message(sha)
+        if is_self_archive_commit(msg):
+            continue
         files = commit_files(sha)
         ids = detect_employees_from_text(msg) | detect_employees_from_files(files)
-        if not ids:
-            continue
         for employee_id in sorted(ids):
             changed = append_entry(employee_id, sha, msg, files) or changed
     print("employee6 per-employee archives updated" if changed else "employee6 per-employee archives no changes")
