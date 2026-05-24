@@ -1,5 +1,325 @@
 # AI 工程师代码变更流水账
 
+<!-- employee6-change:e61273bd91ef -->
+## 2026-05-24 01:54:40 UTC｜Commit `e61273bd91ef`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Make global kline period rules prominent in README
+- 自动归类：{"global_docs": 1}
+- 可能目的：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 修改路径：
+- `README.md`
+
+
+<!-- employee6-change:c471e71818a0 -->
+## 2026-05-24 01:54:40 UTC｜Commit `c471e71818a0`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Record proactive AI success experience rule
+- 自动归类：{"global_docs": 1}
+- 可能目的：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 修改路径：
+- `AI_ENGINEER_START_HERE.md`
+
+
+<!-- employee6-change:08eb2357ade6 -->
+## 2026-05-24 01:54:40 UTC｜Commit `08eb2357ade6`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Use BaoStock first for employee5 historical K lines
+- 自动归类：{"employee5": 1}
+- 可能目的：历史K线数据源口径：BaoStock/Bostock优先，AKShare辅助，东方财富最后兜底。
+- 修改路径：
+- `employee5_runner.py`
+
+
+<!-- employee6-change:77309eb3a4d6 -->
+## 2026-05-24 01:54:40 UTC｜Commit `77309eb3a4d6`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Install BaoStock for employee5 workflow
+- 自动归类：{"workflow": 1}
+- 可能目的：历史K线数据源口径：BaoStock/Bostock优先，AKShare辅助，东方财富最后兜底。
+- 修改路径：
+- `.github/workflows/fifth_employee.yml`
+
+
+<!-- employee6-change:96caa95045d0 -->
+## 2026-05-24 01:54:40 UTC｜Commit `96caa95045d0`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Document BaoStock-first K-line source priority
+- 自动归类：{"global_docs": 1}
+- 可能目的：历史K线数据源口径：BaoStock/Bostock优先，AKShare辅助，东方财富最后兜底。
+- 修改路径：
+- `AI_ENGINEER_START_HERE.md`
+
+
+<!-- employee6-change:4444da55f674 -->
+## 2026-05-24 01:54:40 UTC｜Commit `4444da55f674`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Update employee5 runbook with BaoStock-first data source rule
+- 自动归类：{"employee5": 1}
+- 可能目的：历史K线数据源口径：BaoStock/Bostock优先，AKShare辅助，东方财富最后兜底。
+- 修改路径：
+- `EMPLOYEE5_OPERATION_RUNBOOK.md`
+
+
+<!-- employee6-change:dc05501c8a1f -->
+## 2026-05-24 01:54:40 UTC｜Commit `dc05501c8a1f`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add employee6 document curator script
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee6_doc_curator.py`
+
+
+<!-- employee6-change:914c16ed8c55 -->
+## 2026-05-24 01:54:40 UTC｜Commit `914c16ed8c55`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add employee6 operation runbook
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `EMPLOYEE6_OPERATION_RUNBOOK.md`
+
+
+<!-- employee6-change:b1aaa0b1e2aa -->
+## 2026-05-24 01:54:40 UTC｜Commit `b1aaa0b1e2aa`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add AI engineer document map
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 修改路径：
+- `AI_ENGINEER_DOCUMENT_MAP.md`
+
+
+<!-- employee6-change:31a16241fd6e -->
+## 2026-05-24 01:54:40 UTC｜Commit `31a16241fd6e`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add employee6 auto documentation workflow
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:3d208960a3c1 -->
+## 2026-05-24 01:54:40 UTC｜Commit `3d208960a3c1`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add employee6 auto template generator
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee6_auto_templates.py`
+
+
+<!-- employee6-change:45b57b9147ab -->
+## 2026-05-24 01:54:40 UTC｜Commit `45b57b9147ab`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Run employee6 auto template generator
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:6e93aab3d1f7 -->
+## 2026-05-24 01:54:40 UTC｜Commit `6e93aab3d1f7`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Reduce employee6 auto-run frequency to avoid workflow contention
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:bbe310d7b01d -->
+## 2026-05-24 01:54:40 UTC｜Commit `bbe310d7b01d`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Restore employee6 push monitoring without blocking main tasks
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:b6a9d34a5ee6 -->
+## 2026-05-24 01:54:40 UTC｜Commit `b6a9d34a5ee6`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Make employee6 backfill recent commits in real time
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee6_doc_curator.py`
+
+
+<!-- employee6-change:2c2a9f1956b5 -->
+## 2026-05-24 01:54:40 UTC｜Commit `2c2a9f1956b5`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add employee6 per-employee change archiver
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee6_employee_archiver.py`
+
+
+<!-- employee6-change:c94c06925b27 -->
+## 2026-05-24 01:54:40 UTC｜Commit `c94c06925b27`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Archive every employee action into its own employee file
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:ad9c37722b48 -->
+## 2026-05-24 01:54:40 UTC｜Commit `ad9c37722b48`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add zero employee code auditor
+- 自动归类：{"employee0": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee0_code_auditor.py`
+
+
+<!-- employee6-change:d493e239f96e -->
+## 2026-05-24 01:54:40 UTC｜Commit `d493e239f96e`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add zero employee code audit workflow
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee0_code_auditor.yml`
+
+
+<!-- employee6-change:b318d584ab9b -->
+## 2026-05-24 01:54:40 UTC｜Commit `b318d584ab9b`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Harden employee6 realtime recording for all employees
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:9416cb6d93a6 -->
+## 2026-05-24 01:54:40 UTC｜Commit `9416cb6d93a6`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Add zero employee operation runbook
+- 自动归类：{"employee0": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `EMPLOYEE0_OPERATION_RUNBOOK.md`
+
+
+<!-- employee6-change:a2c789a46e08 -->
+## 2026-05-24 01:54:40 UTC｜Commit `a2c789a46e08`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Update employee6 runbook with zero-six audit archive flow
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `EMPLOYEE6_OPERATION_RUNBOOK.md`
+
+
+<!-- employee6-change:295748e49bb6 -->
+## 2026-05-24 01:54:40 UTC｜Commit `295748e49bb6`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Separate zero audit trigger from employee6 archive trigger
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:f42c3e3a563b -->
+## 2026-05-24 01:54:40 UTC｜Commit `f42c3e3a563b`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Record low frequency employee6 backfill rule
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `EMPLOYEE6_OPERATION_RUNBOOK.md`
+
+
+<!-- employee6-change:e1c04d1c8a25 -->
+## 2026-05-24 01:54:40 UTC｜Commit `e1c04d1c8a25`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Set employee6 daily fallback schedule
+- 自动归类：{"workflow": 1}
+- 可能目的：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 修改路径：
+- `.github/workflows/employee6_doc_curator.yml`
+
+
+<!-- employee6-change:b58df3eaabfe -->
+## 2026-05-24 01:54:40 UTC｜Commit `b58df3eaabfe`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- message：Fix employee6 archive dedupe and skip self commits
+- 自动归类：{"employee6_docs": 1}
+- 可能目的：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 修改路径：
+- `employee6_doc_curator.py`
+
+
+<!-- employee6-workflow:workflow-____-8-success -->
+## 2026-05-24 01:54:40 UTC｜workflow运行结果：`零号员工` #8
+
+- 状态：status=`completed`，conclusion=`success`
+- 链接：https://github.com/driveaway1207/stock-alert-public-runner/actions/runs/26349029804
+- 归档规则：运行结果进入六号员工总账；代码风险由零号员工审计，六号员工只归档。
+
+
 <!-- employee6-change:workflow_run-26349012633-e1c04d1c8a25-cc15d20fabc5-7c27f74eeffd-9b78df5fa9d1-d844caa4abfc-70b210a607a5-f4 -->
 ## 2026-05-24 01:53:31 UTC｜事件：workflow_run｜运行：22
 

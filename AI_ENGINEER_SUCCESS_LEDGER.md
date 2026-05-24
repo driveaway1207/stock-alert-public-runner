@@ -1,5 +1,27 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:ad9c37722b48 -->
+## 2026-05-24 01:54:40 UTC｜自动沉淀候选：`ad9c37722b48`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Add zero employee code auditor
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee0": 1}
+- 对应路径：
+- `employee0_code_auditor.py`
+
+
+<!-- employee6-ledger:b58df3eaabfe -->
+## 2026-05-24 01:54:40 UTC｜自动沉淀候选：`b58df3eaabfe`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Fix employee6 archive dedupe and skip self commits
+- 经验归纳：员工体系更新：涉及员工脚本、员工手册、workflow或报告规范。
+- 影响范围：{"employee6_docs": 1}
+- 对应路径：
+- `employee6_doc_curator.py`
+
+
 <!-- employee6-ledger:workflow-____-7-success -->
 ## 2026-05-24 01:53:31 UTC｜workflow运行结果：`零号员工` #7
 

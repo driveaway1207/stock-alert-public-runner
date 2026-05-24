@@ -364,3 +364,28 @@
   - `AI_ENGINEER_SUCCESS_LEDGER.md`
   - `EMPLOYEE5_CHANGE_LOG.md`
   - `EMPLOYEE6_CHANGE_LOG.md`
+
+<!-- employee6-employee-6:b58df3eaabfe -->
+## 2026-05-24 01:54:40 UTC｜Commit `b58df3eaabfe`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Fix employee6 archive dedupe and skip self commits
+- 自动归类：{"code": 1}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `employee6_doc_curator.py`
+
+<!-- employee6-employee-6:a4070a24a25f -->
+## 2026-05-24 01:54:40 UTC｜Commit `a4070a24a25f`
+
+- 事件：`workflow_run`｜运行：`23`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：[employee6-skip] 六号员工自动更新文档账本
+- 自动归类：{"docs": 4}
+- 归档判断：文档/操作手册/成功经验更新。
+- 修改路径：
+  - `AI_ENGINEER_CHANGE_LOG.md`
+  - `AI_ENGINEER_SUCCESS_LEDGER.md`
+  - `EMPLOYEE5_CHANGE_LOG.md`
+  - `EMPLOYEE6_CHANGE_LOG.md`
