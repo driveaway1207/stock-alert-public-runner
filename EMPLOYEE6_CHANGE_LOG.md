@@ -433,3 +433,14 @@
 - 归档判断：文档/操作手册/成功经验更新。
 - 修改路径：
   - `EMPLOYEE6_OPERATION_RUNBOOK.md`
+
+<!-- employee6-employee-6:d8277fb4ae96 -->
+## 2026-05-24 10:13:36 UTC｜Commit `d8277fb4ae96`
+
+- 事件：`workflow_run`｜运行：`62`
+- 触发人：`driveaway1207`｜仓库：`driveaway1207/stock-alert-public-runner`
+- commit message：Remove merged employee6 report spec
+- 自动归类：{"docs": 1}
+- 归档判断：报告输出/格式更新。
+- 修改路径：
+  - `EMPLOYEE6_REPORT_SPEC.md`
