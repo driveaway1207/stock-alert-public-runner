@@ -2,6 +2,13 @@ name: 六号员工
 run-name: 六号员工
 
 on:
+  push:
+    branches:
+      - main
+  workflow_run:
+    workflows: ['零号员工', '一号员工', '二号员工', '三号员工', '四号员工', '五号员工']
+    types:
+      - completed
   workflow_dispatch:
 
 concurrency:
@@ -9,19 +16,26 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
-  inspect-docs:
-    name: 六号员工-手动文档清洁检查
+  track-docs:
+    name: 六号员工-自动跟踪记录
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, '[employee6-skip]') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 20
+          fetch-depth: 40
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       - run: python -u employee6_doc_curator.py
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: '[employee6-skip] 六号员工更新主手册跟踪记录'
+          file_pattern: 'EMPLOYEE6_OPERATION_RUNBOOK.md'
+          commit_user_name: employee6-doc-curator
+          commit_user_email: employee6-doc-curator@users.noreply.github.com
