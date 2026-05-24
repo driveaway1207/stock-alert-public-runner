@@ -4,7 +4,7 @@ run-name: 六号员工
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 16 * * *'
   workflow_run:
     workflows: ['零号员工', '一号员工', '二号员工', '三号员工', '四号员工', '五号员工']
     types: [completed]
