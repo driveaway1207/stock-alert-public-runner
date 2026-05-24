@@ -39,6 +39,10 @@ WORKFLOW_EMPLOYEE_HINTS = {
     "doc_curator": 6,
 }
 
+# 文档合并原则：
+# 六号不得再生成 EMPLOYEE{n}_CHANGE_LOG.md。
+# 所有分员工归档写入 EMPLOYEE{n}_OPERATION_RUNBOOK.md 的“自动归档记录”区域。
+
 
 def now_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -156,25 +160,31 @@ def marker(employee_id: int, sha: str) -> str:
 
 
 def employee_file(employee_id: int) -> Path:
-    return ROOT / f"EMPLOYEE{employee_id}_CHANGE_LOG.md"
+    return ROOT / f"EMPLOYEE{employee_id}_OPERATION_RUNBOOK.md"
 
 
 def employee_header(employee_id: int) -> str:
     cn = CN_NUM.get(employee_id, str(employee_id))
-    return f"# {cn}号员工变更档案\n\n本文件由六号员工自动维护。凡是识别为 {cn}号员工 相关的代码、文档、workflow、报告规范、运行链路改动，都会记录到这里。\n"
+    return f"# {cn}号员工运行总手册\n\n本文件由六号员工自动创建。后续所有 {cn}号员工 相关说明、报告规范、变更记录和运行经验统一写入本主手册，不再创建散文档。\n"
+
+
+def ensure_archive_section(text: str) -> str:
+    if "## 自动归档记录" in text:
+        return text
+    return text.rstrip() + "\n\n---\n\n## 自动归档记录\n\n本区由六号员工追加，记录该员工相关代码、文档、workflow、报告规范、运行链路改动。\n"
 
 
 def append_entry(employee_id: int, sha: str, msg: str, files: List[str]) -> bool:
     path = employee_file(employee_id)
-    header = employee_header(employee_id)
-    text = path.read_text(encoding="utf-8") if path.exists() else header
+    text = path.read_text(encoding="utf-8") if path.exists() else employee_header(employee_id)
+    text = ensure_archive_section(text)
     mk = marker(employee_id, sha)
     if mk in text:
         return False
     entry = "\n".join([
         "",
         mk,
-        f"## {now_text()}｜Commit `{sha[:12]}`",
+        f"### {now_text()}｜Commit `{sha[:12]}`",
         "",
         f"- 事件：`{EVENT_NAME}`｜运行：`{RUN_NUMBER or RUN_ID or 'local'}`",
         f"- 触发人：`{ACTOR or 'unknown'}`｜仓库：`{REPO}`",
@@ -199,7 +209,7 @@ def main() -> None:
         ids = detect_employees_from_text(msg) | detect_employees_from_files(files)
         for employee_id in sorted(ids):
             changed = append_entry(employee_id, sha, msg, files) or changed
-    print("employee6 per-employee archives updated" if changed else "employee6 per-employee archives no changes")
+    print("employee6 per-employee runbooks updated" if changed else "employee6 per-employee runbooks no changes")
 
 
 if __name__ == "__main__":
