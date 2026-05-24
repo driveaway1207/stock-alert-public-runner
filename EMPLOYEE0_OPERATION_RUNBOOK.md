@@ -16,6 +16,28 @@
 - workflow 误改。
 - PAT / token / secrets 误伤。
 - 缓存、Telegram、BaoStock、artifact 等生产链路误伤。
+- 员工名字、身份、职责、workflow 显示名、报告身份未经用户明确要求被改。
+
+## 1.1 员工身份与命名锁定红线
+
+所有员工的中文名字、编号、身份定位、职责边界、workflow 显示名、报告标题和主脚本身份，默认全部锁定。
+
+正确原则：
+
+- 用户明确要求改名、改身份、改职责，才允许修改。
+- 用户没有明确要求时，AI 工程师不能自己理解、发挥、包装、重命名或重新解释员工身份。
+- “为了更专业”“为了统一命名”“为了架构升级”都不能成为擅自改名的理由。
+- 任何未授权的名字漂移、身份漂移、职责漂移，都按猴子代码风险处理。
+- 零号员工必须把这类问题列为 P0/P1 审计项，而不是当成文档小问题。
+
+审计时必须检查：
+
+- `EMPLOYEE_SYSTEM_ROLES.md` 中员工身份是否仍是用户确认过的口径。
+- `.github/workflows/*.yml` 的 `name` / `run-name` / job name 是否擅自改了员工名。
+- 员工主脚本、报告标题、artifact 名、报告目录是否出现未经授权的新名字或旧名字回流。
+- 是否出现“把某员工改成另一个员工职责”的情况，例如把研究员改成审计官、把归因员工改成买入推荐员工。
+
+允许修改的前提只有一个：用户明确说要改，并且本次修改记录清楚说明“这是用户要求”。
 
 ## 2. 与六号员工分工
 
@@ -55,6 +77,7 @@ employee0_reports/employee0_audit_report.json
 - 受保护文件：`stock_alert.py`、`.github/workflows/`、各员工主脚本、缓存目录、推送链路。
 - 敏感关键词：PAT、GH_PAT、GITHUB_TOKEN、secrets、Telegram token、DATA_GATE_TARGET_DATE、LAST_TRADE_DAY、BaoStock、cache、artifact。
 - 猴子代码信号：monkey、patch、wrapper、quick fix、临时、TODO、FIXME、hardcode、eval、exec、os.system 等。
+- 身份漂移信号：员工名字、编号、职责、workflow 显示名、报告标题、报告目录、主脚本身份在没有用户明确要求时被改。
 
 ## 6. 禁止事项
 
@@ -63,9 +86,10 @@ employee0_reports/employee0_audit_report.json
 - 不要把审计结果包装成成功经验。
 - 不要替六号员工写长期文档账本。
 - 不要误伤 PAT、secrets、token。
+- 不要未经用户明确要求修改任何员工的名字、身份、职责、workflow 显示名或报告身份。
 
 ## 7. 一句话总结
 
 ```text
-零号员工负责抓代码风险，六号员工负责把所有人的动作和经验记录进档案。
+零号员工负责抓代码风险、生产链路风险和员工身份漂移风险；六号员工负责把所有人的动作和经验记录进档案。
 ```
