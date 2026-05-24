@@ -67,6 +67,19 @@ def current_sha_from_event(event: Dict) -> str:
     return SHA or sh(["git", "rev-parse", "HEAD"])
 
 
+def workflow_context(event: Dict) -> Dict:
+    if EVENT_NAME != "workflow_run":
+        return {}
+    wr = event.get("workflow_run", {}) or {}
+    return {
+        "workflow_name": str(wr.get("name") or ""),
+        "workflow_status": str(wr.get("status") or ""),
+        "workflow_conclusion": str(wr.get("conclusion") or ""),
+        "workflow_run_number": str(wr.get("run_number") or ""),
+        "workflow_url": str(wr.get("html_url") or ""),
+    }
+
+
 def commit_message(sha: str) -> str:
     return sh(["git", "log", "-1", "--pretty=%B", sha]) if sha else ""
 
@@ -102,7 +115,7 @@ def classify(files: list[str]) -> dict[str, int]:
 def ensure_section(text: str) -> str:
     if "## 自动跟踪记录" in text:
         return text
-    return text.rstrip() + "\n\n---\n\n## 自动跟踪记录\n\n本区由六号员工自动追加，只记录关键事实：触发事件、commit、修改路径、是否发现散文档。六号不得在本区判断成功经验。\n"
+    return text.rstrip() + "\n\n---\n\n## 自动跟踪记录\n\n本区由六号员工自动追加，只记录关键事实：触发事件、commit、修改路径、workflow结果、是否发现散文档。六号不得在本区判断成功经验。\n"
 
 
 def marker(sha: str) -> str:
@@ -110,17 +123,25 @@ def marker(sha: str) -> str:
     return f"<!-- employee6-track:{safe} -->"
 
 
-def build_entry(sha: str, msg: str, files: list[str], scattered: list[str], global_ledgers: list[str]) -> str:
+def build_entry(sha: str, msg: str, files: list[str], scattered: list[str], global_ledgers: list[str], wf: Dict) -> str:
     title_msg = msg.splitlines()[0] if msg else "无"
     changed_paths = "\n".join(f"  - `{x}`" for x in files[:40]) if files else "  - 无"
     scattered_text = "\n".join(f"  - `{x}`" for x in scattered) if scattered else "  - 无"
     global_text = "\n".join(f"  - `{x}`" for x in global_ledgers) if global_ledgers else "  - 无"
+    workflow_lines = ["- workflow结果：无，本次不是 workflow_run 事件。"]
+    if wf:
+        workflow_lines = [
+            f"- workflow：`{wf.get('workflow_name') or 'unknown'}` #{wf.get('workflow_run_number') or 'unknown'}",
+            f"- workflow状态：status=`{wf.get('workflow_status') or 'unknown'}`，conclusion=`{wf.get('workflow_conclusion') or 'unknown'}`",
+            f"- workflow链接：{wf.get('workflow_url') or '无'}",
+        ]
     return "\n".join([
         "",
         marker(sha),
         f"### {now_text()}｜{EVENT_NAME}｜`{sha[:12] if sha else 'unknown'}`",
         "",
         f"- 运行：`{RUN_NUMBER or RUN_ID or 'local'}`｜触发人：`{ACTOR or 'unknown'}`｜仓库：`{REPO}`",
+        *workflow_lines,
         f"- commit message：{title_msg}",
         f"- 文件归类：{json.dumps(classify(files), ensure_ascii=False)}",
         "- 修改路径：",
@@ -148,6 +169,7 @@ def main() -> None:
         scattered.extend(list_matches(pattern))
     scattered = sorted(set(scattered))
     global_ledgers = sorted(name for name in GLOBAL_LEDGER_FILES if (ROOT / name).exists())
+    wf = workflow_context(event)
 
     text = RUNBOOK.read_text(encoding="utf-8") if RUNBOOK.exists() else "# 六号员工运行总手册\n"
     text = ensure_section(text)
@@ -155,7 +177,7 @@ def main() -> None:
     if mk in text:
         print("employee6 tracking already recorded")
         return
-    text = text.rstrip() + "\n" + build_entry(sha, msg, files, scattered, global_ledgers)
+    text = text.rstrip() + "\n" + build_entry(sha, msg, files, scattered, global_ledgers, wf)
     RUNBOOK.write_text(text.rstrip() + "\n", encoding="utf-8")
     print("employee6 appended single-file tracking record")
 
