@@ -14,7 +14,7 @@
 driveaway1207/stock-alert-public-runner
 ```
 
-适用范围包括：零号员工、一号员工、二号员工、三号员工、四号员工、五号员工，以及已经在本 public 仓库完成身份定义、runbook、runner 或 workflow 支持的后续员工。
+当前已落地员工以本 public 仓库实际文件为准，包括零号员工、一号员工、二号员工、三号员工、四号员工、五号员工、六号员工，以及后续已经在本 public 仓库完成身份定义、runbook、runner 或 workflow 支持的员工。
 
 不允许把尚未有代码、runbook、workflow 或用户明确确认的新编号员工写成“当前已支持员工”。未落地员工只能写为“待建设/待确认”，不能写成事实。
 
@@ -55,6 +55,7 @@ EMPLOYEE2_OPERATION_RUNBOOK.md
 EMPLOYEE3_OPERATION_RUNBOOK.md
 EMPLOYEE4_OPERATION_RUNBOOK.md
 EMPLOYEE5_OPERATION_RUNBOOK.md
+EMPLOYEE6_OPERATION_RUNBOOK.md
 ```
 
 只有当某个新增员工已经有用户明确确认，并且具备身份定义、runbook、runner/workflow 或明确建设计划时，才允许新增对应 `EMPLOYEE*_OPERATION_RUNBOOK.md`。禁止提前把代码不支持、链路不存在的员工写成当前员工。
@@ -85,7 +86,7 @@ EMPLOYEE5_OPERATION_RUNBOOK.md
 4. 代码实现细节同时写入代码注释或对应 runbook。
 5. 用户提到尚未落地的新员工时，不得直接写成当前员工；只能记录为“待确认/待建设”，并明确当前代码不支持。
 
-特别记录：用户明确要求“文件干净、关键文件放一起、分层分级、不要弄一堆文件、执行后必须记录在案”。该规则适用于整个员工系统。
+特别记录：用户明确要求“文件干净、关键文件放一起、分层分级、不要弄一堆文件、执行后必须记录在案”。该规则适用于整个员工系统；六号员工是已落地的自动实时跟踪员和单文件文档清洁员，专门负责把关键事实记录进自己的唯一主手册，不生成散乱文档。
 
 ## 5. 强制读取顺序
 
@@ -139,6 +140,6 @@ EMPLOYEE5_OPERATION_RUNBOOK.md
 
 整个员工系统只有一个默认事实源：`driveaway1207/stock-alert-public-runner`。
 
-零号、一号、二号、三号、四号、五号及所有已确认、已落地的后续员工，均从本 public 仓库读取规则、代码、workflow、报告和操作手册；私有仓库默认不作为当前依据。
+零号、一号、二号、三号、四号、五号、六号及所有已确认、已落地的后续员工，均从本 public 仓库读取规则、代码、workflow、报告和操作手册；私有仓库默认不作为当前依据。
 
 仓库文件必须干净、集中、分层：一级规则进 `README.md` / `AI_ENGINEER_START_HERE.md` / `EMPLOYEE_SYSTEM_ROLES.md`，二级员工规则进对应 `EMPLOYEE*_OPERATION_RUNBOOK.md`，不要乱建一堆文件，也不要把未落地的员工写成当前支持范围。
