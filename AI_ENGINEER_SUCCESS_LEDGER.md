@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:de977f3c62fd -->
+## 2026-05-24 10:20:49 UTC｜自动沉淀候选：`de977f3c62fd`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Fix employee5 runbook retained-docs wording
+- 经验归纳：运行可观测性：进度条、ETA、阶段日志或artifact进度文件。
+- 影响范围：{"employee5": 1}
+- 对应路径：
+- `EMPLOYEE5_OPERATION_RUNBOOK.md`
+
+
 <!-- employee6-ledger:d756a301ae86 -->
 ## 2026-05-24 10:19:55 UTC｜自动沉淀候选：`d756a301ae86`
 
