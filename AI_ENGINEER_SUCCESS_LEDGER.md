@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:eedc96da457b -->
+## 2026-05-24 02:23:38 UTC｜自动沉淀候选：`eedc96da457b`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：Add zero employee gate workflow
+- 经验归纳：自动触发/运行链路：workflow、并发锁、触发频率或依赖安装。
+- 影响范围：{"workflow": 1}
+- 对应路径：
+- `.github/workflows/employee0_gate.yml`
+
+
 <!-- employee6-ledger:c34b4571d6fb -->
 ## 2026-05-24 02:22:29 UTC｜自动沉淀候选：`c34b4571d6fb`
 
