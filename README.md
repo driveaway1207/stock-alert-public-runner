@@ -2,12 +2,31 @@
 
 ## Start here
 
-后续任何 AI 工程师进入仓库，先读：
+后续任何 AI 工程师进入仓库，接到用户需求后的第一件事，必须先读文档，再动代码、workflow、报告或员工体系。
 
-1. `AI_ENGINEER_START_HERE.md`
-2. `AI_ENGINEER_KLINE_PERIOD_RULES.md`
-3. `EMPLOYEE_SYSTEM_ROLES.md`
-4. `EMPLOYEE5_OPERATION_RUNBOOK.md`
+先读顺序：
+
+1. `README.md`
+2. `AI_ENGINEER_START_HERE.md`
+3. `AI_ENGINEER_FINAL_RULES_INDEX.md`
+4. `AI_ENGINEER_KLINE_PERIOD_RULES.md`
+5. `EMPLOYEE_SYSTEM_ROLES.md`
+6. 对应员工的 `EMPLOYEE*_OPERATION_RUNBOOK.md`
+7. 对应 workflow 和主脚本
+
+## Highest engineering rule
+
+不能只在聊天里说“已经改好”。任何工程修改必须以 GitHub 实际文件、commit sha、复查结果和运行证据为准。
+
+回复用户时必须区分：
+
+- 已提交：GitHub 已返回 commit sha。
+- 已复查：重新读取 GitHub 文件，确认内容真实存在。
+- 已验证：workflow 或脚本运行成功，并产生预期输出。
+
+如果工具报错、被拦截、冲突、没有返回 commit sha，必须明确说明没有落地，不能假装成功。
+
+只改文档而没有改真正生效的代码或 workflow，不能说已经修好。
 
 ## Global rule
 
