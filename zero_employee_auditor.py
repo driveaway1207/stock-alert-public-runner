@@ -72,6 +72,12 @@ BANNED_IDENTITY_DRIFT_PATTERNS = [
     "EMPLOYEE4_MODEL_AUDITOR_SPEC.md",
 ]
 
+SCAN_SELF_EXEMPT_FILES = {
+    "zero_employee_auditor.py",
+    "EMPLOYEE0_OPERATION_RUNBOOK.md",
+    "EMPLOYEE_SYSTEM_ROLES.md",
+}
+
 
 def bj_now() -> str:
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
@@ -166,6 +172,8 @@ def audit_identity_locks() -> List[dict]:
         if not path.is_file():
             continue
         rel = str(path.relative_to(ROOT))
+        if rel in SCAN_SELF_EXEMPT_FILES:
+            continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for banned in BANNED_IDENTITY_DRIFT_PATTERNS:
             if banned in text:
