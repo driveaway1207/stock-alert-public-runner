@@ -1,5 +1,16 @@
 # AI 工程师成功经验沉淀账
 
+<!-- employee6-ledger:e66df5017ef6 -->
+## 2026-05-24 06:35:07 UTC｜自动沉淀候选：`e66df5017ef6`
+
+- 状态：已落地代码/文档经验候选。若后续被用户否定，必须更正或移出成功经验库。
+- commit message：docs: mark public runner repository in README
+- 经验归纳：文档和成功经验沉淀：更新工程入口、操作手册、规则索引或经验库。
+- 影响范围：{"global_docs": 1}
+- 对应路径：
+- `README.md`
+
+
 <!-- employee6-ledger:59cf804a22ec -->
 ## 2026-05-24 06:23:41 UTC｜自动沉淀候选：`59cf804a22ec`
 
