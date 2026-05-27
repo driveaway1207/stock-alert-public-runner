@@ -58,6 +58,29 @@ jobs:
             employee5-kline-cache-
             kline-cache-
 
+      - name: fallback download kline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          COUNT=$(find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || echo 0)
+          echo "cache count before artifact fallback: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            exit 0
+          fi
+          mkdir -p artifact_cache_downloads kline_cache
+          for WF in "A Stock Full Kline Cache Auto Backfill" "A Stock Kline Cache Acceptance"; do
+            RUN_ID=$(gh run list --workflow "$WF" --status success --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null)
+            echo "workflow=$WF run_id=$RUN_ID"
+            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+              gh run download "$RUN_ID" --dir artifact_cache_downloads || true
+              break
+            fi
+          done
+          find artifact_cache_downloads -type f \( -name "*.json" -o -name "*.csv" -o -name "*.txt" -o -name "*.pkl" -o -name "*.pickle" \) -exec cp -n {} kline_cache/ \; 2>/dev/null || true
+          echo "cache count after artifact fallback:"
+          find kline_cache -type f 2>/dev/null | wc -l || true
+
       - name: inspect cache before employee5
         run: |
           echo "cache file count:"
