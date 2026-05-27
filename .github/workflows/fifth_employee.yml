@@ -9,7 +9,7 @@ run-name: 五号员工
         required: false
         default: ""
       max_stocks:
-        description: "最多分析涨停样本数量"
+        description: "兼容旧入口；新版五号员工默认全量扫描缓存"
         required: false
         default: "300"
   schedule:
@@ -42,26 +42,28 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: restore employee5 kline cache
-        uses: actions/cache@v4
+      - name: restore kline cache
+        uses: actions/cache/restore@v4
         with:
           path: |
-            employee5_kline_cache/
             kline_cache/
+            employee5_kline_cache/
             data/kline_cache/
             cache/kline_cache/
-          key: employee5-kline-cache-${{ github.run_id }}
+          key: a-stock-kline-cache-v1-${{ github.run_id }}
           restore-keys: |
-            employee5-kline-cache-
+            a-stock-kline-cache-v1-
             a-stock-full-kline-cache-
+            full-kline-cache-
+            employee5-kline-cache-
             kline-cache-
 
-      - name: inspect restored cache
+      - name: inspect cache before employee5
         run: |
-          echo "employee5 cache tree:"
-          find employee5_kline_cache kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
           echo "cache file count:"
-          find employee5_kline_cache kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          echo "cache preview:"
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
 
       - name: install dependencies
         run: |
@@ -75,8 +77,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
-          EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
-          EMPLOYEE5_SCAN_LIMIT: ${{ github.event.inputs.max_stocks || '0' }}
+          EMPLOYEE5_SCAN_LIMIT: "0"
         run: python -u employee5_runner.py
 
       - name: upload reports
@@ -88,14 +89,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: upload restored cache preview
+      - name: upload cache visibility snapshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: employee5-cache-preview
+          name: employee5-cache-visibility-snapshot
           path: |
-            employee5_kline_cache/
             kline_cache/
+            employee5_kline_cache/
             data/kline_cache/
             cache/kline_cache/
           if-no-files-found: ignore
