@@ -42,10 +42,31 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: restore employee5 kline cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            employee5_kline_cache/
+            kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          key: employee5-kline-cache-${{ github.run_id }}
+          restore-keys: |
+            employee5-kline-cache-
+            a-stock-full-kline-cache-
+            kline-cache-
+
+      - name: inspect restored cache
+        run: |
+          echo "employee5 cache tree:"
+          find employee5_kline_cache kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
+          echo "cache file count:"
+          find employee5_kline_cache kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+
       - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas requests
+          pip install pandas requests
 
       - name: run employee5
         env:
@@ -55,8 +76,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
           EMPLOYEE5_MAX_STOCKS: ${{ github.event.inputs.max_stocks || '300' }}
-          EMPLOYEE5_AK_TIMEOUT_SECONDS: "18"
-          EMPLOYEE5_REQUEST_SLEEP: "0.15"
+          EMPLOYEE5_SCAN_LIMIT: ${{ github.event.inputs.max_stocks || '0' }}
         run: python -u employee5_runner.py
 
       - name: upload reports
@@ -67,3 +87,16 @@ jobs:
           path: employee5_reports/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: upload restored cache preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: employee5-cache-preview
+          path: |
+            employee5_kline_cache/
+            kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          if-no-files-found: ignore
+          retention-days: 3
