@@ -68,6 +68,11 @@ ANALYZE_MAX_STOCKS = int(os.getenv("EMPLOYEE5_REASON_MAX_STOCKS", os.getenv("EMP
 DEEP_SAMPLE_COUNT = int(os.getenv("EMPLOYEE5_DEEP_SAMPLE_COUNT", "3"))
 DEEP_HIST_SCAN_LIMIT = int(os.getenv("EMPLOYEE5_DEEP_HIST_SCAN_LIMIT", str(MAX_POOL_SCAN)))
 B_GROUP_SCAN_LIMIT = int(os.getenv("EMPLOYEE5_B_GROUP_SCAN_LIMIT", "0"))  # 0=全市场扫描；>0=显式限量扫描
+HISTORICAL_UNIVERSE_SCAN_LIMIT = int(os.getenv("EMPLOYEE5_HISTORICAL_UNIVERSE_SCAN_LIMIT", "0"))  # 0=历史模式也全市场扫描；>0=历史模式限量
+HISTORICAL_REBUILD_LIMIT_POOL = os.getenv("EMPLOYEE5_HISTORICAL_REBUILD_LIMIT_POOL", "1") != "0"
+EXTREME_MAIN_PCT = float(os.getenv("EMPLOYEE5_EXTREME_MAIN_PCT", "8.5"))
+EXTREME_20CM_PCT = float(os.getenv("EMPLOYEE5_EXTREME_20CM_PCT", "15.0"))
+EXTREME_30CM_PCT = float(os.getenv("EMPLOYEE5_EXTREME_30CM_PCT", "22.0"))
 HIST_START_DATE = os.getenv("EMPLOYEE5_HIST_START_DATE", "2010-01-01")
 HIST_START_YYYYMMDD = HIST_START_DATE.replace("-", "")
 KLINE_CACHE_DIR = ROOT / os.getenv("EMPLOYEE5_KLINE_CACHE_DIR", "employee5_kline_cache")
@@ -381,19 +386,277 @@ def normalize_pool(df: pd.DataFrame, source: str) -> pd.DataFrame:
 def safe_source_call(fn_name: str, **kwargs) -> pd.DataFrame:
     try:
         fn = getattr(ak, fn_name)
-    except Exception:
+    except Exception as e:
+        print(f"source {fn_name} unavailable: {type(e).__name__}", flush=True)
         return pd.DataFrame()
     try:
         with timeout_guard(AK_TIMEOUT_SECONDS, fn_name):
             return fn(**kwargs)
-    except TypeError:
+    except TypeError as e:
+        # 部分 akshare 函数版本之间参数不一致，先记录再尝试无参调用。
+        print(f"source {fn_name} kwargs rejected: {type(e).__name__}", flush=True)
         try:
             with timeout_guard(AK_TIMEOUT_SECONDS, fn_name):
                 return fn()
-        except Exception:
+        except Exception as e2:
+            print(f"source {fn_name} failed without kwargs: {type(e2).__name__}", flush=True)
             return pd.DataFrame()
-    except Exception:
+    except Exception as e:
+        print(f"source {fn_name} failed: {type(e).__name__}", flush=True)
         return pd.DataFrame()
+
+
+def is_common_stock_code(code: str) -> bool:
+    c = code6(code)
+    return bool(c and c.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689", "920", "8", "4")))
+
+
+def normalize_universe(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    code_col = first_col(df, ["代码", "股票代码", "证券代码", "A股代码", "code", "symbol"])
+    name_col = first_col(df, ["名称", "股票简称", "证券简称", "A股简称", "name", "code_name", "简称"])
+    if not code_col:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["code"] = df[code_col].map(code6)
+    if name_col:
+        out["name"] = df[name_col].astype(str)
+    else:
+        out["name"] = out["code"]
+    out = out[out["code"].map(is_common_stock_code)].drop_duplicates("code", keep="first")
+    if out.empty:
+        return pd.DataFrame()
+    boards = out.apply(lambda r: board_limit(r["code"], r["name"]), axis=1)
+    out["board"] = [x[0] for x in boards]
+    out["limit_pct"] = [x[1] for x in boards]
+    out["limit_style"] = out["limit_pct"].apply(limit_style)
+    out["pct_chg"] = 0.0
+    out["close"] = 0.0
+    out["source"] = source
+    return out.reset_index(drop=True)
+
+
+def fetch_universe_from_baostock(target_date: str) -> pd.DataFrame:
+    if bs is None:
+        return pd.DataFrame()
+    try:
+        if not ensure_baostock_login():
+            return pd.DataFrame()
+        with timeout_guard(max(AK_TIMEOUT_SECONDS * 2, 20), "baostock_all_stock"):
+            rs = bs.query_all_stock(day=ymd_to_dash(target_date))
+            if getattr(rs, "error_code", "1") != "0":
+                return pd.DataFrame()
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+        df = pd.DataFrame(rows, columns=rs.fields)
+        if df.empty:
+            return pd.DataFrame()
+        if "tradeStatus" in df.columns:
+            df = df[df["tradeStatus"].astype(str) == "1"]
+        if "type" in df.columns:
+            df = df[df["type"].astype(str).isin(["1", "股票", "stock"])]
+        out = pd.DataFrame({
+            "code": df["code"].astype(str).map(lambda x: code6(x.split(".")[-1])),
+            "name": df["code_name"].astype(str) if "code_name" in df.columns else df["code"].astype(str),
+        })
+        return normalize_universe(out, "baostock_all_stock")
+    except Exception as e:
+        print(f"baostock universe failed: {type(e).__name__}", flush=True)
+        return pd.DataFrame()
+
+
+def fetch_static_universe(target_date: str, start_ts: Optional[float] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    历史复盘专用股票池：只拿代码/名称，不混入当日实时涨跌幅。
+    手动日期、本地历史复盘、涨停池接口为空时，都必须走这里兜底，
+    然后用逐票历史K线反推出A组涨停/极强样本和B组20日涨幅样本。
+    """
+    source_defs = [
+        ("a_code_name", "stock_info_a_code_name", {}),
+        ("sh_code_name", "stock_info_sh_name_code", {}),
+        ("sz_code_name", "stock_info_sz_name_code", {}),
+        ("a_spot_name_only", "stock_zh_a_spot_em", {}),
+    ]
+    stage_start = start_ts or time.time()
+    parts, source_counts = [], {}
+    for i, (source, fn_name, kwargs) in enumerate(source_defs, 1):
+        df = normalize_universe(safe_source_call(fn_name, **kwargs), source)
+        source_counts[source] = int(len(df)) if df is not None and not df.empty else 0
+        if df is not None and not df.empty:
+            parts.append(df)
+        write_progress("①B 历史股票池兜底", i, len(source_defs) + 1, stage_start, f"source={source} rows={source_counts[source]}")
+    bdf = fetch_universe_from_baostock(target_date)
+    source_counts["baostock_all_stock"] = int(len(bdf)) if bdf is not None and not bdf.empty else 0
+    if bdf is not None and not bdf.empty:
+        parts.append(bdf)
+    write_progress("①B 历史股票池兜底", len(source_defs) + 1, len(source_defs) + 1, stage_start, f"source=baostock_all_stock rows={source_counts['baostock_all_stock']}")
+    if not parts:
+        return pd.DataFrame(), {"universe_source_counts": source_counts, "universe_total": 0}
+    raw = pd.concat(parts, ignore_index=True)
+    raw["source_rank"] = raw["source"].map({"baostock_all_stock": 1, "a_code_name": 2, "sh_code_name": 3, "sz_code_name": 4, "a_spot_name_only": 5}).fillna(9)
+    raw = raw.sort_values(["source_rank", "code"]).drop_duplicates("code", keep="first").drop(columns=["source_rank"])
+    raw = raw[raw["code"].map(is_common_stock_code)].reset_index(drop=True)
+    return raw, {"universe_source_counts": source_counts, "universe_total": int(len(raw))}
+
+
+def is_extreme_move(pct_chg: float, limit_pct: float) -> bool:
+    if limit_pct <= 5:
+        return pct_chg >= 4.3
+    if limit_pct <= 10:
+        return pct_chg >= EXTREME_MAIN_PCT
+    if limit_pct <= 20:
+        return pct_chg >= EXTREME_20CM_PCT
+    return pct_chg >= EXTREME_30CM_PCT
+
+
+def trigger_day_pct(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return 0.0
+    last = df.iloc[-1]
+    v = sf(last.get("pct_chg"), 0.0)
+    if abs(v) > 0.001:
+        return rd(v)
+    if len(df) >= 2:
+        return rd(pct(last.get("close"), df.iloc[-2].get("close")))
+    return 0.0
+
+
+def build_history_universe_items(target_date: str, diagnostics: Dict[str, Any], run_start: float) -> List[Dict[str, Any]]:
+    """生成需要做历史K线预扫描的全市场样本池。历史模式下不能因为实时源禁用就跳过B组。"""
+    source_note = ""
+    if REALTIME_SOURCE_ALLOWED and MARKET_UNIVERSE_POOL is not None and not MARKET_UNIVERSE_POOL.empty:
+        uni = MARKET_UNIVERSE_POOL.copy()
+        source_note = "realtime_market_universe"
+    else:
+        uni, uni_diag = fetch_static_universe(target_date, run_start)
+        diagnostics["historical_static_universe"] = uni_diag
+        source_note = "historical_static_universe"
+    if uni is None or uni.empty:
+        diagnostics["universe_scan_source"] = source_note
+        return []
+    uni = uni.copy()
+    uni["code"] = uni["code"].map(code6)
+    uni = uni[uni["code"].map(is_common_stock_code)].drop_duplicates("code", keep="first").sort_values("code")
+    # B组默认全市场；如果设置了限量，则显式限量。历史模式下也允许额外用 HISTORICAL_UNIVERSE_SCAN_LIMIT 控制运行时间。
+    limit = B_GROUP_SCAN_LIMIT if B_GROUP_SCAN_LIMIT > 0 else (HISTORICAL_UNIVERSE_SCAN_LIMIT if (not REALTIME_SOURCE_ALLOWED and HISTORICAL_UNIVERSE_SCAN_LIMIT > 0) else 0)
+    if limit > 0:
+        uni = uni.head(limit)
+    diagnostics["universe_scan_source"] = source_note
+    diagnostics["universe_scan_limit_effective"] = int(limit)
+    diagnostics["universe_scan_total_before_limit"] = int(len(uni) if limit == 0 else (diagnostics.get("historical_static_universe", {}) or {}).get("universe_total", len(uni)))
+    items: List[Dict[str, Any]] = []
+    for _, row in uni.iterrows():
+        name = ss(row.get("name")) or code6(row.get("code"))
+        board, lim = board_limit(row.get("code"), name)
+        items.append({
+            "code": code6(row.get("code")),
+            "name": name,
+            "board": board,
+            "limit_pct": lim,
+            "pct_chg": 0.0,
+            "limit_style": limit_style(lim),
+            "tags": fallback_tags({"board": board, "limit_pct": lim, "pct_chg": 0.0}),
+            "candidate_source": source_note,
+            "sample_type": "rolling_20d_top_gain",
+        })
+    return items
+
+
+def scan_history_candidates(target_date: str, scan_items: List[Dict[str, Any]], run_start: float) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    先轻量扫描历史K线，只确定两件事：
+    1）A组：目标日是否涨停/极强；
+    2）B组：近20个交易日累计涨幅排名。
+    深度归因只对筛出的A/B样本再做，避免全市场几千只全部跑归因。
+    """
+    prelim: List[Dict[str, Any]] = []
+    hist_sources: Dict[str, int] = {}
+    total = len(scan_items)
+    for idx, item in enumerate(scan_items, 1):
+        code = code6(item.get("code")); name = ss(item.get("name")) or code
+        if not code:
+            continue
+        hist = fetch_hist(code, target_date)
+        time.sleep(REQUEST_SLEEP)
+        if hist is not None and not hist.empty and len(hist) >= 30:
+            df = add_indicators(hist)
+            board, lim = board_limit(code, name)
+            day_pct = trigger_day_pct(df)
+            return20 = ret_pct(df, 20)
+            limit_hit = is_limit_up(day_pct, lim)
+            extreme_hit = is_extreme_move(day_pct, lim)
+            hist_source = ss(hist.get("hist_source", pd.Series(["unknown"])).iloc[-1]) if "hist_source" in hist.columns else "unknown"
+            hist_sources[hist_source] = hist_sources.get(hist_source, 0) + 1
+            sample_type = "today_limit_up" if limit_hit else ("today_extreme_move" if extreme_hit else "rolling_20d_top_gain")
+            candidate_source = "historical_kline_limit_rebuild" if limit_hit else ("historical_kline_extreme_rebuild" if extreme_hit else item.get("candidate_source", "universe_for_20d_top"))
+            tags = list(dict.fromkeys((item.get("tags", []) or []) + structure_tags(df)))
+            prelim.append({
+                **item,
+                "code": code, "name": name, "board": board, "limit_pct": lim, "limit_style": limit_style(lim),
+                "pct_chg": day_pct, "return20": return20, "hist_source": hist_source,
+                "hist_last_date": HIST_LAST_DATE_BY_CODE.get(code, ""),
+                "is_limit_sample": bool(limit_hit), "is_extreme_sample": bool(extreme_hit),
+                "sample_type": sample_type, "candidate_source": candidate_source, "tags": tags,
+            })
+        if idx == 1 or idx == total or idx % max(PROGRESS_EVERY, 1) == 0:
+            extra = f"当前={name}({code}) 已有效={len(prelim)}"
+            write_progress("④A 全市场K线预扫描", idx, total, run_start, extra)
+    return prelim, hist_sources
+
+
+def select_research_items(prelim: List[Dict[str, Any]], base_items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    # A组先看目标日涨停，再看极强大涨；B组严格按近20个交易日累计涨幅。
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for x in prelim:
+        c = code6(x.get("code"))
+        if not c:
+            continue
+        old = by_code.get(c)
+        if old is None or (sf(x.get("pct_chg")), sf(x.get("return20"))) > (sf(old.get("pct_chg")), sf(old.get("return20"))):
+            by_code[c] = x
+    prelim = list(by_code.values())
+    limit_candidates = [x for x in prelim if bool(x.get("is_limit_sample"))]
+    extreme_candidates = [x for x in prelim if not bool(x.get("is_limit_sample")) and bool(x.get("is_extreme_sample"))]
+    a_ranked = sorted(limit_candidates + extreme_candidates, key=lambda x: (bool(x.get("is_limit_sample")), sf(x.get("pct_chg")), sf(x.get("return20"))), reverse=True)
+    # B组默认排除ST，避免20日涨幅榜被ST或异常低质票污染；A组ST涨停仍可做归因样本。
+    b_candidates = [x for x in prelim if sf(x.get("return20")) != 0 and "ST" not in ss(x.get("name")).upper()]
+    b_ranked = sorted(b_candidates, key=lambda x: sf(x.get("return20")), reverse=True)
+    selected_codes: List[str] = []
+    selected: List[Dict[str, Any]] = []
+    def add_many(rows: List[Dict[str, Any]], cap: int) -> None:
+        for r in rows[:max(0, cap)]:
+            c = code6(r.get("code"))
+            if c and c not in selected_codes:
+                selected_codes.append(c); selected.append(r)
+    add_many(a_ranked, min(max(ANALYZE_MAX_STOCKS, DEEP_SAMPLE_COUNT), MAX_POOL_SCAN))
+    add_many(b_ranked, max(DEEP_SAMPLE_COUNT, min(20, MAX_DEEP_REPORT_ITEMS)))
+    summary = {
+        "prelim_valid_hist_count": len(prelim),
+        "rebuild_limit_count": len(limit_candidates),
+        "rebuild_extreme_count": len(extreme_candidates),
+        "rolling_20d_candidate_count": len(b_candidates),
+        "selected_for_deep_attribution": len(selected),
+        "a_top_codes_after_rebuild": [code6(x.get("code")) for x in a_ranked[:DEEP_SAMPLE_COUNT]],
+        "b_top_codes_after_rebuild": [code6(x.get("code")) for x in b_ranked[:DEEP_SAMPLE_COUNT]],
+        "base_limit_pool_count_before_rebuild": len(base_items),
+    }
+    return selected, summary
+
+
+def rebuild_pool_from_results_like(items: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for x in items:
+        if not bool(x.get("is_limit_sample")):
+            continue
+        rows.append({
+            "code": code6(x.get("code")), "name": ss(x.get("name")), "pct_chg": sf(x.get("pct_chg")),
+            "close": 0.0, "source": x.get("candidate_source", "historical_kline_limit_rebuild"),
+            "board": x.get("board"), "limit_pct": x.get("limit_pct"), "limit_style": x.get("limit_style"),
+            "is_limit_up": True,
+        })
+    return pd.DataFrame(rows)
 
 
 def fetch_limit_pool(target_date: str, start_ts: Optional[float] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -3006,7 +3269,7 @@ def build_employee1_feedback_potential(item: Dict[str, Any], profile: Dict[str, 
 
 def assign_sample_groups(results: List[Dict[str, Any]], deep_count: int = DEEP_SAMPLE_COUNT) -> Dict[str, Any]:
     """A组=当日涨停/极强前三；B组=近20日累计涨幅前三。报告深讲A/B并集，其余只做统计沉淀。"""
-    limit_rank_source = [x for x in results if x.get("sample_type") in ("today_limit_up", "today_extreme_move") or x.get("is_limit_sample", True)] or results
+    limit_rank_source = [x for x in results if x.get("sample_type") in ("today_limit_up", "today_extreme_move") or bool(x.get("is_limit_sample", False))] or results
     day_ranked = sorted(limit_rank_source, key=lambda x: (sf(x.get("pct_chg")), sf(x.get("reason_confidence"))), reverse=True)
     ret_candidates = [x for x in results if sf(x.get("return20")) != 0 and x.get("hist_source") != "missing"]
     ret_ranked = sorted(ret_candidates, key=lambda x: sf(x.get("return20")), reverse=True)
@@ -3020,7 +3283,9 @@ def assign_sample_groups(results: List[Dict[str, Any]], deep_count: int = DEEP_S
         if code in group_b_codes: groups.append("B组近20日累计涨幅前三")
         if not groups: groups.append("统计沉淀样本")
         x["sample_groups"] = groups; x["deep_report_selected"] = bool(code in deep_codes[:MAX_DEEP_REPORT_ITEMS])
-    return {"group_a_today_top": group_a_codes, "group_b_20d_top": group_b_codes, "deep_report_codes": deep_codes[:MAX_DEEP_REPORT_ITEMS], "deep_report_count": len(deep_codes[:MAX_DEEP_REPORT_ITEMS]), "b_group_scan_limit": B_GROUP_SCAN_LIMIT, "b_group_scope": "全市场行情池" if B_GROUP_SCAN_LIMIT <= 0 else f"全市场行情池限量前{B_GROUP_SCAN_LIMIT}只", "max_deep_report_items": MAX_DEEP_REPORT_ITEMS}
+    scope_base = "实时全市场行情池" if REALTIME_SOURCE_ALLOWED else "历史静态股票池+历史K线反推"
+    limit_desc = "全市场" if B_GROUP_SCAN_LIMIT <= 0 else f"限量前{B_GROUP_SCAN_LIMIT}只"
+    return {"group_a_today_top": group_a_codes, "group_b_20d_top": group_b_codes, "deep_report_codes": deep_codes[:MAX_DEEP_REPORT_ITEMS], "deep_report_count": len(deep_codes[:MAX_DEEP_REPORT_ITEMS]), "b_group_scan_limit": B_GROUP_SCAN_LIMIT, "b_group_scope": f"{scope_base}{limit_desc}", "max_deep_report_items": MAX_DEEP_REPORT_ITEMS}
 
 
 def make_telegram_summary(target_date: str, results: List[Dict[str, Any]], hotspots: List[Dict[str, Any]], elapsed: float) -> str:
@@ -3262,89 +3527,137 @@ def main() -> None:
     write_progress("启动", 0, 100, run_start, f"target_date={target_date}")
 
     pool, diagnostics = fetch_limit_pool(target_date, run_start)
-    if pool.empty:
-        msg = f"🧬【五号员工-涨停归因】\n日期：{target_date}\n未识别到涨停/极强样本。"
-        (REPORT_DIR / "limit_up_research_report.md").write_text(msg, encoding="utf-8")
-        (REPORT_DIR / "limit_up_research_report.json").write_text(json.dumps({"target_date": target_date, "results": []}, ensure_ascii=False, indent=2), encoding="utf-8")
-        send_msg(msg)
-        return
 
-    pool = pool.head(MAX_POOL_SCAN).copy()
     base_items: List[Dict[str, Any]] = []
-    for _, row in pool.iterrows():
-        base_items.append({
-            "code": ss(row.get("code")),
-            "name": ss(row.get("name")),
-            "board": ss(row.get("board")),
-            "pct_chg": sf(row.get("pct_chg")),
-            "limit_style": ss(row.get("limit_style")),
-            "tags": fallback_tags(row),
-            "sample_type": "today_limit_up",
-            "candidate_source": "limit_pool",
-        })
-    write_progress("② 涨停池整理", 1, 1, run_start, f"涨停总数={len(base_items)} 北交所={diagnostics.get('beijing_count', 0)}")
-
-    write_progress("③ 行情热点提取", 0, 1, run_start, "只用板块行情与涨停集中度，不读取财经新闻")
-    hotspots, hotspot_map = build_market_hotspots(base_items) if REALTIME_SOURCE_ALLOWED else ([], {})
-    write_progress("③ 行情热点提取", 1, 1, run_start, f"热点数={len(hotspots)}")
-
-    results: List[Dict[str, Any]] = []
-    hist_source_count: Dict[str, int] = {}
-    universe_items: List[Dict[str, Any]] = []
-    if REALTIME_SOURCE_ALLOWED and MARKET_UNIVERSE_POOL is not None and not MARKET_UNIVERSE_POOL.empty:
-        uni = MARKET_UNIVERSE_POOL.copy()
-        uni = uni[~uni["name"].astype(str).str.upper().str.contains("ST", na=False)]
-        uni = uni.sort_values("code", ascending=True)
-        if B_GROUP_SCAN_LIMIT > 0:
-            uni = uni.head(B_GROUP_SCAN_LIMIT)
-        for _, row in uni.iterrows():
-            universe_items.append({
+    if pool is not None and not pool.empty:
+        pool = pool.head(MAX_POOL_SCAN).copy()
+        for _, row in pool.iterrows():
+            base_items.append({
                 "code": ss(row.get("code")),
                 "name": ss(row.get("name")),
                 "board": ss(row.get("board")),
+                "limit_pct": sf(row.get("limit_pct")),
                 "pct_chg": sf(row.get("pct_chg")),
                 "limit_style": ss(row.get("limit_style")),
                 "tags": fallback_tags(row),
-                "candidate_source": "universe_for_20d_top",
-                "sample_type": "rolling_20d_top_gain",
+                "sample_type": "today_limit_up",
+                "is_limit_sample": True,
+                "candidate_source": ss(row.get("source")) or "limit_pool",
             })
+    else:
+        pool = pd.DataFrame()
+        diagnostics["limit_pool_empty_policy"] = "不再直接return；继续用历史K线反推A组，并强制计算B组20日涨幅前三。"
+
+    write_progress("② 涨停池整理", 1, 1, run_start, f"接口涨停数={len(base_items)}；空池不短路")
+
+    write_progress("③ 行情热点提取", 0, 1, run_start, "历史/手动日期不混入实时热点；只在当前收盘后模式提取板块热点")
+    hotspots, hotspot_map = build_market_hotspots(base_items) if REALTIME_SOURCE_ALLOWED else ([], {})
+    write_progress("③ 行情热点提取", 1, 1, run_start, f"热点数={len(hotspots)}")
+
+    universe_items = build_history_universe_items(target_date, diagnostics, run_start)
+
     scan_map: Dict[str, Dict[str, Any]] = {}
-    for it in base_items[:ANALYZE_MAX_STOCKS] + universe_items:
+    for it in base_items + universe_items:
         c = code6(it.get("code"))
         if not c:
             continue
         if c not in scan_map:
             scan_map[c] = it
-        elif scan_map[c].get("sample_type") == "rolling_20d_top_gain" and it.get("sample_type") == "today_limit_up":
-            scan_map[c] = {**scan_map[c], **it, "sample_type": "today_limit_up", "candidate_source": "limit_pool"}
+        else:
+            # 接口涨停池优先保留A组身份；历史全市场池只补充B组扫描口径。
+            if it.get("sample_type") == "today_limit_up" or bool(it.get("is_limit_sample")):
+                scan_map[c] = {**scan_map[c], **it, "sample_type": "today_limit_up", "is_limit_sample": True}
     scan_items = list(scan_map.values())
-    diagnostics["universe_scan_for_20d_top"] = {"enabled": bool(universe_items), "scan_limit": B_GROUP_SCAN_LIMIT, "scan_scope": "full_market" if B_GROUP_SCAN_LIMIT <= 0 else "limited_market", "actual_added_universe_candidates": len(universe_items), "deduped_scan_items": len(scan_items), "disabled_reason": "historical_or_previous_trade_day_realtime_sources_disabled" if not universe_items and not REALTIME_SOURCE_ALLOWED else ""}
-    write_progress("④ 逐只K线归因", 0, len(scan_items), run_start, "A组涨停样本 + B组20日涨幅候选 + 深度归因")
+    diagnostics["universe_scan_for_20d_top"] = {
+        "enabled": bool(universe_items),
+        "scan_limit": B_GROUP_SCAN_LIMIT,
+        "historical_universe_scan_limit": HISTORICAL_UNIVERSE_SCAN_LIMIT,
+        "scan_scope": "full_market" if B_GROUP_SCAN_LIMIT <= 0 else "limited_market",
+        "universe_candidates": len(universe_items),
+        "deduped_scan_items": len(scan_items),
+        "disabled_reason": "无法取得静态股票池，且接口涨停池为空" if not scan_items else "",
+    }
 
-    for idx, item in enumerate(scan_items, 1):
+    if not scan_items:
+        msg = (
+            f"🧬【五号员工-涨停归因】\n日期：{target_date}\n"
+            "数据源采集失败：涨停池接口为空，静态股票池也为空，无法用历史K线反推A组/B组。\n"
+            "这不是市场没有样本，而是采集链路没有拿到可扫描股票池。"
+        )
+        (REPORT_DIR / "limit_up_research_report.md").write_text(msg, encoding="utf-8")
+        (REPORT_DIR / "limit_up_research_report.json").write_text(json.dumps({"target_date": target_date, "diagnostics": diagnostics, "results": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+        send_msg(msg)
+        return
+
+    write_progress("④A 全市场K线预扫描", 0, len(scan_items), run_start, "反推A组涨停/极强 + 计算B组20日累计涨幅")
+    prelim, prelim_hist_source_count = scan_history_candidates(target_date, scan_items, run_start)
+    research_items, selection_summary = select_research_items(prelim, base_items)
+    diagnostics["historical_rebuild_selection"] = selection_summary
+
+    rebuilt_pool = rebuild_pool_from_results_like(prelim)
+    if (pool is None or pool.empty) and not rebuilt_pool.empty:
+        pool = rebuilt_pool.sort_values(["limit_pct", "pct_chg", "code"], ascending=[False, False, True]).head(MAX_POOL_SCAN).reset_index(drop=True)
+        diagnostics["pool_rebuilt_from_kline"] = True
+        diagnostics["total_limit_up_identified"] = int(len(pool))
+        diagnostics["source_limit_counts"] = pool["source"].value_counts().to_dict() if "source" in pool.columns else {}
+        diagnostics["board_counts"] = pool["board"].value_counts().to_dict() if "board" in pool.columns else {}
+        diagnostics["limit_style_counts"] = pool["limit_style"].value_counts().to_dict() if "limit_style" in pool.columns else {}
+    else:
+        diagnostics["pool_rebuilt_from_kline"] = False
+
+    if not research_items:
+        msg = (
+            f"🧬【五号员工-涨停归因】\n日期：{target_date}\n"
+            "完成了历史K线预扫描，但没有拿到可归因的A组涨停/极强样本或B组20日大涨样本。\n"
+            f"诊断：{json.dumps(diagnostics.get('historical_rebuild_selection', {}), ensure_ascii=False)}"
+        )
+        (REPORT_DIR / "limit_up_research_report.md").write_text(msg, encoding="utf-8")
+        (REPORT_DIR / "limit_up_research_report.json").write_text(json.dumps({"target_date": target_date, "diagnostics": diagnostics, "prelim_count": len(prelim), "results": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+        send_msg(msg)
+        return
+
+    results: List[Dict[str, Any]] = []
+    hist_source_count: Dict[str, int] = {}
+    write_progress("④B 逐只深度归因", 0, len(research_items), run_start, "只展开A组涨停/极强与B组20日涨幅前列，避免全市场无意义深跑")
+
+    for idx, item in enumerate(research_items, 1):
         code, name = code6(item.get("code")), ss(item.get("name"))
         hist = fetch_hist(code, target_date)
         time.sleep(REQUEST_SLEEP)
 
         if hist is None or hist.empty or len(hist) < 30:
             core = {"valid": False, "status": "未确认", "reason": "历史K线不足，无法计算自然月核心线。", "box_candidates": []}
-            return20 = 0.0
+            return20 = sf(item.get("return20"))
             tags = item.get("tags", [])
             hist_source = "missing"
             df = pd.DataFrame()
+            pct_chg_value = sf(item.get("pct_chg"))
         else:
             df = add_indicators(hist)
             return20 = ret_pct(df, 20)
+            pct_chg_value = trigger_day_pct(df)
             hist_source = ss(hist.get("hist_source", pd.Series(["unknown"])).iloc[-1]) if "hist_source" in hist.columns else "unknown"
             hist_source_count[hist_source] = hist_source_count.get(hist_source, 0) + 1
             tags = list(dict.fromkeys((item.get("tags", []) or []) + structure_tags(df)))
             df_pre_for_core = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
             core = find_monthly_coreline(df_pre_for_core)
 
+        board, lim = board_limit(code, name)
+        limit_hit = is_limit_up(pct_chg_value, lim)
+        extreme_hit = is_extreme_move(pct_chg_value, lim)
+        if limit_hit:
+            sample_type = "today_limit_up"
+            candidate_source = item.get("candidate_source") or "historical_kline_limit_rebuild"
+        elif extreme_hit:
+            sample_type = "today_extreme_move"
+            candidate_source = item.get("candidate_source") or "historical_kline_extreme_rebuild"
+        else:
+            sample_type = "rolling_20d_top_gain"
+            candidate_source = item.get("candidate_source") or "universe_for_20d_top"
+
         matches = hotspot_map.get(code, [])
-        profile_item = {**item, "code": code, "name": name, "hotspot_matches": matches}
+        profile_item = {**item, "code": code, "name": name, "board": board, "limit_pct": lim, "pct_chg": pct_chg_value, "sample_type": sample_type, "candidate_source": candidate_source, "hotspot_matches": matches}
         deep_profile = build_deep_attribution_profile(df, core, matches, profile_item)
-        # 字段在逐只归因完成后立刻一次性固化；报告层只读取，不再二次补齐。
         deep_profile["coreline_price_details"] = build_item_coreline_price_details(profile_item, deep_profile, core)
         deep_profile["deep_research_questions"] = build_deep_research_questions(profile_item, deep_profile)
         deep_profile["employee1_feedback_potential"] = build_employee1_feedback_potential(profile_item, deep_profile)
@@ -3357,12 +3670,13 @@ def main() -> None:
         results.append({
             "code": code,
             "name": name,
-            "board": item.get("board"),
-            "pct_chg": item.get("pct_chg"),
-            "limit_style": item.get("limit_style"),
-            "candidate_source": item.get("candidate_source", "limit_pool"),
-            "sample_type": item.get("sample_type") or ("rolling_20d_top_gain" if item.get("candidate_source") == "universe_for_20d_top" else "today_limit_up"),
-            "is_limit_sample": bool((item.get("sample_type") or "today_limit_up") == "today_limit_up"),
+            "board": board,
+            "pct_chg": pct_chg_value,
+            "limit_style": limit_style(lim),
+            "candidate_source": candidate_source,
+            "sample_type": sample_type,
+            "is_limit_sample": bool(limit_hit),
+            "is_extreme_sample": bool(extreme_hit),
             "return20": return20,
             "hist_source": hist_source,
             "hist_last_date": HIST_LAST_DATE_BY_CODE.get(code, ""),
@@ -3375,8 +3689,11 @@ def main() -> None:
             "deep_attribution": deep_profile,
         })
 
-        if idx == 1 or idx == len(scan_items) or idx % max(PROGRESS_EVERY, 1) == 0:
-            write_progress("④ 逐只K线归因", idx, len(scan_items), run_start, f"当前={name}({code}) 原因={reason_type}")
+        if idx == 1 or idx == len(research_items) or idx % max(PROGRESS_EVERY, 1) == 0:
+            write_progress("④B 逐只深度归因", idx, len(research_items), run_start, f"当前={name}({code}) 原因={reason_type}")
+
+    # 预扫描历史源也写进诊断，深度归因源单独统计。
+    diagnostics["pre_scan_hist_source_count"] = prelim_hist_source_count
 
     write_progress("⑤ 认知提炼", 0, 1, run_start, "从逐只归因提炼今日大涨逻辑，并更新五号员工认知库")
     cognition_library, daily_lessons, cognition_actions, feedback_md = distill_daily_cognition(target_date, results)
