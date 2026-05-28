@@ -5,7 +5,7 @@ run-name: 五号员工
   workflow_dispatch:
     inputs:
       employee5_target_date:
-        description: "五号员工分析日期，可空。格式YYYY-MM-DD或YYYYMMDD；空=最近交易日"
+        description: "五号员工分析日期，可空。格式YYYY-MM-DD或YYYYMMDD；空=北京时间上一个交易日"
         required: false
         default: ""
       max_stocks:
@@ -13,7 +13,8 @@ run-name: 五号员工
         required: false
         default: "300"
   schedule:
-    - cron: '45 12 * * 1-5'
+    # 北京时间 20:00 = UTC 12:00；周一到周五自动运行。
+    - cron: '0 12 * * 1-5'
 
 concurrency:
   group: fifth-employee-singleton-main
@@ -27,18 +28,51 @@ jobs:
   employee5:
     name: 五号员工
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 360
 
     steps:
       - name: checkout
         uses: actions/checkout@v4
+
+      - name: resolve target date
+        id: config
+        shell: bash
+        env:
+          EMPLOYEE5_INPUT_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          def norm_date(x):
+              s = str(x or '').strip().replace('/', '-')
+              if not s:
+                  return ''
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              return s[:10]
+
+          def previous_trading_day(d):
+              d = d - timedelta(days=1)
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              return d
+
+          manual = norm_date(os.environ.get('EMPLOYEE5_INPUT_TARGET_DATE'))
+          now = datetime.now(timezone(timedelta(hours=8)))
+          target = manual or previous_trading_day(now.date()).isoformat()
+          print(f'target_date={target}')
+          print(f'target_reason={"manual" if manual else "beijing_previous_trading_day"}')
+          PY
 
       - name: setup python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: restore kline cache
+      - name: restore shared kline cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -46,16 +80,21 @@ jobs:
             employee5_kline_cache/
             data/kline_cache/
             cache/kline_cache/
-          key: a-stock-kline-cache-v1-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-employee5-check-${{ github.run_id }}
           restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
             a-stock-kline-cache-v1-
             a-stock-full-kline-cache-
-            full-kline-cache-
             employee5-kline-cache-
             kline-cache-
 
       - name: inspect cache before employee5
         run: |
+          echo "target date: ${{ steps.config.outputs.target_date }}"
           echo "cache file count:"
           find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
           echo "cache preview:"
@@ -64,7 +103,190 @@ jobs:
       - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests baostock
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
+
+      - name: audit restored cache coverage
+        id: cache_audit_before
+        shell: bash
+        env:
+          TARGET_DATE: ${{ steps.config.outputs.target_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, os
+          from pathlib import Path
+          from collections import Counter
+
+          def norm_date(x):
+              s = str(x or '').strip().replace('/', '-')
+              if not s:
+                  return ''
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              return s[:10]
+
+          target = norm_date(os.environ.get('TARGET_DATE'))
+          roots = [Path('kline_cache'), Path('employee5_kline_cache'), Path('data/kline_cache'), Path('cache/kline_cache')]
+          files = []
+          for root in roots:
+              if root.exists():
+                  files.extend([p for p in root.rglob('*.csv') if not p.name.startswith('_')])
+          dates = []
+          for f in files:
+              try:
+                  with open(f, 'r', encoding='utf-8-sig', newline='') as fh:
+                      reader = csv.reader(fh)
+                      header = next(reader, [])
+                      rows = list(reader)
+                  if not rows:
+                      continue
+                  idx = 0
+                  for name in ('date', '日期', 'trade_date', '交易日期'):
+                      if name in header:
+                          idx = header.index(name)
+                          break
+                  last = ''
+                  for row in reversed(rows):
+                      if row and len(row) > idx and str(row[idx]).strip():
+                          last = norm_date(row[idx])
+                          break
+                  if last:
+                      dates.append(last)
+              except Exception:
+                  pass
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ''
+          count = len(files)
+          with_date = len(dates)
+          ok = bool(count >= 1000 and with_date >= 1000 and majority and (not target or majority >= target))
+          print(f'cache_ok={str(ok).lower()}')
+          print(f'cache_count={count}')
+          print(f'cache_with_date={with_date}')
+          print(f'cache_majority_date={majority}')
+          PY
+
+      - name: show cache audit before backfill
+        shell: bash
+        run: |
+          echo "缓存是否覆盖目标日期：${{ steps.cache_audit_before.outputs.cache_ok }}"
+          echo "缓存CSV数量：${{ steps.cache_audit_before.outputs.cache_count }}"
+          echo "缓存有效日期数量：${{ steps.cache_audit_before.outputs.cache_with_date }}"
+          echo "缓存众数日期：${{ steps.cache_audit_before.outputs.cache_majority_date }}"
+          echo "目标日期：${{ steps.config.outputs.target_date }}"
+
+      - name: auto backfill cache if target data missing
+        if: ${{ steps.cache_audit_before.outputs.cache_ok != 'true' }}
+        env:
+          PYTHONUNBUFFERED: '1'
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          EXPECTED_KLINE_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          RUN_ROUND: '1'
+          MAX_AUTO_ROUNDS: '1'
+          AUTO_CONTINUE: '0'
+          FULL_REBUILD: '1'
+          MIN_CACHE_FILES_REQUIRED: '3000'
+          MAX_RUNTIME_MINUTES: '270'
+          SOFT_STOP_BUFFER_MINUTES: '20'
+          EASTMONEY_TIMEOUT: '20'
+          AKSHARE_TIMEOUT: '35'
+          BAOSTOCK_TIMEOUT: '45'
+          SOURCE_FAIL_THRESHOLD: '5'
+          SOURCE_COOLDOWN_SECONDS: '900'
+        shell: bash
+        run: |
+          mkdir -p outputs kline_cache employee5_reports
+          echo "五号员工缓存未覆盖目标日期，先自动补拉K线缓存。"
+          echo "缓存目标日期：$TARGET_TRADE_DATE"
+          echo "缓存CSV数量-补拉前：$(find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f -name '*.csv' ! -name '_*.csv' 2>/dev/null | wc -l)"
+          python -u tools/export_neckline_candidates.py
+          echo "缓存CSV数量-补拉后：$(find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f -name '*.csv' ! -name '_*.csv' 2>/dev/null | wc -l)"
+
+      - name: audit cache after optional backfill
+        id: cache_audit_after
+        if: always()
+        shell: bash
+        env:
+          TARGET_DATE: ${{ steps.config.outputs.target_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import csv, os
+          from pathlib import Path
+          from collections import Counter
+
+          def norm_date(x):
+              s = str(x or '').strip().replace('/', '-')
+              if not s:
+                  return ''
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              return s[:10]
+
+          target = norm_date(os.environ.get('TARGET_DATE'))
+          roots = [Path('kline_cache'), Path('employee5_kline_cache'), Path('data/kline_cache'), Path('cache/kline_cache')]
+          files = []
+          for root in roots:
+              if root.exists():
+                  files.extend([p for p in root.rglob('*.csv') if not p.name.startswith('_')])
+          dates = []
+          for f in files:
+              try:
+                  with open(f, 'r', encoding='utf-8-sig', newline='') as fh:
+                      reader = csv.reader(fh)
+                      header = next(reader, [])
+                      rows = list(reader)
+                  if not rows:
+                      continue
+                  idx = 0
+                  for name in ('date', '日期', 'trade_date', '交易日期'):
+                      if name in header:
+                          idx = header.index(name)
+                          break
+                  last = ''
+                  for row in reversed(rows):
+                      if row and len(row) > idx and str(row[idx]).strip():
+                          last = norm_date(row[idx])
+                          break
+                  if last:
+                      dates.append(last)
+              except Exception:
+                  pass
+          c = Counter(dates)
+          majority = c.most_common(1)[0][0] if c else ''
+          count = len(files)
+          with_date = len(dates)
+          ok = bool(count >= 1000 and with_date >= 1000 and majority and (not target or majority >= target))
+          save_cache = bool(count >= 3000)
+          print(f'cache_ok={str(ok).lower()}')
+          print(f'cache_count={count}')
+          print(f'cache_with_date={with_date}')
+          print(f'cache_majority_date={majority}')
+          print(f'save_cache={str(save_cache).lower()}')
+          PY
+
+      - name: show cache audit after optional backfill
+        if: always()
+        shell: bash
+        run: |
+          echo "缓存是否覆盖目标日期：${{ steps.cache_audit_after.outputs.cache_ok }}"
+          echo "缓存CSV数量：${{ steps.cache_audit_after.outputs.cache_count }}"
+          echo "缓存有效日期数量：${{ steps.cache_audit_after.outputs.cache_with_date }}"
+          echo "缓存众数日期：${{ steps.cache_audit_after.outputs.cache_majority_date }}"
+          echo "是否保存共享缓存：${{ steps.cache_audit_after.outputs.save_cache }}"
+
+      - name: save shared kline cache
+        if: ${{ always() && steps.cache_audit_after.outputs.save_cache == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            kline_cache/
+            employee5_kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          key: a-kline-cache-${{ github.ref_name }}-employee5-${{ github.run_id }}
 
       - name: run employee5
         env:
@@ -72,7 +294,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
+          EMPLOYEE5_TARGET_DATE: ${{ steps.config.outputs.target_date }}
           EMPLOYEE5_SCAN_LIMIT: "0"
         run: python -u employee5_runner.py
 
