@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工稳定版：优先读K线缓存；缓存缺失才用BaoStock兜底；不调用AkShare逐票历史接口。"""
+"""五号员工稳定版：优先读K线缓存；缓存缺失才用BaoStock兜底；不调用AkShare逐票历史接口。
+
+V5 core-line fix:
+- 核心线不能由单点最高价或最大量阳K高点直接兜底。
+- 优先用 60日聚合K≈季线 寻找长期市场记忆线。
+- 找不到季线核心线时，再用 20日聚合K≈月线补充。
+- 核心线、逻辑分析线、上方极值压力分开输出。
+"""
 
 import json
 import math
@@ -23,7 +30,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260527_STABLE_CACHE_BAOSTOCK_V4"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260528_CORE_LINE_BAND_V5"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
@@ -306,33 +313,317 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
     return A, B
 
 
-def core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    if len(df) < 45:
-        return {"level": "数据不足", "line": None, "text": "20日聚合K不足，不能硬画核心线。"}
+def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
+    if df is None or df.empty or len(df) < max(22, window * 3):
+        return pd.DataFrame()
     d = df.copy().reset_index(drop=True)
-    d["grp"] = [(len(d) - 1 - i) // 20 for i in range(len(d))]
+    d["grp"] = [(len(d) - 1 - i) // window for i in range(len(d))]
     bars = []
     for _, g in d.groupby("grp"):
         g = g.sort_index()
-        bars.append({"start": g.iloc[0].date, "end": g.iloc[-1].date, "open": sf(g.iloc[0].open), "high": sf(g.high.max()), "low": sf(g.low.min()), "close": sf(g.iloc[-1].close), "volume": sf(g.volume.sum())})
+        bars.append({
+            "start": g.iloc[0].date,
+            "end": g.iloc[-1].date,
+            "open": sf(g.iloc[0].open),
+            "high": sf(g.high.max()),
+            "low": sf(g.low.min()),
+            "close": sf(g.iloc[-1].close),
+            "volume": sf(g.volume.sum()),
+        })
     k = pd.DataFrame(bars).sort_values("end").reset_index(drop=True)
     if k.empty:
-        return {"level": "数据不足", "line": None, "text": "没有聚合K。"}
+        return k
     rng = (k.high - k.low).replace(0, pd.NA)
-    k["body_ratio"] = ((k.close - k.open).abs() / rng).fillna(0)
-    k["close_pos"] = ((k.close - k.low) / rng).fillna(0)
-    c = k.iloc[:-1]
-    c = c[(c.close > c.open) & (c.body_ratio >= 0.25) & (c.close_pos >= 0.5)]
-    if c.empty:
-        return {"level": "疑似", "line": None, "text": "没有找到足够清楚的大量阳K核心线。"}
-    r = c.loc[c.volume.idxmax()]
-    line = rd(r.high)
-    return {"level": "核心线候选", "line": line, "text": f"核心线约{line}元，来自{r.start}~{r.end}的20日聚合大量阳K高点。"}
+    k["body_top"] = k[["open", "close"]].max(axis=1)
+    k["body_bottom"] = k[["open", "close"]].min(axis=1)
+    k["body_mid"] = (k["body_top"] + k["body_bottom"]) / 2.0
+    k["body_ratio"] = ((k.close - k.open).abs() / rng).fillna(0.0)
+    k["close_pos"] = ((k.close - k.low) / rng).fillna(0.0)
+    k["upper_shadow_ratio"] = ((k.high - k.body_top) / rng).fillna(0.0)
+    k["lower_shadow_ratio"] = ((k.body_bottom - k.low) / rng).fillna(0.0)
+    vol_ma = k.volume.rolling(4, min_periods=1).mean().shift(1)
+    k["rel_vol"] = (k.volume / vol_ma.replace(0, pd.NA)).fillna(1.0)
+    k["vol_rank_pct"] = k.volume.rolling(8, min_periods=1).rank(pct=True).fillna(0.5)
+    return k
+
+
+def near(a: float, b: float, pct: float) -> bool:
+    a = sf(a)
+    b = sf(b)
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) / b <= pct
+
+
+def line_band_width(price: float) -> float:
+    price = sf(price)
+    return max(0.15, price * 0.022)
+
+
+def build_candidate_centers(k: pd.DataFrame) -> List[float]:
+    vals: List[float] = []
+    if k is None or k.empty:
+        return vals
+    cols = ["close", "body_top", "body_bottom", "body_mid"]
+    for c in cols:
+        vals.extend([sf(x) for x in k[c].tolist() if sf(x) > 0])
+    supply = k[(k.upper_shadow_ratio >= 0.25) | (k.rel_vol >= 1.3)]
+    vals.extend([sf(x) for x in supply.high.tolist() if sf(x) > 0])
+    vals.extend([sf(x) for x in k.high.nlargest(min(3, len(k))).tolist() if sf(x) > 0])
+    centers = []
+    for v in vals:
+        bw = line_band_width(v)
+        center = round(round(v / bw) * bw, 2)
+        if center > 0:
+            centers.append(center)
+    out = []
+    for c in sorted(set(centers)):
+        if not out or abs(c - out[-1]) / max(c, 1e-9) > 0.012:
+            out.append(c)
+    return out
+
+
+def score_price_band(k: pd.DataFrame, center: float, timeframe: str) -> Dict[str, Any]:
+    bw = line_band_width(center)
+    tol = max(0.03, bw / max(center, 1e-9))
+    max_high = sf(k.high.max())
+    min_low = sf(k.low.min())
+    n = len(k)
+
+    close_score = body_score = supply_score = volume_score = recent_score = 0.0
+    close_hits = body_hits = supply_hits = volume_hits = recent_hits = 0
+    crossing_count = reactive_cross_count = 0
+    anchor_dates: List[str] = []
+    anchor_types: List[str] = []
+    single_extreme_hit = near(center, max_high, max(0.012, tol / 2))
+
+    for idx, row in k.iterrows():
+        recency = 1.0
+        if idx >= n - 4:
+            recency = 1.5
+        elif idx >= n - 8:
+            recency = 1.2
+
+        rel_vol = sf(row.rel_vol, 1.0)
+        vol_rank = sf(row.vol_rank_pct, 0.5)
+        vol_weight = 1.0
+        if rel_vol >= 1.8 or vol_rank >= 0.9:
+            vol_weight = 1.35
+        elif rel_vol >= 1.3 or vol_rank >= 0.8:
+            vol_weight = 1.18
+
+        line_cross = sf(row.low) <= center <= sf(row.high)
+        if line_cross:
+            crossing_count += 1
+
+        hit_this_bar = False
+
+        if near(row.close, center, tol):
+            close_hits += 1
+            hit_this_bar = True
+            close_score += 2.8 * recency * vol_weight
+            anchor_types.append("close")
+        if near(row.body_top, center, tol) or near(row.body_bottom, center, tol):
+            body_hits += 1
+            hit_this_bar = True
+            body_score += 2.2 * recency * vol_weight
+            anchor_types.append("body_edge")
+        elif sf(row.body_bottom) <= center <= sf(row.body_top):
+            body_hits += 1
+            hit_this_bar = True
+            body_score += 1.1 * recency * vol_weight
+            anchor_types.append("body_cross")
+
+        supply_reaction = (
+            near(row.high, center, max(tol, 0.035))
+            and sf(row.upper_shadow_ratio) >= 0.22
+            and sf(row.close) <= center * 1.025
+        )
+        if supply_reaction:
+            supply_hits += 1
+            hit_this_bar = True
+            supply_score += (1.5 + min(sf(row.upper_shadow_ratio), 0.8)) * recency * vol_weight
+            anchor_types.append("upper_supply")
+
+        support_reaction = (
+            near(row.low, center, max(tol, 0.035))
+            and sf(row.lower_shadow_ratio) >= 0.18
+            and sf(row.close) >= center * 0.975
+        )
+        if support_reaction:
+            body_hits += 1
+            hit_this_bar = True
+            body_score += 1.2 * recency * vol_weight
+            anchor_types.append("lower_support")
+
+        if hit_this_bar:
+            anchor_dates.append(f"{row.start}~{row.end}")
+            if line_cross:
+                reactive_cross_count += 1
+            if rel_vol >= 1.3 or vol_rank >= 0.8:
+                volume_hits += 1
+                volume_score += 1.8 * recency
+            if idx >= n - 8:
+                recent_hits += 1
+                recent_score += 1.5 * recency
+
+    anchor_count = len(set(anchor_dates))
+    reaction_count = close_hits + body_hits + supply_hits
+    cleanliness = reactive_cross_count / crossing_count if crossing_count else 1.0
+
+    close_component = min(30.0, close_score * 3.2)
+    body_component = min(25.0, body_score * 3.0)
+    supply_component = min(15.0, supply_score * 2.5)
+    volume_component = min(10.0, volume_score * 2.0)
+    recent_component = min(10.0, recent_score * 2.0)
+    clean_component = min(10.0, max(0.0, cleanliness) * 10.0)
+
+    single_extreme_only = bool(single_extreme_hit and anchor_count <= 1 and close_hits <= 1 and body_hits <= 1)
+    single_extreme_penalty = 35.0 if single_extreme_only else 0.0
+    chaos_penalty = 0.0
+    if crossing_count >= 6 and cleanliness < 0.42:
+        chaos_penalty = 12.0
+    elif crossing_count >= 4 and cleanliness < 0.35:
+        chaos_penalty = 8.0
+
+    score = close_component + body_component + supply_component + volume_component + recent_component + clean_component - single_extreme_penalty - chaos_penalty
+    score = max(0.0, min(100.0, score))
+
+    if single_extreme_only:
+        line_type = "upper_extreme_pressure"
+        level = "极值压力"
+    elif score >= 70 and anchor_count >= 3 and (close_hits + body_hits) >= 2 and volume_hits >= 1:
+        line_type = "core_line"
+        level = "高置信核心线"
+    elif score >= 58 and anchor_count >= 3 and (close_hits + body_hits) >= 2:
+        line_type = "core_line"
+        level = "核心线候选"
+    elif score >= 45 and anchor_count >= 2:
+        line_type = "logic_analysis_line"
+        level = "逻辑分析线候选"
+    else:
+        line_type = "non_core"
+        level = "未成线"
+
+    return {
+        "center": rd(center),
+        "band_low": rd(center - bw),
+        "band_high": rd(center + bw),
+        "score": rd(score),
+        "line_type": line_type,
+        "level": level,
+        "timeframe": timeframe,
+        "anchor_count": anchor_count,
+        "reaction_count": reaction_count,
+        "close_hits": close_hits,
+        "body_hits": body_hits,
+        "supply_hits": supply_hits,
+        "volume_hits": volume_hits,
+        "recent_hits": recent_hits,
+        "crossing_count": crossing_count,
+        "cleanliness": rd(cleanliness, 3),
+        "single_extreme_only": single_extreme_only,
+        "single_extreme_penalty": rd(single_extreme_penalty),
+        "chaos_penalty": rd(chaos_penalty),
+        "anchor_dates": anchor_dates[:8],
+        "anchor_types": sorted(set(anchor_types)),
+        "max_high": rd(max_high),
+        "min_low": rd(min_low),
+    }
+
+
+def find_core_line_on_agg(df: pd.DataFrame, window: int, timeframe: str) -> Dict[str, Any]:
+    k = aggregate_bars(df, window)
+    if k.empty or len(k) < 6:
+        return {"level": "数据不足", "line": None, "line_type": "none", "timeframe": timeframe, "text": f"{timeframe}聚合K不足，不能硬画核心线。"}
+    centers = build_candidate_centers(k)
+    scored = [score_price_band(k, c, timeframe) for c in centers]
+    scored = sorted(scored, key=lambda x: (x.get("line_type") == "core_line", sf(x.get("score")), sf(x.get("anchor_count"))), reverse=True)
+
+    core = next((x for x in scored if x.get("line_type") == "core_line"), None)
+    logic = next((x for x in scored if x.get("line_type") == "logic_analysis_line"), None)
+    extreme_candidates = [x for x in scored if x.get("line_type") == "upper_extreme_pressure"]
+    max_high = rd(k.high.max())
+    upper_extreme = extreme_candidates[0] if extreme_candidates else {"center": max_high, "level": "上方极值压力", "line_type": "upper_extreme_pressure", "score": 0.0}
+
+    if core:
+        core["logic_analysis_line"] = logic.get("center") if logic else None
+        core["upper_extreme_pressure"] = upper_extreme.get("center")
+        core["all_candidates"] = scored[:6]
+        core["text"] = (
+            f"{timeframe}核心线约{core['center']}元，区间{core['band_low']}~{core['band_high']}元；"
+            f"反应点{core['anchor_count']}个，收盘命中{core['close_hits']}次，实体/支撑命中{core['body_hits']}次，"
+            f"带量反应{core['volume_hits']}次，穿越洁净度{core['cleanliness']}。"
+            f"上方极值压力约{upper_extreme.get('center')}元，不能与核心线混用。"
+        )
+        core["line"] = core["center"]
+        return core
+
+    if logic:
+        logic["logic_analysis_line"] = logic.get("center")
+        logic["upper_extreme_pressure"] = upper_extreme.get("center")
+        logic["all_candidates"] = scored[:6]
+        logic["text"] = (
+            f"{timeframe}未识别到高置信核心线；仅识别逻辑分析线约{logic['center']}元，"
+            f"区间{logic['band_low']}~{logic['band_high']}元。"
+            f"上方极值压力约{upper_extreme.get('center')}元。"
+        )
+        logic["line"] = None
+        return logic
+
+    return {
+        "level": "未识别",
+        "line": None,
+        "line_type": "none",
+        "timeframe": timeframe,
+        "upper_extreme_pressure": upper_extreme.get("center"),
+        "all_candidates": scored[:6],
+        "text": f"{timeframe}未识别到合格核心线；上方极值压力约{upper_extreme.get('center')}元，不得硬叫核心线。",
+    }
+
+
+def core_line(df: pd.DataFrame) -> Dict[str, Any]:
+    if len(df) < 80:
+        return {"level": "数据不足", "line": None, "line_type": "none", "text": "历史K线不足，不能硬画核心线。"}
+
+    q = find_core_line_on_agg(df, 60, "60日聚合K/季线")
+    if q.get("line_type") == "core_line":
+        return q
+
+    m = find_core_line_on_agg(df, 20, "20日聚合K/月线")
+    if m.get("line_type") == "core_line":
+        m["seasonal_fallback"] = q
+        return m
+
+    if q.get("line_type") == "logic_analysis_line":
+        q["monthly_fallback"] = m
+        return q
+    return m if m.get("line_type") == "logic_analysis_line" else q
+
+
+def core_line_summary(cl: Dict[str, Any]) -> str:
+    lt = ss(cl.get("line_type"))
+    if lt == "core_line":
+        return f"核心线约 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜区间 {cl.get('band_low')}~{cl.get('band_high')}"
+    if lt == "logic_analysis_line":
+        return f"未确认核心线｜逻辑分析线约 {cl.get('logic_analysis_line')} 元｜{cl.get('level')}｜上方极值压力 {cl.get('upper_extreme_pressure')}"
+    return f"未识别到核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}"
 
 
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
-    lines = ["# 五号员工：大涨/涨停归因学习报告", "", f"- 日期：{TARGET}", f"- 启动指纹：{BOOT}", "- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。", f"- 数据来源：{stat.get('source')}", f"- 缓存/数据命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}", "", "## 核心线状态分布"]
+    lines = [
+        "# 五号员工：大涨/涨停归因学习报告",
+        "",
+        f"- 日期：{TARGET}",
+        f"- 启动指纹：{BOOT}",
+        "- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。",
+        "- 核心线纪律：季线优先找市场记忆线；最高点只允许叫上方极值压力，不能硬叫核心线。",
+        f"- 数据来源：{stat.get('source')}",
+        f"- 缓存/数据命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
+        "",
+        "## 核心线状态分布",
+    ]
     merged = pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True) if not (A.empty and B.empty) else pd.DataFrame()
     results = []
     if merged.empty:
@@ -341,7 +632,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         for _, r in merged.iterrows():
             c = ss(r.get("code"))
             cl = core_line(hist.get(c, pd.DataFrame()))
-            lines.append(f"- {r.get('_group')} {c}：核心线约 {cl.get('line')} 元｜{cl.get('level')}")
+            lines.append(f"- {r.get('_group')} {c}：{core_line_summary(cl)}")
     lines += ["", "## A组：当日涨停/极强样本"]
     if A.empty:
         lines.append("- A组为空：未反推出目标日涨停/极强样本。")
@@ -359,9 +650,41 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         for _, r in pool.iterrows():
             c = ss(r.get("code"))
             cl = core_line(hist.get(c, pd.DataFrame()))
-            lines += [f"### {c}｜{group}", f"- 核心线状态：{cl.get('level')}｜{cl.get('line')}元", "", cl.get("text", ""), "这只票只作为归因样本，不输出买入建议。", "", "**三个核心问题**", "1. 这条核心线为什么有效？", "2. 资金为什么在这个时间点发动？", "3. 能否沉淀成一号员工可提前识别的因子？", ""]
+            lines += [
+                f"### {c}｜{group}",
+                f"- 核心线状态：{core_line_summary(cl)}",
+                "",
+                cl.get("text", ""),
+                "",
+                "候选线证据：",
+            ]
+            for item in cl.get("all_candidates", [])[:4]:
+                lines.append(
+                    f"- {item.get('line_type')}｜{item.get('center')}元｜score={item.get('score')}｜"
+                    f"anchor={item.get('anchor_count')} close={item.get('close_hits')} body={item.get('body_hits')} "
+                    f"supply={item.get('supply_hits')} vol={item.get('volume_hits')} clean={item.get('cleanliness')}"
+                )
+            lines += [
+                "",
+                "这只票只作为归因样本，不输出买入建议。",
+                "",
+                "**三个核心问题**",
+                "1. 这条线为什么有效，还是只是极值压力？",
+                "2. 资金为什么在这个时间点发动？",
+                "3. 能否沉淀成一号员工可提前识别的因子？",
+                "",
+            ]
             results.append({"group": group, "code": c, "sample": r.to_dict(), "core_line": cl})
-    payload = {"target_date": TARGET, "boot_id": BOOT, "cache_stats": stat, "a_pool": A.to_dict("records") if not A.empty else [], "b_pool": B.to_dict("records") if not B.empty else [], "results": results, "research_only": True}
+    payload = {
+        "target_date": TARGET,
+        "boot_id": BOOT,
+        "cache_stats": stat,
+        "a_pool": A.to_dict("records") if not A.empty else [],
+        "b_pool": B.to_dict("records") if not B.empty else [],
+        "results": results,
+        "research_only": True,
+        "core_line_method": "seasonal_agg60_price_band_reaction_density_v1",
+    }
     return "\n".join(lines), payload
 
 
@@ -383,7 +706,13 @@ def send_report(text: str) -> None:
 
 def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    files = {"limit_up_research_report.md": md, "big_rise_story_report.md": md, "left_trace_research_report.md": md, "limit_up_research_report.json": json.dumps(payload, ensure_ascii=False, indent=2), "employee5_runtime_feedback.json": json.dumps({"boot_id": BOOT, "target_date": TARGET, "network_hist_allowed": False, "data_source": payload.get("cache_stats", {}).get("source")}, ensure_ascii=False, indent=2)}
+    files = {
+        "limit_up_research_report.md": md,
+        "big_rise_story_report.md": md,
+        "left_trace_research_report.md": md,
+        "limit_up_research_report.json": json.dumps(payload, ensure_ascii=False, indent=2),
+        "employee5_runtime_feedback.json": json.dumps({"boot_id": BOOT, "target_date": TARGET, "network_hist_allowed": False, "data_source": payload.get("cache_stats", {}).get("source"), "core_line_method": payload.get("core_line_method")}, ensure_ascii=False, indent=2),
+    }
     for name, content in files.items():
         (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
