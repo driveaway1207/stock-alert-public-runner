@@ -75,11 +75,9 @@ jobs:
       - name: restore shared kline cache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            kline_cache/
-            employee5_kline_cache/
-            data/kline_cache/
-            cache/kline_cache/
+          # 必须与一号员工共享缓存保存路径保持一致。
+          # GitHub Actions cache 的版本会包含 path，路径集合不一致会导致同 key 也恢复不到。
+          path: kline_cache
           key: a-kline-cache-${{ github.ref_name }}-employee5-check-${{ github.run_id }}
           restore-keys: |
             a-kline-cache-${{ github.ref_name }}-
@@ -281,11 +279,8 @@ jobs:
         if: ${{ always() && steps.cache_audit_after.outputs.save_cache == 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            kline_cache/
-            employee5_kline_cache/
-            data/kline_cache/
-            cache/kline_cache/
+          # 必须与一号员工共享缓存保存路径保持一致，保证后续一号/五号员工互相可恢复。
+          path: kline_cache
           key: a-kline-cache-${{ github.ref_name }}-employee5-${{ github.run_id }}
 
       - name: run employee5
