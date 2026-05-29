@@ -3,12 +3,13 @@ from __future__ import annotations
 
 """五号员工：大涨/涨停归因学习引擎。
 
-核心线 V56：上影线最大共振核心线。
+核心线 V57：上影线最大共振核心线 + 三问必须作答。
 - 候选线只来自已完成的大周期聚合K的 high；
 - 最新一根20日/月线窗口、60日/季线窗口默认视为未完成，不参与核心线候选与评分；
 - 统计候选线被多少根K的“实体顶—最高价”区间打到；
 - 收盘/实体顶/最高价在 ±0.5% 内都算同一条线的共振并加分；
-- 切实体超过0.5%每根扣1分；切实体达到2根及以上，不算工整线。
+- 切实体超过0.5%每根扣1分；切实体达到2根及以上，不算工整线；
+- 每只样本的三个核心问题必须给出基于字段的回答，不再只列问题。
 """
 
 import json, math, os, re, time
@@ -26,7 +27,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V56_EXCLUDE_CURRENT_AGG_BAR"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V57_QUESTION_ANSWERS"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
@@ -369,9 +370,44 @@ def candidate_line_brief(x: Dict[str, Any]) -> str:
     return f"- {x.get('line_type')}｜线{x.get('line')}元｜打到{x.get('hit_count')}根｜收盘贴线{x.get('close_touch_count')}｜实体顶贴线{x.get('body_top_touch_count')}｜最高价贴线{x.get('high_touch_count')}｜带量{x.get('volume_hit_count')}｜切实体{x.get('body_cut_count')}｜score={x.get('score')}｜工整={x.get('clean_core_line')}"
 
 
+def sample_ref_price(sample: Any) -> float:
+    if isinstance(sample, pd.Series): sample = sample.to_dict()
+    if isinstance(sample, dict):
+        for key in ["close", "end_close"]:
+            v = sf(sample.get(key))
+            if v > 0: return v
+    return 0.0
+
+
+def three_question_answer_lines(cl: Dict[str, Any], sample: Any) -> List[str]:
+    line = sf(cl.get("line")); px = sample_ref_price(sample); lt = ss(cl.get("line_type")); clean = bool(cl.get("clean_core_line"))
+    hit = int(sf(cl.get("hit_count"))); close_n = int(sf(cl.get("close_touch_count"))); body_n = int(sf(cl.get("body_top_touch_count"))); high_n = int(sf(cl.get("high_touch_count"))); vol_n = int(sf(cl.get("volume_hit_count"))); cut_n = int(sf(cl.get("body_cut_count"))); score = rd(cl.get("score"))
+    if lt == "core_line":
+        a1 = f"答：这条线具备有效性，不是单根极值。证据是有{hit}根已完成大周期K打到它，收盘贴线{close_n}次、实体顶贴线{body_n}次、最高价贴线{high_n}次、带量打到{vol_n}次，实体切割{cut_n}次，score={score}。"
+    elif lt == "logic_analysis_line":
+        a1 = f"答：这条线暂时只能算逻辑线，不是高置信核心线。它打到{hit}根，实体切割{cut_n}次，score={score}，还需要更多干净共振验证。"
+    else:
+        a1 = "答：当前没有识别到合格核心线，不能把普通高点硬解释成核心线。"
+    if line > 0 and px > 0:
+        diff = (px / line - 1.0) * 100.0
+        if abs(diff) <= TOL * 100:
+            a2 = f"答：样本价{rd(px)}元贴近核心线{rd(line)}元，说明样本正处在核心线反应区，后续要看是否放量站稳或回踩不破。"
+        elif diff > 0:
+            a2 = f"答：样本价{rd(px)}元高于核心线{rd(line)}元约{rd(diff)}%，更像越过旧供应后的反应；后续重点看是否跌回线下。"
+        else:
+            a2 = f"答：样本价{rd(px)}元低于核心线{rd(line)}元约{rd(abs(diff))}%，说明这条线不是当前发动的直接触发点，只能作为上方确认位继续观察。"
+    else:
+        a2 = "答：样本价格或核心线缺失，暂时不能判断发动点与核心线的直接关系。"
+    if lt == "core_line" and clean and hit >= MIN_CORE_HIT_COUNT:
+        a3 = "答：可以沉淀为一号员工的结构因子：大周期形成干净上影共振线，后续日线若高质量突破或突破后回踩不破，可进入候选评分。"
+    else:
+        a3 = "答：暂时不适合沉淀为一号员工正式因子，只能继续作为五号员工观察样本积累。"
+    return ["1. 这条线为什么有效，还是只是极值压力？", a1, "2. 为什么在这个时间点发动？", a2, "3. 能否沉淀成一号员工可提前识别的因子？", a3]
+
+
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
-    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：使用上影线最大共振法；候选线来自已完成大周期 high；最新一根20日/月线窗口、60日/季线窗口默认未完成，不参与候选与评分；打到K线越多越核心；收盘/实体顶/最高价±0.5%共振额外加分；切实体两根以上不算工整线。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}",f"- 扫描内存保护：全市场仅保留最近{SCAN_KEEP_ROWS}根，入选样本回读完整历史。","","## 核心线状态分布"]
+    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：使用上影线最大共振法；候选线来自已完成大周期 high；最新一根20日/月线窗口、60日/季线窗口默认未完成，不参与候选与评分；打到K线越多越核心；收盘/实体顶/最高价±0.5%共振额外加分；切实体两根以上不算工整线。","- 三问纪律：每只样本必须给出答案，不能只列问题。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}",f"- 扫描内存保护：全市场仅保留最近{SCAN_KEEP_ROWS}根，入选样本回读完整历史。","","## 核心线状态分布"]
     merged = pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True) if not (A.empty and B.empty) else pd.DataFrame(); results = []
     if merged.empty: lines.append("- 没有有效样本：这是缓存/数据源未覆盖目标日，不代表市场没有涨停/大涨股。")
     else:
@@ -388,14 +424,14 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     lines += ["","## 逐只故事归因"]
     for group, pool in [("A组", A), ("B组", B)]:
         for _, r in pool.iterrows():
-            c = ss(r.get("code")); cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame())))
+            c = ss(r.get("code")); cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame()))); qa = three_question_answer_lines(cl, r)
             lines += [f"### {c}｜{group}",f"- 核心线状态：{core_line_summary(cl)}","",cl.get("text", ""),"",f"排除的当前未完成K：{cl.get('excluded_current_bar', {})}","","候选线证据："]
             for item in cl.get("all_candidates", [])[:6]: lines.append(candidate_line_brief(item))
             lines += ["","关键共振K："]
             for ev in cl.get("evidence", [])[:8]: lines.append(f"- {ev.get('date')}｜高{ev.get('high')}｜收{ev.get('close')}｜实体顶{ev.get('body_top')}｜收盘贴线={ev.get('close_touch')} 实体顶贴线={ev.get('body_top_touch')} 最高价贴线={ev.get('high_touch')}")
-            lines += ["","这只票只作为归因样本，不输出买入建议。","","**三个核心问题**","1. 这条线为什么有效，还是只是极值压力？","2. 资金为什么在这个时间点发动？","3. 能否沉淀成一号员工可提前识别的因子？",""]
-            results.append({"group":group,"code":c,"sample":r.to_dict(),"core_line":cl})
-    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"max_upper_shadow_resonance_lowest_high_v56_exclude_current_agg_bar_tol_0_5pct","core_line_tol":TOL,"exclude_current_agg_bar":True}
+            lines += ["","这只票只作为归因样本，不输出交易建议。","","**三个核心问题与回答**"] + qa + [""]
+            results.append({"group":group,"code":c,"sample":r.to_dict(),"core_line":cl,"three_question_answers":qa})
+    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"max_upper_shadow_resonance_lowest_high_v57_question_answers_tol_0_5pct","core_line_tol":TOL,"exclude_current_agg_bar":True,"three_questions_must_answer":True}
     return "\n".join(lines), payload
 
 
@@ -412,7 +448,7 @@ def send_report(text: str) -> None:
 
 def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True); safe = safe_jsonable(payload)
-    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"exclude_current_agg_bar":True,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
+    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"exclude_current_agg_bar":True,"three_questions_must_answer":True,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
     files = {"limit_up_research_report.md":md,"big_rise_story_report.md":md,"left_trace_research_report.md":md,"limit_up_research_report.json":json.dumps(safe, ensure_ascii=False, indent=2, allow_nan=False),"employee5_runtime_feedback.json":json.dumps(feedback, ensure_ascii=False, indent=2, allow_nan=False)}
     for name, content in files.items(): (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
