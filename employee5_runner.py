@@ -3,8 +3,9 @@ from __future__ import annotations
 
 """五号员工：大涨/涨停归因学习引擎。
 
-核心线 V55：上影线最大共振核心线。
-- 候选线只来自大周期聚合K的 high；
+核心线 V56：上影线最大共振核心线。
+- 候选线只来自已完成的大周期聚合K的 high；
+- 最新一根20日/月线窗口、60日/季线窗口默认视为未完成，不参与核心线候选与评分；
 - 统计候选线被多少根K的“实体顶—最高价”区间打到；
 - 收盘/实体顶/最高价在 ±0.5% 内都算同一条线的共振并加分；
 - 切实体超过0.5%每根扣1分；切实体达到2根及以上，不算工整线。
@@ -25,7 +26,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V55_SHADOW_RESONANCE"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V56_EXCLUDE_CURRENT_AGG_BAR"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
@@ -262,6 +263,22 @@ def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
     return k
 
 
+def latest_bar_snapshot(k: pd.DataFrame) -> Dict[str, Any]:
+    if k is None or k.empty: return {}
+    r = k.iloc[-1]
+    return {"start": ss(r.start), "end": ss(r.end), "open": rd(r.open), "high": rd(r.high), "low": rd(r.low), "close": rd(r.close), "body_top": rd(r.body_top), "volume": rd(r.volume)}
+
+
+def completed_bars_for_coreline(k: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """核心线只用已经完成的历史大周期K。最新一根聚合K默认视为当前未完成，不参与候选与评分。"""
+    if k is None or k.empty:
+        return pd.DataFrame(), {}
+    excluded = latest_bar_snapshot(k)
+    if len(k) <= 1:
+        return pd.DataFrame(), excluded
+    return k.iloc[:-1].reset_index(drop=True), excluded
+
+
 def near(a: float, b: float, tol: float = TOL) -> bool:
     a, b = sf(a), sf(b)
     return bool(a > 0 and b > 0 and abs(a - b) / b <= tol)
@@ -293,17 +310,23 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
 
 
 def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[str, Any]:
-    k = aggregate_bars(df, window)
-    if k.empty or len(k) < 6: return {"level":"数据不足","line":None,"line_type":"none","timeframe":timeframe,"text":f"{timeframe}聚合K不足，不能硬画核心线。"}
+    raw_k = aggregate_bars(df, window)
+    k, excluded = completed_bars_for_coreline(raw_k)
+    if raw_k.empty or len(raw_k) < 6:
+        return {"level":"数据不足","line":None,"line_type":"none","timeframe":timeframe,"text":f"{timeframe}聚合K不足，不能硬画核心线。"}
+    if k.empty or len(k) < 5:
+        return {"level":"已排除当前未完成K后数据不足","line":None,"line_type":"none","timeframe":timeframe,"excluded_current_bar":excluded,"text":f"{timeframe}已排除最新未完成聚合K后，历史完成K数量不足，不能硬画核心线。"}
     scored = [score_shadow_line(k, c, timeframe) for c in sorted(set(rd(x) for x in k.high.tolist() if sf(x) > 0))]
     scored = sorted(scored, key=lambda x:(int(x.get("clean_core_line",False)), int(x.get("hit_count",0)), sf(x.get("score")), int(x.get("close_touch_count",0))+int(x.get("body_top_touch_count",0)), int(x.get("high_touch_count",0)), -sf(x.get("line"))), reverse=True)
     best = next((x for x in scored if x.get("clean_core_line") and x.get("hit_count",0) >= MIN_CORE_HIT_COUNT), scored[0] if scored else None)
-    if not best: return {"level":"未识别","line":None,"line_type":"none","timeframe":timeframe,"text":f"{timeframe}未识别到有效候选。"}
+    if not best: return {"level":"未识别","line":None,"line_type":"none","timeframe":timeframe,"excluded_current_bar":excluded,"text":f"{timeframe}未识别到有效候选。"}
     best["all_candidates"] = scored[:10]
+    best["excluded_current_bar"] = excluded
+    best["excluded_current_bar_note"] = "最新一根聚合K默认视为当前未完成，未参与核心线候选与评分。"
     if best.get("line_type") == "core_line":
-        best["text"] = f"{timeframe}按上影线最大共振法识别核心线：{best['line']}元。共有{best['hit_count']}根K的实体顶—最高价区间打到它；收盘贴线{best['close_touch_count']}次、实体顶贴线{best['body_top_touch_count']}次、最高价贴线{best['high_touch_count']}次、带量打到{best['volume_hit_count']}次；实体切割{best['body_cut_count']}次。容差为±{best['tol_pct']}%，容差只统计共振，不改变核心线锚点。"
+        best["text"] = f"{timeframe}按上影线最大共振法识别核心线：{best['line']}元。已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}）。共有{best['hit_count']}根完成K的实体顶—最高价区间打到它；收盘贴线{best['close_touch_count']}次、实体顶贴线{best['body_top_touch_count']}次、最高价贴线{best['high_touch_count']}次、带量打到{best['volume_hit_count']}次；实体切割{best['body_cut_count']}次。容差为±{best['tol_pct']}%，容差只统计共振，不改变核心线锚点。"
     else:
-        best["text"] = f"{timeframe}未形成工整高置信核心线；最强逻辑线为{best.get('line')}元，打到{best.get('hit_count')}根，实体切割{best.get('body_cut_count')}根，score={best.get('score')}。"
+        best["text"] = f"{timeframe}已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}），未形成工整高置信核心线；最强逻辑线为{best.get('line')}元，打到{best.get('hit_count')}根完成K，实体切割{best.get('body_cut_count')}根，score={best.get('score')}。"
     return best
 
 
@@ -319,8 +342,8 @@ def core_line(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def core_line_summary(cl: Dict[str, Any]) -> str:
-    if ss(cl.get("line_type")) == "core_line": return f"核心线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜收盘贴线{cl.get('close_touch_count')}｜实体顶贴线{cl.get('body_top_touch_count')}｜最高价贴线{cl.get('high_touch_count')}｜实体切割{cl.get('body_cut_count')}｜score={cl.get('score')}"
-    if ss(cl.get("line_type")) == "logic_analysis_line": return f"未确认工整核心线｜逻辑线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜实体切割{cl.get('body_cut_count')}｜score={cl.get('score')}"
+    if ss(cl.get("line_type")) == "core_line": return f"核心线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜收盘贴线{cl.get('close_touch_count')}｜实体顶贴线{cl.get('body_top_touch_count')}｜最高价贴线{cl.get('high_touch_count')}｜实体切割{cl.get('body_cut_count')}｜score={cl.get('score')}｜已排除当前未完成K"
+    if ss(cl.get("line_type")) == "logic_analysis_line": return f"未确认工整核心线｜逻辑线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜实体切割{cl.get('body_cut_count')}｜score={cl.get('score')}｜已排除当前未完成K"
     return f"未识别到核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}"
 
 
@@ -348,7 +371,7 @@ def candidate_line_brief(x: Dict[str, Any]) -> str:
 
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
-    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：使用上影线最大共振法；候选线来自大周期 high；打到K线越多越核心；收盘/实体顶/最高价±0.5%共振额外加分；月线/季线切实体两根以上不算工整线。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}",f"- 扫描内存保护：全市场仅保留最近{SCAN_KEEP_ROWS}根，入选样本回读完整历史。","","## 核心线状态分布"]
+    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：使用上影线最大共振法；候选线来自已完成大周期 high；最新一根20日/月线窗口、60日/季线窗口默认未完成，不参与候选与评分；打到K线越多越核心；收盘/实体顶/最高价±0.5%共振额外加分；切实体两根以上不算工整线。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}",f"- 扫描内存保护：全市场仅保留最近{SCAN_KEEP_ROWS}根，入选样本回读完整历史。","","## 核心线状态分布"]
     merged = pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True) if not (A.empty and B.empty) else pd.DataFrame(); results = []
     if merged.empty: lines.append("- 没有有效样本：这是缓存/数据源未覆盖目标日，不代表市场没有涨停/大涨股。")
     else:
@@ -366,13 +389,13 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     for group, pool in [("A组", A), ("B组", B)]:
         for _, r in pool.iterrows():
             c = ss(r.get("code")); cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame())))
-            lines += [f"### {c}｜{group}",f"- 核心线状态：{core_line_summary(cl)}","",cl.get("text", ""),"","候选线证据："]
+            lines += [f"### {c}｜{group}",f"- 核心线状态：{core_line_summary(cl)}","",cl.get("text", ""),"",f"排除的当前未完成K：{cl.get('excluded_current_bar', {})}","","候选线证据："]
             for item in cl.get("all_candidates", [])[:6]: lines.append(candidate_line_brief(item))
             lines += ["","关键共振K："]
             for ev in cl.get("evidence", [])[:8]: lines.append(f"- {ev.get('date')}｜高{ev.get('high')}｜收{ev.get('close')}｜实体顶{ev.get('body_top')}｜收盘贴线={ev.get('close_touch')} 实体顶贴线={ev.get('body_top_touch')} 最高价贴线={ev.get('high_touch')}")
             lines += ["","这只票只作为归因样本，不输出买入建议。","","**三个核心问题**","1. 这条线为什么有效，还是只是极值压力？","2. 资金为什么在这个时间点发动？","3. 能否沉淀成一号员工可提前识别的因子？",""]
             results.append({"group":group,"code":c,"sample":r.to_dict(),"core_line":cl})
-    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"max_upper_shadow_resonance_lowest_high_v55_tol_0_5pct","core_line_tol":TOL}
+    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"max_upper_shadow_resonance_lowest_high_v56_exclude_current_agg_bar_tol_0_5pct","core_line_tol":TOL,"exclude_current_agg_bar":True}
     return "\n".join(lines), payload
 
 
@@ -389,7 +412,7 @@ def send_report(text: str) -> None:
 
 def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True); safe = safe_jsonable(payload)
-    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
+    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"exclude_current_agg_bar":True,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
     files = {"limit_up_research_report.md":md,"big_rise_story_report.md":md,"left_trace_research_report.md":md,"limit_up_research_report.json":json.dumps(safe, ensure_ascii=False, indent=2, allow_nan=False),"employee5_runtime_feedback.json":json.dumps(feedback, ensure_ascii=False, indent=2, allow_nan=False)}
     for name, content in files.items(): (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
