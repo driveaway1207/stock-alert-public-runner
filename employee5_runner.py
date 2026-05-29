@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。
+"""五号员工：大涨/涨停归因学习引擎。V59
 
-核心线 V58：上影线最大共振核心线 + 实体接受硬过滤。
-- 候选线只来自已完成的大周期聚合K的 high；
-- 最新一根20日聚合K窗口、60日聚合K窗口默认视为未完成，不参与核心线候选与评分；
-- 统计候选线被多少根K的“实体顶—最高价”区间打到；
-- 收盘/实体顶/最高价在 ±0.5% 内都算同一条线的共振并加分；
-- 切实体超过0.5%每根扣1分；切实体达到2根及以上，不算工整线；
-- 如果任意一根已完成K的整个实体都在候选线上方，说明该压力线已被实体接受，一次都不能作为当前工整核心压力线；
-- 每只样本的三个核心问题必须给出基于字段的回答，不再只列问题。
+核心线规则：
+1. 先用已完成20日聚合K认真找上影最大共振线，不把最新未完成聚合K算进去。
+2. 候选线来自已完成聚合K的 high；统计“实体顶—最高价”是否打到该线。
+3. 容差0.5%；收盘、实体顶、最高价贴线分别加分。
+4. 切实体1次可接受并扣分；切实体>=2时本周期不工整。
+5. 整根实体在线上方，说明压力线已被实体接受，一次都不能作为当前工整压力线。
+6. 只有当前周期候选线本身有真实共振、但被切碎/接受时，才升到更大周期：20日 -> 60日 -> 250日。250日仍不工整就放弃，不硬画。
 """
 
 import json, math, os, re, time
@@ -28,7 +27,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V58_ENTITY_ACCEPT_FILTER"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V59_SMART_TF"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
@@ -160,7 +159,9 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         df = read_cache_file(p)
         if df.empty: stat["cache_bad"] += 1; continue
         if len(df) < MIN_ROWS or df.iloc[-1]["date"].replace("-", "") < TARGET: stat["cache_short"] += 1; continue
-        CACHE_FILE_MAP[c] = p; hist[c] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True); stat["cache_hit"] += 1
+        CACHE_FILE_MAP[c] = p
+        hist[c] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
+        stat["cache_hit"] += 1
         if i % 500 == 0: print(f"cache scan {i}/{len(files)} hit={stat['cache_hit']}", flush=True)
     return hist, stat
 
@@ -238,7 +239,8 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
     for i, (code, df) in enumerate(hist.items(), 1):
         if df is None or df.empty: continue
         last = df.iloc[-1]; pct = sf(last.pct_chg); lp = limit_pct(code)
-        if pct >= lp - 0.35 or pct >= min(8.0, lp * 0.75): a_rows.append({"code":code,"name":code,"date":last.date,"close":rd(last.close),"pct_chg":rd(pct),"sample_type":"涨停/近涨停" if pct >= lp - 0.35 else "极强上涨"})
+        if pct >= lp - 0.35 or pct >= min(8.0, lp * 0.75):
+            a_rows.append({"code":code,"name":code,"date":last.date,"close":rd(last.close),"pct_chg":rd(pct),"sample_type":"涨停/近涨停" if pct >= lp - 0.35 else "极强上涨"})
         g = gain20(df)
         if g: b_rows.append({"code":code,"name":code,**g})
         if i % 500 == 0: print(f"sample scan {i}/{len(hist)} A={len(a_rows)} B={len(b_rows)}", flush=True)
@@ -250,10 +252,12 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
 
 def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
     if df is None or df.empty or len(df) < max(22, window * 3): return pd.DataFrame()
-    d = df.copy().reset_index(drop=True); d["grp"] = [(len(d) - 1 - i) // window for i in range(len(d))]
+    d = df.copy().reset_index(drop=True)
+    d["grp"] = [(len(d) - 1 - i) // window for i in range(len(d))]
     bars = []
     for _, g in d.groupby("grp"):
-        g = g.sort_index(); bars.append({"start":g.iloc[0].date,"end":g.iloc[-1].date,"open":sf(g.iloc[0].open),"high":sf(g.high.max()),"low":sf(g.low.min()),"close":sf(g.iloc[-1].close),"volume":sf(g.volume.sum())})
+        g = g.sort_index()
+        bars.append({"start":g.iloc[0].date,"end":g.iloc[-1].date,"open":sf(g.iloc[0].open),"high":sf(g.high.max()),"low":sf(g.low.min()),"close":sf(g.iloc[-1].close),"volume":sf(g.volume.sum())})
     k = pd.DataFrame(bars).sort_values("end").reset_index(drop=True)
     if k.empty: return k
     rng = (k.high - k.low).replace(0, pd.NA)
@@ -307,6 +311,8 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
         if is_accept:
             entity_accept += 1; accept_dates.append(tag)
     clean = body_cut < 2 and entity_accept == 0
+    meaningful = hit >= MIN_CORE_HIT_COUNT and score >= max(2.0, MIN_CORE_HIT_COUNT - 1.0)
+    need_escalate = meaningful and (body_cut >= 2 or entity_accept >= 1)
     if entity_accept > 0:
         line_type, level = "logic_analysis_line", "已被实体接受的旧压力线"
     elif clean and hit >= 5 and score >= 5:
@@ -317,7 +323,7 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
         line_type, level = "logic_analysis_line", "逻辑分析线候选" if clean else "不工整逻辑线"
     else:
         line_type, level = "non_core", "未成线"
-    return {"line":rd(L),"core_line":rd(L),"line_type":line_type,"level":level,"timeframe":timeframe,"score":rd(score),"hit_count":hit,"upper_shadow_hit_count":upper_hit,"entity_top_as_shadow_count":top_as_shadow,"close_touch_count":close_touch,"body_top_touch_count":body_touch,"high_touch_count":high_touch,"volume_hit_count":vol_hit,"body_cut_count":body_cut,"entity_accept_count":entity_accept,"entity_accept_dates":accept_dates[:20],"accepted_invalidated":entity_accept>0,"clean_core_line":clean,"tol_pct":rd(TOL*100,3),"hit_dates":hit_dates[:20],"cut_dates":cut_dates[:20],"evidence":evidence[:20],"upper_extreme_pressure":rd(k.high.max()) if not k.empty else 0.0,"core_band_low":rd(L*(1-TOL)),"core_band_high":rd(L*(1+TOL)),"confirmation_source":"max_upper_shadow_resonance_lowest_high"}
+    return {"line":rd(L),"core_line":rd(L),"line_type":line_type,"level":level,"timeframe":timeframe,"score":rd(score),"hit_count":hit,"upper_shadow_hit_count":upper_hit,"entity_top_as_shadow_count":top_as_shadow,"close_touch_count":close_touch,"body_top_touch_count":body_touch,"high_touch_count":high_touch,"volume_hit_count":vol_hit,"body_cut_count":body_cut,"entity_accept_count":entity_accept,"entity_accept_dates":accept_dates[:20],"accepted_invalidated":entity_accept>0,"meaningful_candidate":meaningful,"need_escalate_timeframe":need_escalate,"clean_core_line":clean,"tol_pct":rd(TOL*100,3),"hit_dates":hit_dates[:20],"cut_dates":cut_dates[:20],"evidence":evidence[:20],"upper_extreme_pressure":rd(k.high.max()) if not k.empty else 0.0,"core_band_low":rd(L*(1-TOL)),"core_band_high":rd(L*(1+TOL)),"confirmation_source":"max_upper_shadow_resonance_lowest_high"}
 
 
 def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[str, Any]:
@@ -328,40 +334,65 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
     if k.empty or len(k) < 5:
         return {"level":"已排除当前未完成K后数据不足","line":None,"line_type":"none","timeframe":timeframe,"excluded_current_bar":excluded,"text":f"{timeframe}已排除最新未完成聚合K后，历史完成K数量不足，不能硬画核心线。"}
     scored = [score_shadow_line(k, c, timeframe) for c in sorted(set(rd(x) for x in k.high.tolist() if sf(x) > 0))]
-    scored = sorted(scored, key=lambda x:(int(x.get("clean_core_line",False)), int(x.get("hit_count",0)), sf(x.get("score")), int(x.get("close_touch_count",0))+int(x.get("body_top_touch_count",0)), int(x.get("high_touch_count",0)), -sf(x.get("line"))), reverse=True)
-    best = next((x for x in scored if x.get("clean_core_line") and x.get("hit_count",0) >= MIN_CORE_HIT_COUNT), scored[0] if scored else None)
+    scored = sorted(scored, key=lambda x:(int(x.get("hit_count",0)), sf(x.get("score")), int(x.get("close_touch_count",0))+int(x.get("body_top_touch_count",0)), int(x.get("high_touch_count",0)), -int(x.get("body_cut_count",0)), -int(x.get("entity_accept_count",0)), -sf(x.get("line"))), reverse=True)
+    best = scored[0] if scored else None
     if not best: return {"level":"未识别","line":None,"line_type":"none","timeframe":timeframe,"excluded_current_bar":excluded,"text":f"{timeframe}未识别到有效候选。"}
     best["all_candidates"] = scored[:10]
     best["excluded_current_bar"] = excluded
     best["excluded_current_bar_note"] = "最新一根聚合K默认视为当前未完成，未参与核心线候选与评分。"
     if best.get("line_type") == "core_line":
-        best["text"] = f"{timeframe}按上影线最大共振法识别核心线：{best['line']}元。已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}）。共有{best['hit_count']}根完成K的实体顶—最高价区间打到它；收盘贴线{best['close_touch_count']}次、实体顶贴线{best['body_top_touch_count']}次、最高价贴线{best['high_touch_count']}次、带量打到{best['volume_hit_count']}次；实体切割{best['body_cut_count']}次；实体接受{best.get('entity_accept_count',0)}次。容差为±{best['tol_pct']}%，容差只统计共振，不改变核心线锚点。"
-    elif best.get("accepted_invalidated"):
-        best["text"] = f"{timeframe}识别到逻辑线{best.get('line')}元，但已有{best.get('entity_accept_count')}根完成K的整个实体站在该线上方，说明这条旧压力已被实体接受，不能作为当前工整核心压力线。"
+        best["text"] = f"{timeframe}识别核心线：{best['line']}元。已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}）。打到{best['hit_count']}根；收盘贴线{best['close_touch_count']}次、实体顶贴线{best['body_top_touch_count']}次、最高价贴线{best['high_touch_count']}次、带量打到{best['volume_hit_count']}次；实体切割{best['body_cut_count']}次；实体接受{best.get('entity_accept_count',0)}次。"
+    elif best.get("need_escalate_timeframe"):
+        best["text"] = f"{timeframe}候选线{best.get('line')}元有真实共振：打到{best.get('hit_count')}根、score={best.get('score')}，但实体切割{best.get('body_cut_count')}根、实体接受{best.get('entity_accept_count',0)}根，本周期不工整，需要升一级看更大周期。"
     else:
-        best["text"] = f"{timeframe}已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}），未形成工整高置信核心线；最强逻辑线为{best.get('line')}元，打到{best.get('hit_count')}根完成K，实体切割{best.get('body_cut_count')}根，实体接受{best.get('entity_accept_count',0)}根，score={best.get('score')}。"
+        best["text"] = f"{timeframe}未形成工整核心线；最强候选为{best.get('line')}元，打到{best.get('hit_count')}根，实体切割{best.get('body_cut_count')}根，实体接受{best.get('entity_accept_count',0)}根，score={best.get('score')}。"
     return best
+
+
+def is_clean_core(x: Optional[Dict[str, Any]]) -> bool:
+    return bool(x and x.get("line_type") == "core_line" and x.get("clean_core_line") and x.get("hit_count", 0) >= MIN_CORE_HIT_COUNT)
+
+
+def should_escalate_timeframe(x: Optional[Dict[str, Any]]) -> bool:
+    return bool(x and x.get("meaningful_candidate") and (int(sf(x.get("body_cut_count"))) >= 2 or int(sf(x.get("entity_accept_count"))) >= 1))
+
+
+def attach_path(selected: Dict[str, Any], monthly: Dict[str, Any], seasonal: Optional[Dict[str, Any]], yearly: Optional[Dict[str, Any]], decision: str) -> Dict[str, Any]:
+    selected["monthly_candidate"] = monthly
+    selected["seasonal_candidate"] = seasonal or {}
+    selected["yearly_candidate"] = yearly or {}
+    selected["timeframe_decision"] = decision
+    return selected
 
 
 def core_line(df: pd.DataFrame) -> Dict[str, Any]:
     if len(df) < 80: return {"level":"数据不足","line":None,"line_type":"none","text":"历史K线不足，不能硬画核心线。"}
     monthly = find_shadow_coreline(df, 20, "20日聚合K")
+    if is_clean_core(monthly):
+        monthly["text"] = monthly.get("text", "") + " 周期决策：20日聚合K已工整，不升周期。"
+        return attach_path(monthly, monthly, None, None, "20日工整，直接采用")
+    if not should_escalate_timeframe(monthly):
+        monthly["text"] = monthly.get("text", "") + " 周期决策：20日候选本身不够扎实，不能随意升周期。"
+        return attach_path(monthly, monthly, None, None, "20日候选不足，不升周期")
     seasonal = find_shadow_coreline(df, 60, "60日聚合K")
-    if monthly and monthly.get("line_type") == "core_line":
-        monthly["monthly_candidate"] = monthly; monthly["seasonal_candidate"] = seasonal; return monthly
-    if seasonal and seasonal.get("line_type") == "core_line":
-        seasonal["monthly_candidate"] = monthly; seasonal["seasonal_candidate"] = seasonal; return seasonal
-    cand = [x for x in [monthly, seasonal] if x and x.get("line") is not None]
-    if not cand: return monthly if monthly else seasonal
-    best = sorted(cand, key=lambda x:(int(x.get("clean_core_line",False)), int(x.get("hit_count",0)), sf(x.get("score")), -int(x.get("entity_accept_count",0)), -sf(x.get("line"))), reverse=True)[0]
-    best["monthly_candidate"] = monthly; best["seasonal_candidate"] = seasonal
-    return best
+    if is_clean_core(seasonal):
+        seasonal["text"] = seasonal.get("text", "") + " 周期决策：20日有真实共振但被切碎/接受，升到60日后形成工整核心线。"
+        return attach_path(seasonal, monthly, seasonal, None, "20日不工整，60日工整，采用60日")
+    if not should_escalate_timeframe(seasonal):
+        seasonal["text"] = seasonal.get("text", "") + " 周期决策：60日候选不够扎实或未形成继续升周期条件，不硬切250日。"
+        return attach_path(seasonal, monthly, seasonal, None, "60日候选不足，不硬切250日")
+    yearly = find_shadow_coreline(df, 250, "250日聚合K")
+    if is_clean_core(yearly):
+        yearly["text"] = yearly.get("text", "") + " 周期决策：20日、60日均有真实共振但不工整，升到250日后形成工整大周期核心线。"
+        return attach_path(yearly, monthly, seasonal, yearly, "20日和60日不工整，250日工整，采用250日")
+    yearly["text"] = yearly.get("text", "") + " 周期决策：250日仍未形成工整核心线，放弃，不硬画。"
+    return attach_path(yearly, monthly, seasonal, yearly, "250日仍不工整，放弃核心线")
 
 
 def core_line_summary(cl: Dict[str, Any]) -> str:
-    if ss(cl.get("line_type")) == "core_line": return f"核心线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜收盘贴线{cl.get('close_touch_count')}｜实体顶贴线{cl.get('body_top_touch_count')}｜最高价贴线{cl.get('high_touch_count')}｜实体切割{cl.get('body_cut_count')}｜实体接受{cl.get('entity_accept_count',0)}｜score={cl.get('score')}｜已排除当前未完成K"
-    if ss(cl.get("line_type")) == "logic_analysis_line": return f"未确认工整核心线｜逻辑线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜实体切割{cl.get('body_cut_count')}｜实体接受{cl.get('entity_accept_count',0)}｜score={cl.get('score')}｜已排除当前未完成K"
-    return f"未识别到核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}"
+    if ss(cl.get("line_type")) == "core_line": return f"核心线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜切实体{cl.get('body_cut_count')}｜实体接受{cl.get('entity_accept_count',0)}｜score={cl.get('score')}｜{cl.get('timeframe_decision','')}"
+    if ss(cl.get("line_type")) == "logic_analysis_line": return f"未确认工整核心线｜逻辑线 {cl.get('line')} 元｜{cl.get('level')}｜{cl.get('timeframe')}｜打到{cl.get('hit_count')}根｜切实体{cl.get('body_cut_count')}｜实体接受{cl.get('entity_accept_count',0)}｜score={cl.get('score')}｜{cl.get('timeframe_decision','')}"
+    return f"未识别到核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}｜{cl.get('timeframe_decision','')}"
 
 
 def safe_jsonable(obj: Any, seen: Optional[set] = None) -> Any:
@@ -383,7 +414,7 @@ def safe_jsonable(obj: Any, seen: Optional[set] = None) -> Any:
 
 
 def candidate_line_brief(x: Dict[str, Any]) -> str:
-    return f"- {x.get('line_type')}｜线{x.get('line')}元｜打到{x.get('hit_count')}根｜收盘贴线{x.get('close_touch_count')}｜实体顶贴线{x.get('body_top_touch_count')}｜最高价贴线{x.get('high_touch_count')}｜带量{x.get('volume_hit_count')}｜切实体{x.get('body_cut_count')}｜实体接受{x.get('entity_accept_count',0)}｜score={x.get('score')}｜工整={x.get('clean_core_line')}"
+    return f"- {x.get('line_type')}｜线{x.get('line')}元｜打到{x.get('hit_count')}根｜收盘贴线{x.get('close_touch_count')}｜实体顶贴线{x.get('body_top_touch_count')}｜最高价贴线{x.get('high_touch_count')}｜带量{x.get('volume_hit_count')}｜切实体{x.get('body_cut_count')}｜实体接受{x.get('entity_accept_count',0)}｜score={x.get('score')}｜有效候选={x.get('meaningful_candidate')}｜需升周期={x.get('need_escalate_timeframe')}｜工整={x.get('clean_core_line')}"
 
 
 def sample_ref_price(sample: Any) -> float:
@@ -399,33 +430,30 @@ def three_question_answer_lines(cl: Dict[str, Any], sample: Any) -> List[str]:
     line = sf(cl.get("line")); px = sample_ref_price(sample); lt = ss(cl.get("line_type")); clean = bool(cl.get("clean_core_line"))
     hit = int(sf(cl.get("hit_count"))); close_n = int(sf(cl.get("close_touch_count"))); body_n = int(sf(cl.get("body_top_touch_count"))); high_n = int(sf(cl.get("high_touch_count"))); vol_n = int(sf(cl.get("volume_hit_count"))); cut_n = int(sf(cl.get("body_cut_count"))); accept_n = int(sf(cl.get("entity_accept_count"))); score = rd(cl.get("score"))
     if accept_n > 0:
-        a1 = f"答：这条线不能算当前工整核心压力线，因为已有{accept_n}根完成K的整个实体站在它上方，说明旧压力已被实体接受；虽然它打到{hit}根、score={score}，但实体接受一次都不能接受。"
+        a1 = f"答：这条线不能算当前工整核心压力线，因为已有{accept_n}根完成K的整个实体站在它上方；虽然打到{hit}根、score={score}，但实体接受一次都不能接受。周期决策：{cl.get('timeframe_decision','')}。"
     elif lt == "core_line":
-        a1 = f"答：这条线具备有效性，不是单根极值。证据是有{hit}根已完成大周期K打到它，收盘贴线{close_n}次、实体顶贴线{body_n}次、最高价贴线{high_n}次、带量打到{vol_n}次，实体切割{cut_n}次，实体接受0次，score={score}。"
+        a1 = f"答：这条线具备有效性，不是单根极值。证据是打到{hit}根，收盘贴线{close_n}次、实体顶贴线{body_n}次、最高价贴线{high_n}次、带量打到{vol_n}次，切实体{cut_n}次，实体接受0次，score={score}。周期决策：{cl.get('timeframe_decision','')}。"
     elif lt == "logic_analysis_line":
-        a1 = f"答：这条线暂时只能算逻辑线，不是高置信核心线。它打到{hit}根，实体切割{cut_n}次，实体接受{accept_n}次，score={score}，还需要更多干净共振验证。"
+        a1 = f"答：这条线暂时只能算逻辑线。它打到{hit}根，切实体{cut_n}次，实体接受{accept_n}次，score={score}。周期决策：{cl.get('timeframe_decision','')}。"
     else:
-        a1 = "答：当前没有识别到合格核心线，不能把普通高点硬解释成核心线。"
+        a1 = "答：当前没有识别到合格核心线，不能硬解释。"
     if line > 0 and px > 0:
         diff = (px / line - 1.0) * 100.0
-        if abs(diff) <= TOL * 100:
-            a2 = f"答：样本价{rd(px)}元贴近核心线{rd(line)}元，说明样本正处在核心线反应区，后续要看是否放量站稳或回踩不破。"
-        elif diff > 0:
-            a2 = f"答：样本价{rd(px)}元高于核心线{rd(line)}元约{rd(diff)}%，更像越过旧供应后的反应；后续重点看是否跌回线下。"
-        else:
-            a2 = f"答：样本价{rd(px)}元低于核心线{rd(line)}元约{rd(abs(diff))}%，说明这条线不是当前发动的直接触发点，只能作为上方确认位继续观察。"
+        if abs(diff) <= TOL * 100: a2 = f"答：样本价{rd(px)}元贴近核心线{rd(line)}元，正处在核心线反应区。"
+        elif diff > 0: a2 = f"答：样本价{rd(px)}元高于核心线{rd(line)}元约{rd(diff)}%，后续重点看是否跌回线下。"
+        else: a2 = f"答：样本价{rd(px)}元低于核心线{rd(line)}元约{rd(abs(diff))}%，该线暂作上方确认位。"
     else:
         a2 = "答：样本价格或核心线缺失，暂时不能判断发动点与核心线的直接关系。"
     if lt == "core_line" and clean and accept_n == 0 and hit >= MIN_CORE_HIT_COUNT:
-        a3 = "答：可以沉淀为一号员工的结构因子：大周期形成干净上影共振线，后续日线若高质量突破或突破后回踩不破，可进入候选评分。"
+        a3 = "答：可以沉淀为一号员工的结构因子：大周期形成干净上影共振线，后续日线高质量突破或突破后回踩不破再进入候选评分。"
     else:
-        a3 = "答：暂时不适合沉淀为一号员工正式因子，只能继续作为五号员工观察样本积累。"
+        a3 = "答：暂时不适合沉淀为一号员工正式因子，只能继续作为五号员工观察样本。"
     return ["1. 这条线为什么有效，还是只是极值压力？", a1, "2. 为什么在这个时间点发动？", a2, "3. 能否沉淀成一号员工可提前识别的因子？", a3]
 
 
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
-    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：使用上影线最大共振法；候选线来自已完成20日聚合K为主；最新一根20日/60日聚合K默认未完成，不参与候选与评分；打到K线越多越核心；收盘/实体顶/最高价±0.5%共振额外加分；切实体两根以上不算工整线；整个实体在线上方一次都不能接受。","- 三问纪律：每只样本必须给出答案，不能只列问题。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}",f"- 扫描内存保护：全市场仅保留最近{SCAN_KEEP_ROWS}根，入选样本回读完整历史。","","## 核心线状态分布"]
+    lines = ["# 五号员工：大涨/涨停归因学习报告","",f"- 日期：{TARGET}",f"- 启动指纹：{BOOT}","- 运行纪律：优先读缓存；缓存缺失才用 BaoStock 兜底；不调用 AkShare 逐票历史接口；不荐股。","- 核心线纪律：先按20日聚合K找准；只有20日候选有真实共振但切实体>=2或实体接受>=1时，才升60日；60日同理升250日；250日仍不工整则放弃，不硬画。","- 评分纪律：打到越多越核心；±0.5%共振加分；切实体1次可接受，>=2不工整；整个实体在线上方一次都不能接受。",f"- 数据来源：{stat.get('source')}",f"- 缓存/数据命中：{stat.get('cache_hit',0)} / 文件数 {stat.get('cache_files',0)}","","## 核心线状态分布"]
     merged = pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True) if not (A.empty and B.empty) else pd.DataFrame(); results = []
     if merged.empty: lines.append("- 没有有效样本：这是缓存/数据源未覆盖目标日，不代表市场没有涨停/大涨股。")
     else:
@@ -443,16 +471,20 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     for group, pool in [("A组", A), ("B组", B)]:
         for _, r in pool.iterrows():
             c = ss(r.get("code")); cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame()))); qa = three_question_answer_lines(cl, r)
-            lines += [f"### {c}｜{group}",f"- 核心线状态：{core_line_summary(cl)}","",cl.get("text", ""),"",f"排除的当前未完成K：{cl.get('excluded_current_bar', {})}","","候选线证据："]
+            lines += [f"### {c}｜{group}",f"- 核心线状态：{core_line_summary(cl)}","",cl.get("text", ""),"",f"排除的当前未完成K：{cl.get('excluded_current_bar', {})}",f"周期切换路径：{cl.get('timeframe_decision','')}","","候选线证据："]
             for item in cl.get("all_candidates", [])[:6]: lines.append(candidate_line_brief(item))
+            for key, label in [("monthly_candidate","20日候选"),("seasonal_candidate","60日候选"),("yearly_candidate","250日候选")]:
+                obj = cl.get(key)
+                if isinstance(obj, dict) and obj and obj is not cl:
+                    lines.append(f"- {label}摘要：{candidate_line_brief(obj)}")
             if cl.get("entity_accept_dates"):
                 lines += ["","实体接受K："]
-                for d in cl.get("entity_accept_dates", [])[:8]: lines.append(f"- {d}｜整个实体站在候选线上方，该线不能作为当前工整核心压力线")
+                for d in cl.get("entity_accept_dates", [])[:8]: lines.append(f"- {d}｜整个实体站在候选线上方")
             lines += ["","关键共振K："]
             for ev in cl.get("evidence", [])[:8]: lines.append(f"- {ev.get('date')}｜高{ev.get('high')}｜收{ev.get('close')}｜实体顶{ev.get('body_top')}｜收盘贴线={ev.get('close_touch')} 实体顶贴线={ev.get('body_top_touch')} 最高价贴线={ev.get('high_touch')}")
             lines += ["","这只票只作为归因样本，不输出交易建议。","","**三个核心问题与回答**"] + qa + [""]
             results.append({"group":group,"code":c,"sample":r.to_dict(),"core_line":cl,"three_question_answers":qa})
-    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"max_upper_shadow_resonance_lowest_high_v58_entity_accept_filter_tol_0_5pct","core_line_tol":TOL,"exclude_current_agg_bar":True,"entity_accept_hard_filter":True,"three_questions_must_answer":True}
+    payload = {"target_date":TARGET,"boot_id":BOOT,"cache_stats":stat,"a_pool":A.to_dict("records") if not A.empty else [],"b_pool":B.to_dict("records") if not B.empty else [],"results":results,"research_only":True,"core_line_method":"v59_smart_timeframe_escalation_tol_0_5pct","core_line_tol":TOL,"exclude_current_agg_bar":True,"entity_accept_hard_filter":True,"smart_timeframe_escalation":True}
     return "\n".join(lines), payload
 
 
@@ -469,7 +501,7 @@ def send_report(text: str) -> None:
 
 def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True); safe = safe_jsonable(payload)
-    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"exclude_current_agg_bar":True,"entity_accept_hard_filter":True,"three_questions_must_answer":True,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
+    feedback = safe_jsonable({"boot_id":BOOT,"target_date":TARGET,"network_hist_allowed":False,"data_source":payload.get("cache_stats",{}).get("source"),"core_line_method":payload.get("core_line_method"),"core_line_tol":TOL,"exclude_current_agg_bar":True,"entity_accept_hard_filter":True,"smart_timeframe_escalation":True,"scan_keep_rows":SCAN_KEEP_ROWS,"memsafe_scan":True,"jsonsafe_payload":True})
     files = {"limit_up_research_report.md":md,"big_rise_story_report.md":md,"left_trace_research_report.md":md,"limit_up_research_report.json":json.dumps(safe, ensure_ascii=False, indent=2, allow_nan=False),"employee5_runtime_feedback.json":json.dumps(feedback, ensure_ascii=False, indent=2, allow_nan=False)}
     for name, content in files.items(): (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
