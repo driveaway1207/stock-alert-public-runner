@@ -88,6 +88,7 @@ MIN_CORE_HIT_COUNT = int(os.getenv("EMPLOYEE5_MIN_CORE_HIT_COUNT", "3"))
 LOW_VOLUME_WINDOWS = {20: 12, 60: 6, 250: 3}
 FIRST_CORE_BAND_TOL = float(os.getenv("EMPLOYEE5_FIRST_CORE_BAND_TOL", "0.015"))
 LOWER_LINE_NET_ADVANTAGE = float(os.getenv("EMPLOYEE5_LOWER_LINE_NET_ADVANTAGE", "1.25"))
+ACCEPT_FAIL_PENALTY_CAP = float(os.getenv("EMPLOYEE5_ACCEPT_FAIL_PENALTY_CAP", "4.0"))
 
 # 默认允许“补最近5个交易日”的增量修复，但绝不默认全历史重建。
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "1") != "0"
@@ -1492,7 +1493,7 @@ def volume_event_bonus(r: Any) -> float:
 
 
 def entity_loss_weight(r: Any) -> float:
-    """切实体/接受失败损耗：同样按相较前一根是否放量加权。"""
+    """切实体损耗：按相较前一根是否放量加权。"""
     pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
     if pvr >= 3.0:
         return 1.5
@@ -1501,6 +1502,21 @@ def entity_loss_weight(r: Any) -> float:
     if pvr >= 1.3:
         return 1.0
     return 0.6
+
+
+def accept_failure_loss_weight(r: Any) -> float:
+    """接受后又跌回的损耗：允许连续叠加，但单条线总扣分封顶。
+
+    用户口径：这种失败可以扣，但不能扣太重。
+    每根失败接受K：普通/轻微放量扣0.3，明显放量扣0.5，倍量及以上扣0.8。
+    总接受失败损耗由 ACCEPT_FAIL_PENALTY_CAP 控制，默认最多扣4分。
+    """
+    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
+    if pvr >= 1.8:
+        return 0.8
+    if pvr >= 1.3:
+        return 0.5
+    return 0.3
 
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -1701,17 +1717,23 @@ def score_core_reaction_line(
         is_accept = bool(bb > L)
         if is_accept:
             entity_accept += 1
-            raw_w = entity_loss_weight(r)
-            w = raw_w if accepted_then_failed else 0.0
+            raw_w = accept_failure_loss_weight(r)
+            if accepted_then_failed:
+                remain_cap = max(0.0, ACCEPT_FAIL_PENALTY_CAP - entity_accept_penalty)
+                w = min(raw_w, remain_cap)
+            else:
+                w = 0.0
             entity_accept_penalty += w
             accept_dates.append(tag)
-            if raw_w > 0.6:
+            if raw_w >= 0.5:
                 volume_entity_accept += 1
             ev = dict(base_row)
             ev.update({
                 "entity_loss_weight": rd(w, 3),
                 "raw_entity_loss_weight": rd(raw_w, 3),
-                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_failed_penalty" if accepted_then_failed else "entity_accept",
+                "accept_fail_penalty_cap": rd(ACCEPT_FAIL_PENALTY_CAP, 3),
+                "accept_fail_cap_remaining_after": rd(max(0.0, ACCEPT_FAIL_PENALTY_CAP - entity_accept_penalty), 3),
+                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_failed_penalty_capped" if accepted_then_failed else "entity_accept",
                 "accepted_and_held": bool(accepted_and_held),
                 "accepted_then_failed": bool(accepted_then_failed),
             })
@@ -1817,6 +1839,7 @@ def score_core_reaction_line(
         "body_cut_penalty": rd(body_cut_penalty, 3),
         "entity_accept_count": entity_accept,
         "entity_accept_penalty": rd(entity_accept_penalty, 3),
+        "accept_fail_penalty_cap": rd(ACCEPT_FAIL_PENALTY_CAP, 3),
         "entity_loss_score": rd(entity_loss_score, 3),
         "accepted_and_held": bool(accepted_and_held),
         "accepted_then_failed": bool(accepted_then_failed),
@@ -2369,7 +2392,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; final selection requires net_score > 0 and ranks by net_score first; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - capped_failed_entity_accept_penalty; final selection requires net_score > 0 and ranks by net_score first; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
     }
 
     return "\n".join(lines), payload
