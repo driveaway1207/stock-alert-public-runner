@@ -110,6 +110,9 @@ CACHE_DIRS = [
 MAIN_CACHE_DIR = ROOT / "kline_cache"
 CACHE_FILE_MAP: Dict[str, Path] = {}
 
+# 一号员工公共缓存可能只有扁平CSV，没有五号自己的_qfq_manifest；默认信任公共flat csv，避免缓存明明存在却被判0命中。
+TRUST_PUBLIC_FLAT_CSV = os.getenv("EMPLOYEE5_TRUST_PUBLIC_FLAT_CSV", "1") != "0"
+
 # 五号员工核心线只允许使用前复权缓存。
 # BaoStock: adjustflag=2 前复权；adjustflag=3 不复权，不能再用于核心线。
 QFQ_ADJUST = "qfq"
@@ -404,8 +407,18 @@ def read_cache_file(p: Path, stat: Optional[Dict[str, Any]] = None, require_qfq:
         c = code_of(p)
         if suf == ".csv":
             if require_qfq and not manifest_entry_valid_for_path(c, p, min_rows=MIN_ROWS):
-                reject_untrusted_cache_file(p, "csv_missing_qfq_manifest", stat)
-                return pd.DataFrame()
+                # 一号员工公共缓存是生产级kline_cache，可能没有五号自己的_qfq_manifest。
+                # 不能因为manifest缺失就把5257个CSV全拒绝，否则样本交易日会变成“无”。
+                if not TRUST_PUBLIC_FLAT_CSV:
+                    reject_untrusted_cache_file(p, "csv_missing_qfq_manifest", stat)
+                    return pd.DataFrame()
+                df = normalize_hist(pd.read_csv(p))
+                if df.empty or len(df) < MIN_ROWS:
+                    reject_untrusted_cache_file(p, "csv_flat_cache_bad_or_short", stat)
+                    return pd.DataFrame()
+                if stat is not None:
+                    stat["trusted_public_flat_csv"] = stat.get("trusted_public_flat_csv", 0) + 1
+                return df
             return normalize_hist(pd.read_csv(p))
 
         # V70 只信任一号员工可直接读取的 flat CSV + manifest。历史 JSON qfq 也不参与正式核心线。
@@ -485,6 +498,7 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "qfq_rebuild_state_file": str(QFQ_REBUILD_STATE_FILE),
         "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
         "flat_csv_cache": True,
+        "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
     }
 
@@ -2107,6 +2121,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "qfq_rebuild_state_file": str(QFQ_REBUILD_STATE_FILE),
         "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
         "flat_csv_cache": True,
+        "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
         "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
