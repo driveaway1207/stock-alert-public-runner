@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线归因引擎。V82
+"""五号员工：涨停核心线归因引擎。V85
 
 只做一件事：
 扫描最近一个可用交易日的涨停样本，并按原 18.11/V73 60日核心线逻辑输出核心线。
@@ -30,7 +30,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V82_LIMIT_UP_CORELINES_A_CHAIN_AUDITED"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V85_ACCEPT_HELD_PROGRESS"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -92,6 +92,8 @@ LOWER_LINE_NET_ADVANTAGE = float(os.getenv("EMPLOYEE5_LOWER_LINE_NET_ADVANTAGE",
 # 默认允许“补最近5个交易日”的增量修复，但绝不默认全历史重建。
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "1") != "0"
 BAOSTOCK_LIMIT = int(os.getenv("EMPLOYEE5_BAOSTOCK_FALLBACK_LIMIT", "0"))
+PROGRESS_EVERY = max(1, int(os.getenv("EMPLOYEE5_PROGRESS_EVERY", "250")))
+CORELINE_PROGRESS_EVERY = max(1, int(os.getenv("EMPLOYEE5_CORELINE_PROGRESS_EVERY", "1")))
 INCREMENTAL_REFRESH = os.getenv("EMPLOYEE5_INCREMENTAL_REFRESH", "1") != "0"
 REFRESH_LOOKBACK_TRADE_DAYS = int(os.getenv("EMPLOYEE5_REFRESH_LOOKBACK_TRADE_DAYS", "5"))
 MIN_CACHE_FILES_REQUIRED = int(os.getenv("EMPLOYEE5_MIN_CACHE_FILES_REQUIRED", "3000"))
@@ -211,6 +213,36 @@ def sf(x: Any, default: float = 0.0) -> float:
 def rd(x: Any, n: int = 2) -> float:
     v = sf(x)
     return 0.0 if math.isnan(v) or math.isinf(v) else round(v, n)
+
+
+def fmt_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    return f"{minutes / 60.0:.1f}h"
+
+
+def print_progress(stage: str, done: int, total: int, start_time: float, extra: str = "") -> None:
+    total = max(int(total or 0), 0)
+    done = max(int(done or 0), 0)
+    elapsed = max(time.time() - float(start_time or time.time()), 0.001)
+    speed = done / elapsed if done > 0 else 0.0
+    if total > 0:
+        pct = min(100.0, done / total * 100.0)
+        remain = max(total - done, 0)
+        eta = remain / speed if speed > 0 else 0.0
+        bar_len = 20
+        filled = int(round(bar_len * pct / 100.0))
+        bar = "#" * filled + "-" * (bar_len - filled)
+        msg = f"progress {stage} [{bar}] {done}/{total} {pct:.1f}% elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
+    else:
+        msg = f"progress {stage} 0/0 elapsed={fmt_seconds(elapsed)} eta=0.0s speed=0.00/s"
+    if extra:
+        msg += f" {extra}"
+    print(msg, flush=True)
 
 
 def norm_date(x: Any) -> str:
@@ -502,6 +534,10 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
     }
 
+    total_files = len(files)
+    cache_scan_start = time.time()
+    print_progress("cache_scan", 0, total_files, cache_scan_start, extra="start")
+
     for i, p in enumerate(files, 1):
         c = code_of(p)
         if not valid_code(c):
@@ -524,8 +560,17 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         hist[c] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
         stat["cache_hit"] += 1
 
-        if i % 500 == 0:
-            print(f"cache scan {i}/{len(files)} hit={stat['cache_hit']}", flush=True)
+        if i == 1 or i % PROGRESS_EVERY == 0 or i == total_files:
+            print_progress(
+                "cache_scan",
+                i,
+                total_files,
+                cache_scan_start,
+                extra=f"hit={stat['cache_hit']} bad={stat['cache_bad']} short={stat['cache_short']} current={c}",
+            )
+
+    if total_files == 0:
+        print_progress("cache_scan", 0, 0, cache_scan_start, extra="no_cache_files")
 
     return hist, stat
 
@@ -808,6 +853,7 @@ def refresh_recent_cache(existing_hist: Dict[str, pd.DataFrame]) -> Tuple[Dict[s
         codes = codes[:BAOSTOCK_LIMIT]
     total = len(codes)
     start_time = time.time()
+    print_progress("recent_refresh", 0, total, start_time, extra="start")
     budget_sec = max(60.0, QFQ_REBUILD_TIME_BUDGET_MIN * 60.0)
     processed = refreshed = already_ok = failed = short = 0
     try:
@@ -821,6 +867,14 @@ def refresh_recent_cache(existing_hist: Dict[str, pd.DataFrame]) -> Tuple[Dict[s
             if last_date.replace("-", "") >= TARGET:
                 already_ok += 1
                 processed += 1
+                if i == 1 or i % PROGRESS_EVERY == 0 or i == total:
+                    print_progress(
+                        "recent_refresh",
+                        i,
+                        total,
+                        start_time,
+                        extra=f"processed={processed} refreshed={refreshed} already_ok={already_ok} failed={failed} short={short} current={code}",
+                    )
                 continue
             merged = baostock_fetch_recent_hist(code, load_full_history(code, df))
             processed += 1
@@ -835,12 +889,13 @@ def refresh_recent_cache(existing_hist: Dict[str, pd.DataFrame]) -> Tuple[Dict[s
                 refreshed += 1
             else:
                 failed += 1
-            if i == 1 or i % QFQ_REBUILD_PROGRESS_EVERY == 0 or i == total:
-                speed = processed / max(time.time() - start_time, 0.001)
-                print(
-                    f"recent qfq refresh {i}/{total} processed={processed} refreshed={refreshed} "
-                    f"already_ok={already_ok} failed={failed} short={short} speed={speed:.3f}/s current={code}",
-                    flush=True,
+            if i == 1 or i % PROGRESS_EVERY == 0 or i == total:
+                print_progress(
+                    "recent_refresh",
+                    i,
+                    total,
+                    start_time,
+                    extra=f"processed={processed} refreshed={refreshed} already_ok={already_ok} failed={failed} short={short} current={code}",
                 )
     finally:
         try:
@@ -1465,6 +1520,23 @@ def score_core_reaction_line(
     body_cut_penalty = 0.0
     entity_accept_penalty = 0.0
 
+    # 核心原则：核心线被有效突破并一直守住，不是损耗；只有突破后又有效跌回线下才扣接受失败分。
+    accept_positions: List[int] = []
+    fallback_after_accept = False
+    try:
+        for _idx, _r0 in k.reset_index(drop=True).iterrows():
+            _bb0 = sf(_r0.get("body_bottom", 0)) if hasattr(_r0, "get") else sf(_r0.body_bottom)
+            _cl0 = sf(_r0.get("close", 0)) if hasattr(_r0, "get") else sf(_r0.close)
+            if L > 0 and _bb0 > L:
+                accept_positions.append(int(_idx))
+            if accept_positions and _cl0 < L * (1 - TOL):
+                fallback_after_accept = True
+        accepted_and_held = bool(accept_positions and not fallback_after_accept)
+        accepted_then_failed = bool(accept_positions and fallback_after_accept)
+    except Exception:
+        accepted_and_held = False
+        accepted_then_failed = False
+
     hit_dates: List[str] = []
     cut_dates: List[str] = []
     accept_dates: List[str] = []
@@ -1502,13 +1574,21 @@ def score_core_reaction_line(
 
         if is_accept:
             entity_accept += 1
-            w = entity_loss_weight(r)
+            raw_w = entity_loss_weight(r)
+            # 有效突破并守住核心线：不扣分，只记录状态；突破后又有效跌回线下，才按接受失败扣分。
+            w = raw_w if accepted_then_failed else 0.0
             entity_accept_penalty += w
             accept_dates.append(tag)
-            if w > 0.6:
+            if raw_w > 0.6:
                 volume_entity_accept += 1
             ev = dict(base_row)
-            ev.update({"entity_loss_weight": rd(w, 3), "reason": "entity_accept"})
+            ev.update({
+                "entity_loss_weight": rd(w, 3),
+                "raw_entity_loss_weight": rd(raw_w, 3),
+                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_failed_penalty" if accepted_then_failed else "entity_accept",
+                "accepted_and_held": bool(accepted_and_held),
+                "accepted_then_failed": bool(accepted_then_failed),
+            })
             entity_accept_events.append(ev)
             continue
 
@@ -1599,14 +1679,20 @@ def score_core_reaction_line(
     else:
         line_type, level = "non_core", "未成线"
 
-    if volume_entity_accept > 0:
+    if accepted_then_failed:
+        current_state = "突破接受后又有效跌回线下"
+    elif accepted_and_held and volume_entity_accept > 0:
+        current_state = "已被放量/倍量实体突破接受且未跌回"
+    elif accepted_and_held and entity_accept > 0:
+        current_state = "已被实体突破接受且未跌回"
+    elif volume_entity_accept > 0:
         current_state = "已被放量/倍量实体接受"
     elif entity_accept > 0:
         current_state = "已被普通实体接受"
     else:
         current_state = "未被实体整体接受"
 
-    clean = body_cut == 0 and entity_accept == 0
+    clean = body_cut == 0 and entity_accept_penalty == 0
     need_escalate = meaningful and not core_candidate
 
     downshift_tests: List[Dict[str, Any]] = []
@@ -1629,8 +1715,8 @@ def score_core_reaction_line(
 
     exact_score_formula = (
         "net_score = effective_resonance_count*1.0 + volume_bonus_score "
-        "- body_cut_penalty - entity_accept_penalty; "
-        "cut/accept rows do not also count as resonance"
+        "- body_cut_penalty - failed_entity_accept_penalty; "
+        "accepted-and-held breakthrough does not deduct score; cut/failed-accept rows do not also count as resonance"
     )
 
     return {
@@ -1661,6 +1747,8 @@ def score_core_reaction_line(
         "entity_accept_count": entity_accept,
         "entity_accept_penalty": rd(entity_accept_penalty, 3),
         "entity_loss_score": rd(entity_loss_score, 3),
+        "accepted_and_held": bool(accepted_and_held),
+        "accepted_then_failed": bool(accepted_then_failed),
         "volume_body_cut_count": volume_body_cut,
         "volume_entity_accept_count": volume_entity_accept,
         "current_state": current_state,
@@ -1997,6 +2085,7 @@ def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
         "volume_bonus_score", "volume_hit_count",
         "entity_loss_score", "body_cut_count", "body_cut_penalty",
         "entity_accept_count", "entity_accept_penalty",
+        "accepted_and_held", "accepted_then_failed",
         "volume_body_cut_count", "volume_entity_accept_count",
         "current_state", "clean_core_line", "tol_pct",
         "core_band_low", "core_band_high", "upper_extreme_pressure",
@@ -2069,7 +2158,10 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     if A.empty:
         lines.append("- 无涨停样本。")
     else:
-        for i, r in A.iterrows():
+        coreline_total = len(A)
+        coreline_start = time.time()
+        print_progress("coreline", 0, coreline_total, coreline_start, extra="start")
+        for pos, (_, r) in enumerate(A.iterrows(), 1):
             c = ss(r.get("code"))
             full_df = load_full_history(c, hist.get(c, pd.DataFrame()))
             anchor_cal = calibrate_60d_anchor_for_code(c, full_df, 60)
@@ -2084,10 +2176,10 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
             loss = cl.get("entity_loss_score", 0)
 
             if line is None:
-                lines.append(f"{i + 1}. {c}｜核心线：无｜{level}")
+                lines.append(f"{pos}. {c}｜核心线：无｜{level}")
             else:
                 lines.append(
-                    f"{i + 1}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜放量+{vol_bonus}｜损耗{loss}｜{state}"
+                    f"{pos}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜放量+{vol_bonus}｜损耗{loss}｜{state}"
                 )
 
             results.append({
@@ -2096,6 +2188,15 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
                 "sample": r.to_dict(),
                 "core_line": compact_core_line_for_output(cl),
             })
+
+            if pos == 1 or pos % CORELINE_PROGRESS_EVERY == 0 or pos == coreline_total:
+                print_progress(
+                    "coreline",
+                    pos,
+                    coreline_total,
+                    coreline_start,
+                    extra=f"current={c} line={line}",
+                )
 
     payload = {
         "target_date": TARGET,
@@ -2124,7 +2225,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; accepted-and-held breakthrough does not deduct score; candidate lines only from 60d high; cut/failed-accept rows do not also count as resonance",
     }
 
     return "\n".join(lines), payload
