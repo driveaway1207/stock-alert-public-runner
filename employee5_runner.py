@@ -30,7 +30,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V89_ONE_FILE_AUDIT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V90_FULL_RESONANCE_QUANT"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -1226,6 +1226,8 @@ def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
 
     vol_ma = k.volume.rolling(4, min_periods=1).mean().shift(1)
     k["rel_vol"] = (k.volume / vol_ma.replace(0, pd.NA)).fillna(1.0)
+    prev_vol = k.volume.shift(1)
+    k["prev_vol_ratio"] = (k.volume / prev_vol.replace(0, pd.NA)).fillna(1.0)
     k["vol_rank_pct"] = k.volume.rolling(8, min_periods=1).rank(pct=True).fillna(0.5)
 
     return k
@@ -1282,6 +1284,8 @@ def aggregate_bars_with_anchor(df: pd.DataFrame, window: int = 60, mode: str = "
     k["upper_shadow_ratio"] = ((k.high - k.body_top) / rng).fillna(0.0)
     vol_ma = k.volume.rolling(4, min_periods=1).mean().shift(1)
     k["rel_vol"] = (k.volume / vol_ma.replace(0, pd.NA)).fillna(1.0)
+    prev_vol = k.volume.shift(1)
+    k["prev_vol_ratio"] = (k.volume / prev_vol.replace(0, pd.NA)).fillna(1.0)
     k["vol_rank_pct"] = k.volume.rolling(8, min_periods=1).rank(pct=True).fillna(0.5)
     return k
 
@@ -1470,36 +1474,33 @@ def high_resonance_clusters(highs: List[float], tol: float = TOL) -> List[List[f
 
 
 def volume_event_bonus(r: Any) -> float:
-    """放量/倍量共振加权。普通价格触碰一律等权，只有明显量能事件才额外加分。"""
-    rv = sf(r.get("rel_vol", 1.0), 1.0) if hasattr(r, "get") else 1.0
-    vr = sf(r.get("vol_rank_pct", 0.5), 0.5) if hasattr(r, "get") else 0.5
+    """放量共振加权：以“当前GK量 > 前一根GK量”为主口径。
 
-    # 权重刻意不设过大，避免量能单项压过最大共振主逻辑。
-    if rv >= 3.0:
+    只有有效共振K才会调用本函数；突破接受K、切实体K不参与放量共振加分。
+    prev_vol_ratio = 当前GK成交量 / 前一根GK成交量。
+    """
+    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
+    if pvr >= 3.0:
         return 1.5
-    if rv >= 2.0:
+    if pvr >= 1.8:
         return 1.2
-    if rv >= 1.8:
+    if pvr >= 1.3:
         return 0.8
-    # 轻微高量只给辅助分，不能当作倍量证据。
-    if rv >= 1.3 and vr >= 0.90:
+    if pvr > 1.0:
         return 0.3
     return 0.0
 
 
 def entity_loss_weight(r: Any) -> float:
-    """实体切断和实体接受同权扣实体损耗；放量实体损耗加权，但不一票否决。"""
-    rv = sf(r.get("rel_vol", 1.0), 1.0) if hasattr(r, "get") else 1.0
-
-    # 普通实体损耗低于普通共振点，确保“最大共振第一”；放量/倍量实体损耗适度加权。
-    if rv >= 3.0:
+    """切实体/接受失败损耗：同样按相较前一根是否放量加权。"""
+    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
+    if pvr >= 3.0:
         return 1.5
-    if rv >= 2.0:
+    if pvr >= 1.8:
         return 1.2
-    if rv >= 1.8:
+    if pvr >= 1.3:
         return 1.0
     return 0.6
-
 
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -1554,22 +1555,27 @@ def score_core_reaction_line(
     include_downshift: bool = True,
     evidence_limit: int = 80,
 ) -> Dict[str, Any]:
-    """
-    V67 第一核心线精确打分：
-    1）同一根聚合K只能先归类为：实体接受 / 切实体 / 有效共振 / 无效；
-    2）被实体吞掉的线不再同时算共振，避免低位线靠“假共振”赢；
-    3）普通有效共振等权，一根K最多贡献1分；
-    4）放量/倍量只在“有效共振”上加权；
-    5）切实体和实体接受只扣实体损耗，不做一票否决；
-    6）实顶距线<=0.5%视为实顶贴线有效共振，不算切实体。
+    """全盘唯一核心线打分。
+
+    口径锁死：
+    1）候选线来自GK最高价；本函数负责把这条线横向扫全盘GK。
+    2）一根GK只能归一类：有效共振 / 切实体 / 接受状态 / 无关系。
+    3）有效共振包括：最高价/最低价贴线、上影/下影打线、实体顶/实体底贴线、收盘贴线但未切实体。
+    4）线进实体内部 = 切实体，扣分，不算共振。
+    5）实体整体站上线后一直没跌回 = 接受成功，不扣分，也不算共振。
+    6）实体站上线后又有效跌回 = 接受失败，扣分。
+    7）放量只按当前GK量相较前一根GK量，不再按前4根均量主判。
     """
     L = sf(line)
 
     ordinary_hit = 0
     close_touch = 0
-    body_touch = 0
+    body_top_touch = 0
+    body_bottom_touch = 0
     high_touch = 0
+    low_touch = 0
     upper_hit = 0
+    lower_hit = 0
     vol_hit = 0
     body_cut = 0
     entity_accept = 0
@@ -1583,8 +1589,6 @@ def score_core_reaction_line(
     body_cut_penalty = 0.0
     entity_accept_penalty = 0.0
 
-    # 核心原则：核心线被有效突破并一直守住，不是损耗；只有突破后又有效跌回线下才扣接受失败分。
-    # 另外记录首次突破接受位置，用于在多条线同被同一根大K接受时，优先选择“最低有效最高点”。
     accept_positions: List[int] = []
     fallback_after_accept = False
     first_accept_index = -1
@@ -1623,11 +1627,12 @@ def score_core_reaction_line(
 
     for _, r in k.iterrows():
         bt, bb, hi, lo, op, cl = sf(r.body_top), sf(r.body_bottom), sf(r.high), sf(r.low), sf(r.open), sf(r.close)
-        if L <= 0 or bt <= 0 or bb <= 0 or hi <= 0:
+        if L <= 0 or bt <= 0 or bb <= 0 or hi <= 0 or lo <= 0:
             continue
 
         tag = f"{r.start}~{r.end}"
         rel_vol = sf(r.get("rel_vol", 1.0), 1.0) if hasattr(r, "get") else 1.0
+        prev_vol_ratio = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
         vol_rank = sf(r.get("vol_rank_pct", 0.5), 0.5) if hasattr(r, "get") else 0.5
         base_row = {
             "date": tag,
@@ -1638,20 +1643,90 @@ def score_core_reaction_line(
             "body_top": rd(bt),
             "body_bottom": rd(bb),
             "rel_vol": rd(rel_vol, 3),
+            "prev_vol_ratio": rd(prev_vol_ratio, 3),
             "vol_rank_pct": rd(vol_rank, 3),
         }
 
-        # V87：实体和上影线必须严格分开。
-        # 线进入实体内部，就是切实体；不能因为接近实体顶就当作上影线共振。
-        # 只有线没有进入实体、并落在实体顶到最高价之间，才算上影线压力/供应共振。
-        is_cut = bool(bb < L < bt)
-        is_accept = bool(bb > L)
-        is_body_top_touch = bool(not is_cut and near(bt, L))
+        touch_body_top = near(bt, L)
+        touch_body_bottom = near(bb, L)
+        touch_high = near(hi, L)
+        touch_low = near(lo, L)
+        touch_close = near(cl, L)
 
+        # 线进入实体内部就是切实体；但实体顶/实体底0.5%贴线属于边界反应，不算切实体。
+        is_cut = bool((bb < L < bt) and not touch_body_top and not touch_body_bottom)
+        if is_cut:
+            body_cut += 1
+            w = entity_loss_weight(r)
+            body_cut_penalty += w
+            cut_dates.append(tag)
+            if w > 0.6:
+                volume_body_cut += 1
+            ev = dict(base_row)
+            ev.update({"entity_loss_weight": rd(w, 3), "reason": "body_cut"})
+            body_cut_events.append(ev)
+            continue
+
+        upper_wick_hit = bool(bt <= L <= hi * (1 + TOL))
+        lower_wick_hit = bool(lo * (1 - TOL) <= L <= bb)
+        is_resonance = bool(
+            touch_high
+            or touch_low
+            or touch_body_top
+            or touch_body_bottom
+            or upper_wick_hit
+            or lower_wick_hit
+            or touch_close
+        )
+
+        if is_resonance:
+            ordinary_hit += 1
+            ordinary_score += 1.0
+            hit_dates.append(tag)
+            if upper_wick_hit and not touch_body_top:
+                upper_hit += 1
+            if lower_wick_hit and not touch_body_bottom:
+                lower_hit += 1
+            if touch_body_top:
+                body_top_touch += 1
+            if touch_body_bottom:
+                body_bottom_touch += 1
+            if touch_high:
+                high_touch += 1
+            if touch_low:
+                low_touch += 1
+            if touch_close:
+                close_touch += 1
+
+            vb = volume_event_bonus(r)
+            if vb > 0:
+                vol_hit += 1
+                volume_bonus_score += vb
+
+            ev = dict(base_row)
+            ev.update({
+                "ordinary_hit": True,
+                "upper_shadow_hit": bool(upper_wick_hit),
+                "lower_shadow_hit": bool(lower_wick_hit),
+                "close_touch": bool(touch_close),
+                "body_top_touch": bool(touch_body_top),
+                "body_bottom_touch": bool(touch_body_bottom),
+                "high_touch": bool(touch_high),
+                "low_touch": bool(touch_low),
+                "body_cut": False,
+                "entity_accept": False,
+                "volume_bonus": rd(vb, 3),
+            })
+            resonance_events.append(ev)
+            if evidence_limit > 0 and len(evidence) < evidence_limit:
+                evidence.append(ev)
+            continue
+
+        # 没有打线/贴线，但实体整体在线上方：只记录接受状态，不算共振。
+        is_accept = bool(bb > L)
         if is_accept:
             entity_accept += 1
             raw_w = entity_loss_weight(r)
-            # 有效突破并守住核心线：不扣分，只记录状态；突破后又有效跌回线下，才按接受失败扣分。
             w = raw_w if accepted_then_failed else 0.0
             entity_accept_penalty += w
             accept_dates.append(tag)
@@ -1667,59 +1742,6 @@ def score_core_reaction_line(
             })
             entity_accept_events.append(ev)
             continue
-
-        if is_cut:
-            body_cut += 1
-            w = entity_loss_weight(r)
-            body_cut_penalty += w
-            cut_dates.append(tag)
-            if w > 0.6:
-                volume_body_cut += 1
-            ev = dict(base_row)
-            ev.update({"entity_loss_weight": rd(w, 3), "reason": "body_cut"})
-            body_cut_events.append(ev)
-            continue
-
-        is_close_touch = near(cl, L)
-        is_high_touch = near(hi, L)
-        # V87：有效上影/高点反应必须在线没有进入实体的前提下成立。
-        # 线在实体内部已经在上面的 CUT 分支处理，不能再混成普通共振。
-        is_upper_hit = bool((not is_cut) and (bt <= L <= hi * (1 + TOL)))
-        is_ordinary_hit = bool(is_upper_hit or is_body_top_touch or is_close_touch or is_high_touch)
-
-        if is_ordinary_hit:
-            ordinary_hit += 1
-            ordinary_score += 1.0
-            hit_dates.append(tag)
-
-            if is_upper_hit and not is_body_top_touch:
-                upper_hit += 1
-            if is_body_top_touch:
-                body_touch += 1
-            if is_close_touch:
-                close_touch += 1
-            if is_high_touch:
-                high_touch += 1
-
-            vb = volume_event_bonus(r)
-            if vb > 0:
-                vol_hit += 1
-                volume_bonus_score += vb
-
-            ev = dict(base_row)
-            ev.update({
-                "ordinary_hit": True,
-                "upper_shadow_hit": bool(is_upper_hit),
-                "close_touch": bool(is_close_touch),
-                "body_top_touch": bool(is_body_top_touch),
-                "high_touch": bool(is_high_touch),
-                "body_cut": False,
-                "entity_accept": False,
-                "volume_bonus": rd(vb, 3),
-            })
-            resonance_events.append(ev)
-            if evidence_limit > 0 and len(evidence) < evidence_limit:
-                evidence.append(ev)
 
     low_vol_window = low_volume_window_for_timeframe(timeframe)
     recent_for_low_vol = k.tail(low_vol_window) if low_vol_window > 0 else pd.DataFrame()
@@ -1756,16 +1778,12 @@ def score_core_reaction_line(
     else:
         line_type, level = "non_core", "未成线"
 
-    if accepted_then_failed:
-        current_state = "突破接受后又有效跌回线下"
-    elif accepted_and_held and volume_entity_accept > 0:
-        current_state = "已被放量/倍量实体突破接受且未跌回"
-    elif accepted_and_held and entity_accept > 0:
+    if accepted_and_held and entity_accept > 0:
         current_state = "已被实体突破接受且未跌回"
-    elif volume_entity_accept > 0:
-        current_state = "已被放量/倍量实体接受"
+    elif accepted_then_failed:
+        current_state = "突破接受后又有效跌回"
     elif entity_accept > 0:
-        current_state = "已被普通实体接受"
+        current_state = "已被实体整体接受"
     else:
         current_state = "未被实体整体接受"
 
@@ -1793,7 +1811,7 @@ def score_core_reaction_line(
     exact_score_formula = (
         "net_score = effective_resonance_count*1.0 + volume_bonus_score "
         "- body_cut_penalty - failed_entity_accept_penalty; "
-        "accepted-and-held breakthrough does not deduct score; cut/failed-accept rows do not also count as resonance"
+        "volume_bonus uses current GK volume / previous GK volume; accepted-and-held breakthrough does not deduct score"
     )
 
     return {
@@ -1812,10 +1830,13 @@ def score_core_reaction_line(
         "volume_bonus_score": rd(volume_bonus_score, 3),
         "hit_count": ordinary_hit,
         "upper_shadow_hit_count": upper_hit,
-        "entity_top_as_shadow_count": body_touch,
+        "lower_shadow_hit_count": lower_hit,
+        "entity_top_as_shadow_count": body_top_touch,
         "close_touch_count": close_touch,
-        "body_top_touch_count": body_touch,
+        "body_top_touch_count": body_top_touch,
+        "body_bottom_touch_count": body_bottom_touch,
         "high_touch_count": high_touch,
+        "low_touch_count": low_touch,
         "volume_hit_count": vol_hit,
         "stage_low_volume_high_touch_count": stage_low_volume_high_touch,
         "stage_low_volume_bar": stage_low_volume_bar,
@@ -1848,22 +1869,22 @@ def score_core_reaction_line(
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v70_qfq_flat_csv_manifest_60d_first_core_audit",
+        "confirmation_source": "v90_full_resonance_unique_coreline",
     }
-
 
 # 兼容旧函数名；内部已经升级为 V62 最大共振净分逻辑。
 def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str, Any]:
     return score_core_reaction_line(k, line, timeframe)
 
 
-def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[float, int, float, float, float]:
+def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[int, float, float, float, float]:
+    """最终排序：有效共振数第一，放量共振第二，实体损耗第三，净分第四。"""
     return (
-        sf(x.get("net_score")),
-        int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0)))),
-        sf(x.get("volume_bonus_score")),
-        -sf(x.get("entity_loss_score")),
-        sf(x.get("line")),
+        int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))) or 0),
+        sf(x.get("volume_bonus_score", 0)),
+        -sf(x.get("entity_loss_score", 0)),
+        sf(x.get("net_score", x.get("score", 0))),
+        -sf(x.get("line", 0)),
     )
 
 
@@ -1890,94 +1911,36 @@ def _group_scored_by_price_band(scored: List[Dict[str, Any]], band_tol: float = 
 
 
 def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    同一价格反应带内，不能让更低的内部线只靠多1个普通触碰就压过上方核心压力边界。
-    量化规则：从高价候选往低价候选比较；低价候选只有在净分 > 当前上方边界净分 + LOWER_LINE_NET_ADVANTAGE 时，才允许替代。
-    """
+    """同一价格反应带内，按有效共振数优先选代表线。"""
     if not band:
         return {}
-    ordered = sorted(band, key=lambda x: sf(x.get("line")), reverse=True)
+    ordered = sorted(band, key=_score_rank_tuple, reverse=True)
     chosen = ordered[0]
-    comparisons: List[Dict[str, Any]] = []
-    for cand in ordered[1:]:
-        chosen_net = sf(chosen.get("net_score"))
-        cand_net = sf(cand.get("net_score"))
-        margin = cand_net - chosen_net
-        can_replace = margin > LOWER_LINE_NET_ADVANTAGE
-        comparisons.append({
-            "upper_line": rd(chosen.get("line")),
-            "lower_line": rd(cand.get("line")),
-            "upper_net": rd(chosen_net, 3),
-            "lower_net": rd(cand_net, 3),
-            "lower_net_advantage": rd(margin, 3),
-            "required_advantage": rd(LOWER_LINE_NET_ADVANTAGE, 3),
-            "replace_upper": bool(can_replace),
-        })
-        if can_replace:
-            chosen = cand
-    chosen["same_band_boundary_comparisons"] = comparisons
-    chosen["same_band_selection_rule"] = (
-        f"同一{rd(FIRST_CORE_BAND_TOL*100,2)}%反应带内，低价线必须净分高出上方边界"
-        f"超过{rd(LOWER_LINE_NET_ADVANTAGE,2)}分才可替代；否则保留上方第一核心压力边界"
-    )
-    return chosen
-
-
-def _accepted_held_core_candidates(scored: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for x in scored:
-        if not x:
-            continue
-        if not bool(x.get("accepted_and_held")) or bool(x.get("accepted_then_failed")):
-            continue
-        if ss(x.get("line_type")) != "core_line":
-            continue
-        if int(sf(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))))) < MIN_CORE_HIT_COUNT:
-            continue
-        if sf(x.get("net_score", x.get("score", 0))) < max(1.0, MIN_CORE_HIT_COUNT - 2.0):
-            continue
-        out.append(x)
-    return out
-
-
-def choose_lowest_accepted_core_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """涨停归因核心线选择。
-
-    规则：核心线是历史反复认账的位置，突破后且没有跌回，不能扣掉核心身份。
-    若多条候选线被同一根大K突破接受并一直守住，优先选“最低有效最高点”，
-    即用户图中白线这类真正发动线；更高的线只能作为近端反应线，不抢核心线身份。
-    """
-    xs = _accepted_held_core_candidates(scored)
-    if not xs:
-        return {}
-    latest_accept = max(int(sf(x.get("first_accept_index"), -1)) for x in xs)
-    same_breakout = [x for x in xs if int(sf(x.get("first_accept_index"), -1)) == latest_accept]
-    if not same_breakout:
-        same_breakout = xs
-    chosen = sorted(
-        same_breakout,
-        key=lambda x: (
-            sf(x.get("line")),
-            -int(sf(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))))),
-            -sf(x.get("volume_bonus_score", 0)),
-            sf(x.get("entity_loss_score", 0)),
-        ),
-    )[0]
-    chosen["core_selection_rule"] = "accepted_held_lowest_effective_high"
-    chosen["core_selection_note"] = "多条核心候选被同一突破K接受且未跌回时，优先选最低有效最高点；突破接受只改变状态，不否定核心线。"
+    chosen["same_band_boundary_comparisons"] = [
+        {
+            "line": rd(x.get("line")),
+            "effective_resonance_count": x.get("effective_resonance_count"),
+            "volume_bonus_score": x.get("volume_bonus_score"),
+            "entity_loss_score": x.get("entity_loss_score"),
+            "net_score": x.get("net_score"),
+        }
+        for x in ordered[:8]
+    ]
+    chosen["same_band_selection_rule"] = "同一反应带内按有效共振数优先；再看放量共振、实体损耗、净分。"
     return chosen
 
 
 def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not scored:
         return {}
-    # 先在每个反应带内选出边界，再在各带胜者里优先选已突破且守住的最低有效最高点。
     winners = [choose_first_core_boundary_in_band(g) for g in _group_scored_by_price_band(scored, FIRST_CORE_BAND_TOL)]
     winners = [x for x in winners if x]
-    accepted_core = choose_lowest_accepted_core_boundary(winners)
-    if accepted_core:
-        return accepted_core
-    return sorted(winners, key=_score_rank_tuple, reverse=True)[0] if winners else {}
+    if not winners:
+        return {}
+    chosen = sorted(winners, key=_score_rank_tuple, reverse=True)[0]
+    chosen["core_selection_rule"] = "full_history_high_candidate_max_effective_resonance"
+    chosen["core_selection_note"] = "从全盘GK最高价候选里选有效共振最多的唯一核心线；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
+    return chosen
 
 
 # 兼容旧函数名，避免其他地方调用失败。
