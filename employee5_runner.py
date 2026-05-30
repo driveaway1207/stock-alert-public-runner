@@ -1474,10 +1474,10 @@ def high_resonance_clusters(highs: List[float], tol: float = TOL) -> List[List[f
 
 
 def volume_event_bonus(r: Any) -> float:
-    """放量共振加权：以“当前GK量 > 前一根GK量”为主口径。
+    """放量共振加权：以“当前60日聚合K量 > 前一根60日聚合K量”为主口径。
 
     只有有效共振K才会调用本函数；突破接受K、切实体K不参与放量共振加分。
-    prev_vol_ratio = 当前GK成交量 / 前一根GK成交量。
+    prev_vol_ratio = 当前60日聚合K成交量 / 前一根60日聚合K成交量。
     """
     pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
     if pvr >= 3.0:
@@ -1505,7 +1505,7 @@ def entity_loss_weight(r: Any) -> float:
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     V67 第一核心压力线候选只从 high 产生。
-    实体顶/收盘/上影只参与“有效共振”打分，不再把候选线拖进实体内部。
+    实体顶/上影线只参与“有效共振”打分，不再把候选线拖进实体内部。
     目的：找第一核心上沿/最低有效最高点，而不是箱体内部线。
     """
     out: List[Dict[str, Any]] = []
@@ -1558,24 +1558,21 @@ def score_core_reaction_line(
     """全盘唯一核心线打分。
 
     口径锁死：
-    1）候选线来自GK最高价；本函数负责把这条线横向扫全盘GK。
-    2）一根GK只能归一类：有效共振 / 切实体 / 接受状态 / 无关系。
-    3）有效共振包括：最高价/最低价贴线、上影/下影打线、实体顶/实体底贴线、收盘贴线但未切实体。
-    4）线进实体内部 = 切实体，扣分，不算共振。
-    5）实体整体站上线后一直没跌回 = 接受成功，不扣分，也不算共振。
-    6）实体站上线后又有效跌回 = 接受失败，扣分。
-    7）放量只按当前GK量相较前一根GK量，不再按前4根均量主判。
+    1）候选线只来自60日聚合K最高价。
+    2）一根60日聚合K只能归一类：有效共振 / 切实体 / 接受状态 / 无关系。
+    3）有效共振只看上方反应：最高价贴线、上影线打到、实体顶贴线但未切实体。
+    4）最低价、下影线、实体底、收盘价不参与核心线共振计数。
+    5）线进实体内部 = 切实体，扣分，不算共振。
+    6）实体整体站上线后一直没跌回 = 接受成功，不扣分，也不算共振。
+    7）实体站上线后又有效跌回 = 接受失败，扣分。
+    8）放量只按当前60日聚合K量相较前一根60日聚合K量，不再按前4根均量主判。
     """
     L = sf(line)
 
     ordinary_hit = 0
-    close_touch = 0
     body_top_touch = 0
-    body_bottom_touch = 0
     high_touch = 0
-    low_touch = 0
     upper_hit = 0
-    lower_hit = 0
     vol_hit = 0
     body_cut = 0
     entity_accept = 0
@@ -1648,13 +1645,10 @@ def score_core_reaction_line(
         }
 
         touch_body_top = near(bt, L)
-        touch_body_bottom = near(bb, L)
         touch_high = near(hi, L)
-        touch_low = near(lo, L)
-        touch_close = near(cl, L)
 
-        # 线进入实体内部就是切实体；但实体顶/实体底0.5%贴线属于边界反应，不算切实体。
-        is_cut = bool((bb < L < bt) and not touch_body_top and not touch_body_bottom)
+        # 线进入实体内部就是切实体；实体顶0.5%贴线属于上边界反应，不算切实体。
+        is_cut = bool((bb < L < bt) and not touch_body_top)
         if is_cut:
             body_cut += 1
             w = entity_loss_weight(r)
@@ -1667,17 +1661,10 @@ def score_core_reaction_line(
             body_cut_events.append(ev)
             continue
 
+        # 共振只数上方反应：最高价贴线、上影线打到、实体顶贴线。
+        # 最低价、下影线、实体底、收盘价不参与核心线共振计数。
         upper_wick_hit = bool(bt <= L <= hi * (1 + TOL))
-        lower_wick_hit = bool(lo * (1 - TOL) <= L <= bb)
-        is_resonance = bool(
-            touch_high
-            or touch_low
-            or touch_body_top
-            or touch_body_bottom
-            or upper_wick_hit
-            or lower_wick_hit
-            or touch_close
-        )
+        is_resonance = bool(touch_high or touch_body_top or upper_wick_hit)
 
         if is_resonance:
             ordinary_hit += 1
@@ -1685,18 +1672,10 @@ def score_core_reaction_line(
             hit_dates.append(tag)
             if upper_wick_hit and not touch_body_top:
                 upper_hit += 1
-            if lower_wick_hit and not touch_body_bottom:
-                lower_hit += 1
             if touch_body_top:
                 body_top_touch += 1
-            if touch_body_bottom:
-                body_bottom_touch += 1
             if touch_high:
                 high_touch += 1
-            if touch_low:
-                low_touch += 1
-            if touch_close:
-                close_touch += 1
 
             vb = volume_event_bonus(r)
             if vb > 0:
@@ -1707,12 +1686,8 @@ def score_core_reaction_line(
             ev.update({
                 "ordinary_hit": True,
                 "upper_shadow_hit": bool(upper_wick_hit),
-                "lower_shadow_hit": bool(lower_wick_hit),
-                "close_touch": bool(touch_close),
                 "body_top_touch": bool(touch_body_top),
-                "body_bottom_touch": bool(touch_body_bottom),
                 "high_touch": bool(touch_high),
-                "low_touch": bool(touch_low),
                 "body_cut": False,
                 "entity_accept": False,
                 "volume_bonus": rd(vb, 3),
@@ -1809,9 +1784,11 @@ def score_core_reaction_line(
             })
 
     exact_score_formula = (
-        "net_score = effective_resonance_count*1.0 + volume_bonus_score "
-        "- body_cut_penalty - failed_entity_accept_penalty; "
-        "volume_bonus uses current GK volume / previous GK volume; accepted-and-held breakthrough does not deduct score"
+        "净分 = 有效共振数 + 放量共振加分 - 切实体扣分 - 接受失败扣分；"
+        "有效共振只数最高价贴线、上影线打到、实体顶贴线；"
+        "最低价、下影线、实体底、收盘价不参与核心线共振；"
+        "放量按当前60日聚合K成交量/前一根60日聚合K成交量；"
+        "突破接受且未跌回不扣分"
     )
 
     return {
@@ -1830,13 +1807,9 @@ def score_core_reaction_line(
         "volume_bonus_score": rd(volume_bonus_score, 3),
         "hit_count": ordinary_hit,
         "upper_shadow_hit_count": upper_hit,
-        "lower_shadow_hit_count": lower_hit,
         "entity_top_as_shadow_count": body_top_touch,
-        "close_touch_count": close_touch,
         "body_top_touch_count": body_top_touch,
-        "body_bottom_touch_count": body_bottom_touch,
         "high_touch_count": high_touch,
-        "low_touch_count": low_touch,
         "volume_hit_count": vol_hit,
         "stage_low_volume_high_touch_count": stage_low_volume_high_touch,
         "stage_low_volume_bar": stage_low_volume_bar,
@@ -1938,8 +1911,8 @@ def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str,
     if not winners:
         return {}
     chosen = sorted(winners, key=_score_rank_tuple, reverse=True)[0]
-    chosen["core_selection_rule"] = "full_history_high_candidate_max_effective_resonance"
-    chosen["core_selection_note"] = "从全盘GK最高价候选里选有效共振最多的唯一核心线；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
+    chosen["core_selection_rule"] = "full_history_high_candidate_upper_resonance_only"
+    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选有效共振最多的唯一核心线；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
     return chosen
 
 
@@ -2039,9 +2012,9 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
         best["text"] = (
             f"{timeframe}识别核心线：{best['line']}元。"
             f"已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}）做历史成线。"
-            f"普通共振{best.get('ordinary_resonance_count')}根；"
-            f"收盘贴线{best['close_touch_count']}次、实体顶贴线{best['body_top_touch_count']}次、"
-            f"最高价贴线{best['high_touch_count']}次、上影区打到{best.get('upper_shadow_hit_count')}次；"
+            f"有效共振{best.get('ordinary_resonance_count')}根；"
+            f"实体顶贴线{best['body_top_touch_count']}次、"
+            f"最高价贴线{best['high_touch_count']}次、上影线打到{best.get('upper_shadow_hit_count')}次；"
             f"放量/倍量共振{best['volume_hit_count']}次，放量加权{best.get('volume_bonus_score')}；"
             f"切实体{best['body_cut_count']}次、切实体损耗{best.get('body_cut_penalty', 0)}；"
             f"实体接受{best.get('entity_accept_count', 0)}次、接受损耗{best.get('entity_accept_penalty', 0)}；"
@@ -2173,8 +2146,6 @@ def _event_relation_cn(e: Dict[str, Any]) -> str:
         parts.append("最高价贴线")
     if e.get("body_top_touch"):
         parts.append("实体顶贴线")
-    if e.get("close_touch"):
-        parts.append("收盘贴线")
     if e.get("body_cut"):
         parts.append("切实体")
     if e.get("entity_accept") or ss(e.get("reason", "")).startswith("entity_accept"):
