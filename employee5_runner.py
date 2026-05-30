@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V65
+"""五号员工：大涨/涨停归因学习引擎。V66
 
-本版只先解决 60日聚合K 第一核心线：
-1. 只采用60日聚合K，不再让20日/250日参与最终采用或报告。
-2. 同一根K先归类：实体接受 / 切实体 / 有效共振 / 无效；切实体和实体接受不再同时算共振。
-3. 普通有效共振等权，一根K最多贡献1分；放量/倍量只在有效共振上加权。
-4. 实体切断/实体接受按同一套实体损耗扣分，不做一票否决。
-5. Markdown 报告只保留精简结论和候选Top；逐K明细保留在 JSON。
+本版只解决 60日聚合K 第一核心线：
+1. 第一核心压力线候选只从60日聚合K high 产生，避免 body_top/close 把线拖进实体内部。
+2. 每根K严格互斥归类：实体接受 / 切实体 / 有效共振 / 无效。
+3. 实体接受使用 body_bottom > line，不使用0.5%容差；切实体/接受不再同时算共振。
+4. 普通有效共振等权，一根K最多贡献1分；放量/倍量只在有效共振上加权。
+5. Markdown 报告精简；逐K明细保留在 JSON 供核查。
 """
 
 import json, math, os, re, time
@@ -29,7 +29,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_CORE_LINE_V64_BOUNDARY_GATE_COMPACT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V66_60D_PRECISE_ENTITY_AUDIT"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -578,7 +578,11 @@ def entity_loss_weight(r: Any) -> float:
 
 
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
-    """候选线来源：high + 实体顶 + 收盘；其中 high 尤其用于捕捉“最低有效最高点”。"""
+    """
+    V66 第一核心压力线候选只从 high 产生。
+    实体顶/收盘/上影只参与“有效共振”打分，不再把候选线拖进实体内部。
+    目的：找第一核心上沿/最低有效最高点，而不是箱体内部线。
+    """
     out: List[Dict[str, Any]] = []
     if k is None or k.empty:
         return out
@@ -586,19 +590,15 @@ def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     for idx, r in k.iterrows():
         tag = f"{r.start}~{r.end}"
         rv = sf(r.get("rel_vol", 1.0), 1.0) if hasattr(r, "get") else 1.0
-        bt = sf(r.body_top)
         hi = sf(r.high)
-        cl = sf(r.close)
-
-        for source, val in [("high", hi), ("body_top", bt), ("close", cl)]:
-            if sf(val) > 0:
-                out.append({
-                    "line": rd(val),
-                    "source": source,
-                    "date": tag,
-                    "rel_vol": rd(rv, 2),
-                    "is_volume_source": volume_event_bonus(r) > 0,
-                })
+        if hi > 0:
+            out.append({
+                "line": rd(hi),
+                "source": "high",
+                "date": tag,
+                "rel_vol": rd(rv, 2),
+                "is_volume_source": volume_event_bonus(r) > 0,
+            })
 
     return out
 
@@ -631,7 +631,7 @@ def score_core_reaction_line(
     evidence_limit: int = 80,
 ) -> Dict[str, Any]:
     """
-    V65 第一核心线精确打分：
+    V66 第一核心线精确打分：
     1）同一根聚合K只能先归类为：实体接受 / 切实体 / 有效共振 / 无效；
     2）被实体吞掉的线不再同时算共振，避免低位线靠“假共振”赢；
     3）普通有效共振等权，一根K最多贡献1分；
@@ -689,7 +689,8 @@ def score_core_reaction_line(
 
         is_body_top_touch = near(bt, L)
         # 实体接受优先：整根实体在线上方，说明这根K不能再给该线贡献“压力上沿共振”。
-        is_accept = bool(bb > L * (1 + TOL))
+        # 接受不使用0.5%容差；只要实体底在核心线上方，就算接受。
+        is_accept = bool(bb > L)
         # 切实体第二优先：只要进入实体内部就是切；唯一例外是实顶贴线<=0.5%。
         is_cut = bool((bb < L < bt) and not is_body_top_touch)
 
@@ -874,7 +875,7 @@ def score_core_reaction_line(
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v65_60d_first_effective_resonance_net_score",
+        "confirmation_source": "v66_60d_precise_entity_audit_net_score",
     }
 
 
@@ -1050,7 +1051,7 @@ def _rank_fallback_coreline(x: Dict[str, Any], priority: int) -> Tuple[float, in
 
 
 def core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    """V65：先把60日聚合K第一核心线做准；20日/250日暂不参与采用与报告。"""
+    """V66：只做60日聚合K第一核心线；实体切断/接受严格逐K互斥审计。"""
     if len(df) < 80:
         return {"level": "数据不足", "line": None, "line_type": "none", "text": "历史K线不足，不能硬画60日核心线。"}
 
@@ -1058,8 +1059,8 @@ def core_line(df: pd.DataFrame) -> Dict[str, Any]:
     seasonal["seasonal_candidate"] = seasonal
     seasonal["monthly_candidate"] = {}
     seasonal["yearly_candidate"] = {}
-    seasonal["timeframe_decision"] = "只采用60日聚合K；20日/250日暂不参与"
-    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V65只看60日聚合K第一核心线。"
+    seasonal["timeframe_decision"] = "只采用60日聚合K"
+    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V66只看60日聚合K第一核心线。"
     return seasonal
 
 def _fmt_score(x: Dict[str, Any]) -> str:
@@ -1299,13 +1300,13 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v65_60d_first_effective_resonance_compact",
+        "core_line_method": "v66_60d_precise_entity_audit_compact",
         "core_line_tol": TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
         "seasonal_60d_only": True,
         "report_style": "compact_no_three_questions_no_evidence_lists",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; cut/accept rows do not also count as resonance",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
     }
 
     return "\n".join(lines), payload
