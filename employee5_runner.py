@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V68
+"""五号员工：大涨/涨停归因学习引擎。V70
 
-本版只做一件硬事：全链路强制前复权缓存。
-1. BaoStock 拉数固定 adjustflag="2"（前复权）。
-2. 缓存文件必须带 adjust=qfq / adjustflag=2 元数据，否则视为旧缓存/不可信缓存。
-3. 发现非前复权或无前复权元数据的旧缓存，直接删除，不参与计算。
-4. 所有新写入缓存统一为前复权缓存；不再保留不复权缓存。
-5. 60日第一核心线逻辑沿用 V67：候选只从60日 high 产生，切/受/共振互斥归类。
+本版只做三件硬事：
+1. 前复权缓存统一写成一号员工可直接读取的扁平 CSV：kline_cache/002552.csv。
+2. 用 kline_cache/_qfq_manifest.json 给 CSV 写前复权身份证；没有身份证的旧 CSV 不参与五号核心线正式结论。
+3. 默认只校准 002552；需要全市场时显式设置 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
 """
 
 import json, math, os, re, time
@@ -29,7 +27,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V68_QFQ_STRICT_CACHE"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V70_QFQ_FLAT_CSV_MANIFEST_60D_AUDIT"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -66,8 +64,40 @@ CACHE_FILE_MAP: Dict[str, Path] = {}
 # BaoStock: adjustflag=2 前复权；adjustflag=3 不复权，不能再用于核心线。
 QFQ_ADJUST = "qfq"
 QFQ_ADJUSTFLAG = "2"
-DELETE_NON_QFQ_CACHE = os.getenv("EMPLOYEE5_DELETE_NON_QFQ_CACHE", "1") != "0"
+# 不能启动时全删旧缓存：先拒绝使用，单票前复权覆盖成功后再清掉该票旧缓存。
+DELETE_NON_QFQ_CACHE = os.getenv("EMPLOYEE5_DELETE_NON_QFQ_CACHE", "0") == "1"
+DELETE_LEGACY_AFTER_QFQ_SAVE = os.getenv("EMPLOYEE5_DELETE_LEGACY_AFTER_QFQ_SAVE", "1") != "0"
 BAOSTOCK_START_DATE = os.getenv("EMPLOYEE5_BAOSTOCK_START_DATE", "1990-01-01")
+QFQ_REBUILD_TIME_BUDGET_MIN = float(os.getenv("EMPLOYEE5_QFQ_REBUILD_TIME_BUDGET_MIN", "160"))
+QFQ_REBUILD_SAFETY_STOP_SEC = float(os.getenv("EMPLOYEE5_QFQ_REBUILD_SAFETY_STOP_SEC", "180"))
+QFQ_REBUILD_STATE_FILE = REPORT_DIR / "qfq_rebuild_state.json"
+QFQ_REBUILD_FORCE = os.getenv("EMPLOYEE5_QFQ_REBUILD_FORCE", "0") == "1"
+QFQ_REBUILD_ALWAYS = os.getenv("EMPLOYEE5_QFQ_REBUILD_ALWAYS", "1") != "0"
+QFQ_REBUILD_PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_QFQ_REBUILD_PROGRESS_EVERY", "20"))
+QFQ_MANIFEST_FILE = MAIN_CACHE_DIR / "_qfq_manifest.json"
+# V70 默认只校准 002552，避免误触发全市场重拉；全市场需显式 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
+QFQ_REBUILD_CODES_RAW = os.getenv("EMPLOYEE5_QFQ_REBUILD_CODES", "002552").strip()
+FOCUS_CODES_RAW = os.getenv("EMPLOYEE5_FOCUS_CODES", QFQ_REBUILD_CODES_RAW if QFQ_REBUILD_CODES_RAW.upper() != "ALL" else "002552")
+
+
+def parse_code_list(raw: str) -> List[str]:
+    if not raw:
+        return []
+    if raw.strip().upper() in {"ALL", "*", "FULL", "MARKET"}:
+        return []
+    out: List[str] = []
+    seen = set()
+    for part in re.split(r"[,;\s]+", raw):
+        m = re.search(r"(\d{6})", str(part))
+        c = m.group(1) if m else ""
+        if c.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689", "920", "8", "4")) and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+QFQ_REBUILD_CODES = parse_code_list(QFQ_REBUILD_CODES_RAW)
+FOCUS_CODES = parse_code_list(FOCUS_CODES_RAW) or (["002552"] if QFQ_REBUILD_CODES_RAW.upper() == "ALL" else QFQ_REBUILD_CODES)
 
 
 def ss(x: Any) -> str:
@@ -180,6 +210,76 @@ def rows_from_obj(obj: Any) -> Any:
     return []
 
 
+
+def load_qfq_manifest() -> Dict[str, Any]:
+    try:
+        if QFQ_MANIFEST_FILE.exists():
+            obj = json.loads(QFQ_MANIFEST_FILE.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_qfq_manifest(manifest: Dict[str, Any]) -> None:
+    try:
+        MAIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = QFQ_MANIFEST_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, QFQ_MANIFEST_FILE)
+    except Exception as exc:
+        print(f"qfq manifest save failed: {exc}", flush=True)
+
+
+def update_qfq_manifest_for_code(code: str, df: pd.DataFrame, path: Path, source: str = "baostock") -> None:
+    c = code_of(code)
+    if not c or df is None or df.empty:
+        return
+    manifest = load_qfq_manifest()
+    manifest.setdefault("__meta__", {})
+    manifest["__meta__"].update({
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "format": "flat_csv",
+        "updated_at_bj": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "V70: kline_cache/{code}.csv is trusted only when this manifest marks adjust=qfq and adjustflag=2.",
+    })
+    manifest[c] = {
+        "code": c,
+        "file": path.name,
+        "path": str(path),
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "source": source,
+        "last_date": ss(df.iloc[-1].get("date", "")),
+        "rows": int(len(df)),
+        "target_date": TARGET,
+        "updated_at_bj": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_qfq_manifest(manifest)
+
+
+def manifest_entry_valid_for_path(code: str, path: Path, manifest: Optional[Dict[str, Any]] = None, min_rows: int = 0) -> bool:
+    c = code_of(code)
+    if not c:
+        return False
+    manifest = manifest if isinstance(manifest, dict) else load_qfq_manifest()
+    entry = manifest.get(c)
+    if not isinstance(entry, dict):
+        return False
+    if ss(entry.get("adjust")).lower() != QFQ_ADJUST or ss(entry.get("adjustflag")) != QFQ_ADJUSTFLAG:
+        return False
+    if min_rows and int(entry.get("rows", 0) or 0) < int(min_rows):
+        return False
+    last_date = ss(entry.get("last_date", "")).replace("-", "")
+    if last_date and last_date < TARGET:
+        return False
+    # V70 允许旧 manifest 只写 file，也允许完整 path；但文件名必须是当前 code.csv。
+    if path.suffix.lower() == ".csv" and path.name != f"{c}.csv":
+        return False
+    return True
+
+
 def is_qfq_cache_obj(obj: Any) -> bool:
     """只有明确写入前复权元数据的缓存才可信。"""
     if not isinstance(obj, dict):
@@ -189,40 +289,56 @@ def is_qfq_cache_obj(obj: Any) -> bool:
     return adjust in {"qfq", "前复权", "forward", "forward_adjusted"} or adjustflag == QFQ_ADJUSTFLAG
 
 
-def delete_untrusted_cache_file(p: Path, reason: str, stat: Optional[Dict[str, Any]] = None) -> None:
+def reject_untrusted_cache_file(p: Path, reason: str, stat: Optional[Dict[str, Any]] = None) -> None:
+    """扫描阶段只拒绝不可信缓存，不批量删除，避免缓存被一次性清空。"""
     if stat is not None:
-        stat["non_qfq_deleted" if DELETE_NON_QFQ_CACHE else "non_qfq_rejected"] = stat.get("non_qfq_deleted" if DELETE_NON_QFQ_CACHE else "non_qfq_rejected", 0) + 1
-    if not DELETE_NON_QFQ_CACHE:
-        return
-    try:
-        p.unlink(missing_ok=True)
-        print(f"delete non-qfq cache: {p} reason={reason}", flush=True)
-    except Exception as exc:
-        if stat is not None:
-            stat["non_qfq_delete_failed"] = stat.get("non_qfq_delete_failed", 0) + 1
-        print(f"delete non-qfq cache failed: {p} reason={reason} err={exc}", flush=True)
+        stat["non_qfq_rejected"] = stat.get("non_qfq_rejected", 0) + 1
+        stat.setdefault("non_qfq_reject_reasons", {})[reason] = stat.setdefault("non_qfq_reject_reasons", {}).get(reason, 0) + 1
+    if DELETE_NON_QFQ_CACHE:
+        # 兼容紧急人工模式；默认关闭。真正生产推荐使用单票覆盖后清理。
+        try:
+            p.unlink(missing_ok=True)
+            if stat is not None:
+                stat["non_qfq_deleted"] = stat.get("non_qfq_deleted", 0) + 1
+            print(f"delete non-qfq cache: {p} reason={reason}", flush=True)
+        except Exception as exc:
+            if stat is not None:
+                stat["non_qfq_delete_failed"] = stat.get("non_qfq_delete_failed", 0) + 1
+            print(f"delete non-qfq cache failed: {p} reason={reason} err={exc}", flush=True)
 
 
 def read_cache_file(p: Path, stat: Optional[Dict[str, Any]] = None, require_qfq: bool = True) -> pd.DataFrame:
     try:
         suf = p.suffix.lower()
-        if suf == ".json":
-            obj = json.loads(p.read_text(encoding="utf-8"))
-            if require_qfq and not is_qfq_cache_obj(obj):
-                delete_untrusted_cache_file(p, "missing_qfq_metadata", stat)
+        c = code_of(p)
+        if suf == ".csv":
+            if require_qfq and not manifest_entry_valid_for_path(c, p, min_rows=MIN_ROWS):
+                reject_untrusted_cache_file(p, "csv_missing_qfq_manifest", stat)
                 return pd.DataFrame()
+            return normalize_hist(pd.read_csv(p))
+
+        # V70 只信任一号员工可直接读取的 flat CSV + manifest。历史 JSON qfq 也不参与正式核心线。
+        if suf == ".json":
+            if p.name == QFQ_MANIFEST_FILE.name:
+                return pd.DataFrame()
+            if require_qfq:
+                reject_untrusted_cache_file(p, "json_not_flat_csv_cache", stat)
+                return pd.DataFrame()
+            obj = json.loads(p.read_text(encoding="utf-8"))
             return normalize_hist(pd.DataFrame(rows_from_obj(obj)))
 
-        # CSV/TXT/PKL 无法可靠证明复权口径；在强前复权模式下一律清理。
         if require_qfq:
-            delete_untrusted_cache_file(p, f"{suf}_no_qfq_metadata", stat)
+            reject_untrusted_cache_file(p, f"{suf}_no_qfq_metadata", stat)
             return pd.DataFrame()
 
-        if suf in [".csv", ".txt"]:
+        if suf in [".txt"]:
             return normalize_hist(pd.read_csv(p))
         if suf in [".pkl", ".pickle"]:
             return normalize_hist(pd.read_pickle(p))
-    except Exception:
+    except Exception as exc:
+        if stat is not None:
+            stat["cache_read_error"] = stat.get("cache_read_error", 0) + 1
+        print(f"read cache failed {p}: {str(exc)[:120]}", flush=True)
         return pd.DataFrame()
     return pd.DataFrame()
 
@@ -274,6 +390,11 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "adjust": QFQ_ADJUST,
         "adjustflag": QFQ_ADJUSTFLAG,
         "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
+        "delete_legacy_after_qfq_save": DELETE_LEGACY_AFTER_QFQ_SAVE,
+        "qfq_rebuild_state_file": str(QFQ_REBUILD_STATE_FILE),
+        "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
+        "flat_csv_cache": True,
+        "rebuild_codes": QFQ_REBUILD_CODES_RAW,
     }
 
     for i, p in enumerate(files, 1):
@@ -312,22 +433,113 @@ def load_full_history(code: str, fallback: Optional[pd.DataFrame] = None) -> pd.
     return fallback if fallback is not None else pd.DataFrame()
 
 
-def save_cache_file(code: str, df: pd.DataFrame) -> None:
+def cache_path_for_code(code: str) -> Path:
+    """V70：统一写入一号员工可直接读取的扁平 CSV。"""
+    return MAIN_CACHE_DIR / f"{code_of(code)}.csv"
+
+
+def save_rebuild_state(state: Dict[str, Any]) -> None:
     try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = QFQ_REBUILD_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, QFQ_REBUILD_STATE_FILE)
+    except Exception as exc:
+        print(f"qfq state save failed: {exc}", flush=True)
+
+
+def load_rebuild_state() -> Dict[str, Any]:
+    try:
+        if QFQ_REBUILD_STATE_FILE.exists():
+            obj = json.loads(QFQ_REBUILD_STATE_FILE.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def is_qfq_cache_file(p: Path) -> bool:
+    try:
+        return p.suffix.lower() == ".csv" and manifest_entry_valid_for_path(code_of(p), p, min_rows=MIN_ROWS)
+    except Exception:
+        return False
+
+
+def delete_legacy_cache_for_code(code: str, keep: Optional[Path] = None) -> Dict[str, int]:
+    """单票前复权写入成功后，清理该票旧的不可信缓存；不在全局扫描时批量清空。"""
+    stat = {"legacy_deleted": 0, "legacy_keep_qfq": 0, "legacy_delete_failed": 0}
+    if not DELETE_LEGACY_AFTER_QFQ_SAVE:
+        return stat
+    c = code_of(code)
+    keep_resolved = None
+    try:
+        keep_resolved = str(keep.resolve()) if keep else ""
+    except Exception:
+        keep_resolved = str(keep) if keep else ""
+    for p in iter_cache_files():
+        if code_of(p) != c:
+            continue
+        try:
+            pr = str(p.resolve())
+        except Exception:
+            pr = str(p)
+        if keep_resolved and pr == keep_resolved:
+            continue
+        # 只保留明确前复权 JSON；其他 CSV/TXT/PKL/无元数据 JSON 都删除。
+        if is_qfq_cache_file(p):
+            stat["legacy_keep_qfq"] += 1
+            continue
+        try:
+            p.unlink(missing_ok=True)
+            stat["legacy_deleted"] += 1
+            print(f"delete legacy non-qfq cache after qfq save: {p}", flush=True)
+        except Exception as exc:
+            stat["legacy_delete_failed"] += 1
+            print(f"delete legacy cache failed {p}: {exc}", flush=True)
+    return stat
+
+
+def save_cache_file(code: str, df: pd.DataFrame) -> bool:
+    """V70：原子写入前复权扁平 CSV；成功后更新 manifest，再清理该票旧缓存。"""
+    c = code_of(code)
+    if not c or df is None or df.empty:
+        return False
+    try:
+        df2 = normalize_hist(df)
+        if df2.empty or len(df2) < MIN_ROWS:
+            print(f"cache save rejected {c}: normalized rows too short", flush=True)
+            return False
+        if ss(df2.iloc[-1].get("date", "")).replace("-", "") < TARGET:
+            print(f"cache save rejected {c}: last_date={df2.iloc[-1].get('date')} target={TARGET_DASH}", flush=True)
+            return False
+
         MAIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (MAIN_CACHE_DIR / f"{code}.json").write_text(
-            json.dumps({
-                "target_date": TARGET,
-                "adjust": QFQ_ADJUST,
-                "adjustflag": QFQ_ADJUSTFLAG,
-                "source": "baostock",
-                "rows": df.to_dict("records"),
-            }, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        out = cache_path_for_code(c)
+        tmp = out.with_suffix(".csv.tmp")
+        cols = [x for x in ["date", "open", "close", "high", "low", "volume", "amount", "pct_chg"] if x in df2.columns]
+        df2[cols].to_csv(tmp, index=False, encoding="utf-8")
+
+        # 写完临时文件先反读校验，避免坏文件覆盖旧文件。
+        check_df = normalize_hist(pd.read_csv(tmp))
+        if check_df.empty or len(check_df) < MIN_ROWS or ss(check_df.iloc[-1].get("date", "")).replace("-", "") < TARGET:
+            tmp.unlink(missing_ok=True)
+            print(f"cache save rejected {c}: csv readback check failed", flush=True)
+            return False
+
+        os.replace(tmp, out)
+        update_qfq_manifest_for_code(c, check_df, out, source="baostock")
+        # 再次校验 manifest 身份证；通过后该 CSV 才算可信。
+        if not manifest_entry_valid_for_path(c, out, min_rows=MIN_ROWS):
+            print(f"cache save rejected {c}: manifest check failed after replace", flush=True)
+            return False
+        CACHE_FILE_MAP[c] = out
+        cleanup = delete_legacy_cache_for_code(c, keep=out)
+        if cleanup.get("legacy_deleted"):
+            print(f"qfq csv save {c}: replaced legacy={cleanup.get('legacy_deleted')}", flush=True)
+        return True
     except Exception as exc:
         print(f"cache save failed {code}: {exc}", flush=True)
-
+        return False
 
 def baostock_all_codes() -> List[Tuple[str, str]]:
     if bs is None:
@@ -360,7 +572,6 @@ def baostock_fetch_hist(code: str) -> pd.DataFrame:
     if bs is None:
         return pd.DataFrame()
 
-    target_dt = datetime.strptime(TARGET_DASH, "%Y-%m-%d")
     start = BAOSTOCK_START_DATE
     fields = "date,code,open,high,low,close,volume,amount,pctChg"
 
@@ -384,9 +595,22 @@ def baostock_fetch_hist(code: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def build_baostock_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+def qfq_existing_codes() -> set:
+    out = set()
+    manifest = load_qfq_manifest()
+    for c, entry in manifest.items():
+        if c.startswith("__") or not valid_code(c) or not isinstance(entry, dict):
+            continue
+        p = MAIN_CACHE_DIR / f"{c}.csv"
+        if p.exists() and manifest_entry_valid_for_path(c, p, manifest=manifest, min_rows=MIN_ROWS):
+            out.add(c)
+    return out
+
+
+def build_baostock_cache(existing_hist: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """限时、可续跑地重建前复权缓存。不会先清空旧缓存。"""
     stat = {
-        "source": "baostock_fallback",
+        "source": "baostock_qfq_incremental_rebuild",
         "cache_files": 0,
         "cache_hit": 0,
         "cache_bad": 0,
@@ -396,35 +620,127 @@ def build_baostock_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "adjust": QFQ_ADJUST,
         "adjustflag": QFQ_ADJUSTFLAG,
         "baostock_start_date": BAOSTOCK_START_DATE,
+        "time_budget_min": QFQ_REBUILD_TIME_BUDGET_MIN,
+        "delete_legacy_after_qfq_save": DELETE_LEGACY_AFTER_QFQ_SAVE,
+        "resumable_state_file": str(QFQ_REBUILD_STATE_FILE),
     }
-    hist: Dict[str, pd.DataFrame] = {}
+    hist: Dict[str, pd.DataFrame] = dict(existing_hist or {})
 
     if not ALLOW_BAOSTOCK_FALLBACK:
         stat["baostock_disabled"] = True
         return hist, stat
 
-    codes = baostock_all_codes()
+    if QFQ_REBUILD_CODES:
+        if bs is not None:
+            lg = bs.login()
+            print(f"baostock login: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}", flush=True)
+        codes = [(c, c) for c in QFQ_REBUILD_CODES]
+        stat["rebuild_mode"] = "focus_codes"
+    else:
+        codes = baostock_all_codes()
+        stat["rebuild_mode"] = "all_market"
     codes = codes[:BAOSTOCK_LIMIT] if BAOSTOCK_LIMIT > 0 else codes
-    stat["baostock_universe"] = len(codes)
+    total = len(codes)
+    stat["baostock_universe"] = total
+    stat["rebuild_codes_raw"] = QFQ_REBUILD_CODES_RAW
+
+    old_state = load_rebuild_state()
+    existing_qfq = qfq_existing_codes()
+    stat["existing_qfq_codes"] = len(existing_qfq)
+
+    cursor = int(old_state.get("cursor", 0) or 0)
+    if (
+        QFQ_REBUILD_FORCE
+        or old_state.get("target_date") != TARGET
+        or old_state.get("adjustflag") != QFQ_ADJUSTFLAG
+        or old_state.get("rebuild_codes_raw") != QFQ_REBUILD_CODES_RAW
+    ):
+        cursor = 0
+
     start_time = time.time()
+    budget_sec = max(60.0, QFQ_REBUILD_TIME_BUDGET_MIN * 60.0)
+    processed = 0
+    fetched = 0
+    skipped_existing = 0
+    failed = int(old_state.get("failed", 0) or 0) if cursor > 0 else 0
+    short = 0
+    last_code = ""
+    stop_reason = "completed"
 
-    for i, (code, _) in enumerate(codes, 1):
-        df = baostock_fetch_hist(code)
-        if df.empty:
-            stat["cache_bad"] += 1
-            continue
+    for i in range(cursor, total):
+        elapsed = time.time() - start_time
+        if elapsed >= max(1.0, budget_sec - QFQ_REBUILD_SAFETY_STOP_SEC):
+            stop_reason = "time_budget_stop"
+            break
 
-        if len(df) < MIN_ROWS or df.iloc[-1]["date"].replace("-", "") < TARGET:
-            stat["cache_short"] += 1
-            continue
+        code, _ = codes[i]
+        last_code = code
 
-        hist[code] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
-        stat["cache_hit"] += 1
-        save_cache_file(code, df)
+        if code in existing_qfq and not QFQ_REBUILD_FORCE:
+            skipped_existing += 1
+            # 当前运行需要样本时可按需读取已有 qfq，但避免全量加载长期历史进内存。
+            processed += 1
+            next_cursor = i + 1
+        else:
+            df = baostock_fetch_hist(code)
+            processed += 1
+            next_cursor = i + 1
 
-        if i == 1 or i % 200 == 0 or i == len(codes):
-            speed = i / max(time.time() - start_time, 0.001)
-            print(f"baostock fallback {i}/{len(codes)} hit={stat['cache_hit']} speed={speed:.2f}/s current={code}", flush=True)
+            if df.empty:
+                stat["cache_bad"] += 1
+                failed += 1
+            elif len(df) < MIN_ROWS or df.iloc[-1]["date"].replace("-", "") < TARGET:
+                stat["cache_short"] += 1
+                short += 1
+            elif save_cache_file(code, df):
+                hist[code] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
+                fetched += 1
+                stat["cache_hit"] += 1
+            else:
+                stat["cache_bad"] += 1
+                failed += 1
+
+        elapsed = time.time() - start_time
+        speed = processed / max(elapsed, 0.001)
+        remaining_budget = max(0.0, budget_sec - elapsed)
+        progress_pct = (next_cursor / total * 100.0) if total else 100.0
+        state = {
+            "target_date": TARGET,
+            "adjust": QFQ_ADJUST,
+            "adjustflag": QFQ_ADJUSTFLAG,
+            "format": "flat_csv",
+            "manifest_file": str(QFQ_MANIFEST_FILE),
+            "rebuild_codes_raw": QFQ_REBUILD_CODES_RAW,
+            "total": total,
+            "cursor": next_cursor,
+            "done": next_cursor,
+            "progress_pct": round(progress_pct, 2),
+            "processed_this_run": processed,
+            "fetched_this_run": fetched,
+            "skipped_existing_this_run": skipped_existing,
+            "failed": failed,
+            "short_this_run": short,
+            "elapsed_sec_this_run": round(elapsed, 1),
+            "remaining_budget_sec": round(remaining_budget, 1),
+            "speed_codes_per_sec": round(speed, 4),
+            "last_code": last_code,
+            "stop_reason": stop_reason,
+            "complete": next_cursor >= total,
+            "state_file": str(QFQ_REBUILD_STATE_FILE),
+        }
+        save_rebuild_state(state)
+
+        if processed == 1 or processed % QFQ_REBUILD_PROGRESS_EVERY == 0 or next_cursor >= total:
+            eta_codes = max(0, total - next_cursor)
+            eta_sec = eta_codes / max(speed, 0.0001)
+            eta_runs = math.ceil(eta_sec / max(budget_sec - QFQ_REBUILD_SAFETY_STOP_SEC, 1.0)) if eta_codes else 0
+            print(
+                f"qfq rebuild {next_cursor}/{total} {progress_pct:.2f}% "
+                f"run_processed={processed} fetched={fetched} skip_qfq={skipped_existing} "
+                f"elapsed={elapsed/60:.1f}min remaining={remaining_budget/60:.1f}min "
+                f"speed={speed:.3f}/s eta_runs≈{eta_runs} current={code}",
+                flush=True,
+            )
 
     try:
         if bs is not None:
@@ -432,7 +748,30 @@ def build_baostock_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
     except Exception:
         pass
 
-    stat["cache_files"] = len(list(MAIN_CACHE_DIR.glob("*.json"))) if MAIN_CACHE_DIR.exists() else 0
+    # 运行结束状态
+    final_state = load_rebuild_state()
+    if total and int(final_state.get("cursor", 0) or 0) >= total:
+        final_state["complete"] = True
+        final_state["stop_reason"] = "completed"
+        save_rebuild_state(final_state)
+
+    stat.update({
+        "processed_this_run": processed,
+        "fetched_this_run": fetched,
+        "skipped_existing_this_run": skipped_existing,
+        "failed_total_est": failed,
+        "short_this_run": short,
+        "cursor": int(final_state.get("cursor", cursor) or cursor),
+        "progress_pct": final_state.get("progress_pct", 0),
+        "remaining_budget_sec": final_state.get("remaining_budget_sec", 0),
+        "stop_reason": final_state.get("stop_reason", stop_reason),
+        "complete": bool(final_state.get("complete", False)),
+        "last_code": final_state.get("last_code", last_code),
+    })
+    stat["cache_files"] = len(list(MAIN_CACHE_DIR.glob("*.csv"))) if MAIN_CACHE_DIR.exists() else 0
+    stat["qfq_manifest_file"] = str(QFQ_MANIFEST_FILE)
+    stat["flat_csv_cache"] = True
+    # 重新扫描一次 qfq 命中，但只用于报告样本池，不强制全量驻留长期历史。
     return hist, stat
 
 
@@ -543,6 +882,20 @@ def latest_bar_snapshot(k: pd.DataFrame) -> Dict[str, Any]:
         "body_bottom": rd(r.body_bottom),
         "volume": rd(r.volume),
     }
+
+
+def bars_audit_records(k: pd.DataFrame) -> List[Dict[str, Any]]:
+    if k is None or k.empty:
+        return []
+    cols = [x for x in ["start", "end", "open", "high", "low", "close", "body_top", "body_bottom", "volume", "rel_vol", "vol_rank_pct"] if x in k.columns]
+    out = []
+    for _, r in k[cols].iterrows():
+        item = {}
+        for c in cols:
+            v = r.get(c)
+            item[c] = ss(v) if c in {"start", "end"} else rd(v, 4)
+        out.append(item)
+    return out
 
 
 def completed_bars_for_coreline(k: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -929,7 +1282,7 @@ def score_core_reaction_line(
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v68_qfq_strict_cache_60d_first_core_boundary_margin",
+        "confirmation_source": "v70_qfq_flat_csv_manifest_60d_first_core_audit",
     }
 
 
@@ -1089,6 +1442,8 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
             "text": f"{timeframe}未识别到有效候选。",
         }
 
+    best["raw_60d_bars"] = bars_audit_records(raw_k)
+    best["completed_60d_bars_for_scoring"] = bars_audit_records(k)
     best["all_candidates"] = scored[:10]
     best["high_cluster_count"] = len(clusters)
     best["reaction_cluster_count"] = len(clusters)
@@ -1173,7 +1528,7 @@ def core_line(df: pd.DataFrame) -> Dict[str, Any]:
     seasonal["monthly_candidate"] = {}
     seasonal["yearly_candidate"] = {}
     seasonal["timeframe_decision"] = "只采用60日聚合K"
-    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V68只看前复权60日聚合K第一核心线。"
+    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V70只看前复权60日聚合K第一核心线。"
     return seasonal
 
 def _fmt_score(x: Dict[str, Any]) -> str:
@@ -1350,6 +1705,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         f"- 日期：{TARGET}",
         f"- 启动指纹：{BOOT}",
         f"- 数据来源：{stat.get('source')}｜命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
+        f"- 前复权缓存进度：{stat.get('progress_pct', '-')}%｜本轮新增{stat.get('fetched_this_run', 0)}｜剩余预算{round(sf(stat.get('remaining_budget_sec', 0))/60, 1)}分钟｜状态{stat.get('stop_reason', '-')}",
         "- 公式：净分 = 普通共振 + 放量加权 - 切实体损耗 - 实体接受损耗",
         "",
     ]
@@ -1375,8 +1731,16 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     merged = (
         pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True)
         if not (A.empty and B.empty)
-        else pd.DataFrame()
+        else pd.DataFrame(columns=["code", "_group"])
     )
+    # V70 校准阶段：无论是否进入A/B样本，都强制输出 FOCUS_CODES 的60日审计。
+    existing_codes = set(merged["code"].astype(str).tolist()) if "code" in merged.columns else set()
+    focus_rows = []
+    for c in FOCUS_CODES:
+        if c and c not in existing_codes and c in hist:
+            focus_rows.append({"code": c, "name": c, "_group": "校准样本", "sample_type": "qfq_60d_audit"})
+    if focus_rows:
+        merged = pd.concat([merged, pd.DataFrame(focus_rows)], ignore_index=True)
 
     if merged.empty:
         lines.append("- 无有效样本。")
@@ -1413,7 +1777,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v68_qfq_strict_cache_60d_first_core_boundary_margin",
+        "core_line_method": "v70_qfq_flat_csv_manifest_60d_first_core_audit",
         "core_line_tol": TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
@@ -1422,6 +1786,11 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "adjust": QFQ_ADJUST,
         "adjustflag": QFQ_ADJUSTFLAG,
         "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
+        "delete_legacy_after_qfq_save": DELETE_LEGACY_AFTER_QFQ_SAVE,
+        "qfq_rebuild_state_file": str(QFQ_REBUILD_STATE_FILE),
+        "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
+        "flat_csv_cache": True,
+        "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "compact_no_three_questions_no_evidence_lists",
         "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
     }
@@ -1460,7 +1829,7 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     feedback = safe_jsonable({
         "boot_id": BOOT,
         "target_date": TARGET,
-        "network_hist_allowed": False,
+        "network_hist_allowed": True,
         "data_source": payload.get("cache_stats", {}).get("source"),
         "core_line_method": payload.get("core_line_method"),
         "core_line_tol": TOL,
@@ -1471,6 +1840,11 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
         "adjust": QFQ_ADJUST,
         "adjustflag": QFQ_ADJUSTFLAG,
         "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
+        "delete_legacy_after_qfq_save": DELETE_LEGACY_AFTER_QFQ_SAVE,
+        "qfq_rebuild_state_file": str(QFQ_REBUILD_STATE_FILE),
+        "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
+        "flat_csv_cache": True,
+        "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": payload.get("report_style", "compact"),
         "score_formula": payload.get("score_formula", ""),
         "scan_keep_rows": SCAN_KEEP_ROWS,
@@ -1489,20 +1863,41 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     for name, content in files.items():
         (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
+    # V70：焦点票单独落盘，方便人工逐K核对60日捏合K、切实体、实体接受。
+    for item in safe.get("results", []) or []:
+        c = ss(item.get("code"))
+        if c in set(FOCUS_CODES):
+            audit_path = REPORT_DIR / f"{c}_qfq_60d_audit.json"
+            audit_payload = {
+                "target_date": TARGET,
+                "boot_id": BOOT,
+                "code": c,
+                "adjust": QFQ_ADJUST,
+                "adjustflag": QFQ_ADJUSTFLAG,
+                "cache_format": "flat_csv",
+                "manifest_file": str(QFQ_MANIFEST_FILE),
+                "core_line": item.get("core_line", {}),
+                "top_candidates": item.get("top_candidates", []),
+            }
+            audit_path.write_text(json.dumps(safe_jsonable(audit_payload), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
 
 def main() -> None:
     print(BOOT, flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
-    print(f"target_date={TARGET} network_hist_allowed=False baostock_fallback={ALLOW_BAOSTOCK_FALLBACK}", flush=True)
+    print(f"target_date={TARGET} network_hist_allowed=True baostock_qfq_incremental={ALLOW_BAOSTOCK_FALLBACK}", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
 
     hist, stat = load_cache()
     print(f"cache_stats={stat}", flush=True)
 
-    if not hist and ALLOW_BAOSTOCK_FALLBACK:
-        print("cache empty; start baostock fallback", flush=True)
-        hist, stat = build_baostock_cache()
-        print(f"baostock_stats={stat}", flush=True)
+    if ALLOW_BAOSTOCK_FALLBACK and (QFQ_REBUILD_ALWAYS or not hist):
+        if not hist:
+            print("qfq cache empty; start incremental baostock qfq rebuild", flush=True)
+        else:
+            print("start incremental baostock qfq rebuild / resume", flush=True)
+        hist, stat = build_baostock_cache(existing_hist=hist)
+        print(f"baostock_qfq_rebuild_stats={stat}", flush=True)
 
     md, payload = build_report(hist, stat)
     write_outputs(md, payload)
