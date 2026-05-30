@@ -31,7 +31,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V61_HIGH_CLUSTER_CLEAN_LOWEST"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260529_CORE_LINE_V61_2_HIGH_CLUSTER_CLEAN_LOWEST"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -661,23 +661,42 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
         except Exception:
             stage_low_volume_bar = {}
 
-    # V61：切实体扣分更严。超过0.5%误差切进实体，切1次扣1分、切2次扣2分，依次递增。
+    # V61.2：共振点先完整累加，切实体只是扣点；但切实体过多必须封顶降级，不能靠点数堆成高置信。
+    raw_resonance_points = score
     body_cut_penalty = body_cut
     score -= body_cut_penalty
 
     # 整根实体在线上方，仍然一次都不能接受。
     clean = entity_accept == 0
 
-    # 主旨：high上影共振为主锚点；实体顶/收盘/最高价/地量high共振越多越核心。
-    core_candidate = clean and hit >= MIN_CORE_HIT_COUNT and score >= 3.0
-    meaningful = hit >= MIN_CORE_HIT_COUNT and (score + body_cut_penalty) >= max(2.0, MIN_CORE_HIT_COUNT - 1.0)
+    # 切实体级别封顶：
+    # - 3次及以上：不能评为“高置信”；
+    # - 4次及以上：不能作为主核心线，只能做局部/逻辑共振线，必要时升周期重找。
+    heavy_body_cut = body_cut >= 3
+    body_cut_disqualified = body_cut >= 4
 
-    # V61：本周期被实体接受，或多次切实体导致不工整时，升到更大周期重新找。
-    need_escalate = meaningful and (entity_accept >= 1 or body_cut >= 2 or (body_cut >= 1 and not core_candidate))
+    # 主旨：谁的共振点多谁分高；但切实体过多不能靠点数硬堆成主核心线。
+    core_candidate = (
+        clean
+        and not body_cut_disqualified
+        and hit >= MIN_CORE_HIT_COUNT
+        and score >= 3.0
+    )
+    meaningful = hit >= MIN_CORE_HIT_COUNT and raw_resonance_points >= max(2.0, MIN_CORE_HIT_COUNT - 1.0)
+
+    # 切实体不是机械升周期：扣完还能成核心就留在本周期；
+    # 扣完不成核心但原始共振不弱，或实体被接受/切实体过多，才升周期。
+    need_escalate = meaningful and (
+        entity_accept >= 1
+        or body_cut_disqualified
+        or (body_cut > 0 and not core_candidate)
+    )
 
     if entity_accept > 0:
         line_type, level = "logic_analysis_line", "已被实体接受的旧压力线"
-    elif core_candidate and hit >= 5 and score >= 5:
+    elif body_cut_disqualified:
+        line_type, level = "logic_analysis_line", "切实体过多的局部共振线"
+    elif core_candidate and (not heavy_body_cut) and hit >= 5 and score >= 5:
         line_type, level = "core_line", "高置信上影共振核心线"
     elif core_candidate:
         line_type, level = "core_line", "上影共振核心线候选"
@@ -693,6 +712,9 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
         "level": level,
         "timeframe": timeframe,
         "score": rd(score),
+        "raw_resonance_points": rd(raw_resonance_points),
+        "heavy_body_cut": heavy_body_cut,
+        "body_cut_disqualified": body_cut_disqualified,
         "hit_count": hit,
         "upper_shadow_hit_count": upper_hit,
         "entity_top_as_shadow_count": top_as_shadow,
@@ -971,69 +993,6 @@ def sample_ref_price(sample: Any) -> float:
     return 0.0
 
 
-def three_question_answer_lines(cl: Dict[str, Any], sample: Any) -> List[str]:
-    line = sf(cl.get("line"))
-    px = sample_ref_price(sample)
-    lt = ss(cl.get("line_type"))
-    clean = bool(cl.get("clean_core_line"))
-
-    hit = int(sf(cl.get("hit_count")))
-    close_n = int(sf(cl.get("close_touch_count")))
-    body_n = int(sf(cl.get("body_top_touch_count")))
-    high_n = int(sf(cl.get("high_touch_count")))
-    vol_n = int(sf(cl.get("volume_hit_count")))
-    cut_n = int(sf(cl.get("body_cut_count")))
-    cut_penalty = int(sf(cl.get("body_cut_penalty")))
-    accept_n = int(sf(cl.get("entity_accept_count")))
-    score = rd(cl.get("score"))
-
-    if accept_n > 0:
-        a1 = (
-            f"答：这条线不能算当前工整核心压力线，因为已有{accept_n}根完成K的整个实体站在它上方；"
-            f"虽然打到{hit}根、score={score}，但实体接受一次都不能接受。周期决策：{cl.get('timeframe_decision', '')}。"
-        )
-    elif lt == "core_line":
-        a1 = (
-            f"答：这条线具备有效性，不是单根极值。证据是打到{hit}根，"
-            f"收盘贴线{close_n}次、实体顶贴线{body_n}次、最高价贴线{high_n}次、带量打到{vol_n}次，"
-            f"切实体{cut_n}次、扣{cut_penalty}分，实体接受0次，score={score}。"
-            f"周期决策：{cl.get('timeframe_decision', '')}。"
-        )
-    elif lt == "logic_analysis_line":
-        a1 = (
-            f"答：这条线暂时只能算逻辑线。它打到{hit}根，切实体{cut_n}次、扣{cut_penalty}分，"
-            f"实体接受{accept_n}次，score={score}。周期决策：{cl.get('timeframe_decision', '')}。"
-        )
-    else:
-        a1 = "答：当前没有识别到合格核心线，不能硬解释。"
-
-    if line > 0 and px > 0:
-        diff = (px / line - 1.0) * 100.0
-
-        if abs(diff) <= TOL * 100:
-            a2 = f"答：样本价{rd(px)}元贴近核心线{rd(line)}元，正处在核心线反应区。"
-        elif diff > 0:
-            a2 = f"答：样本价{rd(px)}元高于核心线{rd(line)}元约{rd(diff)}%，后续重点看是否跌回线下。"
-        else:
-            a2 = f"答：样本价{rd(px)}元低于核心线{rd(line)}元约{rd(abs(diff))}%，该线暂作上方确认位。"
-    else:
-        a2 = "答：样本价格或核心线缺失，暂时不能判断发动点与核心线的直接关系。"
-
-    if lt == "core_line" and clean and accept_n == 0 and hit >= MIN_CORE_HIT_COUNT:
-        a3 = "答：可以沉淀为一号员工的结构因子：大周期形成干净上影共振线，后续日线高质量突破或突破后回踩不破再进入候选评分。"
-    else:
-        a3 = "答：暂时不适合沉淀为一号员工正式因子，只能继续作为五号员工观察样本。"
-
-    return [
-        "1. 这条线为什么有效，还是只是极值压力？",
-        a1,
-        "2. 为什么在这个时间点发动？",
-        a2,
-        "3. 能否沉淀成一号员工可提前识别的因子？",
-        a3,
-    ]
-
-
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
 
@@ -1088,46 +1047,19 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         for _, r in pool.iterrows():
             c = ss(r.get("code"))
             cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame())))
-            qa = three_question_answer_lines(cl, r)
 
+            # 正文只保留核心线结论；详细审计字段只写入 JSON，避免报告刷屏。
             lines += [
                 f"### {c}｜{group}",
                 f"- 核心线状态：{core_line_summary(cl)}",
                 "",
-                cl.get("text", ""),
-                "",
-                f"排除的当前未完成K：{cl.get('excluded_current_bar', {})}",
-                f"周期切换路径：{cl.get('timeframe_decision', '')}",
-                f"high共振簇：{cl.get('cluster_highs', [])}｜选择规则：{cl.get('cluster_selection_rule', '')}",
-                f"阶段地量K：{cl.get('stage_low_volume_bar', {})}｜地量high共振：{cl.get('stage_low_volume_high_touch_count', 0)}",
             ]
-
-            if cl.get("entity_accept_dates"):
-                lines += ["", "实体接受K："]
-                for d in cl.get("entity_accept_dates", [])[:8]:
-                    lines.append(f"- {d}｜整个实体站在候选线上方")
-
-            lines += ["", "关键共振K："]
-
-            for ev in cl.get("evidence", [])[:8]:
-                lines.append(
-                    f"- {ev.get('date')}｜高{ev.get('high')}｜收{ev.get('close')}｜实体顶{ev.get('body_top')}｜"
-                    f"收盘贴线={ev.get('close_touch')} 实体顶贴线={ev.get('body_top_touch')} 最高价贴线={ev.get('high_touch')}"
-                )
-
-            lines += [
-                "",
-                "这只票只作为归因样本，不输出交易建议。",
-                "",
-                "**三个核心问题与回答**",
-            ] + qa + [""]
 
             results.append({
                 "group": group,
                 "code": c,
                 "sample": r.to_dict(),
                 "core_line": cl,
-                "three_question_answers": qa,
             })
 
     payload = {
