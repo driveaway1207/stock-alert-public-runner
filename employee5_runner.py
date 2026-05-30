@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V73
+"""五号员工：涨停核心线归因引擎。V77
 
-本版只做四件硬事：
-1. 前复权缓存统一写成一号员工可直接读取的扁平 CSV：kline_cache/002552.csv。
-2. 用 kline_cache/_qfq_manifest.json 给 CSV 写前复权身份证；没有身份证的旧 CSV 不参与五号核心线正式结论。
-3. 默认只校准 002552；需要全市场时显式设置 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
-4. 新增60日捏合K锚点校准并应用：用用户软件截图给出的OHLC样本反查最接近的软件捏合口径，并用该锚点重新计算核心线。
+只做一件事：
+扫描最近一个可用交易日的涨停样本，并按原 18.11/V73 60日核心线逻辑输出核心线。
+
+硬约束：
+- 核心线识别、评分、锚点校准逻辑不重写、不降级；
+- 只使用前复权缓存；
+- 报告只输出涨停样本核心线。
 """
 
 import json, math, os, re, time
@@ -28,15 +30,17 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V73_QFQ_APPLY_60D_ANCHOR"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V77_LIMIT_UP_CORELINES_ONLY_CLEAN"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
 TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
+TARGET_MANUAL = bool(os.getenv("EMPLOYEE5_TARGET_DATE"))
 TARGET = re.sub(r"\D", "", str(TARGET_RAW))[:8] or datetime.now().strftime("%Y%m%d")
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}"
 
-TOP_N = int(os.getenv("EMPLOYEE5_TOP_N", "3"))
+# 涨停识别容差：保留原口径 0.35，避免数据源 pctChg 四舍五入导致真实涨停漏选。
+LIMIT_UP_TOL = float(os.getenv("EMPLOYEE5_LIMIT_UP_TOL", "0.35"))
 MIN_ROWS = int(os.getenv("EMPLOYEE5_MIN_CACHE_ROWS", "22"))
 SCAN_KEEP_ROWS = int(os.getenv("EMPLOYEE5_SCAN_KEEP_ROWS", "80"))
 TOL = float(os.getenv("EMPLOYEE5_CORE_LINE_TOL", "0.005"))
@@ -76,9 +80,9 @@ QFQ_REBUILD_FORCE = os.getenv("EMPLOYEE5_QFQ_REBUILD_FORCE", "0") == "1"
 QFQ_REBUILD_ALWAYS = os.getenv("EMPLOYEE5_QFQ_REBUILD_ALWAYS", "1") != "0"
 QFQ_REBUILD_PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_QFQ_REBUILD_PROGRESS_EVERY", "20"))
 QFQ_MANIFEST_FILE = MAIN_CACHE_DIR / "_qfq_manifest.json"
-# V70 默认只校准 002552，避免误触发全市场重拉；全市场需显式 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
-QFQ_REBUILD_CODES_RAW = os.getenv("EMPLOYEE5_QFQ_REBUILD_CODES", "002552").strip()
-FOCUS_CODES_RAW = os.getenv("EMPLOYEE5_FOCUS_CODES", QFQ_REBUILD_CODES_RAW if QFQ_REBUILD_CODES_RAW.upper() != "ALL" else "002552")
+# 默认全市场扫描前复权缓存/增量；不再默认锁死单票。
+QFQ_REBUILD_CODES_RAW = os.getenv("EMPLOYEE5_QFQ_REBUILD_CODES", "FULL").strip()
+FOCUS_CODES_RAW = os.getenv("EMPLOYEE5_FOCUS_CODES", "").strip()
 
 
 def parse_code_list(raw: str) -> List[str]:
@@ -98,7 +102,7 @@ def parse_code_list(raw: str) -> List[str]:
 
 
 QFQ_REBUILD_CODES = parse_code_list(QFQ_REBUILD_CODES_RAW)
-FOCUS_CODES = parse_code_list(FOCUS_CODES_RAW) or (["002552"] if QFQ_REBUILD_CODES_RAW.upper() == "ALL" else QFQ_REBUILD_CODES)
+FOCUS_CODES = parse_code_list(FOCUS_CODES_RAW)
 
 
 # V72：用户软件截图里的60日捏合K校准样本。
@@ -450,7 +454,9 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
             stat["cache_bad"] += 1
             continue
 
-        if len(df) < MIN_ROWS or df.iloc[-1]["date"].replace("-", "") < TARGET:
+        last_cache_date = ss(df.iloc[-1]["date"]).replace("-", "")
+        # 手动指定复盘日期时，必须缓存覆盖到该日；自动运行时允许周六/周日/盘中使用最近一个交易日。
+        if len(df) < MIN_ROWS or (TARGET_MANUAL and last_cache_date < TARGET):
             stat["cache_short"] += 1
             continue
 
@@ -552,7 +558,9 @@ def save_cache_file(code: str, df: pd.DataFrame) -> bool:
         if df2.empty or len(df2) < MIN_ROWS:
             print(f"cache save rejected {c}: normalized rows too short", flush=True)
             return False
-        if ss(df2.iloc[-1].get("date", "")).replace("-", "") < TARGET:
+        last_save_date = ss(df2.iloc[-1].get("date", "")).replace("-", "")
+        # 手动复盘日期要严格覆盖；自动运行允许非交易日/盘中保存到最近交易日。
+        if TARGET_MANUAL and last_save_date < TARGET:
             print(f"cache save rejected {c}: last_date={df2.iloc[-1].get('date')} target={TARGET_DASH}", flush=True)
             return False
 
@@ -818,24 +826,13 @@ def build_baostock_cache(existing_hist: Optional[Dict[str, pd.DataFrame]] = None
     return hist, stat
 
 
-def gain20(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if len(df) < 22:
-        return None
+def pick_samples(hist: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """筛出最近一个可用交易日的涨停样本。
 
-    a, b = df.iloc[-21], df.iloc[-1]
-    g = (sf(b.close) / sf(a.close) - 1.0) * 100 if sf(a.close) else 0.0
-
-    return {
-        "gain_20d": rd(g),
-        "start_date": a.date,
-        "end_date": b.date,
-        "start_close": rd(a.close),
-        "end_close": rd(b.close),
-    }
-
-
-def pick_samples(hist: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    a_rows, b_rows = [], []
+    只负责样本池；核心线算法不在这里改。
+    LIMIT_UP_TOL 仅用于容忍数据源涨幅四舍五入误差。
+    """
+    rows: List[Dict[str, Any]] = []
 
     for i, (code, df) in enumerate(hist.items(), 1):
         if df is None or df.empty:
@@ -845,32 +842,24 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFr
         pct = sf(last.pct_chg)
         lp = limit_pct(code)
 
-        if pct >= lp - 0.35 or pct >= min(8.0, lp * 0.75):
-            a_rows.append({
+        if pct >= lp - LIMIT_UP_TOL:
+            rows.append({
                 "code": code,
                 "name": code,
                 "date": last.date,
                 "close": rd(last.close),
                 "pct_chg": rd(pct),
-                "sample_type": "涨停/近涨停" if pct >= lp - 0.35 else "极强上涨",
+                "limit_pct": rd(lp),
+                "sample_type": "涨停",
             })
 
-        g = gain20(df)
-        if g:
-            b_rows.append({"code": code, "name": code, **g})
-
         if i % 500 == 0:
-            print(f"sample scan {i}/{len(hist)} A={len(a_rows)} B={len(b_rows)}", flush=True)
+            print(f"sample scan {i}/{len(hist)} limit_up={len(rows)}", flush=True)
 
-    A, B = pd.DataFrame(a_rows), pd.DataFrame(b_rows)
-
+    A = pd.DataFrame(rows)
     if not A.empty:
-        A = A.sort_values(["pct_chg", "close"], ascending=[False, False]).head(TOP_N).reset_index(drop=True)
-
-    if not B.empty:
-        B = B.sort_values("gain_20d", ascending=False).head(TOP_N).reset_index(drop=True)
-
-    return A, B
+        A = A.sort_values(["pct_chg", "close"], ascending=[False, False]).reset_index(drop=True)
+    return A
 
 
 def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -1826,198 +1815,66 @@ def safe_jsonable(obj: Any, seen: Optional[set] = None) -> Any:
     return ss(obj)
 
 
-def candidate_line_brief(x: Dict[str, Any]) -> str:
-    return (
-        f"线{x.get('line')}｜{x.get('line_type')}｜净分{x.get('net_score', x.get('score'))}｜"
-        f"毛分{x.get('gross_score', '')}｜有效共振{x.get('effective_resonance_count', x.get('ordinary_resonance_count', x.get('hit_count')))}｜"
-        f"放量+{x.get('volume_bonus_score', 0)}｜损耗{x.get('entity_loss_score', 0)}｜"
-        f"切{x.get('body_cut_count')}｜受{x.get('entity_accept_count')}｜"
-        f"放切{x.get('volume_body_cut_count')}｜放受{x.get('volume_entity_accept_count')}｜{x.get('current_state', '')}"
-    )
-
-
-def top_candidate_lines(cl: Dict[str, Any], limit: int = 5) -> List[str]:
-    out: List[str] = []
-    for x in (cl.get("all_candidates") or [])[:limit]:
-        out.append(candidate_line_brief(x))
-    return out
-
-
-def timeframe_brief(cl: Dict[str, Any]) -> str:
-    parts = []
-    for key, name in [("monthly_candidate", "20日"), ("seasonal_candidate", "60日"), ("yearly_candidate", "250日")]:
-        x = cl.get(key) or {}
-        if x.get("line") is not None:
-            parts.append(f"{name}:{_fmt_score(x)}")
-    return "；".join(parts) if parts else "无"
-
-
-def sample_ref_price(sample: Any) -> float:
-    if isinstance(sample, pd.Series):
-        sample = sample.to_dict()
-
-    if isinstance(sample, dict):
-        for key in ["close", "end_close"]:
-            v = sf(sample.get(key))
-            if v > 0:
-                return v
-
-    return 0.0
-
-
-def three_question_answer_lines(cl: Dict[str, Any], sample: Any) -> List[str]:
-    line = sf(cl.get("line"))
-    px = sample_ref_price(sample)
-    lt = ss(cl.get("line_type"))
-
-    hit = int(sf(cl.get("ordinary_resonance_count", cl.get("hit_count"))))
-    close_n = int(sf(cl.get("close_touch_count")))
-    body_n = int(sf(cl.get("body_top_touch_count")))
-    high_n = int(sf(cl.get("high_touch_count")))
-    vol_n = int(sf(cl.get("volume_hit_count")))
-    cut_n = int(sf(cl.get("body_cut_count")))
-    accept_n = int(sf(cl.get("entity_accept_count")))
-    net_score = rd(cl.get("net_score", cl.get("score")))
-    gross = rd(cl.get("gross_score"))
-    entity_loss = rd(cl.get("entity_loss_score"))
-    volume_bonus = rd(cl.get("volume_bonus_score"))
-    state = ss(cl.get("current_state"))
-
-    if lt == "core_line":
-        a1 = (
-            f"答：这条线按最大共振净分逻辑成立。普通共振{hit}根，"
-            f"收盘/实体顶/最高价/上影触碰均等权统计，其中收盘贴线{close_n}次、实体顶贴线{body_n}次、最高价贴线{high_n}次；"
-            f"放量/倍量共振{vol_n}次，放量加权{volume_bonus}；"
-            f"切实体{cut_n}次、实体接受{accept_n}次，实体总损耗{entity_loss}；"
-            f"毛分{gross}、净分{net_score}。状态：{state}。周期决策：{cl.get('timeframe_decision', '')}。"
-        )
-    elif lt == "logic_analysis_line":
-        a1 = (
-            f"答：这条线有共振但暂未确认核心。普通共振{hit}根、放量加权{volume_bonus}、"
-            f"切实体{cut_n}次、实体接受{accept_n}次、实体总损耗{entity_loss}，净分{net_score}。"
-            f"说明共振收益扣掉实体损耗后还不够硬。周期决策：{cl.get('timeframe_decision', '')}。"
-        )
-    else:
-        a1 = "答：当前没有识别到合格核心线，不能硬解释。"
-
-    if line > 0 and px > 0:
-        diff = (px / line - 1.0) * 100.0
-
-        if abs(diff) <= TOL * 100:
-            a2 = f"答：样本价{rd(px)}元贴近核心线{rd(line)}元，正处在核心线反应区。"
-        elif diff > 0:
-            a2 = f"答：样本价{rd(px)}元高于核心线{rd(line)}元约{rd(diff)}%，后续重点看是否回踩线附近不破、是否形成支撑转换。"
-        else:
-            a2 = f"答：样本价{rd(px)}元低于核心线{rd(line)}元约{rd(abs(diff))}%，该线暂作上方突破确认位。"
-    else:
-        a2 = "答：样本价格或核心线缺失，暂时不能判断发动点与核心线的直接关系。"
-
-    if lt == "core_line" and hit >= MIN_CORE_HIT_COUNT:
-        a3 = "答：可以沉淀为一号员工结构因子：最大共振核心线被日线高质量突破、接受或回踩不破时，才进入正式候选评分。"
-    else:
-        a3 = "答：暂时只适合五号员工观察，不能直接沉淀为一号员工正式买入因子。"
-
-    return [
-        "1. 这条线为什么有效，还是只是极值压力？",
-        a1,
-        "2. 为什么在这个时间点发动？",
-        a2,
-        "3. 能否沉淀成一号员工可提前识别的因子？",
-        a3,
-    ]
-
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    A, B = pick_samples(hist) if hist else (pd.DataFrame(), pd.DataFrame())
+    """只输出最近一个可用交易日涨停样本的核心线。"""
+    A = pick_samples(hist) if hist else pd.DataFrame()
+
+    sample_dates = sorted({ss(x) for x in (A.get("date", pd.Series(dtype=str)).tolist() if not A.empty else []) if ss(x)})
+    sample_date_text = ",".join(sample_dates) if sample_dates else "无"
 
     lines = [
-        "# 五号员工：核心线量化报告",
-        "",
-        f"- 日期：{TARGET}",
-        f"- 启动指纹：{BOOT}",
-        f"- 数据来源：{stat.get('source')}｜命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
-        f"- 前复权缓存进度：{stat.get('progress_pct', '-')}%｜本轮新增{stat.get('fetched_this_run', 0)}｜剩余预算{round(sf(stat.get('remaining_budget_sec', 0))/60, 1)}分钟｜状态{stat.get('stop_reason', '-')}",
-        "- 公式：净分 = 普通共振 + 放量加权 - 切实体损耗 - 实体接受损耗",
+        "# 五号员工：涨停核心线",
+        f"- 运行日期：{TARGET}",
+        f"- 样本交易日：{sample_date_text}",
         "",
     ]
 
     results = []
 
-    lines += ["## A组：当日涨停/极强样本"]
     if A.empty:
-        lines.append("- 无")
+        lines.append("- 无涨停样本。")
     else:
         for i, r in A.iterrows():
-            lines.append(f"{i + 1}. {r.code}｜{r.sample_type}｜涨幅{r.pct_chg}%｜收盘{r.close}")
-
-    lines += ["", "## B组：近20日累计涨幅前三"]
-    if B.empty:
-        lines.append("- 无")
-    else:
-        for i, r in B.iterrows():
-            lines.append(f"{i + 1}. {r.code}｜{r.gain_20d}%｜{r.start_date}→{r.end_date}")
-
-    lines += ["", "## 核心线结果"]
-
-    merged = (
-        pd.concat([A.assign(_group="A组"), B.assign(_group="B组")], ignore_index=True)
-        if not (A.empty and B.empty)
-        else pd.DataFrame(columns=["code", "_group"])
-    )
-    # V70 校准阶段：无论是否进入A/B样本，都强制输出 FOCUS_CODES 的60日审计。
-    existing_codes = set(merged["code"].astype(str).tolist()) if "code" in merged.columns else set()
-    focus_rows = []
-    for c in FOCUS_CODES:
-        if c and c not in existing_codes and c in hist:
-            focus_rows.append({"code": c, "name": c, "_group": "校准样本", "sample_type": "qfq_60d_audit"})
-    if focus_rows:
-        merged = pd.concat([merged, pd.DataFrame(focus_rows)], ignore_index=True)
-
-    if merged.empty:
-        lines.append("- 无有效样本。")
-    else:
-        for _, r in merged.iterrows():
             c = ss(r.get("code"))
             full_df = load_full_history(c, hist.get(c, pd.DataFrame()))
             anchor_cal = calibrate_60d_anchor_for_code(c, full_df, 60)
             cl = core_line(full_df, code=c, anchor_calibration=anchor_cal)
-            best_anchor = anchor_cal.get("best", {}) if isinstance(anchor_cal, dict) else {}
-            anchor_text = "无校准样本"
-            if best_anchor:
-                anchor_text = f"best={best_anchor.get('mode')} offset={best_anchor.get('offset')} error={best_anchor.get('total_error')}"
-            lines += [
-                f"### {c}｜{r.get('_group')}",
-                f"- 采用：{core_line_summary(cl)}",
-                f"- 60日锚点校准：{anchor_text}",
-                f"- 60日锚点应用：{cl.get('applied_60d_anchor', {}).get('applied')}｜{cl.get('applied_60d_anchor', {}).get('mode', '')}｜offset={cl.get('applied_60d_anchor', {}).get('offset', '')}｜当前K关系={cl.get('current_excluded_bar_relation_to_line', '')}",
-                "- 候选Top：",
-            ]
-            tops = top_candidate_lines(cl, 5)
-            if tops:
-                for t in tops:
-                    lines.append(f"  - {t}")
+
+            line = cl.get("line")
+            state = cl.get("current_state", "")
+            level = cl.get("level", "")
+            net = cl.get("net_score", cl.get("score", ""))
+            hit = cl.get("effective_resonance_count", cl.get("ordinary_resonance_count", cl.get("hit_count", "")))
+            vol_bonus = cl.get("volume_bonus_score", 0)
+            loss = cl.get("entity_loss_score", 0)
+
+            if line is None:
+                lines.append(f"{i + 1}. {c}｜核心线：无｜{level}")
             else:
-                lines.append("  - 无")
-            lines.append("")
+                lines.append(
+                    f"{i + 1}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜放量+{vol_bonus}｜损耗{loss}｜{state}"
+                )
 
             results.append({
-                "group": r.get("_group"),
+                "group": "涨停样本",
                 "code": c,
                 "sample": r.to_dict(),
                 "core_line": cl,
-                "top_candidates": cl.get("all_candidates", [])[:10],
                 "anchor_calibration_60d": anchor_cal,
             })
 
     payload = {
         "target_date": TARGET,
+        "target_manual": TARGET_MANUAL,
+        "sample_trade_dates": sample_dates,
         "boot_id": BOOT,
         "cache_stats": stat,
         "a_pool": A.to_dict("records") if not A.empty else [],
-        "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
         "core_line_method": "v73_qfq_apply_60d_anchor",
         "core_line_tol": TOL,
+        "limit_up_tol": LIMIT_UP_TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
         "seasonal_60d_only": True,
@@ -2030,12 +1887,11 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "qfq_manifest_file": str(QFQ_MANIFEST_FILE),
         "flat_csv_cache": True,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
-        "report_style": "compact_no_three_questions_no_evidence_lists",
+        "report_style": "limit_up_core_lines_only_clean",
         "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
     }
 
     return "\n".join(lines), payload
-
 
 def send_report(text: str) -> None:
     print(f"telegram_env_present token={bool(BOT)} chat={bool(CHAT)} requests={requests is not None}", flush=True)
