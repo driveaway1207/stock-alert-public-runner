@@ -1850,13 +1850,13 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
     return score_core_reaction_line(k, line, timeframe)
 
 
-def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[int, float, float, float, float]:
-    """最终排序：有效共振数第一，放量共振第二，实体损耗第三，净分第四。"""
+def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[float, int, float, float, float]:
+    """最终排序：净分第一；净分接近时再看有效共振、放量共振、实体损耗。"""
     return (
+        sf(x.get("net_score", x.get("score", 0))),
         int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))) or 0),
         sf(x.get("volume_bonus_score", 0)),
         -sf(x.get("entity_loss_score", 0)),
-        sf(x.get("net_score", x.get("score", 0))),
         -sf(x.get("line", 0)),
     )
 
@@ -1884,10 +1884,13 @@ def _group_scored_by_price_band(scored: List[Dict[str, Any]], band_tol: float = 
 
 
 def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """同一价格反应带内，按有效共振数优先选代表线。"""
+    """同一价格反应带内，先剔除净分非正候选，再按净分选代表线。"""
     if not band:
         return {}
-    ordered = sorted(band, key=_score_rank_tuple, reverse=True)
+    eligible = [x for x in band if sf(x.get("net_score", x.get("score", 0))) > 0]
+    if not eligible:
+        return {}
+    ordered = sorted(eligible, key=_score_rank_tuple, reverse=True)
     chosen = ordered[0]
     chosen["same_band_boundary_comparisons"] = [
         {
@@ -1899,20 +1902,23 @@ def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, 
         }
         for x in ordered[:8]
     ]
-    chosen["same_band_selection_rule"] = "同一反应带内按有效共振数优先；再看放量共振、实体损耗、净分。"
+    chosen["same_band_selection_rule"] = "同一反应带内先剔除净分非正候选；再按净分优先，净分接近时看有效共振、放量共振和实体损耗。"
     return chosen
 
 
 def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not scored:
         return {}
+    scored = [x for x in scored if sf(x.get("net_score", x.get("score", 0))) > 0]
+    if not scored:
+        return {}
     winners = [choose_first_core_boundary_in_band(g) for g in _group_scored_by_price_band(scored, FIRST_CORE_BAND_TOL)]
-    winners = [x for x in winners if x]
+    winners = [x for x in winners if x and sf(x.get("net_score", x.get("score", 0))) > 0]
     if not winners:
         return {}
     chosen = sorted(winners, key=_score_rank_tuple, reverse=True)[0]
-    chosen["core_selection_rule"] = "full_history_high_candidate_upper_resonance_only"
-    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选有效共振最多的唯一核心线；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
+    chosen["core_selection_rule"] = "net_score_first_high_candidate_upper_resonance_only"
+    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选唯一核心线；先剔除净分非正候选；最终按净分优先，净分接近时再看有效共振、放量共振、实体损耗；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
     return chosen
 
 
@@ -1959,7 +1965,7 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
             selected["cluster_size"] = len(cluster)
             selected["cluster_lowest_price"] = rd(min(cluster))
             selected["cluster_lowest_high"] = rd(min(cluster))
-            selected["cluster_selection_rule"] = "60日第一核心线：先精确审计有效共振/切实体/实体接受；同一反应带低价线需显著净分优势才可替代上方边界"
+            selected["cluster_selection_rule"] = "60日第一核心线：先精确审计有效共振/切实体/实体接受；净分非正直接淘汰；同一反应带按净分优先"
             selected["candidate_source_summary"] = candidate_source_summary(raw_candidates, selected.get("line"))
             selected["cluster_all_lines"] = sorted(
                 cluster_scored,
@@ -2363,7 +2369,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; final selection requires net_score > 0 and ranks by net_score first; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
     }
 
     return "\n".join(lines), payload
