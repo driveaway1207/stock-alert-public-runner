@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V72
+"""五号员工：大涨/涨停归因学习引擎。V73
 
 本版只做四件硬事：
 1. 前复权缓存统一写成一号员工可直接读取的扁平 CSV：kline_cache/002552.csv。
 2. 用 kline_cache/_qfq_manifest.json 给 CSV 写前复权身份证；没有身份证的旧 CSV 不参与五号核心线正式结论。
 3. 默认只校准 002552；需要全市场时显式设置 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
-4. 新增60日捏合K锚点校准：用用户软件截图给出的OHLC样本反查最接近的软件捏合口径。
+4. 新增60日捏合K锚点校准并应用：用用户软件截图给出的OHLC样本反查最接近的软件捏合口径，并用该锚点重新计算核心线。
 """
 
 import json, math, os, re, time
@@ -28,7 +28,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V72_QFQ_60D_ANCHOR_CALIBRATION"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V73_QFQ_APPLY_60D_ANCHOR"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -116,6 +116,10 @@ try:
         USER_60D_ANCHOR_SAMPLES = {}
 except Exception:
     USER_60D_ANCHOR_SAMPLES = {}
+
+# V73：校准误差足够低时，正式核心线计算也使用该锚点，不再只打印校准结果。
+APPLY_60D_ANCHOR = os.getenv("EMPLOYEE5_APPLY_60D_ANCHOR", "1") != "0"
+ANCHOR_MAX_TOTAL_ERROR = float(os.getenv("EMPLOYEE5_60D_ANCHOR_MAX_TOTAL_ERROR", "1.0"))
 
 
 def get_60d_anchor_samples(code: str) -> List[Dict[str, Any]]:
@@ -1562,8 +1566,8 @@ def choose_cleanest_lowest_high(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     return choose_max_resonance_net_boundary(scored)
 
 
-def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[str, Any]:
-    raw_k = aggregate_bars(df, window)
+def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_override: Optional[pd.DataFrame] = None, anchor_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    raw_k = raw_k_override.copy() if isinstance(raw_k_override, pd.DataFrame) and not raw_k_override.empty else aggregate_bars(df, window)
     k, excluded = completed_bars_for_coreline(raw_k)
 
     if raw_k.empty or len(raw_k) < 6:
@@ -1642,6 +1646,12 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
     best["lower_line_required_net_advantage"] = rd(LOWER_LINE_NET_ADVANTAGE, 3)
     best["excluded_current_bar"] = excluded
     best["excluded_current_bar_note"] = "最新一根聚合K不参与历史成线，但可在报告中作为当前确认观察。"
+    if anchor_info:
+        best["applied_60d_anchor"] = anchor_info
+        try:
+            best["current_excluded_bar_relation_to_line"] = classify_line_on_bar(sf(best.get("line")), excluded, TOL) if excluded else "NONE"
+        except Exception:
+            best["current_excluded_bar_relation_to_line"] = "UNKNOWN"
 
     if best.get("line_type") == "core_line":
         best["text"] = (
@@ -1709,17 +1719,46 @@ def _rank_fallback_coreline(x: Dict[str, Any], priority: int) -> Tuple[float, in
     )
 
 
-def core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    """V67：只做60日聚合K第一核心线；实体切断/接受严格逐K互斥审计。"""
+def core_line(df: pd.DataFrame, code: str = "", anchor_calibration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """V73：只做60日聚合K第一核心线；若锚点校准成功，则用校准后的60日K正式评分。"""
     if len(df) < 80:
         return {"level": "数据不足", "line": None, "line_type": "none", "text": "历史K线不足，不能硬画60日核心线。"}
 
-    seasonal = find_shadow_coreline(df, 60, "60日聚合K")
+    anchor_info: Dict[str, Any] = {"applied": False, "reason": "no_anchor_applied"}
+    raw_k_override: Optional[pd.DataFrame] = None
+    cal = anchor_calibration if isinstance(anchor_calibration, dict) else (calibrate_60d_anchor_for_code(code, df, 60) if code else {})
+    best_anchor = cal.get("best", {}) if isinstance(cal, dict) else {}
+    if APPLY_60D_ANCHOR and best_anchor and sf(best_anchor.get("total_error"), 9999) <= ANCHOR_MAX_TOTAL_ERROR:
+        mode = ss(best_anchor.get("mode")) or "backward"
+        offset = int(sf(best_anchor.get("offset"), 0))
+        raw_k_override = aggregate_bars_with_anchor(df, window=60, mode=mode, offset=offset)
+        anchor_info = {
+            "applied": True,
+            "mode": mode,
+            "offset": offset,
+            "total_error": rd(best_anchor.get("total_error"), 6),
+            "max_allowed_error": ANCHOR_MAX_TOTAL_ERROR,
+            "source": "v73_user_chart_anchor_calibration",
+            "samples": get_60d_anchor_samples(code),
+        }
+    elif best_anchor:
+        anchor_info = {
+            "applied": False,
+            "reason": "anchor_error_too_large_or_disabled",
+            "best_mode": best_anchor.get("mode"),
+            "best_offset": best_anchor.get("offset"),
+            "best_total_error": best_anchor.get("total_error"),
+            "max_allowed_error": ANCHOR_MAX_TOTAL_ERROR,
+            "apply_enabled": APPLY_60D_ANCHOR,
+        }
+
+    seasonal = find_shadow_coreline(df, 60, "60日聚合K", raw_k_override=raw_k_override, anchor_info=anchor_info)
     seasonal["seasonal_candidate"] = seasonal
     seasonal["monthly_candidate"] = {}
     seasonal["yearly_candidate"] = {}
     seasonal["timeframe_decision"] = "只采用60日聚合K"
-    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V70只看前复权60日聚合K第一核心线。"
+    seasonal["anchor_calibration_60d"] = cal
+    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V73只看前复权60日聚合K第一核心线；若锚点校准通过，则正式应用校准锚点。"
     return seasonal
 
 def _fmt_score(x: Dict[str, Any]) -> str:
@@ -1939,8 +1978,8 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         for _, r in merged.iterrows():
             c = ss(r.get("code"))
             full_df = load_full_history(c, hist.get(c, pd.DataFrame()))
-            cl = core_line(full_df)
             anchor_cal = calibrate_60d_anchor_for_code(c, full_df, 60)
+            cl = core_line(full_df, code=c, anchor_calibration=anchor_cal)
             best_anchor = anchor_cal.get("best", {}) if isinstance(anchor_cal, dict) else {}
             anchor_text = "无校准样本"
             if best_anchor:
@@ -1949,6 +1988,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
                 f"### {c}｜{r.get('_group')}",
                 f"- 采用：{core_line_summary(cl)}",
                 f"- 60日锚点校准：{anchor_text}",
+                f"- 60日锚点应用：{cl.get('applied_60d_anchor', {}).get('applied')}｜{cl.get('applied_60d_anchor', {}).get('mode', '')}｜offset={cl.get('applied_60d_anchor', {}).get('offset', '')}｜当前K关系={cl.get('current_excluded_bar_relation_to_line', '')}",
                 "- 候选Top：",
             ]
             tops = top_candidate_lines(cl, 5)
@@ -1976,7 +2016,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v72_qfq_60d_anchor_calibration",
+        "core_line_method": "v73_qfq_apply_60d_anchor",
         "core_line_tol": TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
