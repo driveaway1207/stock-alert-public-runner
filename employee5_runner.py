@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V70
+"""五号员工：大涨/涨停归因学习引擎。V72
 
-本版只做三件硬事：
+本版只做四件硬事：
 1. 前复权缓存统一写成一号员工可直接读取的扁平 CSV：kline_cache/002552.csv。
 2. 用 kline_cache/_qfq_manifest.json 给 CSV 写前复权身份证；没有身份证的旧 CSV 不参与五号核心线正式结论。
 3. 默认只校准 002552；需要全市场时显式设置 EMPLOYEE5_QFQ_REBUILD_CODES=ALL。
+4. 新增60日捏合K锚点校准：用用户软件截图给出的OHLC样本反查最接近的软件捏合口径。
 """
 
 import json, math, os, re, time
@@ -27,7 +28,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V70_QFQ_FLAT_CSV_MANIFEST_60D_AUDIT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V72_QFQ_60D_ANCHOR_CALIBRATION"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -98,6 +99,44 @@ def parse_code_list(raw: str) -> List[str]:
 
 QFQ_REBUILD_CODES = parse_code_list(QFQ_REBUILD_CODES_RAW)
 FOCUS_CODES = parse_code_list(FOCUS_CODES_RAW) or (["002552"] if QFQ_REBUILD_CODES_RAW.upper() == "ALL" else QFQ_REBUILD_CODES)
+
+
+# V72：用户软件截图里的60日捏合K校准样本。
+# 注意：这是校准锚点用，不参与交易评分。后续可用环境变量 EMPLOYEE5_60D_ANCHOR_SAMPLES_JSON 覆盖。
+# JSON格式示例：{"002552":[{"date":"2020-02-19","open":23.32,"high":31.44,"low":17.17,"close":20.49}]}
+DEFAULT_60D_ANCHOR_SAMPLES: Dict[str, List[Dict[str, Any]]] = {
+    "002552": [
+        {"date": "2020-02-19", "open": 23.32, "high": 31.44, "low": 17.17, "close": 20.49, "source": "user_chart_60d"},
+        {"date": "2023-08-16", "open": 18.49, "high": 19.15, "low": 16.50, "close": 17.86, "source": "user_chart_60d"},
+    ]
+}
+try:
+    USER_60D_ANCHOR_SAMPLES = json.loads(os.getenv("EMPLOYEE5_60D_ANCHOR_SAMPLES_JSON", "") or "{}")
+    if not isinstance(USER_60D_ANCHOR_SAMPLES, dict):
+        USER_60D_ANCHOR_SAMPLES = {}
+except Exception:
+    USER_60D_ANCHOR_SAMPLES = {}
+
+
+def get_60d_anchor_samples(code: str) -> List[Dict[str, Any]]:
+    c = code_of(code)
+    samples = USER_60D_ANCHOR_SAMPLES.get(c) or DEFAULT_60D_ANCHOR_SAMPLES.get(c) or []
+    out = []
+    for x in samples:
+        if not isinstance(x, dict):
+            continue
+        d = norm_date(x.get("date") or x.get("end") or x.get("bar_date"))
+        if not d:
+            continue
+        out.append({
+            "date": d,
+            "open": rd(x.get("open"), 4),
+            "high": rd(x.get("high"), 4),
+            "low": rd(x.get("low"), 4),
+            "close": rd(x.get("close"), 4),
+            "source": ss(x.get("source") or "user_chart_60d"),
+        })
+    return out
 
 
 def ss(x: Any) -> str:
@@ -865,6 +904,158 @@ def aggregate_bars(df: pd.DataFrame, window: int) -> pd.DataFrame:
 
     return k
 
+
+
+
+def aggregate_bars_with_anchor(df: pd.DataFrame, window: int = 60, mode: str = "backward", offset: int = 0) -> pd.DataFrame:
+    """生成可校准锚点的60日捏合K。
+
+    mode=backward: 从目标日/数据末端向左每60根分组；offset表示先忽略末端offset根日K再分组，用来模拟软件锚点差异。
+    mode=forward: 从数据起点向右每60根分组；offset表示从第offset根日K开始分组。
+    该函数只用于锚点校准，不替代正式核心线，除非校准通过后再显式切换。
+    """
+    if df is None or df.empty or len(df) < max(22, window * 3):
+        return pd.DataFrame()
+    offset = int(max(0, min(int(offset), window - 1)))
+    d = df.copy().reset_index(drop=True)
+    if mode == "forward":
+        if offset > 0:
+            d = d.iloc[offset:].reset_index(drop=True)
+        if len(d) < window:
+            return pd.DataFrame()
+        d["grp"] = [i // window for i in range(len(d))]
+    else:
+        if offset > 0:
+            d = d.iloc[:-offset].reset_index(drop=True)
+        if len(d) < window:
+            return pd.DataFrame()
+        d["grp"] = [(len(d) - 1 - i) // window for i in range(len(d))]
+
+    bars = []
+    for _, g in d.groupby("grp"):
+        g = g.sort_index()
+        if len(g) <= 0:
+            continue
+        bars.append({
+            "start": g.iloc[0].date,
+            "end": g.iloc[-1].date,
+            "open": sf(g.iloc[0].open),
+            "high": sf(g.high.max()),
+            "low": sf(g.low.min()),
+            "close": sf(g.iloc[-1].close),
+            "volume": sf(g.volume.sum()),
+            "bar_days": int(len(g)),
+        })
+
+    k = pd.DataFrame(bars).sort_values("end").reset_index(drop=True)
+    if k.empty:
+        return k
+    rng = (k.high - k.low).replace(0, pd.NA)
+    k["body_top"] = k[["open", "close"]].max(axis=1)
+    k["body_bottom"] = k[["open", "close"]].min(axis=1)
+    k["upper_shadow_ratio"] = ((k.high - k.body_top) / rng).fillna(0.0)
+    vol_ma = k.volume.rolling(4, min_periods=1).mean().shift(1)
+    k["rel_vol"] = (k.volume / vol_ma.replace(0, pd.NA)).fillna(1.0)
+    k["vol_rank_pct"] = k.volume.rolling(8, min_periods=1).rank(pct=True).fillna(0.5)
+    return k
+
+
+def _date_gap_days(a: str, b: str) -> int:
+    try:
+        da = datetime.strptime(norm_date(a), "%Y-%m-%d")
+        db = datetime.strptime(norm_date(b), "%Y-%m-%d")
+        return abs((da - db).days)
+    except Exception:
+        return 9999
+
+
+def _ohlc_error(bar: Dict[str, Any], sample: Dict[str, Any]) -> float:
+    err = 0.0
+    for f in ["open", "high", "low", "close"]:
+        sv = sf(sample.get(f))
+        bv = sf(bar.get(f))
+        base = max(abs(sv), 0.01)
+        err += abs(bv - sv) / base
+    return err
+
+
+def classify_line_on_bar(line: float, bar: Dict[str, Any], tol_pct: float = 0.005) -> str:
+    body_top = sf(bar.get("body_top"))
+    body_bottom = sf(bar.get("body_bottom"))
+    high = sf(bar.get("high"))
+    low = sf(bar.get("low"))
+    ln = sf(line)
+    if body_bottom > ln:
+        return "ACCEPT"
+    if body_bottom < ln < body_top:
+        # 实顶距离线≤0.5%视为实顶贴线，不算切实体。
+        if abs(body_top - ln) / max(ln, 0.01) <= tol_pct:
+            return "BODY_TOP_TOUCH"
+        return "CUT"
+    if low <= ln <= high:
+        return "RESONANCE"
+    return "NONE"
+
+
+def calibrate_60d_anchor_for_code(code: str, df: pd.DataFrame, window: int = 60) -> Dict[str, Any]:
+    c = code_of(code)
+    samples = get_60d_anchor_samples(c)
+    if not samples or df is None or df.empty:
+        return {"code": c, "samples": samples, "status": "no_samples_or_no_data"}
+
+    trials = []
+    for mode in ["backward", "forward"]:
+        for offset in range(window):
+            k = aggregate_bars_with_anchor(df, window=window, mode=mode, offset=offset)
+            if k.empty:
+                continue
+            sample_matches = []
+            total_error = 0.0
+            for smp in samples:
+                sdate = norm_date(smp.get("date"))
+                # 先按显示日期/结束日期精确匹配；没有则找end最近的一根。
+                exact = k[k["end"].astype(str).map(norm_date) == sdate]
+                if not exact.empty:
+                    row = exact.iloc[-1]
+                    date_gap = 0
+                    exact_end_match = True
+                else:
+                    gaps = k["end"].astype(str).map(lambda x: _date_gap_days(x, sdate))
+                    idx = int(gaps.idxmin()) if len(gaps) else 0
+                    row = k.loc[idx]
+                    date_gap = int(gaps.loc[idx]) if len(gaps) else 9999
+                    exact_end_match = False
+                bar = {x: row.get(x) for x in ["start", "end", "open", "high", "low", "close", "body_top", "body_bottom", "volume", "bar_days", "rel_vol", "vol_rank_pct"]}
+                e = _ohlc_error(bar, smp)
+                # 日期不匹配要加罚，但不能压过OHLC本身；这样能看出是锚点偏移还是价格源问题。
+                total_error += e + min(date_gap, 30) * 0.02
+                sample_matches.append({
+                    "sample": smp,
+                    "matched_bar": {k2: rd(v, 4) if isinstance(v, (int, float)) else v for k2, v in bar.items()},
+                    "exact_end_match": exact_end_match,
+                    "date_gap_days": date_gap,
+                    "ohlc_error": rd(e, 6),
+                    "line_17_25_class": classify_line_on_bar(17.25, bar, TOL),
+                    "line_17_09_class": classify_line_on_bar(17.09, bar, TOL),
+                })
+            trials.append({
+                "mode": mode,
+                "offset": offset,
+                "total_error": rd(total_error, 6),
+                "matches": sample_matches,
+            })
+    trials = sorted(trials, key=lambda x: sf(x.get("total_error")))
+    return {
+        "code": c,
+        "window": window,
+        "status": "ok",
+        "purpose": "校准前复权日线生成的60日捏合K是否和用户软件截图OHLC一致；不参与评分。",
+        "samples": samples,
+        "best": trials[0] if trials else {},
+        "top10": trials[:10],
+        "current_v70_like": [x for x in trials if x.get("mode") == "backward" and int(x.get("offset", -1)) == 0][:1],
+        "conclusion_hint": "若best不是backward offset=0，说明V70正式核心线使用的60日锚点与软件截图不一致，应先切换聚合锚点再谈切实体/实体接受/评分。",
+    }
 
 def latest_bar_snapshot(k: pd.DataFrame) -> Dict[str, Any]:
     if k is None or k.empty:
@@ -1747,10 +1938,17 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
     else:
         for _, r in merged.iterrows():
             c = ss(r.get("code"))
-            cl = core_line(load_full_history(c, hist.get(c, pd.DataFrame())))
+            full_df = load_full_history(c, hist.get(c, pd.DataFrame()))
+            cl = core_line(full_df)
+            anchor_cal = calibrate_60d_anchor_for_code(c, full_df, 60)
+            best_anchor = anchor_cal.get("best", {}) if isinstance(anchor_cal, dict) else {}
+            anchor_text = "无校准样本"
+            if best_anchor:
+                anchor_text = f"best={best_anchor.get('mode')} offset={best_anchor.get('offset')} error={best_anchor.get('total_error')}"
             lines += [
                 f"### {c}｜{r.get('_group')}",
                 f"- 采用：{core_line_summary(cl)}",
+                f"- 60日锚点校准：{anchor_text}",
                 "- 候选Top：",
             ]
             tops = top_candidate_lines(cl, 5)
@@ -1767,6 +1965,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
                 "sample": r.to_dict(),
                 "core_line": cl,
                 "top_candidates": cl.get("all_candidates", [])[:10],
+                "anchor_calibration_60d": anchor_cal,
             })
 
     payload = {
@@ -1777,7 +1976,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v70_qfq_flat_csv_manifest_60d_first_core_audit",
+        "core_line_method": "v72_qfq_60d_anchor_calibration",
         "core_line_tol": TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
@@ -1880,6 +2079,16 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
                 "top_candidates": item.get("top_candidates", []),
             }
             audit_path.write_text(json.dumps(safe_jsonable(audit_payload), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+            anchor_path = REPORT_DIR / f"{c}_qfq_60d_anchor_calibration.json"
+            anchor_payload = {
+                "target_date": TARGET,
+                "boot_id": BOOT,
+                "code": c,
+                "adjust": QFQ_ADJUST,
+                "adjustflag": QFQ_ADJUSTFLAG,
+                "anchor_calibration_60d": item.get("anchor_calibration_60d", {}),
+            }
+            anchor_path.write_text(json.dumps(safe_jsonable(anchor_payload), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
 def main() -> None:
