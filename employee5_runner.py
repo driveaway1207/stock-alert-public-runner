@@ -30,7 +30,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V85_ACCEPT_HELD_PROGRESS"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V88_COLOR_PROGRESS"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -225,23 +225,86 @@ def fmt_seconds(seconds: float) -> str:
     return f"{minutes / 60.0:.1f}h"
 
 
+def progress_color_enabled() -> bool:
+    raw = ss(os.getenv("EMPLOYEE5_PROGRESS_COLOR", "auto")).lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if os.getenv("NO_COLOR"):
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return bool(os.getenv("GITHUB_ACTIONS")) or bool(os.getenv("CI"))
+
+
+def _ansi(text: str, color: str = "", bold: bool = False) -> str:
+    if not progress_color_enabled():
+        return text
+    codes = []
+    if bold:
+        codes.append("1")
+    palette = {
+        "cyan": "36",
+        "blue": "34",
+        "green": "32",
+        "yellow": "33",
+        "magenta": "35",
+        "red": "31",
+        "gray": "90",
+        "white": "37",
+    }
+    if color in palette:
+        codes.append(palette[color])
+    if not codes:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def _stage_style(stage: str) -> Tuple[str, str]:
+    s = ss(stage)
+    if "cache" in s:
+        return "🔎", "cyan"
+    if "refresh" in s or "rebuild" in s:
+        return "🔄", "yellow"
+    if "core" in s:
+        return "⚡", "magenta"
+    return "📌", "green"
+
+
+def _progress_bar(pct: float, width: int = 24, color: str = "green") -> str:
+    pct = max(0.0, min(100.0, float(pct or 0.0)))
+    filled = int(width * pct / 100.0)
+    if pct > 0 and filled == 0:
+        filled = 1
+    done_part = "█" * filled
+    todo_part = "░" * max(width - filled, 0)
+    return _ansi(done_part, color, bold=True) + _ansi(todo_part, "gray")
+
+
 def print_progress(stage: str, done: int, total: int, start_time: float, extra: str = "") -> None:
     total = max(int(total or 0), 0)
     done = max(int(done or 0), 0)
     elapsed = max(time.time() - float(start_time or time.time()), 0.001)
     speed = done / elapsed if done > 0 else 0.0
+    icon, color = _stage_style(stage)
+    label = _ansi(f"{icon} {stage}", color, bold=True)
+
     if total > 0:
         pct = min(100.0, done / total * 100.0)
         remain = max(total - done, 0)
         eta = remain / speed if speed > 0 else 0.0
-        bar_len = 20
-        filled = int(round(bar_len * pct / 100.0))
-        bar = "#" * filled + "-" * (bar_len - filled)
-        msg = f"progress {stage} [{bar}] {done}/{total} {pct:.1f}% elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
+        bar = _progress_bar(pct, width=24, color=color)
+        msg = (
+            f"{label} {bar} "
+            f"{_ansi(f'{pct:5.1f}%', color, bold=True)} "
+            f"{done}/{total} "
+            f"elapsed={fmt_seconds(elapsed)} "
+            f"eta={fmt_seconds(eta)} "
+            f"speed={speed:.2f}/s"
+        )
     else:
-        msg = f"progress {stage} 0/0 elapsed={fmt_seconds(elapsed)} eta=0.0s speed=0.00/s"
+        msg = f"{label} {_ansi('no_items', 'gray')} elapsed={fmt_seconds(elapsed)} eta=0.0s speed=0.00/s"
     if extra:
-        msg += f" {extra}"
+        msg += f" | {extra}"
     print(msg, flush=True)
 
 
@@ -1521,10 +1584,14 @@ def score_core_reaction_line(
     entity_accept_penalty = 0.0
 
     # 核心原则：核心线被有效突破并一直守住，不是损耗；只有突破后又有效跌回线下才扣接受失败分。
+    # 另外记录首次突破接受位置，用于在多条线同被同一根大K接受时，优先选择“最低有效最高点”。
     accept_positions: List[int] = []
     fallback_after_accept = False
+    first_accept_index = -1
+    first_accept_date = ""
     try:
-        for _idx, _r0 in k.reset_index(drop=True).iterrows():
+        k_reset = k.reset_index(drop=True)
+        for _idx, _r0 in k_reset.iterrows():
             _bb0 = sf(_r0.get("body_bottom", 0)) if hasattr(_r0, "get") else sf(_r0.body_bottom)
             _cl0 = sf(_r0.get("close", 0)) if hasattr(_r0, "get") else sf(_r0.close)
             if L > 0 and _bb0 > L:
@@ -1533,9 +1600,18 @@ def score_core_reaction_line(
                 fallback_after_accept = True
         accepted_and_held = bool(accept_positions and not fallback_after_accept)
         accepted_then_failed = bool(accept_positions and fallback_after_accept)
+        if accept_positions:
+            first_accept_index = int(accept_positions[0])
+            try:
+                _fa = k_reset.iloc[first_accept_index]
+                first_accept_date = f"{_fa.start}~{_fa.end}"
+            except Exception:
+                first_accept_date = ""
     except Exception:
         accepted_and_held = False
         accepted_then_failed = False
+        first_accept_index = -1
+        first_accept_date = ""
 
     hit_dates: List[str] = []
     cut_dates: List[str] = []
@@ -1565,12 +1641,12 @@ def score_core_reaction_line(
             "vol_rank_pct": rd(vol_rank, 3),
         }
 
-        is_body_top_touch = near(bt, L)
-        # 实体接受优先：整根实体在线上方，说明这根K不能再给该线贡献“压力上沿共振”。
-        # 接受不使用0.5%容差；只要实体底在核心线上方，就算接受。
+        # V87：实体和上影线必须严格分开。
+        # 线进入实体内部，就是切实体；不能因为接近实体顶就当作上影线共振。
+        # 只有线没有进入实体、并落在实体顶到最高价之间，才算上影线压力/供应共振。
+        is_cut = bool(bb < L < bt)
         is_accept = bool(bb > L)
-        # 切实体第二优先：只要进入实体内部就是切；唯一例外是实顶贴线<=0.5%。
-        is_cut = bool((bb < L < bt) and not is_body_top_touch)
+        is_body_top_touch = bool(not is_cut and near(bt, L))
 
         if is_accept:
             entity_accept += 1
@@ -1606,8 +1682,9 @@ def score_core_reaction_line(
 
         is_close_touch = near(cl, L)
         is_high_touch = near(hi, L)
-        # 有效上影/高点反应：线落在实体顶到最高价反应区；实体没有吞掉线时才算。
-        is_upper_hit = bt * (1 - TOL) <= L <= hi * (1 + TOL)
+        # V87：有效上影/高点反应必须在线没有进入实体的前提下成立。
+        # 线在实体内部已经在上面的 CUT 分支处理，不能再混成普通共振。
+        is_upper_hit = bool((not is_cut) and (bt <= L <= hi * (1 + TOL)))
         is_ordinary_hit = bool(is_upper_hit or is_body_top_touch or is_close_touch or is_high_touch)
 
         if is_ordinary_hit:
@@ -1749,6 +1826,8 @@ def score_core_reaction_line(
         "entity_loss_score": rd(entity_loss_score, 3),
         "accepted_and_held": bool(accepted_and_held),
         "accepted_then_failed": bool(accepted_then_failed),
+        "first_accept_index": first_accept_index,
+        "first_accept_date": first_accept_date,
         "volume_body_cut_count": volume_body_cut,
         "volume_entity_accept_count": volume_entity_accept,
         "current_state": current_state,
@@ -1844,12 +1923,60 @@ def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, 
     return chosen
 
 
+def _accepted_held_core_candidates(scored: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for x in scored:
+        if not x:
+            continue
+        if not bool(x.get("accepted_and_held")) or bool(x.get("accepted_then_failed")):
+            continue
+        if ss(x.get("line_type")) != "core_line":
+            continue
+        if int(sf(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))))) < MIN_CORE_HIT_COUNT:
+            continue
+        if sf(x.get("net_score", x.get("score", 0))) < max(1.0, MIN_CORE_HIT_COUNT - 2.0):
+            continue
+        out.append(x)
+    return out
+
+
+def choose_lowest_accepted_core_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """涨停归因核心线选择。
+
+    规则：核心线是历史反复认账的位置，突破后且没有跌回，不能扣掉核心身份。
+    若多条候选线被同一根大K突破接受并一直守住，优先选“最低有效最高点”，
+    即用户图中白线这类真正发动线；更高的线只能作为近端反应线，不抢核心线身份。
+    """
+    xs = _accepted_held_core_candidates(scored)
+    if not xs:
+        return {}
+    latest_accept = max(int(sf(x.get("first_accept_index"), -1)) for x in xs)
+    same_breakout = [x for x in xs if int(sf(x.get("first_accept_index"), -1)) == latest_accept]
+    if not same_breakout:
+        same_breakout = xs
+    chosen = sorted(
+        same_breakout,
+        key=lambda x: (
+            sf(x.get("line")),
+            -int(sf(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))))),
+            -sf(x.get("volume_bonus_score", 0)),
+            sf(x.get("entity_loss_score", 0)),
+        ),
+    )[0]
+    chosen["core_selection_rule"] = "accepted_held_lowest_effective_high"
+    chosen["core_selection_note"] = "多条核心候选被同一突破K接受且未跌回时，优先选最低有效最高点；突破接受只改变状态，不否定核心线。"
+    return chosen
+
+
 def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not scored:
         return {}
-    # 先在每个反应带内选出第一核心边界，再在各带胜者里按净分/共振排序。
+    # 先在每个反应带内选出边界，再在各带胜者里优先选已突破且守住的最低有效最高点。
     winners = [choose_first_core_boundary_in_band(g) for g in _group_scored_by_price_band(scored, FIRST_CORE_BAND_TOL)]
     winners = [x for x in winners if x]
+    accepted_core = choose_lowest_accepted_core_boundary(winners)
+    if accepted_core:
+        return accepted_core
     return sorted(winners, key=_score_rank_tuple, reverse=True)[0] if winners else {}
 
 
@@ -2085,7 +2212,7 @@ def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
         "volume_bonus_score", "volume_hit_count",
         "entity_loss_score", "body_cut_count", "body_cut_penalty",
         "entity_accept_count", "entity_accept_penalty",
-        "accepted_and_held", "accepted_then_failed",
+        "accepted_and_held", "accepted_then_failed", "first_accept_index", "first_accept_date",
         "volume_body_cut_count", "volume_entity_accept_count",
         "current_state", "clean_core_line", "tol_pct",
         "core_band_low", "core_band_high", "upper_extreme_pressure",
@@ -2225,7 +2352,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; accepted-and-held breakthrough does not deduct score; candidate lines only from 60d high; cut/failed-accept rows do not also count as resonance",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - failed_entity_accept_penalty; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
     }
 
     return "\n".join(lines), payload
