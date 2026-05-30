@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：大涨/涨停归因学习引擎。V66
+"""五号员工：大涨/涨停归因学习引擎。V68
 
-本版只解决 60日聚合K 第一核心线：
-1. 第一核心压力线候选只从60日聚合K high 产生，避免 body_top/close 把线拖进实体内部。
-2. 每根K严格互斥归类：实体接受 / 切实体 / 有效共振 / 无效。
-3. 实体接受使用 body_bottom > line，不使用0.5%容差；切实体/接受不再同时算共振。
-4. 普通有效共振等权，一根K最多贡献1分；放量/倍量只在有效共振上加权。
-5. Markdown 报告精简；逐K明细保留在 JSON 供核查。
+本版只做一件硬事：全链路强制前复权缓存。
+1. BaoStock 拉数固定 adjustflag="2"（前复权）。
+2. 缓存文件必须带 adjust=qfq / adjustflag=2 元数据，否则视为旧缓存/不可信缓存。
+3. 发现非前复权或无前复权元数据的旧缓存，直接删除，不参与计算。
+4. 所有新写入缓存统一为前复权缓存；不再保留不复权缓存。
+5. 60日第一核心线逻辑沿用 V67：候选只从60日 high 产生，切/受/共振互斥归类。
 """
 
 import json, math, os, re, time
@@ -29,7 +29,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V66_60D_PRECISE_ENTITY_AUDIT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V68_QFQ_STRICT_CACHE"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -43,6 +43,8 @@ SCAN_KEEP_ROWS = int(os.getenv("EMPLOYEE5_SCAN_KEEP_ROWS", "80"))
 TOL = float(os.getenv("EMPLOYEE5_CORE_LINE_TOL", "0.005"))
 MIN_CORE_HIT_COUNT = int(os.getenv("EMPLOYEE5_MIN_CORE_HIT_COUNT", "3"))
 LOW_VOLUME_WINDOWS = {20: 12, 60: 6, 250: 3}
+FIRST_CORE_BAND_TOL = float(os.getenv("EMPLOYEE5_FIRST_CORE_BAND_TOL", "0.015"))
+LOWER_LINE_NET_ADVANTAGE = float(os.getenv("EMPLOYEE5_LOWER_LINE_NET_ADVANTAGE", "1.25"))
 
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "1") != "0"
 BAOSTOCK_LIMIT = int(os.getenv("EMPLOYEE5_BAOSTOCK_FALLBACK_LIMIT", "0"))
@@ -59,6 +61,13 @@ CACHE_DIRS = [
 ]
 MAIN_CACHE_DIR = ROOT / "kline_cache"
 CACHE_FILE_MAP: Dict[str, Path] = {}
+
+# 五号员工核心线只允许使用前复权缓存。
+# BaoStock: adjustflag=2 前复权；adjustflag=3 不复权，不能再用于核心线。
+QFQ_ADJUST = "qfq"
+QFQ_ADJUSTFLAG = "2"
+DELETE_NON_QFQ_CACHE = os.getenv("EMPLOYEE5_DELETE_NON_QFQ_CACHE", "1") != "0"
+BAOSTOCK_START_DATE = os.getenv("EMPLOYEE5_BAOSTOCK_START_DATE", "1990-01-01")
 
 
 def ss(x: Any) -> str:
@@ -171,11 +180,44 @@ def rows_from_obj(obj: Any) -> Any:
     return []
 
 
-def read_cache_file(p: Path) -> pd.DataFrame:
+def is_qfq_cache_obj(obj: Any) -> bool:
+    """只有明确写入前复权元数据的缓存才可信。"""
+    if not isinstance(obj, dict):
+        return False
+    adjust = ss(obj.get("adjust") or obj.get("adjust_type") or obj.get("fq") or obj.get("复权")).lower()
+    adjustflag = ss(obj.get("adjustflag") or obj.get("adjust_flag") or obj.get("baostock_adjustflag"))
+    return adjust in {"qfq", "前复权", "forward", "forward_adjusted"} or adjustflag == QFQ_ADJUSTFLAG
+
+
+def delete_untrusted_cache_file(p: Path, reason: str, stat: Optional[Dict[str, Any]] = None) -> None:
+    if stat is not None:
+        stat["non_qfq_deleted" if DELETE_NON_QFQ_CACHE else "non_qfq_rejected"] = stat.get("non_qfq_deleted" if DELETE_NON_QFQ_CACHE else "non_qfq_rejected", 0) + 1
+    if not DELETE_NON_QFQ_CACHE:
+        return
+    try:
+        p.unlink(missing_ok=True)
+        print(f"delete non-qfq cache: {p} reason={reason}", flush=True)
+    except Exception as exc:
+        if stat is not None:
+            stat["non_qfq_delete_failed"] = stat.get("non_qfq_delete_failed", 0) + 1
+        print(f"delete non-qfq cache failed: {p} reason={reason} err={exc}", flush=True)
+
+
+def read_cache_file(p: Path, stat: Optional[Dict[str, Any]] = None, require_qfq: bool = True) -> pd.DataFrame:
     try:
         suf = p.suffix.lower()
         if suf == ".json":
-            return normalize_hist(pd.DataFrame(rows_from_obj(json.loads(p.read_text(encoding="utf-8")))))
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if require_qfq and not is_qfq_cache_obj(obj):
+                delete_untrusted_cache_file(p, "missing_qfq_metadata", stat)
+                return pd.DataFrame()
+            return normalize_hist(pd.DataFrame(rows_from_obj(obj)))
+
+        # CSV/TXT/PKL 无法可靠证明复权口径；在强前复权模式下一律清理。
+        if require_qfq:
+            delete_untrusted_cache_file(p, f"{suf}_no_qfq_metadata", stat)
+            return pd.DataFrame()
+
         if suf in [".csv", ".txt"]:
             return normalize_hist(pd.read_csv(p))
         if suf in [".pkl", ".pickle"]:
@@ -183,7 +225,6 @@ def read_cache_file(p: Path) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
     return pd.DataFrame()
-
 
 def iter_cache_files() -> List[Path]:
     out, seen_dirs = [], set()
@@ -229,6 +270,10 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "cache_dirs": [str(x) for x in CACHE_DIRS],
         "scan_keep_rows": SCAN_KEEP_ROWS,
         "memsafe_scan": True,
+        "qfq_only": True,
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
     }
 
     for i, p in enumerate(files, 1):
@@ -236,7 +281,7 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         if not valid_code(c):
             continue
 
-        df = read_cache_file(p)
+        df = read_cache_file(p, stat=stat, require_qfq=True)
         if df.empty:
             stat["cache_bad"] += 1
             continue
@@ -260,7 +305,7 @@ def load_full_history(code: str, fallback: Optional[pd.DataFrame] = None) -> pd.
     p = CACHE_FILE_MAP.get(c)
 
     if p is not None and Path(p).exists():
-        df = read_cache_file(Path(p))
+        df = read_cache_file(Path(p), require_qfq=True)
         if not df.empty:
             return df
 
@@ -271,7 +316,13 @@ def save_cache_file(code: str, df: pd.DataFrame) -> None:
     try:
         MAIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         (MAIN_CACHE_DIR / f"{code}.json").write_text(
-            json.dumps({"target_date": TARGET, "rows": df.to_dict("records")}, ensure_ascii=False),
+            json.dumps({
+                "target_date": TARGET,
+                "adjust": QFQ_ADJUST,
+                "adjustflag": QFQ_ADJUSTFLAG,
+                "source": "baostock",
+                "rows": df.to_dict("records"),
+            }, ensure_ascii=False),
             encoding="utf-8",
         )
     except Exception as exc:
@@ -310,7 +361,7 @@ def baostock_fetch_hist(code: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     target_dt = datetime.strptime(TARGET_DASH, "%Y-%m-%d")
-    start = (target_dt - timedelta(days=140)).strftime("%Y-%m-%d")
+    start = BAOSTOCK_START_DATE
     fields = "date,code,open,high,low,close,volume,amount,pctChg"
 
     try:
@@ -320,7 +371,7 @@ def baostock_fetch_hist(code: str) -> pd.DataFrame:
             start_date=start,
             end_date=TARGET_DASH,
             frequency="d",
-            adjustflag="3",
+            adjustflag=QFQ_ADJUSTFLAG,
         )
 
         data = []
@@ -342,6 +393,9 @@ def build_baostock_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
         "cache_short": 0,
         "target_date": TARGET,
         "baostock_used": True,
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "baostock_start_date": BAOSTOCK_START_DATE,
     }
     hist: Dict[str, pd.DataFrame] = {}
 
@@ -579,7 +633,7 @@ def entity_loss_weight(r: Any) -> float:
 
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    V66 第一核心压力线候选只从 high 产生。
+    V67 第一核心压力线候选只从 high 产生。
     实体顶/收盘/上影只参与“有效共振”打分，不再把候选线拖进实体内部。
     目的：找第一核心上沿/最低有效最高点，而不是箱体内部线。
     """
@@ -631,7 +685,7 @@ def score_core_reaction_line(
     evidence_limit: int = 80,
 ) -> Dict[str, Any]:
     """
-    V66 第一核心线精确打分：
+    V67 第一核心线精确打分：
     1）同一根聚合K只能先归类为：实体接受 / 切实体 / 有效共振 / 无效；
     2）被实体吞掉的线不再同时算共振，避免低位线靠“假共振”赢；
     3）普通有效共振等权，一根K最多贡献1分；
@@ -875,7 +929,7 @@ def score_core_reaction_line(
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v66_60d_precise_entity_audit_net_score",
+        "confirmation_source": "v68_qfq_strict_cache_60d_first_core_boundary_margin",
     }
 
 
@@ -884,22 +938,79 @@ def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str,
     return score_core_reaction_line(k, line, timeframe)
 
 
+def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[float, int, float, float, float]:
+    return (
+        sf(x.get("net_score")),
+        int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0)))),
+        sf(x.get("volume_bonus_score")),
+        -sf(x.get("entity_loss_score")),
+        sf(x.get("line")),
+    )
+
+
+def _group_scored_by_price_band(scored: List[Dict[str, Any]], band_tol: float = FIRST_CORE_BAND_TOL) -> List[List[Dict[str, Any]]]:
+    xs = sorted([x for x in scored if sf(x.get("line")) > 0], key=lambda x: sf(x.get("line")))
+    groups: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    anchor = 0.0
+    for x in xs:
+        L = sf(x.get("line"))
+        if not cur:
+            cur = [x]
+            anchor = L
+            continue
+        if anchor > 0 and abs(L - anchor) / anchor <= band_tol:
+            cur.append(x)
+        else:
+            groups.append(cur)
+            cur = [x]
+            anchor = L
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    同一价格反应带内，不能让更低的内部线只靠多1个普通触碰就压过上方核心压力边界。
+    量化规则：从高价候选往低价候选比较；低价候选只有在净分 > 当前上方边界净分 + LOWER_LINE_NET_ADVANTAGE 时，才允许替代。
+    """
+    if not band:
+        return {}
+    ordered = sorted(band, key=lambda x: sf(x.get("line")), reverse=True)
+    chosen = ordered[0]
+    comparisons: List[Dict[str, Any]] = []
+    for cand in ordered[1:]:
+        chosen_net = sf(chosen.get("net_score"))
+        cand_net = sf(cand.get("net_score"))
+        margin = cand_net - chosen_net
+        can_replace = margin > LOWER_LINE_NET_ADVANTAGE
+        comparisons.append({
+            "upper_line": rd(chosen.get("line")),
+            "lower_line": rd(cand.get("line")),
+            "upper_net": rd(chosen_net, 3),
+            "lower_net": rd(cand_net, 3),
+            "lower_net_advantage": rd(margin, 3),
+            "required_advantage": rd(LOWER_LINE_NET_ADVANTAGE, 3),
+            "replace_upper": bool(can_replace),
+        })
+        if can_replace:
+            chosen = cand
+    chosen["same_band_boundary_comparisons"] = comparisons
+    chosen["same_band_selection_rule"] = (
+        f"同一{rd(FIRST_CORE_BAND_TOL*100,2)}%反应带内，低价线必须净分高出上方边界"
+        f"超过{rd(LOWER_LINE_NET_ADVANTAGE,2)}分才可替代；否则保留上方第一核心压力边界"
+    )
+    return chosen
+
+
 def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """同一反应簇内：净分优先；有效共振、放量共振确认；最后才取更低有效边界。"""
     if not scored:
         return {}
-
-    return sorted(
-        scored,
-        key=lambda x: (
-            sf(x.get("net_score")),
-            int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0)))),
-            sf(x.get("volume_bonus_score")),
-            -sf(x.get("entity_loss_score")),
-            -sf(x.get("line")),
-        ),
-        reverse=True,
-    )[0]
+    # 先在每个反应带内选出第一核心边界，再在各带胜者里按净分/共振排序。
+    winners = [choose_first_core_boundary_in_band(g) for g in _group_scored_by_price_band(scored, FIRST_CORE_BAND_TOL)]
+    winners = [x for x in winners if x]
+    return sorted(winners, key=_score_rank_tuple, reverse=True)[0] if winners else {}
 
 
 # 兼容旧函数名，避免其他地方调用失败。
@@ -945,7 +1056,7 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
             selected["cluster_size"] = len(cluster)
             selected["cluster_lowest_price"] = rd(min(cluster))
             selected["cluster_lowest_high"] = rd(min(cluster))
-            selected["cluster_selection_rule"] = "60日第一核心线：有效共振净分优先；切实体/实体接受不再同时算共振；同分取更低有效边界"
+            selected["cluster_selection_rule"] = "60日第一核心线：先精确审计有效共振/切实体/实体接受；同一反应带低价线需显著净分优势才可替代上方边界"
             selected["candidate_source_summary"] = candidate_source_summary(raw_candidates, selected.get("line"))
             selected["cluster_all_lines"] = sorted(
                 cluster_scored,
@@ -966,7 +1077,7 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
         reverse=True,
     )
 
-    best = scored[0] if scored else None
+    best = choose_max_resonance_net_boundary(scored) if scored else None
 
     if not best:
         return {
@@ -981,6 +1092,8 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str) -> Dict[
     best["all_candidates"] = scored[:10]
     best["high_cluster_count"] = len(clusters)
     best["reaction_cluster_count"] = len(clusters)
+    best["first_core_band_tol_pct"] = rd(FIRST_CORE_BAND_TOL * 100, 3)
+    best["lower_line_required_net_advantage"] = rd(LOWER_LINE_NET_ADVANTAGE, 3)
     best["excluded_current_bar"] = excluded
     best["excluded_current_bar_note"] = "最新一根聚合K不参与历史成线，但可在报告中作为当前确认观察。"
 
@@ -1051,7 +1164,7 @@ def _rank_fallback_coreline(x: Dict[str, Any], priority: int) -> Tuple[float, in
 
 
 def core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    """V66：只做60日聚合K第一核心线；实体切断/接受严格逐K互斥审计。"""
+    """V67：只做60日聚合K第一核心线；实体切断/接受严格逐K互斥审计。"""
     if len(df) < 80:
         return {"level": "数据不足", "line": None, "line_type": "none", "text": "历史K线不足，不能硬画60日核心线。"}
 
@@ -1060,7 +1173,7 @@ def core_line(df: pd.DataFrame) -> Dict[str, Any]:
     seasonal["monthly_candidate"] = {}
     seasonal["yearly_candidate"] = {}
     seasonal["timeframe_decision"] = "只采用60日聚合K"
-    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V66只看60日聚合K第一核心线。"
+    seasonal["text"] = seasonal.get("text", "") + " 周期决策：V68只看前复权60日聚合K第一核心线。"
     return seasonal
 
 def _fmt_score(x: Dict[str, Any]) -> str:
@@ -1300,11 +1413,15 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "b_pool": B.to_dict("records") if not B.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v66_60d_precise_entity_audit_compact",
+        "core_line_method": "v68_qfq_strict_cache_60d_first_core_boundary_margin",
         "core_line_tol": TOL,
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
         "seasonal_60d_only": True,
+        "qfq_only": True,
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
         "report_style": "compact_no_three_questions_no_evidence_lists",
         "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - entity_accept_penalty; candidate lines only from 60d high; cut/accept rows do not also count as resonance; entity_accept uses body_bottom > line with no tolerance",
     }
@@ -1350,6 +1467,10 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
         "exclude_current_agg_bar": True,
         "entity_accept_hard_filter": False,
         "seasonal_60d_only": True,
+        "qfq_only": True,
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+        "delete_non_qfq_cache": DELETE_NON_QFQ_CACHE,
         "report_style": payload.get("report_style", "compact"),
         "score_formula": payload.get("score_formula", ""),
         "scan_keep_rows": SCAN_KEEP_ROWS,
