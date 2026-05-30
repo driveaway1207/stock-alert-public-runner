@@ -30,7 +30,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V88_COLOR_PROGRESS"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V89_ONE_FILE_AUDIT"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -2201,6 +2201,82 @@ def core_line_summary(cl: Dict[str, Any]) -> str:
     return f"未识别核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}｜{cl.get('timeframe_decision', '')}"
 
 
+def _event_relation_cn(e: Dict[str, Any]) -> str:
+    """把一根聚合K与核心线的关系翻成人能看懂的中文。"""
+    parts: List[str] = []
+    if e.get("upper_shadow_hit"):
+        parts.append("上影线打到")
+    if e.get("high_touch"):
+        parts.append("最高价贴线")
+    if e.get("body_top_touch"):
+        parts.append("实体顶贴线")
+    if e.get("close_touch"):
+        parts.append("收盘贴线")
+    if e.get("body_cut"):
+        parts.append("切实体")
+    if e.get("entity_accept") or ss(e.get("reason", "")).startswith("entity_accept"):
+        if e.get("accepted_and_held"):
+            parts.append("突破接受且未跌回")
+        elif e.get("accepted_then_failed"):
+            parts.append("突破接受后跌回")
+        else:
+            parts.append("实体站上")
+    return "+".join(parts) if parts else ss(e.get("reason")) or "反应"
+
+
+def _fmt_event_line(i: int, e: Dict[str, Any]) -> str:
+    return (
+        f"  {i}. {e.get('date')}｜{_event_relation_cn(e)}｜"
+        f"开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
+        f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜放量+{e.get('volume_bonus', 0)}"
+    )
+
+
+def core_line_audit_lines(cl: Dict[str, Any], limit: int = 20) -> List[str]:
+    """输出当前核心线的逐条证据，避免只给一个“共振N”的黑箱数字。"""
+    out: List[str] = []
+    if not isinstance(cl, dict) or cl.get("line") is None:
+        return out
+
+    resonance = cl.get("resonance_events") or []
+    cuts = cl.get("body_cut_events") or []
+    accepts = cl.get("entity_accept_events") or []
+
+    out.append(f"  共振明细（{len(resonance)}）：")
+    if resonance:
+        for i, e in enumerate(resonance[:limit], 1):
+            out.append(_fmt_event_line(i, e))
+        if len(resonance) > limit:
+            out.append(f"  ... 还有{len(resonance) - limit}条共振明细未展开")
+    else:
+        out.append("  无")
+
+    out.append(f"  切实体明细（{len(cuts)}）：")
+    if cuts:
+        for i, e in enumerate(cuts[:limit], 1):
+            out.append(
+                f"  {i}. {e.get('date')}｜切实体｜开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
+                f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜扣{e.get('entity_loss_weight')}"
+            )
+        if len(cuts) > limit:
+            out.append(f"  ... 还有{len(cuts) - limit}条切实体明细未展开")
+    else:
+        out.append("  无")
+
+    out.append(f"  接受/站上明细（{len(accepts)}）：")
+    if accepts:
+        for i, e in enumerate(accepts[:limit], 1):
+            out.append(
+                f"  {i}. {e.get('date')}｜{_event_relation_cn(e)}｜开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
+                f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜扣{e.get('entity_loss_weight', 0)}"
+            )
+        if len(accepts) > limit:
+            out.append(f"  ... 还有{len(accepts) - limit}条接受明细未展开")
+    else:
+        out.append("  无")
+    return out
+
+
 def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
     """报告/JSON只保留核心线必要字段，不落大段候选证据。"""
     if not isinstance(cl, dict):
@@ -2308,6 +2384,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
                 lines.append(
                     f"{pos}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜放量+{vol_bonus}｜损耗{loss}｜{state}"
                 )
+                lines.extend(core_line_audit_lines(cl))
 
             results.append({
                 "group": "涨停样本",
@@ -2411,12 +2488,9 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
         "jsonsafe_payload": True,
     })
 
+    # V89：只落一个可直接下载/查看的 Markdown 文件；不再落大 JSON，避免 artifact 过大。
     files = {
         "limit_up_research_report.md": md,
-        "big_rise_story_report.md": md,
-        "left_trace_research_report.md": md,
-        "limit_up_research_report.json": json.dumps(safe, ensure_ascii=False, indent=2, allow_nan=False),
-        "employee5_runtime_feedback.json": json.dumps(feedback, ensure_ascii=False, indent=2, allow_nan=False),
     }
 
     for name, content in files.items():
