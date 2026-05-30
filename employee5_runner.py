@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线归因引擎。V77
+"""五号员工：涨停核心线归因引擎。V82
 
 只做一件事：
 扫描最近一个可用交易日的涨停样本，并按原 18.11/V73 60日核心线逻辑输出核心线。
@@ -30,17 +30,57 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V77_LIMIT_UP_CORELINES_ONLY_CLEAN"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V82_LIMIT_UP_CORELINES_A_CHAIN_AUDITED"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
-TARGET_RAW = os.getenv("EMPLOYEE5_TARGET_DATE") or datetime.now().strftime("%Y%m%d")
-TARGET_MANUAL = bool(os.getenv("EMPLOYEE5_TARGET_DATE"))
-TARGET = re.sub(r"\D", "", str(TARGET_RAW))[:8] or datetime.now().strftime("%Y%m%d")
+def _now_bj() -> datetime:
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def _prev_workday(d):
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _auto_target_yyyymmdd() -> str:
+    """对齐一号员工日期门控：周末回退；交易日20:35前回退到前一工作日。"""
+    now = _now_bj()
+    today = now.date()
+    if today.weekday() >= 5:
+        d = today
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d")
+    if now.hour > 20 or (now.hour == 20 and now.minute >= 35):
+        return today.strftime("%Y%m%d")
+    return _prev_workday(today).strftime("%Y%m%d")
+
+
+TARGET_RAW = (
+    os.getenv("EMPLOYEE5_TARGET_DATE")
+    or os.getenv("LAST_TRADE_DAY_OVERRIDE")
+    or os.getenv("REQUIRED_CACHE_DATE")
+    or os.getenv("SELECTION_TRADE_DATE")
+    or os.getenv("DATA_GATE_TARGET_DATE")
+    or os.getenv("TARGET_TRADE_DATE")
+    or _auto_target_yyyymmdd()
+)
+TARGET_MANUAL = bool(
+    os.getenv("EMPLOYEE5_TARGET_DATE")
+    or os.getenv("LAST_TRADE_DAY_OVERRIDE")
+    or os.getenv("REQUIRED_CACHE_DATE")
+    or os.getenv("SELECTION_TRADE_DATE")
+    or os.getenv("DATA_GATE_TARGET_DATE")
+    or os.getenv("TARGET_TRADE_DATE")
+)
+TARGET = re.sub(r"\D", "", str(TARGET_RAW))[:8] or _auto_target_yyyymmdd()
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}"
 
-# 涨停识别容差：保留原口径 0.35，避免数据源 pctChg 四舍五入导致真实涨停漏选。
-LIMIT_UP_TOL = float(os.getenv("EMPLOYEE5_LIMIT_UP_TOL", "0.35"))
+# 涨停识别容差：只筛涨停板；默认0.15用于兼容pctChg四舍五入，不再把大涨股混入。
+LIMIT_UP_TOL = float(os.getenv("EMPLOYEE5_LIMIT_UP_TOL", "0.15"))
 MIN_ROWS = int(os.getenv("EMPLOYEE5_MIN_CACHE_ROWS", "22"))
 SCAN_KEEP_ROWS = int(os.getenv("EMPLOYEE5_SCAN_KEEP_ROWS", "80"))
 TOL = float(os.getenv("EMPLOYEE5_CORE_LINE_TOL", "0.005"))
@@ -49,8 +89,13 @@ LOW_VOLUME_WINDOWS = {20: 12, 60: 6, 250: 3}
 FIRST_CORE_BAND_TOL = float(os.getenv("EMPLOYEE5_FIRST_CORE_BAND_TOL", "0.015"))
 LOWER_LINE_NET_ADVANTAGE = float(os.getenv("EMPLOYEE5_LOWER_LINE_NET_ADVANTAGE", "1.25"))
 
+# 默认允许“补最近5个交易日”的增量修复，但绝不默认全历史重建。
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "1") != "0"
 BAOSTOCK_LIMIT = int(os.getenv("EMPLOYEE5_BAOSTOCK_FALLBACK_LIMIT", "0"))
+INCREMENTAL_REFRESH = os.getenv("EMPLOYEE5_INCREMENTAL_REFRESH", "1") != "0"
+REFRESH_LOOKBACK_TRADE_DAYS = int(os.getenv("EMPLOYEE5_REFRESH_LOOKBACK_TRADE_DAYS", "5"))
+MIN_CACHE_FILES_REQUIRED = int(os.getenv("EMPLOYEE5_MIN_CACHE_FILES_REQUIRED", "3000"))
+ALLOW_FULL_REBUILD = os.getenv("EMPLOYEE5_ALLOW_FULL_REBUILD", "0") == "1"
 
 BOT = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID")
@@ -77,11 +122,11 @@ QFQ_REBUILD_TIME_BUDGET_MIN = float(os.getenv("EMPLOYEE5_QFQ_REBUILD_TIME_BUDGET
 QFQ_REBUILD_SAFETY_STOP_SEC = float(os.getenv("EMPLOYEE5_QFQ_REBUILD_SAFETY_STOP_SEC", "180"))
 QFQ_REBUILD_STATE_FILE = REPORT_DIR / "qfq_rebuild_state.json"
 QFQ_REBUILD_FORCE = os.getenv("EMPLOYEE5_QFQ_REBUILD_FORCE", "0") == "1"
-QFQ_REBUILD_ALWAYS = os.getenv("EMPLOYEE5_QFQ_REBUILD_ALWAYS", "1") != "0"
+QFQ_REBUILD_ALWAYS = os.getenv("EMPLOYEE5_QFQ_REBUILD_ALWAYS", "0") == "1"
 QFQ_REBUILD_PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_QFQ_REBUILD_PROGRESS_EVERY", "20"))
 QFQ_MANIFEST_FILE = MAIN_CACHE_DIR / "_qfq_manifest.json"
-# 默认全市场扫描前复权缓存/增量；不再默认锁死单票。
-QFQ_REBUILD_CODES_RAW = os.getenv("EMPLOYEE5_QFQ_REBUILD_CODES", "FULL").strip()
+# 正式报告默认不触发全历史重建；该变量只在显式允许全量重建时使用。
+QFQ_REBUILD_CODES_RAW = os.getenv("EMPLOYEE5_QFQ_REBUILD_CODES", "002552").strip()
 FOCUS_CODES_RAW = os.getenv("EMPLOYEE5_FOCUS_CODES", "").strip()
 
 
@@ -318,9 +363,8 @@ def manifest_entry_valid_for_path(code: str, path: Path, manifest: Optional[Dict
         return False
     if min_rows and int(entry.get("rows", 0) or 0) < int(min_rows):
         return False
-    last_date = ss(entry.get("last_date", "")).replace("-", "")
-    if last_date and last_date < TARGET:
-        return False
+    # 这里不因日期落后拒绝缓存：五号员工要先读一号员工公共缓存，再判断是否只补最近5个交易日。
+    # 日期覆盖由 cache_date_profile / refresh_recent_cache 控制，不能在 manifest 阶段把旧缓存挡掉。
     # V70 允许旧 manifest 只写 file，也允许完整 path；但文件名必须是当前 code.csv。
     if path.suffix.lower() == ".csv" and path.name != f"{c}.csv":
         return False
@@ -455,10 +499,12 @@ def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
             continue
 
         last_cache_date = ss(df.iloc[-1]["date"]).replace("-", "")
-        # 手动指定复盘日期时，必须缓存覆盖到该日；自动运行时允许周六/周日/盘中使用最近一个交易日。
-        if len(df) < MIN_ROWS or (TARGET_MANUAL and last_cache_date < TARGET):
+        # 一号员工式缓存链路：先把公共缓存读进来，再由日期门控/最近5日增量决定是否补数据。
+        # 这里不能因为缓存日期落后就丢弃，否则五号无法基于一号旧缓存做最近5日补齐。
+        if len(df) < MIN_ROWS:
             stat["cache_short"] += 1
             continue
+        stat.setdefault("cache_last_date_counts", {})[last_cache_date] = stat.setdefault("cache_last_date_counts", {}).get(last_cache_date, 0) + 1
 
         CACHE_FILE_MAP[c] = p
         hist[c] = df.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
@@ -572,7 +618,8 @@ def save_cache_file(code: str, df: pd.DataFrame) -> bool:
 
         # 写完临时文件先反读校验，避免坏文件覆盖旧文件。
         check_df = normalize_hist(pd.read_csv(tmp))
-        if check_df.empty or len(check_df) < MIN_ROWS or ss(check_df.iloc[-1].get("date", "")).replace("-", "") < TARGET:
+        last_check_date = ss(check_df.iloc[-1].get("date", "")).replace("-", "") if not check_df.empty else ""
+        if check_df.empty or len(check_df) < MIN_ROWS or (TARGET_MANUAL and last_check_date < TARGET):
             tmp.unlink(missing_ok=True)
             print(f"cache save rejected {c}: csv readback check failed", flush=True)
             return False
@@ -644,6 +691,159 @@ def baostock_fetch_hist(code: str) -> pd.DataFrame:
     except Exception as exc:
         print(f"baostock hist failed {code}: {exc}", flush=True)
         return pd.DataFrame()
+
+
+def cache_date_profile(hist: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    dates: List[str] = []
+    for df in hist.values():
+        if df is None or df.empty:
+            continue
+        d = ss(df.iloc[-1].get("date", ""))
+        if d:
+            dates.append(d)
+    counts: Dict[str, int] = {}
+    for d in dates:
+        counts[d] = counts.get(d, 0) + 1
+    majority = ""
+    if counts:
+        majority = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)[0][0]
+    return {
+        "cache_count": len(hist),
+        "cache_date_count": len(dates),
+        "cache_majority_date": majority,
+        "cache_date_top": sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)[:10],
+        "target_date": TARGET_DASH,
+        "accepted_for_report": bool(len(hist) >= MIN_CACHE_FILES_REQUIRED and majority and majority >= TARGET_DASH),
+    }
+
+
+def choose_sample_trade_date(hist: Dict[str, pd.DataFrame]) -> str:
+    """按一号员工思路使用缓存众数交易日作为样本日，避免部分增量成功时混入不同日期样本。"""
+    profile = cache_date_profile(hist)
+    return ss(profile.get("cache_majority_date"))
+
+
+def _refresh_start_date_from_df(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return TARGET_DASH
+    try:
+        last = datetime.strptime(ss(df.iloc[-1].get("date", "")), "%Y-%m-%d").date()
+    except Exception:
+        return TARGET_DASH
+    # A股节假日无法从纯日期准确判断，这里按自然日回退留足缓冲；最终仍以交易日数据合并去重。
+    start = last - timedelta(days=max(10, REFRESH_LOOKBACK_TRADE_DAYS * 3))
+    return start.isoformat()
+
+
+def baostock_fetch_recent_hist(code: str, existing_df: pd.DataFrame) -> pd.DataFrame:
+    """只补最近若干交易日，不做1990以来全历史重拉。"""
+    if bs is None:
+        return pd.DataFrame()
+    start = _refresh_start_date_from_df(existing_df)
+    fields = "date,code,open,high,low,close,volume,amount,pctChg"
+    try:
+        rs = bs.query_history_k_data_plus(
+            bs_code(code),
+            fields,
+            start_date=start,
+            end_date=TARGET_DASH,
+            frequency="d",
+            adjustflag=QFQ_ADJUSTFLAG,
+        )
+        data = []
+        while rs.error_code == "0" and rs.next():
+            data.append(rs.get_row_data())
+        recent = normalize_hist(pd.DataFrame(data, columns=fields.split(","))) if data else pd.DataFrame()
+        if recent.empty:
+            return pd.DataFrame()
+        base = normalize_hist(existing_df)
+        merged = pd.concat([base, recent], ignore_index=True) if not base.empty else recent
+        merged = normalize_hist(merged).sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+        return merged
+    except Exception as exc:
+        print(f"baostock recent refresh failed {code}: {exc}", flush=True)
+        return pd.DataFrame()
+
+
+def refresh_recent_cache(existing_hist: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """复用一号员工公共缓存；若缓存日期落后，只补最近5个交易日。"""
+    stat = {
+        "source": "baostock_qfq_recent_incremental_refresh",
+        "target_date": TARGET,
+        "target_dash": TARGET_DASH,
+        "cache_before": len(existing_hist or {}),
+        "lookback_trade_days": REFRESH_LOOKBACK_TRADE_DAYS,
+        "full_history_rebuild": False,
+        "min_cache_files_required": MIN_CACHE_FILES_REQUIRED,
+        "baostock_used": True,
+        "adjust": QFQ_ADJUST,
+        "adjustflag": QFQ_ADJUSTFLAG,
+    }
+    hist: Dict[str, pd.DataFrame] = dict(existing_hist or {})
+    if not hist or len(hist) < MIN_CACHE_FILES_REQUIRED:
+        stat["skipped_reason"] = "公共缓存缺失或数量不足；五号员工不从零全量重建"
+        return hist, stat
+    if bs is None:
+        stat["skipped_reason"] = "baostock package missing"
+        return hist, stat
+
+    lg = bs.login()
+    print(f"baostock login: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}", flush=True)
+    codes = list(hist.keys())
+    if BAOSTOCK_LIMIT > 0:
+        codes = codes[:BAOSTOCK_LIMIT]
+    total = len(codes)
+    start_time = time.time()
+    budget_sec = max(60.0, QFQ_REBUILD_TIME_BUDGET_MIN * 60.0)
+    processed = refreshed = already_ok = failed = short = 0
+    try:
+        for i, code in enumerate(codes, 1):
+            elapsed = time.time() - start_time
+            if elapsed >= max(1.0, budget_sec - QFQ_REBUILD_SAFETY_STOP_SEC):
+                stat["stop_reason"] = "time_budget_stop"
+                break
+            df = hist.get(code, pd.DataFrame())
+            last_date = ss(df.iloc[-1].get("date", "")) if df is not None and not df.empty else ""
+            if last_date.replace("-", "") >= TARGET:
+                already_ok += 1
+                processed += 1
+                continue
+            merged = baostock_fetch_recent_hist(code, load_full_history(code, df))
+            processed += 1
+            if merged.empty:
+                failed += 1
+                continue
+            last_new = ss(merged.iloc[-1].get("date", "")).replace("-", "")
+            if last_new < TARGET:
+                short += 1
+            if save_cache_file(code, merged):
+                hist[code] = merged.tail(max(30, SCAN_KEEP_ROWS)).reset_index(drop=True)
+                refreshed += 1
+            else:
+                failed += 1
+            if i == 1 or i % QFQ_REBUILD_PROGRESS_EVERY == 0 or i == total:
+                speed = processed / max(time.time() - start_time, 0.001)
+                print(
+                    f"recent qfq refresh {i}/{total} processed={processed} refreshed={refreshed} "
+                    f"already_ok={already_ok} failed={failed} short={short} speed={speed:.3f}/s current={code}",
+                    flush=True,
+                )
+    finally:
+        try:
+            bs.logout()
+        except Exception as exc:
+            print(f"baostock logout skipped: {exc}", flush=True)
+    stat.update({
+        "processed_this_run": processed,
+        "refreshed_this_run": refreshed,
+        "already_ok_this_run": already_ok,
+        "failed_this_run": failed,
+        "short_this_run": short,
+        "cache_after": len(hist),
+        "stop_reason": stat.get("stop_reason", "completed"),
+        "cache_profile_after": cache_date_profile(hist),
+    })
+    return hist, stat
 
 
 def qfq_existing_codes() -> set:
@@ -796,8 +996,8 @@ def build_baostock_cache(existing_hist: Optional[Dict[str, pd.DataFrame]] = None
     try:
         if bs is not None:
             bs.logout()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"baostock logout skipped: {exc}", flush=True)
 
     # 运行结束状态
     final_state = load_rebuild_state()
@@ -826,19 +1026,20 @@ def build_baostock_cache(existing_hist: Optional[Dict[str, pd.DataFrame]] = None
     return hist, stat
 
 
-def pick_samples(hist: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """筛出最近一个可用交易日的涨停样本。
-
-    只负责样本池；核心线算法不在这里改。
-    LIMIT_UP_TOL 仅用于容忍数据源涨幅四舍五入误差。
-    """
+def pick_samples(hist: Dict[str, pd.DataFrame], sample_trade_date: str) -> pd.DataFrame:
+    """只筛样本交易日涨停股；不同日期的旧缓存不混入报告。"""
     rows: List[Dict[str, Any]] = []
+    sample_trade_date = norm_date(sample_trade_date)
 
     for i, (code, df) in enumerate(hist.items(), 1):
         if df is None or df.empty:
             continue
 
         last = df.iloc[-1]
+        last_date = norm_date(last.date)
+        if sample_trade_date and last_date != sample_trade_date:
+            continue
+
         pct = sf(last.pct_chg)
         lp = limit_pct(code)
 
@@ -846,7 +1047,7 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             rows.append({
                 "code": code,
                 "name": code,
-                "date": last.date,
+                "date": last_date,
                 "close": rd(last.close),
                 "pct_chg": rd(pct),
                 "limit_pct": rd(lp),
@@ -854,7 +1055,7 @@ def pick_samples(hist: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             })
 
         if i % 500 == 0:
-            print(f"sample scan {i}/{len(hist)} limit_up={len(rows)}", flush=True)
+            print(f"sample scan {i}/{len(hist)} sample_date={sample_trade_date} limit_up={len(rows)}", flush=True)
 
     A = pd.DataFrame(rows)
     if not A.empty:
@@ -1771,6 +1972,25 @@ def core_line_summary(cl: Dict[str, Any]) -> str:
     return f"未识别核心线｜上方极值压力 {cl.get('upper_extreme_pressure')}｜{cl.get('timeframe_decision', '')}"
 
 
+def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
+    """报告/JSON只保留核心线必要字段，不落大段候选证据。"""
+    if not isinstance(cl, dict):
+        return {}
+    keys = [
+        "line", "core_line", "line_type", "level", "timeframe",
+        "score", "net_score", "gross_score",
+        "effective_resonance_count", "ordinary_resonance_count", "hit_count",
+        "volume_bonus_score", "volume_hit_count",
+        "entity_loss_score", "body_cut_count", "body_cut_penalty",
+        "entity_accept_count", "entity_accept_penalty",
+        "volume_body_cut_count", "volume_entity_accept_count",
+        "current_state", "clean_core_line", "tol_pct",
+        "core_band_low", "core_band_high", "upper_extreme_pressure",
+        "timeframe_decision", "confirmation_source",
+    ]
+    return {k: cl.get(k) for k in keys if k in cl}
+
+
 def safe_jsonable(obj: Any, seen: Optional[set] = None) -> Any:
     if seen is None:
         seen = set()
@@ -1804,23 +2024,24 @@ def safe_jsonable(obj: Any, seen: Optional[set] = None) -> Any:
         if pd.isna(obj):
             return None
     except Exception:
-        pass
+        obj_is_not_pandas_scalar = True
 
     if hasattr(obj, "item"):
         try:
             return safe_jsonable(obj.item(), seen)
         except Exception:
-            pass
+            return ss(obj)
 
     return ss(obj)
 
 
 def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """只输出最近一个可用交易日涨停样本的核心线。"""
-    A = pick_samples(hist) if hist else pd.DataFrame()
+    """只输出样本交易日涨停股核心线。"""
+    sample_trade_date = choose_sample_trade_date(hist) if hist else ""
+    A = pick_samples(hist, sample_trade_date) if hist and sample_trade_date else pd.DataFrame()
 
-    sample_dates = sorted({ss(x) for x in (A.get("date", pd.Series(dtype=str)).tolist() if not A.empty else []) if ss(x)})
-    sample_date_text = ",".join(sample_dates) if sample_dates else "无"
+    sample_dates = [sample_trade_date] if sample_trade_date else []
+    sample_date_text = sample_trade_date or "无"
 
     lines = [
         "# 五号员工：涨停核心线",
@@ -1859,14 +2080,14 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
                 "group": "涨停样本",
                 "code": c,
                 "sample": r.to_dict(),
-                "core_line": cl,
-                "anchor_calibration_60d": anchor_cal,
+                "core_line": compact_core_line_for_output(cl),
             })
 
     payload = {
         "target_date": TARGET,
         "target_manual": TARGET_MANUAL,
         "sample_trade_dates": sample_dates,
+        "cache_date_profile": cache_date_profile(hist),
         "boot_id": BOOT,
         "cache_stats": stat,
         "a_pool": A.to_dict("records") if not A.empty else [],
@@ -1924,7 +2145,7 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     feedback = safe_jsonable({
         "boot_id": BOOT,
         "target_date": TARGET,
-        "network_hist_allowed": True,
+        "network_hist_allowed": bool(ALLOW_BAOSTOCK_FALLBACK),
         "data_source": payload.get("cache_stats", {}).get("source"),
         "core_line_method": payload.get("core_line_method"),
         "core_line_tol": TOL,
@@ -1958,49 +2179,28 @@ def write_outputs(md: str, payload: Dict[str, Any]) -> None:
     for name, content in files.items():
         (REPORT_DIR / name).write_text(content, encoding="utf-8")
 
-    # V70：焦点票单独落盘，方便人工逐K核对60日捏合K、切实体、实体接受。
-    for item in safe.get("results", []) or []:
-        c = ss(item.get("code"))
-        if c in set(FOCUS_CODES):
-            audit_path = REPORT_DIR / f"{c}_qfq_60d_audit.json"
-            audit_payload = {
-                "target_date": TARGET,
-                "boot_id": BOOT,
-                "code": c,
-                "adjust": QFQ_ADJUST,
-                "adjustflag": QFQ_ADJUSTFLAG,
-                "cache_format": "flat_csv",
-                "manifest_file": str(QFQ_MANIFEST_FILE),
-                "core_line": item.get("core_line", {}),
-                "top_candidates": item.get("top_candidates", []),
-            }
-            audit_path.write_text(json.dumps(safe_jsonable(audit_payload), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-            anchor_path = REPORT_DIR / f"{c}_qfq_60d_anchor_calibration.json"
-            anchor_payload = {
-                "target_date": TARGET,
-                "boot_id": BOOT,
-                "code": c,
-                "adjust": QFQ_ADJUST,
-                "adjustflag": QFQ_ADJUSTFLAG,
-                "anchor_calibration_60d": item.get("anchor_calibration_60d", {}),
-            }
-            anchor_path.write_text(json.dumps(safe_jsonable(anchor_payload), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-
 
 def main() -> None:
     print(BOOT, flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
-    print(f"target_date={TARGET} network_hist_allowed=True baostock_qfq_incremental={ALLOW_BAOSTOCK_FALLBACK}", flush=True)
+    print(f"target_date={TARGET} target_dash={TARGET_DASH} recent_refresh={INCREMENTAL_REFRESH} baostock_allowed={ALLOW_BAOSTOCK_FALLBACK} full_rebuild_allowed={ALLOW_FULL_REBUILD}", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
 
     hist, stat = load_cache()
     print(f"cache_stats={stat}", flush=True)
 
-    if ALLOW_BAOSTOCK_FALLBACK and (QFQ_REBUILD_ALWAYS or not hist):
-        if not hist:
-            print("qfq cache empty; start incremental baostock qfq rebuild", flush=True)
-        else:
-            print("start incremental baostock qfq rebuild / resume", flush=True)
+    profile = cache_date_profile(hist)
+    print(f"cache_date_profile={profile}", flush=True)
+
+    if hist and profile.get("cache_majority_date", "") < TARGET_DASH and ALLOW_BAOSTOCK_FALLBACK and INCREMENTAL_REFRESH:
+        print("公共缓存日期落后：按一号员工缓存链路只补最近5个交易日，不做全历史重建", flush=True)
+        hist, stat = refresh_recent_cache(hist)
+        print(f"recent_qfq_refresh_stats={stat}", flush=True)
+    elif not hist:
+        print("qfq cache empty; 五号员工不从零全市场重建，请先恢复/运行一号员工公共缓存", flush=True)
+
+    if ALLOW_FULL_REBUILD and ALLOW_BAOSTOCK_FALLBACK and (QFQ_REBUILD_ALWAYS or (not hist and QFQ_REBUILD_FORCE)):
+        print("显式允许全历史重建：开始 baostock qfq rebuild / resume", flush=True)
         hist, stat = build_baostock_cache(existing_hist=hist)
         print(f"baostock_qfq_rebuild_stats={stat}", flush=True)
 
