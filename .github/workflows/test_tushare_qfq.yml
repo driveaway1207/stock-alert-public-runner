@@ -1,10 +1,10 @@
-name: Test Tushare QFQ V2
+name: Test Tushare QFQ
 
 on:
   workflow_dispatch:
 
 jobs:
-  test-tushare-qfq-v2:
+  test-tushare-qfq:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,4 +31,4 @@ jobs:
           TUSHARE_EXPECTED_CLOSE: '49.38'
           TUSHARE_TOL: '0.01'
         run: |
-          python test_tushare_qfq_v2.py
+          python test_tushare_qfq.py
