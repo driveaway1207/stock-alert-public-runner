@@ -4,14 +4,24 @@ run-name: 五号员工
 "on":
   workflow_dispatch:
     inputs:
+      employee5_date_choice:
+        description: "🎨 选择分析日期｜默认：上一个交易日"
+        required: false
+        type: choice
+        default: "🟦 上一个交易日"
+        options:
+          - "🟦 上一个交易日"
+          - "🟩 当前交易日"
+          - "🟨 上两个交易日"
+          - "🟧 上三个交易日"
+          - "🟥 上四个交易日"
+          - "🟪 上五个交易日"
+          - "🟫 上六个交易日"
+          - "⬛ 上七个交易日"
       employee5_target_date:
-        description: "五号员工分析日期，可空。格式YYYY-MM-DD或YYYYMMDD；空=北京时间上一个交易日"
+        description: "✍️ 手动日期｜可填0604、6.4、YYYY-MM-DD、YYYYMMDD｜填了优先"
         required: false
         default: ""
-      max_stocks:
-        description: "兼容旧入口；新版五号员工默认全量扫描缓存"
-        required: false
-        default: "300"
   schedule:
     # 北京时间 20:00 = UTC 12:00；周一到周五自动运行。
     - cron: '0 12 * * 1-5'
@@ -38,33 +48,76 @@ jobs:
         id: config
         shell: bash
         env:
+          EMPLOYEE5_INPUT_DATE_CHOICE: ${{ github.event.inputs.employee5_date_choice }}
           EMPLOYEE5_INPUT_TARGET_DATE: ${{ github.event.inputs.employee5_target_date }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import os
+          import re
           from datetime import datetime, timedelta, timezone
 
-          def norm_date(x):
-              s = str(x or '').strip().replace('/', '-')
+          def norm_date(x, today):
+              s = str(x or '').strip()
               if not s:
                   return ''
+              s = s.replace('年', '-').replace('月', '-').replace('日', '')
+              s = s.replace('/', '-').replace('.', '-').replace('_', '-').strip()
               if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
                   return s[:10]
               if len(s) == 8 and s.isdigit():
                   return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              m = re.fullmatch(r'(\d{1,2})-(\d{1,2})', s)
+              if m:
+                  month, day = int(m.group(1)), int(m.group(2))
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
+              if len(s) in (3, 4) and s.isdigit():
+                  month, day = int(s[:-2]), int(s[-2:])
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
               return s[:10]
 
-          def previous_trading_day(d):
-              d = d - timedelta(days=1)
-              while d.weekday() >= 5:
+          def shift_trading_day(d, n):
+              # n=0：当前交易日；n=1：上一个交易日。
+              if n == 0:
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  return d
+              moved = 0
+              while moved < n:
                   d -= timedelta(days=1)
+                  if d.weekday() < 5:
+                      moved += 1
               return d
 
-          manual = norm_date(os.environ.get('EMPLOYEE5_INPUT_TARGET_DATE'))
           now = datetime.now(timezone(timedelta(hours=8)))
-          target = manual or previous_trading_day(now.date()).isoformat()
+          today = now.date()
+          manual = norm_date(os.environ.get('EMPLOYEE5_INPUT_TARGET_DATE'), today)
+          choice = str(os.environ.get('EMPLOYEE5_INPUT_DATE_CHOICE') or '').strip()
+          choice_map = {
+              '当前交易日': 0,
+              '上一个交易日': 1,
+              '上两个交易日': 2,
+              '上三个交易日': 3,
+              '上四个交易日': 4,
+              '上五个交易日': 5,
+              '上六个交易日': 6,
+              '上七个交易日': 7,
+          }
+          offset = 1
+          for key, value in choice_map.items():
+              if key in choice:
+                  offset = value
+                  break
+
+          if manual:
+              target = manual
+              reason = 'manual_date'
+          else:
+              target = shift_trading_day(today, offset).isoformat()
+              reason = f'dropdown_offset_{offset}'
+
           print(f'target_date={target}')
-          print(f'target_reason={"manual" if manual else "beijing_previous_trading_day"}')
+          print(f'target_reason={reason}')
+          print(f'date_choice={choice}')
           PY
 
       - name: setup python
