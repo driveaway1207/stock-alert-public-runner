@@ -76,7 +76,7 @@ ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK", "0") ==
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE3_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE3_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
-PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "0") == "1" and not os.getenv("NO_COLOR")
+PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "1") != "0" and not os.getenv("NO_COLOR")
 PROGRESS_WIDTH = int(os.getenv("EMPLOYEE3_PROGRESS_WIDTH", "34"))
 PROGRESS_DIAG_CODE_RAW = os.getenv("EMPLOYEE3_DIAG_CODE", "")
 _m_diag_code = re.search(r"(\d{6})", str(PROGRESS_DIAG_CODE_RAW))
@@ -208,31 +208,66 @@ def parse_progress_extra(extra: str) -> Dict[str, str]:
     return out
 
 
-def purple(text: str) -> str:
-    # GitHub Actions 对 ANSI 色彩支持不稳定；这里不用 ANSI，直接用紫色符号保证可见。
-    return text
+def ansi(text: str, color: str = "magenta", bold: bool = True) -> str:
+    """GitHub Actions 支持 ANSI 时显示彩色；不支持时仍保持干净单行。"""
+    if not PROGRESS_COLOR:
+        return text
+    codes = {
+        "cyan": "36",
+        "blue": "34",
+        "magenta": "35",
+        "purple": "95",
+        "yellow": "33",
+        "orange": "33",
+        "green": "32",
+        "red": "31",
+        "dim": "2",
+        "white": "37",
+    }
+    if color == "dim":
+        return f"\033[2m{text}\033[0m"
+    prefix = "1;" if bold else ""
+    return f"\033[{prefix}{codes.get(color, '35')}m{text}\033[0m"
 
 
 def stage_skin(stage: str) -> Dict[str, str]:
+    # 不照搬五号员工；只借鉴“一行、短、清楚、有颜色”的节奏。
     if stage == "cache":
-        return {"fill": "🔷", "empty": "▫️", "pulse": "🔹", "title": "🔷 缓存读取雷达"}
+        return {"icon": "🔎", "label": "缓存读取", "color": "cyan", "metric": "命中缓存"}
     if stage == "refresh":
-        return {"fill": "🟧", "empty": "▫️", "pulse": "🟠", "title": "🟧 BaoStock补拉"}
+        return {"icon": "🔄", "label": "数据补拉", "color": "yellow", "metric": "已保存"}
     if stage == "screen":
-        return {"fill": "🟪", "empty": "▫️", "pulse": "🟣", "title": "🟪 核心线海选引擎"}
-    return {"fill": "🟣", "empty": "▫️", "pulse": "🟣", "title": stage_label(stage)}
+        return {"icon": "⚡", "label": "核心线海选", "color": "purple", "metric": "命中股票"}
+    return {"icon": "▶", "label": stage_label(stage), "color": "magenta", "metric": "进度"}
 
 
-def progress_bar(pct: float, width: int = PROGRESS_WIDTH, fill: str = "🟪", empty: str = "▫️") -> str:
-    width = max(16, min(width, 42))
-    filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
+def progress_bar(pct: float, width: int = PROGRESS_WIDTH, color: str = "purple") -> str:
+    width = max(18, min(width, 38))
+    ratio = max(0.0, min(100.0, pct)) / 100.0
+    filled = int(round(width * ratio))
     filled = max(0, min(width, filled))
-    return fill * filled + empty * (width - filled)
+    if filled <= 0:
+        return ansi("░" * width, "dim", False)
+    full = "█" * filled
+    empty = "░" * (width - filled)
 
+    # 渐变感：同一条进度内用亮色 + 主色 + 淡色三段；GitHub 支持 ANSI 时会比普通单色更有层次。
+    if color == "cyan":
+        a, b, c = "cyan", "blue", "purple"
+    elif color == "yellow":
+        a, b, c = "yellow", "orange", "magenta"
+    elif color == "purple":
+        a, b, c = "purple", "magenta", "cyan"
+    else:
+        a, b, c = color, color, color
 
-def mini_bar(pct: float, width: int = 12, pulse: str = "🟣") -> str:
-    filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
-    return pulse * filled + "·" * (width - filled)
+    n1 = max(0, min(filled, filled // 3))
+    n2 = max(0, min(filled - n1, filled // 3))
+    n3 = max(0, filled - n1 - n2)
+    bar = ansi("█" * n1, a) + ansi("█" * n2, b) + ansi("█" * n3, c)
+    if empty:
+        bar += ansi(empty, "dim", False)
+    return bar
 
 
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
@@ -252,31 +287,27 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     saved = info.get("saved", "0")
     failed = info.get("failed", "0")
 
-    bar = progress_bar(pct, fill=skin["fill"], empty=skin["empty"])
-    pulse = mini_bar(pct, pulse=skin["pulse"])
-    title = skin["title"]
-
-    lines = [
-        "╭" + "─" * 72 + "╮",
-        f"│ 🚀 三号员工 · 核心线突破海选 V1  ｜ {title} ｜ {pct:6.2f}%".ljust(73) + "│",
-        f"│ {bar}".ljust(73) + "│",
-        f"│ 进度脉冲：{pulse}".ljust(73) + "│",
-        "├" + "─" * 72 + "┤",
-        f"│ 📊 已处理：{done:,}/{total:,}只  ｜ ⚡处理速度：{speed:.2f}只/秒  ｜ ⏱已用：{fmt_seconds(elapsed)}".ljust(73) + "│",
-        f"│ ⌛剩余：{fmt_seconds(eta)}  ｜ 🎯当前股票：{current}".ljust(73) + "│",
-    ]
-
     if stage == "cache":
-        lines.append(f"│ 💾命中缓存：{hit}  ｜ 🧯坏文件：{bad}  ｜ 📉数据过短：{short}".ljust(73) + "│")
+        tail = f"{skin['metric']} {hit}｜坏文件 {bad}｜数据过短 {short}"
     elif stage == "refresh":
-        lines.append(f"│ ☁️已保存：{saved}  ｜ ⚠️失败：{failed}".ljust(73) + "│")
+        tail = f"{skin['metric']} {saved}｜失败 {failed}"
     elif stage == "screen":
-        lines.append(f"│ 🎯命中股票：{hit}  ｜ 🔍状态：正在扫描核心线突破候选".ljust(73) + "│")
-    elif extra:
-        lines.append(f"│ 📝备注：{extra}".ljust(73) + "│")
+        tail = f"{skin['metric']} {hit}"
+    else:
+        tail = extra
 
-    lines.append("╰" + "─" * 72 + "╯")
-    print("\n".join(lines), flush=True)
+    head = ansi(f"{skin['icon']} {skin['label']}", skin["color"])
+    bar = progress_bar(pct, color=skin["color"])
+    msg = (
+        f"{head} {bar} "
+        f"{ansi(f'{pct:5.1f}%', skin['color'])}｜"
+        f"已处理 {done:,}/{total:,}只｜"
+        f"速度 {speed:.2f}只/秒｜"
+        f"已用 {fmt_seconds(elapsed)}｜"
+        f"剩余 {fmt_seconds(eta)}｜"
+        f"当前 {current}｜{tail}"
+    )
+    print(msg, flush=True)
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
