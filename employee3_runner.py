@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+import numpy as np
 
 try:
     import requests
@@ -212,16 +213,26 @@ def purple(text: str) -> str:
     return text
 
 
-def progress_bar(pct: float, width: int = PROGRESS_WIDTH) -> str:
-    width = max(18, min(width, 48))
+def stage_skin(stage: str) -> Dict[str, str]:
+    if stage == "cache":
+        return {"fill": "🔷", "empty": "▫️", "pulse": "🔹", "title": "🔷 缓存读取雷达"}
+    if stage == "refresh":
+        return {"fill": "🟧", "empty": "▫️", "pulse": "🟠", "title": "🟧 BaoStock补拉"}
+    if stage == "screen":
+        return {"fill": "🟪", "empty": "▫️", "pulse": "🟣", "title": "🟪 核心线海选引擎"}
+    return {"fill": "🟣", "empty": "▫️", "pulse": "🟣", "title": stage_label(stage)}
+
+
+def progress_bar(pct: float, width: int = PROGRESS_WIDTH, fill: str = "🟪", empty: str = "▫️") -> str:
+    width = max(16, min(width, 42))
     filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
     filled = max(0, min(width, filled))
-    return "🟪" * filled + "⬛" * (width - filled)
+    return fill * filled + empty * (width - filled)
 
 
-def mini_bar(pct: float, width: int = 12) -> str:
+def mini_bar(pct: float, width: int = 12, pulse: str = "🟣") -> str:
     filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
-    return "🟣" * filled + "⚫" * (width - filled)
+    return pulse * filled + "·" * (width - filled)
 
 
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
@@ -231,9 +242,8 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     speed = done / elapsed if elapsed > 0 and done > 0 else 0.0
     eta = (total - done) / speed if speed > 0 else 0.0
     pct = min(max(done / total, 0.0), 1.0) * 100.0
-    label = stage_label(stage)
-    icon = stage_icon(stage)
     info = parse_progress_extra(extra)
+    skin = stage_skin(stage)
 
     current = info.get("current", "") or "-"
     hit = info.get("hit", "0")
@@ -242,33 +252,31 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     saved = info.get("saved", "0")
     failed = info.get("failed", "0")
 
-    bar = progress_bar(pct)
-    pulse = mini_bar(pct)
-    border = "✨" + "═" * 74 + "✨"
-    divider = "🌌" + "─" * 74 + "🌌"
+    bar = progress_bar(pct, fill=skin["fill"], empty=skin["empty"])
+    pulse = mini_bar(pct, pulse=skin["pulse"])
+    title = skin["title"]
 
     lines = [
-        border,
-        f"┃ 🛸 三号员工 · 核心线突破海选 V1        {icon} {label}        {pct:6.2f}% ┃",
-        f"┃ {bar} ┃",
-        f"┃ 进度脉冲：{pulse} ┃",
-        divider,
-        f"┃ 🧮 已处理：{done:,} / {total:,} 只     ⚡ 处理速度：{speed:.2f} 只/秒     ⏱ 已用时间：{fmt_seconds(elapsed)} ┃",
-        f"┃ ⌛ 剩余时间：{fmt_seconds(eta)}        🎯 当前股票：{current} ┃",
+        "╭" + "─" * 72 + "╮",
+        f"│ 🚀 三号员工 · 核心线突破海选 V1  ｜ {title} ｜ {pct:6.2f}%".ljust(73) + "│",
+        f"│ {bar}".ljust(73) + "│",
+        f"│ 进度脉冲：{pulse}".ljust(73) + "│",
+        "├" + "─" * 72 + "┤",
+        f"│ 📊 已处理：{done:,}/{total:,}只  ｜ ⚡处理速度：{speed:.2f}只/秒  ｜ ⏱已用：{fmt_seconds(elapsed)}".ljust(73) + "│",
+        f"│ ⌛剩余：{fmt_seconds(eta)}  ｜ 🎯当前股票：{current}".ljust(73) + "│",
     ]
 
     if stage == "cache":
-        lines.append(f"┃ 💾 命中缓存：{hit}      🧨 坏文件：{bad}      📉 数据过短：{short} ┃")
+        lines.append(f"│ 💾命中缓存：{hit}  ｜ 🧯坏文件：{bad}  ｜ 📉数据过短：{short}".ljust(73) + "│")
     elif stage == "refresh":
-        lines.append(f"┃ ☁️ 已保存：{saved}      ⚠️ 失败：{failed} ┃")
+        lines.append(f"│ ☁️已保存：{saved}  ｜ ⚠️失败：{failed}".ljust(73) + "│")
     elif stage == "screen":
-        lines.append(f"┃ 🎯 命中股票：{hit}      🔎 状态：正在扫描核心线突破候选 ┃")
+        lines.append(f"│ 🎯命中股票：{hit}  ｜ 🔍状态：正在扫描核心线突破候选".ljust(73) + "│")
     elif extra:
-        lines.append(f"┃ 📝 备注：{extra} ┃")
+        lines.append(f"│ 📝备注：{extra}".ljust(73) + "│")
 
-    lines.append("🚀" + "═" * 74 + "🚀")
+    lines.append("╰" + "─" * 72 + "╯")
     print("\n".join(lines), flush=True)
-
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -599,6 +607,85 @@ def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
     }
 
 
+
+def batch_score_lines(k: pd.DataFrame, sources: Dict[float, str], chunk_size: int = 768) -> List[Dict[str, Any]]:
+    """批量计算核心线分数：口径保持 score_line 一致，但用矩阵一次性计算，避免逐线慢循环。"""
+    if k.empty or not sources:
+        return []
+    need_cols = ["high", "body_top", "body_bottom", "close", "volume"]
+    if not all(c in k.columns for c in need_cols):
+        return []
+
+    hi = pd.to_numeric(k["high"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:, None]
+    bt = pd.to_numeric(k["body_top"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:, None]
+    bb = pd.to_numeric(k["body_bottom"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:, None]
+    cl = pd.to_numeric(k["close"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:, None]
+    vol = pd.to_numeric(k["volume"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:, None]
+
+    valid = (hi > 0) & (bt > 0) & (bb > 0)
+    if not bool(valid.any()):
+        return []
+    valid_flat = valid[:, 0]
+    vol_flat = vol[:, 0]
+    vol_med = sf(np.median(vol_flat[valid_flat])) if bool(valid_flat.any()) else 0.0
+    is_volume_bar = (vol_med > 0) & (vol >= vol_med * 1.30)
+
+    sorted_lines = sorted([sf(x) for x in sources.keys() if sf(x) > 0])
+    out: List[Dict[str, Any]] = []
+
+    for start_idx in range(0, len(sorted_lines), max(32, chunk_size)):
+        part = sorted_lines[start_idx:start_idx + max(32, chunk_size)]
+        L = np.array(part, dtype=float)[None, :]
+        denom = np.maximum(L, 1e-9)
+
+        entity_accept = valid & (bb > L)
+        entity_cut = valid & (bb < L) & (L < bt)
+        normal_zone = valid & (~entity_accept) & (~entity_cut)
+
+        is_high = normal_zone & (np.abs(hi - L) / denom <= CORE_LINE_TOL)
+        is_upper = normal_zone & (bt <= L) & (L <= hi)
+        is_body_top = normal_zone & (np.abs(bt - L) / denom <= CORE_LINE_TOL)
+        is_close = normal_zone & (np.abs(cl - L) / denom <= CORE_LINE_TOL)
+        touch = is_high | is_upper | is_body_top | is_close
+
+        hit_arr = touch.sum(axis=0).astype(int)
+        high_touch_arr = is_high.sum(axis=0).astype(int)
+        upper_hit_arr = (is_upper & (~is_body_top)).sum(axis=0).astype(int)
+        body_top_touch_arr = is_body_top.sum(axis=0).astype(int)
+        close_touch_arr = is_close.sum(axis=0).astype(int)
+        entity_cut_arr = entity_cut.sum(axis=0).astype(int)
+        entity_accept_arr = entity_accept.sum(axis=0).astype(int)
+        volume_res_arr = (touch & is_volume_bar).sum(axis=0).astype(int)
+        volume_cut_arr = (entity_cut & is_volume_bar).sum(axis=0).astype(int)
+        volume_accept_arr = (entity_accept & is_volume_bar).sum(axis=0).astype(int)
+        net_arr = hit_arr + volume_res_arr * 0.50 - entity_cut_arr * 0.35 - volume_cut_arr * 0.75
+
+        for j, line in enumerate(part):
+            hit = int(hit_arr[j])
+            net = float(net_arr[j])
+            level = "核心线候选" if hit >= MIN_CORE_RESONANCE and net > 0 else "未成线"
+            out.append({
+                "line": rd(line, 3),
+                "score": rd(hit, 3),
+                "net_score": rd(net, 3),
+                "effective_resonance_count": hit,
+                "volume_resonance_count": int(volume_res_arr[j]),
+                "high_touch_count": int(high_touch_arr[j]),
+                "upper_shadow_hit_count": int(upper_hit_arr[j]),
+                "body_top_touch_count": int(body_top_touch_arr[j]),
+                "close_touch_count": int(close_touch_arr[j]),
+                "entity_cut_count": int(entity_cut_arr[j]),
+                "volume_entity_cut_count": int(volume_cut_arr[j]),
+                "entity_accept_count": int(entity_accept_arr[j]),
+                "volume_entity_accept_count": int(volume_accept_arr[j]),
+                "level": level,
+                "line_type": "core_line" if level == "核心线候选" else "non_core",
+                "timeframe": f"{AGG_WINDOW}日聚合K",
+                "current_state": "存在实体接受记录" if int(entity_accept_arr[j]) else "暂无实体接受记录",
+                "source": sources.get(rd(line, 3), sources.get(line, "")),
+            })
+    return out
+
 def group_by_band(scored: List[Dict[str, Any]], tol: float = CORE_LINE_BAND_TOL) -> List[List[Dict[str, Any]]]:
     xs = sorted([x for x in scored if sf(x.get("line")) > 0], key=lambda x: sf(x.get("line")))
     groups: List[List[Dict[str, Any]]] = []
@@ -634,29 +721,14 @@ def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
     if not sources:
         return {"line": None, "level": "未识别", "reason": "未识别到候选核心线"}
 
-    # 科学提速：核心线本质是供需反应带，不是一分钱一条线。
-    # 先把相邻候选价格按 CORE_LINE_BAND_TOL 合并成价格带；
-    # 每个价格带内部仍按原 score_line 口径评分，保留带内最优代表线。
-    raw_items = [{"line": rd(line, 3), "source": src} for line, src in sources.items()]
-    grouped_raw = group_by_band(raw_items)
-    band_winners: List[Dict[str, Any]] = []
-
-    for group in grouped_raw:
-        best_in_band: Dict[str, Any] | None = None
-        for item in group:
-            L = sf(item.get("line"))
-            x = score_line(completed, L)
-            x["source"] = item.get("source", "")
-            if sf(x.get("net_score")) <= 0:
-                continue
-            if best_in_band is None or rank_key(x) > rank_key(best_in_band):
-                best_in_band = x
-        if best_in_band is not None:
-            band_winners.append(best_in_band)
-
-    if not band_winners:
+    # 核心优化：不改变核心线口径，不硬砍候选线。
+    # 仍然对所有候选线评分，但用矩阵批量计算；再按价格带合并，选每个价格带最优代表。
+    scored_all = batch_score_lines(completed, sources)
+    scored = [x for x in scored_all if sf(x.get("net_score")) > 0]
+    if not scored:
         return {"line": None, "level": "未识别", "reason": "未识别到有效核心线"}
 
+    band_winners = [max(g, key=rank_key) for g in group_by_band(scored)]
     ranked = sorted(band_winners, key=rank_key, reverse=True)
     best = dict(ranked[0])
     top_candidates = []
@@ -664,11 +736,10 @@ def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
         top_candidates.append({k: v for k, v in item.items() if k not in {"top_candidates", "excluded_current_bar"}})
     best["top_candidates"] = top_candidates
     best["all_candidates_count"] = len(sources)
+    best["positive_candidates_count"] = len(scored)
     best["band_candidates_count"] = len(band_winners)
     best["excluded_current_bar"] = {k: (rd(v, 3) if isinstance(v, (int, float)) else v) for k, v in raw_k.iloc[-1].to_dict().items()}
     return best
-
-
 def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
     d = normalize_hist(df)
     L = sf(line)
