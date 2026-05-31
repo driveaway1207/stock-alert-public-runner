@@ -30,7 +30,7 @@ except Exception:
     bs = None
 
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V90_FULL_RESONANCE_QUANT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V96_RESONANCE_COUNT_ONLY"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 
@@ -83,7 +83,7 @@ TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}"
 LIMIT_UP_TOL = float(os.getenv("EMPLOYEE5_LIMIT_UP_TOL", "0.15"))
 MIN_ROWS = int(os.getenv("EMPLOYEE5_MIN_CACHE_ROWS", "22"))
 SCAN_KEEP_ROWS = int(os.getenv("EMPLOYEE5_SCAN_KEEP_ROWS", "80"))
-TOL = float(os.getenv("EMPLOYEE5_CORE_LINE_TOL", "0.005"))
+TOL = float(os.getenv("EMPLOYEE5_CORE_LINE_TOL", "0.01"))
 MIN_CORE_HIT_COUNT = int(os.getenv("EMPLOYEE5_MIN_CORE_HIT_COUNT", "3"))
 LOW_VOLUME_WINDOWS = {20: 12, 60: 6, 250: 3}
 FIRST_CORE_BAND_TOL = float(os.getenv("EMPLOYEE5_FIRST_CORE_BAND_TOL", "0.015"))
@@ -1474,34 +1474,13 @@ def high_resonance_clusters(highs: List[float], tol: float = TOL) -> List[List[f
 
 
 def volume_event_bonus(r: Any) -> float:
-    """放量共振加权：以“当前60日聚合K量 > 前一根60日聚合K量”为主口径。
-
-    只有有效共振K才会调用本函数；突破接受K、切实体K不参与放量共振加分。
-    prev_vol_ratio = 当前60日聚合K成交量 / 前一根60日聚合K成交量。
-    """
-    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
-    if pvr >= 3.0:
-        return 1.5
-    if pvr >= 1.8:
-        return 1.2
-    if pvr >= 1.3:
-        return 0.8
-    if pvr > 1.0:
-        return 0.3
+    """成交量只做审计记录，不参与加分或扣分。"""
     return 0.0
 
 
 def entity_loss_weight(r: Any) -> float:
-    """切实体损耗：按相较前一根是否放量加权。"""
-    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
-    if pvr >= 3.0:
-        return 1.5
-    if pvr >= 1.8:
-        return 1.2
-    if pvr >= 1.3:
-        return 1.0
+    """V96：扣分体系删除；保留函数名兼容旧字段，实际不扣分。"""
     return 0.6
-
 
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -1556,24 +1535,23 @@ def score_core_reaction_line(
     include_downshift: bool = True,
     evidence_limit: int = 80,
 ) -> Dict[str, Any]:
-    """全盘唯一核心线打分。
+    """全盘唯一核心线打分。V96
 
     口径锁死：
     1）候选线只来自60日聚合K最高价。
-    2）一根60日聚合K只能归一类：有效共振 / 切实体 / 接受状态 / 无关系。
-    3）有效共振只看上方反应：最高价贴线、上影线打到、实体顶贴线但未切实体。
-    4）最低价、下影线、实体底、收盘价不参与核心线共振计数。
-    5）线进实体内部 = 切实体，扣分，不算共振。
-    6）实体整体站上线 = 突破接受状态，不算共振，不扣分。
-    7）实体站上线后又有效跌回 = 只记录“接受后跌回”状态，不扣分。
-    8）放量只按当前60日聚合K量相较前一根60日聚合K量，不再按前4根均量主判。
+    2）扣分体系全部删除；成交量不加分也不扣分。
+    3）最终只看有效共振数量；误差默认±1%。
+    4）有效共振包括：最高价贴线、上影线打到、实体顶贴线、实体内部穿线、收盘贴线。
+    5）实体整体站上线只记录接受状态，不参与加分或扣分。
     """
     L = sf(line)
 
     ordinary_hit = 0
     body_top_touch = 0
+    close_touch = 0
     high_touch = 0
     upper_hit = 0
+    entity_inside_hit = 0
     vol_hit = 0
     body_cut = 0
     entity_accept = 0
@@ -1645,27 +1623,29 @@ def score_core_reaction_line(
             "vol_rank_pct": rd(vol_rank, 3),
         }
 
-        touch_body_top = near(bt, L)
-        touch_high = near(hi, L)
-
-        # 线进入实体内部就是切实体；实体顶0.5%贴线属于上边界反应，不算切实体。
-        is_cut = bool((bb < L < bt) and not touch_body_top)
-        if is_cut:
-            body_cut += 1
-            w = entity_loss_weight(r)
-            body_cut_penalty += w
-            cut_dates.append(tag)
-            if w > 0.6:
-                volume_body_cut += 1
+        # 实体整体在线上方：只记录接受状态，不加分、不扣分。
+        is_accept = bool(bb > L)
+        if is_accept:
+            entity_accept += 1
+            accept_dates.append(tag)
             ev = dict(base_row)
-            ev.update({"entity_loss_weight": rd(w, 3), "reason": "body_cut"})
-            body_cut_events.append(ev)
+            ev.update({
+                "entity_loss_weight": 0.0,
+                "reason": "entity_accept_no_score",
+                "accepted_and_held": bool(accepted_and_held),
+                "accepted_then_failed": bool(accepted_then_failed),
+            })
+            entity_accept_events.append(ev)
             continue
 
-        # 共振只数上方反应：最高价贴线、上影线打到、实体顶贴线。
-        # 最低价、下影线、实体底、收盘价不参与核心线共振计数。
+        # V96：扣分体系删除；线进入实体内部也算一种有效共振，不再扣分。
+        touch_high = near(hi, L)
+        touch_body_top = near(bt, L)
+        touch_close = near(cl, L)
         upper_wick_hit = bool(bt <= L <= hi * (1 + TOL))
-        is_resonance = bool(touch_high or touch_body_top or upper_wick_hit)
+        inside_body_hit = bool(bb * (1 - TOL) <= L <= bt * (1 + TOL))
+
+        is_resonance = bool(touch_high or upper_wick_hit or touch_body_top or inside_body_hit or touch_close)
 
         if is_resonance:
             ordinary_hit += 1
@@ -1675,48 +1655,28 @@ def score_core_reaction_line(
                 upper_hit += 1
             if touch_body_top:
                 body_top_touch += 1
+            if touch_close:
+                close_touch += 1
             if touch_high:
                 high_touch += 1
-
-            vb = volume_event_bonus(r)
-            if vb > 0:
-                vol_hit += 1
-                volume_bonus_score += vb
+            if inside_body_hit and not upper_wick_hit:
+                entity_inside_hit += 1
 
             ev = dict(base_row)
             ev.update({
                 "ordinary_hit": True,
                 "upper_shadow_hit": bool(upper_wick_hit),
                 "body_top_touch": bool(touch_body_top),
+                "close_touch": bool(touch_close),
                 "high_touch": bool(touch_high),
+                "entity_inside_hit": bool(inside_body_hit),
                 "body_cut": False,
                 "entity_accept": False,
-                "volume_bonus": rd(vb, 3),
+                "volume_bonus": 0.0,
             })
             resonance_events.append(ev)
             if evidence_limit > 0 and len(evidence) < evidence_limit:
                 evidence.append(ev)
-            continue
-
-        # 没有打线/贴线，但实体整体在线上方：只记录接受状态，不算共振。
-        is_accept = bool(bb > L)
-        if is_accept:
-            entity_accept += 1
-            # 用户最终口径：实体接受后即使后面跌回，也只记录状态，不扣分；
-            # 扣分只来自切实体。接受不是共振，也不是损耗。
-            w = 0.0
-            entity_accept_penalty += w
-            accept_dates.append(tag)
-            if prev_vol_ratio > 1.0:
-                volume_entity_accept += 1
-            ev = dict(base_row)
-            ev.update({
-                "entity_loss_weight": rd(w, 3),
-                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_fell_back_no_penalty" if accepted_then_failed else "entity_accept_no_penalty",
-                "accepted_and_held": bool(accepted_and_held),
-                "accepted_then_failed": bool(accepted_then_failed),
-            })
-            entity_accept_events.append(ev)
             continue
 
     low_vol_window = low_volume_window_for_timeframe(timeframe)
@@ -1732,23 +1692,20 @@ def score_core_reaction_line(
             }
             if near(lv.high, L):
                 stage_low_volume_high_touch = 1
-                volume_bonus_score += 0.3
         except Exception:
             stage_low_volume_bar = {}
 
-    entity_loss_score = body_cut_penalty
-    gross_score = ordinary_score + volume_bonus_score
-    net_score = gross_score - entity_loss_score
+    entity_loss_score = 0.0
+    gross_score = ordinary_score
+    net_score = ordinary_score
 
-    meaningful = ordinary_hit >= MIN_CORE_HIT_COUNT or (ordinary_hit >= 2 and volume_bonus_score >= 1.2)
-    core_candidate = meaningful and net_score >= max(1.0, MIN_CORE_HIT_COUNT - 2.0)
+    meaningful = ordinary_hit >= MIN_CORE_HIT_COUNT
+    core_candidate = meaningful and net_score > 0
 
-    if core_candidate and ordinary_hit >= 5 and net_score >= 4:
+    if core_candidate and ordinary_hit >= 5:
         line_type, level = "core_line", "第一核心线候选"
     elif core_candidate:
         line_type, level = "core_line", "核心线候选"
-    elif meaningful:
-        line_type, level = "logic_analysis_line", "共振不足以确认核心"
     elif ordinary_hit >= 2:
         line_type, level = "logic_analysis_line", "普通反应线"
     else:
@@ -1763,8 +1720,8 @@ def score_core_reaction_line(
     else:
         current_state = "未被实体整体接受"
 
-    clean = body_cut == 0
-    need_escalate = meaningful and not core_candidate
+    clean = True
+    need_escalate = False
 
     downshift_tests: List[Dict[str, Any]] = []
     if include_downshift and L > 0 and not k.empty:
@@ -1775,22 +1732,19 @@ def score_core_reaction_line(
                 "shift_pct": rd(pct * 100, 3),
                 "line": rd(shifted),
                 "ordinary_resonance_count": s.get("ordinary_resonance_count"),
-                "volume_bonus_score": s.get("volume_bonus_score"),
-                "body_cut_count": s.get("body_cut_count"),
+                "body_cut_count": 0,
                 "entity_accept_count": s.get("entity_accept_count"),
-                "entity_loss_score": s.get("entity_loss_score"),
+                "entity_loss_score": 0.0,
                 "gross_score": s.get("gross_score"),
                 "net_score": s.get("net_score"),
                 "delta_net_vs_current": rd(sf(s.get("net_score")) - net_score, 3),
             })
 
     exact_score_formula = (
-        "净分 = 有效共振数 + 放量共振加分 - 切实体扣分；"
-        "实体接受后跌回只记录状态，不扣分；"
-        "有效共振只数最高价贴线、上影线打到、实体顶贴线；"
-        "最低价、下影线、实体底、收盘价不参与核心线共振；"
-        "放量按当前60日聚合K成交量/前一根60日聚合K成交量；"
-        "实体接受不扣分，接受后跌回也不扣分"
+        "净分 = 有效共振数；扣分体系全部删除；"
+        "成交量不加分也不扣分；实体接受和接受后跌回不加扣；"
+        "有效共振包括最高价贴线、上影线打到、实体顶贴线、实体内部穿线、收盘贴线；"
+        "默认误差为正负1%。"
     )
 
     return {
@@ -1806,26 +1760,28 @@ def score_core_reaction_line(
         "ordinary_resonance_count": ordinary_hit,
         "effective_resonance_count": ordinary_hit,
         "resonance_score": rd(ordinary_score, 3),
-        "volume_bonus_score": rd(volume_bonus_score, 3),
+        "volume_bonus_score": 0.0,
         "hit_count": ordinary_hit,
         "upper_shadow_hit_count": upper_hit,
         "entity_top_as_shadow_count": body_top_touch,
+        "close_touch_count": close_touch,
         "body_top_touch_count": body_top_touch,
         "high_touch_count": high_touch,
-        "volume_hit_count": vol_hit,
+        "entity_inside_hit_count": entity_inside_hit,
+        "volume_hit_count": 0,
         "stage_low_volume_high_touch_count": stage_low_volume_high_touch,
         "stage_low_volume_bar": stage_low_volume_bar,
-        "body_cut_count": body_cut,
-        "body_cut_penalty": rd(body_cut_penalty, 3),
+        "body_cut_count": 0,
+        "body_cut_penalty": 0.0,
         "entity_accept_count": entity_accept,
-        "entity_accept_penalty": rd(entity_accept_penalty, 3),
-        "entity_loss_score": rd(entity_loss_score, 3),
+        "entity_accept_penalty": 0.0,
+        "entity_loss_score": 0.0,
         "accepted_and_held": bool(accepted_and_held),
         "accepted_then_failed": bool(accepted_then_failed),
         "first_accept_index": first_accept_index,
         "first_accept_date": first_accept_date,
-        "volume_body_cut_count": volume_body_cut,
-        "volume_entity_accept_count": volume_entity_accept,
+        "volume_body_cut_count": 0,
+        "volume_entity_accept_count": 0,
         "current_state": current_state,
         "entity_accept_dates": accept_dates[:80],
         "accepted_invalidated": False,
@@ -1834,32 +1790,31 @@ def score_core_reaction_line(
         "clean_core_line": clean,
         "tol_pct": rd(TOL * 100, 3),
         "hit_dates": hit_dates[:80],
-        "cut_dates": cut_dates[:80],
+        "cut_dates": [],
         "downshift_tests": downshift_tests,
         "evidence": evidence[:evidence_limit] if evidence_limit > 0 else [],
         "resonance_events": resonance_events,
-        "body_cut_events": body_cut_events,
+        "body_cut_events": [],
         "entity_accept_events": entity_accept_events,
         "exact_score_formula": exact_score_formula,
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v94_accept_fallback_no_penalty",
+        "confirmation_source": "v96_qfq_60d_high_candidate_resonance_count_only_tol_1pct",
     }
 
-# 兼容旧函数名；内部已经升级为 V62 最大共振净分逻辑。
+# 兼容旧函数名；内部已经升级为V96有效共振数量优先逻辑。
 def score_shadow_line(k: pd.DataFrame, line: float, timeframe: str) -> Dict[str, Any]:
     return score_core_reaction_line(k, line, timeframe)
 
 
-def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[float, int, float, float, float]:
-    """最终排序：净分第一；净分接近时再看有效共振、放量共振、实体损耗。"""
+def _score_rank_tuple(x: Dict[str, Any]) -> Tuple[float, int, float, float]:
+    """最终排序：只看有效共振数量；净分等于有效共振数。"""
     return (
         sf(x.get("net_score", x.get("score", 0))),
         int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0))) or 0),
-        sf(x.get("volume_bonus_score", 0)),
-        -sf(x.get("entity_loss_score", 0)),
         -sf(x.get("line", 0)),
+        0.0,
     )
 
 
@@ -1886,7 +1841,7 @@ def _group_scored_by_price_band(scored: List[Dict[str, Any]], band_tol: float = 
 
 
 def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """同一价格反应带内，先剔除净分非正候选，再按净分选代表线。"""
+    """同一价格反应带内，按有效共振数量选代表线。"""
     if not band:
         return {}
     eligible = [x for x in band if sf(x.get("net_score", x.get("score", 0))) > 0]
@@ -1904,7 +1859,7 @@ def choose_first_core_boundary_in_band(band: List[Dict[str, Any]]) -> Dict[str, 
         }
         for x in ordered[:8]
     ]
-    chosen["same_band_selection_rule"] = "同一反应带内先剔除净分非正候选；再按净分优先，净分接近时看有效共振、放量共振和实体损耗。"
+    chosen["same_band_selection_rule"] = "同一反应带内按有效共振数量优先；净分等于有效共振数。"
     return chosen
 
 
@@ -1919,8 +1874,8 @@ def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str,
     if not winners:
         return {}
     chosen = sorted(winners, key=_score_rank_tuple, reverse=True)[0]
-    chosen["core_selection_rule"] = "net_score_first_high_candidate_upper_resonance_only"
-    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选唯一核心线；先剔除净分非正候选；最终按净分优先，净分接近时再看有效共振、放量共振、实体损耗；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；实体接受不扣分，接受后跌回也不扣分。"
+    chosen["core_selection_rule"] = "resonance_count_only_high_candidate_tol_1pct"
+    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选唯一核心线；扣分体系删除；净分等于有效共振数；最终只看有效共振数量；有效共振包括最高价、上影线、实体顶、实体内部、收盘，误差默认正负1%；成交量和实体接受均不参与加扣。"
     return chosen
 
 
@@ -1967,11 +1922,11 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
             selected["cluster_size"] = len(cluster)
             selected["cluster_lowest_price"] = rd(min(cluster))
             selected["cluster_lowest_high"] = rd(min(cluster))
-            selected["cluster_selection_rule"] = "60日第一核心线：先精确审计有效共振/切实体/实体接受；净分非正直接淘汰；同一反应带按净分优先"
+            selected["cluster_selection_rule"] = "60日第一核心线：扣分体系删除；同一反应带按有效共振数量优先；净分等于有效共振数"
             selected["candidate_source_summary"] = candidate_source_summary(raw_candidates, selected.get("line"))
             selected["cluster_all_lines"] = sorted(
                 cluster_scored,
-                key=lambda x: (sf(x.get("net_score")), int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", 0))), sf(x.get("volume_bonus_score")), -sf(x.get("entity_loss_score")), -sf(x.get("line"))),
+                key=lambda x: (sf(x.get("net_score")), int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", 0))), -sf(x.get("entity_loss_score")), -sf(x.get("line"))),
                 reverse=True,
             )[:8]
             scored.append(selected)
@@ -1981,7 +1936,6 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
         key=lambda x: (
             sf(x.get("net_score")),
             int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0)))),
-            sf(x.get("volume_bonus_score")),
             -sf(x.get("entity_loss_score")),
             -sf(x.get("line")),
         ),
@@ -2021,25 +1975,24 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
             f"{timeframe}识别核心线：{best['line']}元。"
             f"已排除最新未完成聚合K（{excluded.get('start')}~{excluded.get('end')}）做历史成线。"
             f"有效共振{best.get('ordinary_resonance_count')}根；"
-            f"实体顶贴线{best['body_top_touch_count']}次、"
-            f"最高价贴线{best['high_touch_count']}次、上影线打到{best.get('upper_shadow_hit_count')}次；"
-            f"放量/倍量共振{best['volume_hit_count']}次，放量加权{best.get('volume_bonus_score')}；"
-            f"切实体{best['body_cut_count']}次、切实体损耗{best.get('body_cut_penalty', 0)}；"
-            f"实体接受{best.get('entity_accept_count', 0)}次、接受不扣分；"
+            f"最高价贴线{best['high_touch_count']}次、上影线打到{best.get('upper_shadow_hit_count')}次、"
+            f"实体顶贴线{best['body_top_touch_count']}次、实体内部/收盘共振{best.get('entity_inside_hit_count', 0) + best.get('close_touch_count', 0)}次；"
+            f"扣分体系删除，净分=有效共振数；"
+            f"实体接受{best.get('entity_accept_count', 0)}次只记录状态；"
             f"净分{best.get('net_score')}，状态：{best.get('current_state')}。"
         )
     elif best.get("meaningful_candidate"):
         best["text"] = (
             f"{timeframe}候选线{best.get('line')}元有真实共振："
-            f"普通共振{best.get('ordinary_resonance_count')}根、放量加权{best.get('volume_bonus_score')}、"
-            f"实体总损耗{best.get('entity_loss_score')}、净分{best.get('net_score')}。"
-            f"当前只能作逻辑线，原因是共振收益扣除实体损耗后不足以确认核心。"
+            f"普通共振{best.get('ordinary_resonance_count')}根、"
+            f"净分{best.get('net_score')}。"
+            f"当前只能作逻辑线，原因是有效共振数量不足以确认核心。"
         )
     else:
         best["text"] = (
             f"{timeframe}未形成核心线；最强候选为{best.get('line')}元，"
-            f"普通共振{best.get('ordinary_resonance_count')}根，放量加权{best.get('volume_bonus_score')}，"
-            f"实体总损耗{best.get('entity_loss_score')}，净分{best.get('net_score')}。"
+            f"普通共振{best.get('ordinary_resonance_count')}根，"
+            f"净分{best.get('net_score')}。"
         )
 
     return best
@@ -2072,11 +2025,10 @@ def attach_path(
     return selected
 
 
-def _rank_fallback_coreline(x: Dict[str, Any], priority: int) -> Tuple[float, int, float, float, int]:
+def _rank_fallback_coreline(x: Dict[str, Any], priority: int) -> Tuple[float, int, float, int]:
     return (
         sf(x.get("net_score", x.get("score", -9999))),
         int(x.get("effective_resonance_count", x.get("ordinary_resonance_count", x.get("hit_count", 0)))),
-        sf(x.get("volume_bonus_score", 0)),
         -sf(x.get("entity_loss_score", 0)),
         -priority,
     )
@@ -2129,9 +2081,8 @@ def _fmt_score(x: Dict[str, Any]) -> str:
         return "无"
     return (
         f"{x.get('line')}｜{x.get('timeframe')}｜净{x.get('net_score', x.get('score'))}"
-        f"｜毛{x.get('gross_score', '')}｜有效共振{x.get('effective_resonance_count', x.get('ordinary_resonance_count', x.get('hit_count')))}"
-        f"｜放量+{x.get('volume_bonus_score', 0)}｜损耗{x.get('entity_loss_score', 0)}"
-        f"｜切{x.get('body_cut_count')}｜受{x.get('entity_accept_count')}｜{x.get('current_state', '')}"
+        f"｜有效共振{x.get('effective_resonance_count', x.get('ordinary_resonance_count', x.get('hit_count')))}"
+        f"｜受{x.get('entity_accept_count')}｜{x.get('current_state', '')}"
     )
 
 
@@ -2154,8 +2105,12 @@ def _event_relation_cn(e: Dict[str, Any]) -> str:
         parts.append("最高价贴线")
     if e.get("body_top_touch"):
         parts.append("实体顶贴线")
+    if e.get("entity_inside_hit"):
+        parts.append("实体内部共振")
+    if e.get("close_touch"):
+        parts.append("收盘贴线")
     if e.get("body_cut"):
-        parts.append("切实体")
+        parts.append("实体内部共振")
     if e.get("entity_accept") or ss(e.get("reason", "")).startswith("entity_accept"):
         if e.get("accepted_and_held"):
             parts.append("突破接受且未跌回")
@@ -2170,18 +2125,17 @@ def _fmt_event_line(i: int, e: Dict[str, Any]) -> str:
     return (
         f"  {i}. {e.get('date')}｜{_event_relation_cn(e)}｜"
         f"开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
-        f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜放量+{e.get('volume_bonus', 0)}"
+        f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜前量比{e.get('prev_vol_ratio')}"
     )
 
 
 def core_line_audit_lines(cl: Dict[str, Any], limit: int = 20) -> List[str]:
-    """输出当前核心线的逐条证据，避免只给一个“共振N”的黑箱数字。"""
+    """输出当前核心线的逐条共振证据。V96只保留共振明细。"""
     out: List[str] = []
     if not isinstance(cl, dict) or cl.get("line") is None:
         return out
 
     resonance = cl.get("resonance_events") or []
-    cuts = cl.get("body_cut_events") or []
     accepts = cl.get("entity_accept_events") or []
 
     out.append(f"  共振明细（{len(resonance)}）：")
@@ -2193,31 +2147,15 @@ def core_line_audit_lines(cl: Dict[str, Any], limit: int = 20) -> List[str]:
     else:
         out.append("  无")
 
-    out.append(f"  切实体明细（{len(cuts)}）：")
-    if cuts:
-        for i, e in enumerate(cuts[:limit], 1):
-            out.append(
-                f"  {i}. {e.get('date')}｜切实体｜开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
-                f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜扣{e.get('entity_loss_weight')}"
-            )
-        if len(cuts) > limit:
-            out.append(f"  ... 还有{len(cuts) - limit}条切实体明细未展开")
-    else:
-        out.append("  无")
-
-    out.append(f"  接受/站上明细（{len(accepts)}）：")
+    out.append(f"  实体接受状态（{len(accepts)}，只记录不加扣）：")
     if accepts:
-        for i, e in enumerate(accepts[:limit], 1):
-            out.append(
-                f"  {i}. {e.get('date')}｜{_event_relation_cn(e)}｜开{e.get('open')} 高{e.get('high')} 低{e.get('low')} 收{e.get('close')}｜"
-                f"实体{e.get('body_bottom')}~{e.get('body_top')}｜量比{e.get('rel_vol')}｜扣{e.get('entity_loss_weight', 0)}"
-            )
+        for i, e in enumerate(accepts[:min(limit, len(accepts))], 1):
+            out.append(_fmt_event_line(i, e))
         if len(accepts) > limit:
-            out.append(f"  ... 还有{len(accepts) - limit}条接受明细未展开")
+            out.append(f"  ... 还有{len(accepts) - limit}条接受状态未展开")
     else:
         out.append("  无")
     return out
-
 
 def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
     """报告/JSON只保留核心线必要字段，不落大段候选证据。"""
@@ -2227,7 +2165,6 @@ def compact_core_line_for_output(cl: Dict[str, Any]) -> Dict[str, Any]:
         "line", "core_line", "line_type", "level", "timeframe",
         "score", "net_score", "gross_score",
         "effective_resonance_count", "ordinary_resonance_count", "hit_count",
-        "volume_bonus_score", "volume_hit_count",
         "entity_loss_score", "body_cut_count", "body_cut_penalty",
         "entity_accept_count", "entity_accept_penalty",
         "accepted_and_held", "accepted_then_failed", "first_accept_index", "first_accept_date",
@@ -2317,14 +2254,13 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
             level = cl.get("level", "")
             net = cl.get("net_score", cl.get("score", ""))
             hit = cl.get("effective_resonance_count", cl.get("ordinary_resonance_count", cl.get("hit_count", "")))
-            vol_bonus = cl.get("volume_bonus_score", 0)
             loss = cl.get("entity_loss_score", 0)
 
             if line is None:
                 lines.append(f"{pos}. {c}｜核心线：无｜{level}")
             else:
                 lines.append(
-                    f"{pos}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜放量+{vol_bonus}｜损耗{loss}｜{state}"
+                    f"{pos}. {c}｜核心线：{line}｜净分{net}｜共振{hit}｜{state}"
                 )
                 lines.extend(core_line_audit_lines(cl))
 
@@ -2354,7 +2290,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "a_pool": A.to_dict("records") if not A.empty else [],
         "results": results,
         "research_only": True,
-        "core_line_method": "v73_qfq_apply_60d_anchor",
+        "core_line_method": "v96_qfq_60d_high_resonance_count_only_tol_1pct",
         "core_line_tol": TOL,
         "limit_up_tol": LIMIT_UP_TOL,
         "exclude_current_agg_bar": True,
@@ -2370,8 +2306,8 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "flat_csv_cache": True,
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
-        "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty; final selection requires net_score > 0 and ranks by net_score first; entity acceptance and fallback after acceptance do not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
+        "report_style": "limit_up_core_lines_only_resonance_count_only",
+        "score_formula": "净分=有效共振数；扣分体系删除；成交量不参与加扣；实体接受只记录状态；有效共振包括最高价贴线、上影线打到、实体顶贴线、实体内部穿线、收盘贴线；误差默认正负1%；候选线只来自60日聚合K最高价",
     }
 
     return "\n".join(lines), payload
