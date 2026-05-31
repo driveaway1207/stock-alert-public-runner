@@ -75,6 +75,7 @@ ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK", "0") ==
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE3_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE3_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
+PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "0") == "1" and not os.getenv("NO_COLOR")
 
 # 高质量突破阈值：全部是日K可计算字段。
 BREAK_PREV_BELOW_PCT = float(os.getenv("EMPLOYEE3_BREAK_PREV_BELOW_PCT", "0.005"))
@@ -169,6 +170,24 @@ def fmt_seconds(seconds: float) -> str:
     return f"{seconds / 60:.1f}m"
 
 
+def progress_color(stage: str, pct: float) -> Tuple[str, str, str]:
+    if stage == "cache":
+        return "🟦", "\033[94m", "缓存读取"
+    if stage == "refresh":
+        return "🟧", "\033[93m", "BaoStock补拉"
+    if stage == "screen":
+        return "🟩", "\033[92m", "核心线海选"
+    if pct >= 100:
+        return "🟪", "\033[95m", stage
+    return "⬜", "\033[0m", stage
+
+
+def paint(text: str, ansi: str) -> str:
+    if not PROGRESS_COLOR:
+        return text
+    return f"{ansi}{text}\033[0m"
+
+
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
     if total <= 0:
         return
@@ -176,10 +195,12 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     speed = done / elapsed if elapsed > 0 and done > 0 else 0.0
     eta = (total - done) / speed if speed > 0 else 0.0
     pct = min(max(done / total, 0.0), 1.0) * 100
-    msg = f"{stage}: {pct:5.1f}% {done}/{total} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
+    emoji, ansi, label = progress_color(stage, pct)
+    prefix = f"{emoji} {label}" if PROGRESS_COLOR else stage
+    msg = f"{prefix}: {pct:5.1f}% {done}/{total} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
     if extra:
         msg += f" | {extra}"
-    print(msg, flush=True)
+    print(paint(msg, ansi), flush=True)
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -806,6 +827,7 @@ def main() -> None:
     print(BOOT, flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
+    print(f"progress_color_enabled={PROGRESS_COLOR}", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
     self_check = run_self_check()
     print(f"self_check_overall_ok={self_check.get('overall_ok')}", flush=True)
