@@ -69,16 +69,13 @@ CORE_LINE_BAND_TOL = float(os.getenv("EMPLOYEE3_CORE_LINE_BAND_TOL", "0.015"))
 MIN_CACHE_ROWS = int(os.getenv("EMPLOYEE3_MIN_CACHE_ROWS", "80"))
 MIN_CORE_RESONANCE = int(os.getenv("EMPLOYEE3_MIN_CORE_RESONANCE", "3"))
 CACHE_SCAN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_CACHE_SCAN_PROGRESS_EVERY", "500"))
-SCREEN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_SCREEN_PROGRESS_EVERY", "20"))
+SCREEN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_SCREEN_PROGRESS_EVERY", "200"))
 MAX_STOCKS = int(os.getenv("MAX_STOCKS", os.getenv("EMPLOYEE3_MAX_STOCKS", "0")))
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK", "0") == "1"
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE3_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE3_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
 PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "0") == "1" and not os.getenv("NO_COLOR")
-PROGRESS_WIDTH = int(os.getenv("EMPLOYEE3_PROGRESS_WIDTH", "28"))
-DIAG_CODE_RAW = os.getenv("EMPLOYEE3_DIAG_CODE", "000001")
-DIAG_ENABLED = os.getenv("EMPLOYEE3_DIAG", "1") == "1"
 
 # 高质量突破阈值：全部是日K可计算字段。
 BREAK_PREV_BELOW_PCT = float(os.getenv("EMPLOYEE3_BREAK_PREV_BELOW_PCT", "0.005"))
@@ -149,9 +146,6 @@ def code_of(x: Any) -> str:
     return m.group(1) if m else ""
 
 
-DIAG_CODE = code_of(DIAG_CODE_RAW)
-
-
 def valid_code(code: str) -> bool:
     c = code_of(code)
     return c.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689", "920", "8", "4"))
@@ -178,30 +172,20 @@ def fmt_seconds(seconds: float) -> str:
 
 def progress_color(stage: str, pct: float) -> Tuple[str, str, str]:
     if stage == "cache":
-        return "🧊", "\033[96m", "CACHE / 缓存雷达"
+        return "🟦", "\033[94m", "缓存读取"
     if stage == "refresh":
-        return "🛰️", "\033[93m", "REFRESH / BaoStock补拉"
+        return "🟧", "\033[93m", "BaoStock补拉"
     if stage == "screen":
-        return "🚀", "\033[92m", "SCREEN / 核心线海选"
+        return "🟩", "\033[92m", "核心线海选"
     if pct >= 100:
-        return "🏁", "\033[95m", stage
-    return "⚙️", "\033[0m", stage
+        return "🟪", "\033[95m", stage
+    return "⬜", "\033[0m", stage
 
 
 def paint(text: str, ansi: str) -> str:
     if not PROGRESS_COLOR:
         return text
     return f"{ansi}{text}\033[0m"
-
-
-def progress_bar(pct: float, width: int = PROGRESS_WIDTH) -> str:
-    width = max(12, min(width, 60))
-    filled = int(round(width * min(max(pct, 0.0), 100.0) / 100.0))
-    if filled >= width:
-        return "█" * width
-    if filled <= 0:
-        return "░" * width
-    return "█" * filled + "▓" + "░" * max(width - filled - 1, 0)
 
 
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
@@ -212,30 +196,11 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     eta = (total - done) / speed if speed > 0 else 0.0
     pct = min(max(done / total, 0.0), 1.0) * 100
     emoji, ansi, label = progress_color(stage, pct)
-    if not PROGRESS_COLOR:
-        msg = f"{stage}: {pct:5.1f}% {done}/{total} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
-        if extra:
-            msg += f" | {extra}"
-        print(msg, flush=True)
-        return
-
-    line = "═" * 72
-    bar = progress_bar(pct)
-    extra_line = f"│ 🧭 {extra}" if extra else "│ 🧭 -"
-    msg = "\n".join([
-        paint(f"╔{line}╗", ansi),
-        paint(f"║ {emoji}  EMPLOYEE-3 {label:<26} {pct:6.2f}%", ansi),
-        paint(f"║ {bar}", ansi),
-        paint(f"║ ⚡ {done:,}/{total:,}   🚄 {speed:,.2f}/s   ⏱ elapsed {fmt_seconds(elapsed)}   🕒 ETA {fmt_seconds(eta)}", ansi),
-        paint(extra_line, ansi),
-        paint(f"╚{line}╝", ansi),
-    ])
-    print(msg, flush=True)
-
-
-def diag(code: str, message: str) -> None:
-    if DIAG_ENABLED and DIAG_CODE and code_of(code) == DIAG_CODE:
-        print(f"🧪 DIAG {code_of(code)} | {message}", flush=True)
+    prefix = f"{emoji} {label}" if PROGRESS_COLOR else stage
+    msg = f"{prefix}: {pct:5.1f}% {done}/{total} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)} speed={speed:.2f}/s"
+    if extra:
+        msg += f" | {extra}"
+    print(paint(msg, ansi), flush=True)
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -501,53 +466,47 @@ def line_candidate_sources(k: pd.DataFrame) -> Dict[float, str]:
 
 
 def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
-    """核心线打分。
-
-    说明：这里保留原口径，只把逐行 iterrows 改成向量化布尔掩码，避免
-    “候选线 × 聚合K”在全市场海选时拖死。规则不变：
-    - 普通共振点等权；
-    - 放量共振加权；
-    - 切实体扣分；
-    - 实体接受只记录状态，不淘汰核心线。
-    """
     L = sf(line)
+    hit = 0
+    high_touch = 0
+    upper_hit = 0
+    body_top_touch = 0
+    close_touch = 0
+    entity_cut_count = 0
+    entity_accept_count = 0
+    volume_resonance_count = 0
+    volume_entity_cut_count = 0
+    volume_entity_accept_count = 0
     if k.empty or L <= 0:
         return {"line": rd(L), "net_score": 0.0, "effective_resonance_count": 0, "line_type": "non_core"}
-
-    cols = ["high", "body_top", "body_bottom", "close", "volume"]
-    work = k[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    hi = work["high"]
-    bt = work["body_top"]
-    bb = work["body_bottom"]
-    cl = work["close"]
-    vol = work["volume"]
-
-    valid = (hi > 0) & (bt > 0) & (bb > 0)
-    vol_med = sf(vol.median()) if "volume" in k.columns else 0.0
-    is_volume_bar = valid & (vol_med > 0) & (vol >= vol_med * 1.30)
-
-    accept_mask = valid & (bb > L)
-    cut_mask = valid & (bb < L) & (L < bt)
-    touch_scope = valid & (~accept_mask) & (~cut_mask)
-
-    denom = L if L > 0 else 1.0
-    is_high = touch_scope & ((hi - L).abs() / denom <= CORE_LINE_TOL)
-    is_upper = touch_scope & (bt <= L) & (L <= hi)
-    is_body_top = touch_scope & ((bt - L).abs() / denom <= CORE_LINE_TOL)
-    is_close = touch_scope & ((cl - L).abs() / denom <= CORE_LINE_TOL)
-    hit_mask = is_high | is_upper | is_body_top | is_close
-
-    hit = int(hit_mask.sum())
-    high_touch = int(is_high.sum())
-    upper_hit = int((is_upper & (~is_body_top)).sum())
-    body_top_touch = int(is_body_top.sum())
-    close_touch = int(is_close.sum())
-    entity_cut_count = int(cut_mask.sum())
-    entity_accept_count = int(accept_mask.sum())
-    volume_resonance_count = int((hit_mask & is_volume_bar).sum())
-    volume_entity_cut_count = int((cut_mask & is_volume_bar).sum())
-    volume_entity_accept_count = int((accept_mask & is_volume_bar).sum())
-
+    vol_med = sf(k["volume"].median()) if "volume" in k.columns else 0.0
+    for _, r in k.iterrows():
+        hi, bt, bb, cl, vol = sf(r.high), sf(r.body_top), sf(r.body_bottom), sf(r.close), sf(r.volume)
+        if hi <= 0 or bt <= 0 or bb <= 0:
+            continue
+        is_volume_bar = vol_med > 0 and vol >= vol_med * 1.30
+        if bb > L:
+            entity_accept_count += 1
+            if is_volume_bar:
+                volume_entity_accept_count += 1
+            continue
+        if bb < L < bt:
+            entity_cut_count += 1
+            if is_volume_bar:
+                volume_entity_cut_count += 1
+            continue
+        is_high = near(hi, L)
+        is_upper = bool(bt <= L <= hi)
+        is_body_top = near(bt, L)
+        is_close = near(cl, L)
+        if is_high or is_upper or is_body_top or is_close:
+            hit += 1
+            high_touch += int(is_high)
+            upper_hit += int(is_upper and not is_body_top)
+            body_top_touch += int(is_body_top)
+            close_touch += int(is_close)
+            if is_volume_bar:
+                volume_resonance_count += 1
     net = hit + volume_resonance_count * 0.50 - entity_cut_count * 0.35 - volume_entity_cut_count * 0.75
     level = "核心线候选" if hit >= MIN_CORE_RESONANCE and net > 0 else "未成线"
     return {
@@ -569,6 +528,7 @@ def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
         "timeframe": f"{AGG_WINDOW}日聚合K",
         "current_state": "存在实体接受记录" if entity_accept_count else "暂无实体接受记录",
     }
+
 
 def group_by_band(scored: List[Dict[str, Any]], tol: float = CORE_LINE_BAND_TOL) -> List[List[Dict[str, Any]]]:
     xs = sorted([x for x in scored if sf(x.get("line")) > 0], key=lambda x: sf(x.get("line")))
@@ -593,28 +553,20 @@ def rank_key(x: Dict[str, Any]) -> Tuple[float, int, int, float]:
     return (sf(x.get("net_score")), int(sf(x.get("effective_resonance_count"))), int(sf(x.get("volume_resonance_count"))), -sf(x.get("line")))
 
 
-def choose_core_line(df: pd.DataFrame, code: str = "") -> Dict[str, Any]:
-    t0 = time.time()
-    diag(code, f"choose_core_line start rows={len(df) if df is not None else 0}")
+def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
     raw_k = aggregate_bars(df, AGG_WINDOW)
-    diag(code, f"after aggregate_bars raw_bars={len(raw_k) if raw_k is not None else 0} cost={fmt_seconds(time.time() - t0)}")
     if raw_k.empty or len(raw_k) < 3:
         return {"line": None, "level": "数据不足", "reason": "历史K线不足"}
     completed = raw_k.iloc[:-1].reset_index(drop=True)
     if completed.empty:
         return {"line": None, "level": "数据不足", "reason": "无已完成聚合K"}
     sources = line_candidate_sources(completed)
-    diag(code, f"after line_candidate_sources sources={len(sources)} completed_bars={len(completed)} cost={fmt_seconds(time.time() - t0)}")
     scored = []
-    total_sources = len(sources)
-    for idx, L in enumerate(sorted(sources), 1):
+    for L in sorted(sources):
         x = score_line(completed, L)
         x["source"] = sources.get(L, "")
         scored.append(x)
-        if DIAG_ENABLED and DIAG_CODE and code_of(code) == DIAG_CODE and (idx == 1 or idx % 200 == 0 or idx == total_sources):
-            diag(code, f"score_line {idx}/{total_sources} cost={fmt_seconds(time.time() - t0)}")
     scored = [x for x in scored if sf(x.get("net_score")) > 0]
-    diag(code, f"positive_scored={len(scored)} cost={fmt_seconds(time.time() - t0)}")
     if not scored:
         return {"line": None, "level": "未识别", "reason": "未识别到有效核心线"}
     band_winners = [max(g, key=rank_key) for g in group_by_band(scored)]
@@ -626,7 +578,6 @@ def choose_core_line(df: pd.DataFrame, code: str = "") -> Dict[str, Any]:
     best["top_candidates"] = top_candidates
     best["all_candidates_count"] = len(scored)
     best["excluded_current_bar"] = {k: (rd(v, 3) if isinstance(v, (int, float)) else v) for k, v in raw_k.iloc[-1].to_dict().items()}
-    diag(code, f"choose_core_line done line={best.get('line')} net={best.get('net_score')} cost={fmt_seconds(time.time() - t0)}")
     return best
 
 
@@ -692,12 +643,9 @@ def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
 
 
 def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
-    diag(code, f"screen_one_stock start name={name} rows={len(df) if df is not None else 0}")
-    core = choose_core_line(df, code)
+    core = choose_core_line(df)
     line = sf(core.get("line")) if core.get("line") is not None else 0.0
-    diag(code, f"before daily_breakout_quality line={line}")
     br = daily_breakout_quality(df, line)
-    diag(code, f"after daily_breakout_quality hit={br.get('hit')} date={br.get('date')} quality={br.get('quality')}")
     if not br.get("hit"):
         return {}
     return {
@@ -880,7 +828,6 @@ def main() -> None:
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
     print(f"progress_color_enabled={PROGRESS_COLOR}", flush=True)
-    print(f"diag_enabled={DIAG_ENABLED} diag_code={DIAG_CODE}", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
     self_check = run_self_check()
     print(f"self_check_overall_ok={self_check.get('overall_ok')}", flush=True)
