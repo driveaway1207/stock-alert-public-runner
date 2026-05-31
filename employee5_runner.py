@@ -88,7 +88,6 @@ MIN_CORE_HIT_COUNT = int(os.getenv("EMPLOYEE5_MIN_CORE_HIT_COUNT", "3"))
 LOW_VOLUME_WINDOWS = {20: 12, 60: 6, 250: 3}
 FIRST_CORE_BAND_TOL = float(os.getenv("EMPLOYEE5_FIRST_CORE_BAND_TOL", "0.015"))
 LOWER_LINE_NET_ADVANTAGE = float(os.getenv("EMPLOYEE5_LOWER_LINE_NET_ADVANTAGE", "1.25"))
-ACCEPT_FAIL_PENALTY_CAP = float(os.getenv("EMPLOYEE5_ACCEPT_FAIL_PENALTY_CAP", "4.0"))
 
 # 默认允许“补最近5个交易日”的增量修复，但绝不默认全历史重建。
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "1") != "0"
@@ -1504,20 +1503,6 @@ def entity_loss_weight(r: Any) -> float:
     return 0.6
 
 
-def accept_failure_loss_weight(r: Any) -> float:
-    """接受后又跌回的损耗：允许连续叠加，但单条线总扣分封顶。
-
-    用户口径：这种失败可以扣，但不能扣太重。
-    每根失败接受K：普通/轻微放量扣0.3，明显放量扣0.5，倍量及以上扣0.8。
-    总接受失败损耗由 ACCEPT_FAIL_PENALTY_CAP 控制，默认最多扣4分。
-    """
-    pvr = sf(r.get("prev_vol_ratio", 1.0), 1.0) if hasattr(r, "get") else 1.0
-    if pvr >= 1.8:
-        return 0.8
-    if pvr >= 1.3:
-        return 0.5
-    return 0.3
-
 def candidate_lines_from_bars(k: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     V67 第一核心压力线候选只从 high 产生。
@@ -1579,8 +1564,8 @@ def score_core_reaction_line(
     3）有效共振只看上方反应：最高价贴线、上影线打到、实体顶贴线但未切实体。
     4）最低价、下影线、实体底、收盘价不参与核心线共振计数。
     5）线进实体内部 = 切实体，扣分，不算共振。
-    6）实体整体站上线后一直没跌回 = 接受成功，不扣分，也不算共振。
-    7）实体站上线后又有效跌回 = 接受失败，扣分。
+    6）实体整体站上线 = 突破接受状态，不算共振，不扣分。
+    7）实体站上线后又有效跌回 = 只记录“接受后跌回”状态，不扣分。
     8）放量只按当前60日聚合K量相较前一根60日聚合K量，不再按前4根均量主判。
     """
     L = sf(line)
@@ -1717,23 +1702,17 @@ def score_core_reaction_line(
         is_accept = bool(bb > L)
         if is_accept:
             entity_accept += 1
-            raw_w = accept_failure_loss_weight(r)
-            if accepted_then_failed:
-                remain_cap = max(0.0, ACCEPT_FAIL_PENALTY_CAP - entity_accept_penalty)
-                w = min(raw_w, remain_cap)
-            else:
-                w = 0.0
+            # 用户最终口径：实体接受后即使后面跌回，也只记录状态，不扣分；
+            # 扣分只来自切实体。接受不是共振，也不是损耗。
+            w = 0.0
             entity_accept_penalty += w
             accept_dates.append(tag)
-            if raw_w >= 0.5:
+            if prev_vol_ratio > 1.0:
                 volume_entity_accept += 1
             ev = dict(base_row)
             ev.update({
                 "entity_loss_weight": rd(w, 3),
-                "raw_entity_loss_weight": rd(raw_w, 3),
-                "accept_fail_penalty_cap": rd(ACCEPT_FAIL_PENALTY_CAP, 3),
-                "accept_fail_cap_remaining_after": rd(max(0.0, ACCEPT_FAIL_PENALTY_CAP - entity_accept_penalty), 3),
-                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_failed_penalty_capped" if accepted_then_failed else "entity_accept",
+                "reason": "entity_accept_held_no_penalty" if accepted_and_held else "entity_accept_fell_back_no_penalty" if accepted_then_failed else "entity_accept_no_penalty",
                 "accepted_and_held": bool(accepted_and_held),
                 "accepted_then_failed": bool(accepted_then_failed),
             })
@@ -1757,7 +1736,7 @@ def score_core_reaction_line(
         except Exception:
             stage_low_volume_bar = {}
 
-    entity_loss_score = body_cut_penalty + entity_accept_penalty
+    entity_loss_score = body_cut_penalty
     gross_score = ordinary_score + volume_bonus_score
     net_score = gross_score - entity_loss_score
 
@@ -1778,13 +1757,13 @@ def score_core_reaction_line(
     if accepted_and_held and entity_accept > 0:
         current_state = "已被实体突破接受且未跌回"
     elif accepted_then_failed:
-        current_state = "突破接受后又有效跌回"
+        current_state = "实体接受后又有效跌回（不扣分）"
     elif entity_accept > 0:
         current_state = "已被实体整体接受"
     else:
         current_state = "未被实体整体接受"
 
-    clean = body_cut == 0 and entity_accept_penalty == 0
+    clean = body_cut == 0
     need_escalate = meaningful and not core_candidate
 
     downshift_tests: List[Dict[str, Any]] = []
@@ -1806,11 +1785,12 @@ def score_core_reaction_line(
             })
 
     exact_score_formula = (
-        "净分 = 有效共振数 + 放量共振加分 - 切实体扣分 - 接受失败扣分；"
+        "净分 = 有效共振数 + 放量共振加分 - 切实体扣分；"
+        "实体接受后跌回只记录状态，不扣分；"
         "有效共振只数最高价贴线、上影线打到、实体顶贴线；"
         "最低价、下影线、实体底、收盘价不参与核心线共振；"
         "放量按当前60日聚合K成交量/前一根60日聚合K成交量；"
-        "突破接受且未跌回不扣分"
+        "实体接受不扣分，接受后跌回也不扣分"
     )
 
     return {
@@ -1839,7 +1819,6 @@ def score_core_reaction_line(
         "body_cut_penalty": rd(body_cut_penalty, 3),
         "entity_accept_count": entity_accept,
         "entity_accept_penalty": rd(entity_accept_penalty, 3),
-        "accept_fail_penalty_cap": rd(ACCEPT_FAIL_PENALTY_CAP, 3),
         "entity_loss_score": rd(entity_loss_score, 3),
         "accepted_and_held": bool(accepted_and_held),
         "accepted_then_failed": bool(accepted_then_failed),
@@ -1865,7 +1844,7 @@ def score_core_reaction_line(
         "upper_extreme_pressure": rd(k.high.max()) if not k.empty else 0.0,
         "core_band_low": rd(L * (1 - TOL)),
         "core_band_high": rd(L * (1 + TOL)),
-        "confirmation_source": "v90_full_resonance_unique_coreline",
+        "confirmation_source": "v94_accept_fallback_no_penalty",
     }
 
 # 兼容旧函数名；内部已经升级为 V62 最大共振净分逻辑。
@@ -1941,7 +1920,7 @@ def choose_max_resonance_net_boundary(scored: List[Dict[str, Any]]) -> Dict[str,
         return {}
     chosen = sorted(winners, key=_score_rank_tuple, reverse=True)[0]
     chosen["core_selection_rule"] = "net_score_first_high_candidate_upper_resonance_only"
-    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选唯一核心线；先剔除净分非正候选；最终按净分优先，净分接近时再看有效共振、放量共振、实体损耗；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；突破接受且未跌回不扣分。"
+    chosen["core_selection_note"] = "从全盘60日聚合K最高价候选里选唯一核心线；先剔除净分非正候选；最终按净分优先，净分接近时再看有效共振、放量共振、实体损耗；有效共振只数最高价/上影线/实体顶；放量按当前量/前一根量；切实体扣分；实体接受不扣分，接受后跌回也不扣分。"
     return chosen
 
 
@@ -2046,7 +2025,7 @@ def find_shadow_coreline(df: pd.DataFrame, window: int, timeframe: str, raw_k_ov
             f"最高价贴线{best['high_touch_count']}次、上影线打到{best.get('upper_shadow_hit_count')}次；"
             f"放量/倍量共振{best['volume_hit_count']}次，放量加权{best.get('volume_bonus_score')}；"
             f"切实体{best['body_cut_count']}次、切实体损耗{best.get('body_cut_penalty', 0)}；"
-            f"实体接受{best.get('entity_accept_count', 0)}次、接受损耗{best.get('entity_accept_penalty', 0)}；"
+            f"实体接受{best.get('entity_accept_count', 0)}次、接受不扣分；"
             f"净分{best.get('net_score')}，状态：{best.get('current_state')}。"
         )
     elif best.get("meaningful_candidate"):
@@ -2181,7 +2160,7 @@ def _event_relation_cn(e: Dict[str, Any]) -> str:
         if e.get("accepted_and_held"):
             parts.append("突破接受且未跌回")
         elif e.get("accepted_then_failed"):
-            parts.append("突破接受后跌回")
+            parts.append("接受后跌回（不扣分）")
         else:
             parts.append("实体站上")
     return "+".join(parts) if parts else ss(e.get("reason")) or "反应"
@@ -2392,7 +2371,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> Tuple[s
         "trust_public_flat_csv": TRUST_PUBLIC_FLAT_CSV,
         "rebuild_codes": QFQ_REBUILD_CODES_RAW,
         "report_style": "limit_up_core_lines_only_clean",
-        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty - capped_failed_entity_accept_penalty; final selection requires net_score > 0 and ranks by net_score first; accepted-and-held breakthrough does not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
+        "score_formula": "net_score = effective_resonance_count + volume_bonus_score - body_cut_penalty; final selection requires net_score > 0 and ranks by net_score first; entity acceptance and fallback after acceptance do not deduct score; line inside entity is CUT, line in upper wick is RESONANCE; candidate lines only from 60d high",
     }
 
     return "\n".join(lines), payload
