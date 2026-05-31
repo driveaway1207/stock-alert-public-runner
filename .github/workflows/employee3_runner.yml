@@ -1,16 +1,31 @@
 name: 三号员工
 
+run-name: 三号员工
+
 on:
   workflow_dispatch:
     inputs:
       target_date:
-        description: "目标交易日，可空。格式：2026-05-31 或 20260531"
+        description: "目标交易日，可空；空=按北京时间自动取最近有效交易日。格式：2026-05-31 或 20260531"
         required: false
         default: ""
+        type: string
       send_telegram:
-        description: "是否发送Telegram：1发送，0不发送"
-        required: false
+        description: "是否发送Telegram"
+        required: true
         default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+      allow_baostock_fallback:
+        description: "是否允许BaoStock补拉最近K线；默认0=只读公共缓存"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 jobs:
   run:
@@ -22,17 +37,30 @@ jobs:
       PYTHONUNBUFFERED: "1"
       NO_COLOR: ""
 
+      # 目标日：同时兼容一号员工/五号员工/三号员工已有口径。
       EMPLOYEE3_TARGET_DATE: ${{ github.event.inputs.target_date }}
+      EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.target_date }}
       SELECTION_TRADE_DATE: ${{ github.event.inputs.target_date }}
-      TARGET_TRADE_DATE: ${{ github.event.inputs.target_date }}
       DATA_GATE_TARGET_DATE: ${{ github.event.inputs.target_date }}
+      TARGET_TRADE_DATE: ${{ github.event.inputs.target_date }}
+      LAST_TRADE_DAY_OVERRIDE: ${{ github.event.inputs.target_date }}
+      REQUIRED_CACHE_DATE: ${{ github.event.inputs.target_date }}
 
+      # Telegram：沿用现有 secrets 字段，不新增凭证名。
       ENABLE_TELEGRAM: ${{ github.event.inputs.send_telegram }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
+      # 缓存/进度：对齐五号员工 runner 的只读公共缓存、彩色进度条、BaoStock可选补拉思路。
       EMPLOYEE3_PROGRESS_COLOR: "1"
+      EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ github.event.inputs.allow_baostock_fallback }}
+      EMPLOYEE3_CACHE_SCAN_PROGRESS_EVERY: "500"
+      EMPLOYEE3_SCREEN_PROGRESS_EVERY: "200"
+      EMPLOYEE3_BREAKOUT_LOOKBACK_DAYS: "20"
+      EMPLOYEE3_AGG_WINDOW: "20"
+      EMPLOYEE3_CORE_LINE_TOL: "0.01"
+      EMPLOYEE3_MIN_CORE_RESONANCE: "3"
 
     steps:
       - name: 拉取仓库代码
@@ -42,6 +70,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: 恢复公共K线缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            kline_cache
+            employee5_kline_cache
+            data/kline_cache
+            cache/kline_cache
+          key: employee-kline-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            employee-kline-cache-${{ runner.os }}-
+            employee-kline-cache-
 
       - name: 安装依赖
         run: |
@@ -56,6 +97,10 @@ jobs:
         if: always()
         run: |
           echo "## 三号员工" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 目标交易日输入：${{ github.event.inputs.target_date }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Telegram：${{ github.event.inputs.send_telegram }}" >> $GITHUB_STEP_SUMMARY
+          echo "- BaoStock补拉：${{ github.event.inputs.allow_baostock_fallback }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f employee3_reports/core_line_breakout_screen.md ]; then
             cat employee3_reports/core_line_breakout_screen.md >> $GITHUB_STEP_SUMMARY
