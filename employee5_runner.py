@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线报告（V100修正版）
+"""五号员工：涨停核心线报告（V101）
 
 核心口径：
 1. 只读一号员工公共 kline_cache；默认不做全市场历史重建。
 2. 只扫描样本交易日涨停股。
 3. 核心线只用前复权 20日聚合K（月线口径）计算。
 4. 候选线来自两类锚点：20日聚合K最高价、阳线放量20日聚合K收盘价。
-5. 净分 = 有效共振数；无扣分体系；成交量不参与加减分。
-6. 报告只输出核心线摘要，不展开共振明细。
+5. 净分 = 有效共振数；无扣分体系；成交量只用于识别“阳线放量收盘价锚点”，不参与加减分。
+6. 报告默认输出最终核心线 + Top3候选线，便于核对为什么选它。
 """
 
 import json
@@ -34,7 +34,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V100_LINE_COMPARE_AUDIT"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V101_TOP3_CANDIDATES"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -418,19 +418,23 @@ def near(a: float, b: float, tol: float = TOL) -> bool:
     return b > 0 and abs(a - b) / b <= tol
 
 
-def line_candidates(k: pd.DataFrame) -> List[float]:
+def line_candidate_sources(k: pd.DataFrame) -> Dict[float, str]:
     """候选线两类来源：
     1）每根20日聚合K最高价；
     2）阳线且相较前一根20日聚合K放量时，该阳线20日聚合K收盘价。
 
     放量口径：当前20日聚合K成交量 > 前一根20日聚合K成交量。
+    成交量只用于生成第二类候选线，不参与加分或减分。
     """
-    candidates = set()
+    sources: Dict[float, set] = {}
+
+    def add(line: float, source: str) -> None:
+        if line <= 0:
+            return
+        sources.setdefault(rd(line), set()).add(source)
 
     for _, r in k.iterrows():
-        high = rd(r.get("high"))
-        if high > 0:
-            candidates.add(high)
+        add(sf(r.get("high")), "最高价")
 
     prev_volume = k.volume.shift(1) if "volume" in k.columns else pd.Series([0.0] * len(k))
     for idx, r in k.iterrows():
@@ -439,9 +443,13 @@ def line_candidates(k: pd.DataFrame) -> List[float]:
         volume = sf(r.get("volume"))
         pv = sf(prev_volume.iloc[idx] if idx < len(prev_volume) else 0.0)
         if close > open_ and volume > pv and close > 0:
-            candidates.add(rd(close))
+            add(close, "阳线放量收盘价")
 
-    return sorted(candidates)
+    return {line: "+".join(sorted(srcs)) for line, srcs in sources.items()}
+
+
+def line_candidates(k: pd.DataFrame) -> List[float]:
+    return sorted(line_candidate_sources(k))
 
 
 def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
@@ -596,12 +604,26 @@ def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
     completed = raw_k.iloc[:-1].reset_index(drop=True)
     if completed.empty:
         return {"line": None, "level": "数据不足", "text": "无已完成20日聚合K。"}
-    scored = [score_line(completed, L) for L in line_candidates(completed)]
+    sources = line_candidate_sources(completed)
+    scored = []
+    for L in sorted(sources):
+        x = score_line(completed, L)
+        x["source"] = sources.get(L, "")
+        scored.append(x)
     scored = [x for x in scored if sf(x.get("net_score")) > 0]
     if not scored:
         return {"line": None, "level": "未识别", "text": "未识别到有效核心线。"}
     band_winners = [max(g, key=rank_key) for g in group_by_band(scored)]
-    best = max(band_winners, key=rank_key)
+    ranked = sorted(band_winners, key=rank_key, reverse=True)
+    best = ranked[0]
+    best["top_candidates"] = [
+        {
+            "line": x.get("line"),
+            "resonance": x.get("effective_resonance_count"),
+            "source": x.get("source", ""),
+        }
+        for x in ranked[:3]
+    ]
     best["all_candidates_count"] = len(scored)
     best["excluded_current_bar"] = raw_k.iloc[-1].to_dict()
     return best
@@ -615,7 +637,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
         f"- 运行日期：{TARGET}",
         f"- 样本交易日：{trade_date or '无'}",
         f"- 缓存命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
-        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价、阳线放量20日聚合K收盘价；净分=有效共振数；误差±1%；不展开共振明细。",
+        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价、阳线放量20日聚合K收盘价；净分=有效共振数；误差±1%；默认展示Top3候选线。",
         "",
     ]
     if samples.empty:
@@ -630,8 +652,15 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
             lines.append(f"{pos}. {code}｜核心线：无｜{cl.get('level')}")
         else:
             lines.append(
-                f"{pos}. {code}｜核心线：{cl.get('line')}｜净分{cl.get('net_score')}｜共振{cl.get('effective_resonance_count')}｜{cl.get('current_state')}"
+                f"{pos}. {code}｜核心线：{cl.get('line')}｜净分{cl.get('net_score')}｜共振{cl.get('effective_resonance_count')}｜来源{cl.get('source', '')}｜{cl.get('current_state')}"
             )
+            top = cl.get("top_candidates") or []
+            if top:
+                brief = "；".join(
+                    f"{i}. {x.get('line')} 共振{x.get('resonance')} 来源{x.get('source', '')}"
+                    for i, x in enumerate(top, 1)
+                )
+                lines.append(f"   Top3候选线：{brief}")
         if pos == 1 or pos % CORELINE_PROGRESS_EVERY == 0 or pos == len(samples):
             progress("coreline", pos, len(samples), start, f"current={code} line={cl.get('line')}")
     lines.extend(audit_compare_lines(hist))
