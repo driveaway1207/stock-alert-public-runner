@@ -1,10 +1,10 @@
-name: Test Tushare QFQ
+name: Test Tushare QFQ V2
 
 on:
   workflow_dispatch:
 
 jobs:
-  test-tushare-qfq:
+  test-tushare-qfq-v2:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,11 +17,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip -q
           pip install tushare pandas -q
 
-      - name: Test 301360 qfq anchor
+      - name: Test 301360 qfq full-window anchor
         env:
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TUSHARE_TEST_CODE: '301360.SZ'
+          TUSHARE_TEST_START_DATE: '20240101'
+          TUSHARE_TEST_END_DATE: '20260529'
+          TUSHARE_TEST_ANCHOR_DATE: '20241008'
+          TUSHARE_EXPECTED_HIGH: '51.25'
+          TUSHARE_EXPECTED_CLOSE: '49.38'
+          TUSHARE_TOL: '0.01'
         run: |
-          python test_tushare_qfq.py
+          python test_tushare_qfq_v2.py
