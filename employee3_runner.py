@@ -7,12 +7,12 @@ from __future__ import annotations
 1）读取现有日线前复权缓存；
 2）全市场逐票计算20日聚合K核心线；
 3）筛选最近20个交易日内日K线从下往上高质量突破核心线的股票；
-4）推送只输出：股票代码、股票中文名称、核心线价位、高质量突破日期。
+4）对海选命中股票做平铺式深度筛选，输出等级、得分、状态、交易防守位、赔率和归因。
 
 约束：
 - 不改 workflow 链路，不写入生产凭证，不运行时替换函数；
 - 实体接受不淘汰核心线，只输出状态字段；
-- 当前版本只做海选，不做深度评分。
+- 当前版本在海选后直接做深度筛选；只落地日线缓存可计算字段。
 """
 
 import json
@@ -37,7 +37,7 @@ try:
 except Exception:  # pragma: no cover
     bs = None
 
-BOOT = "EMPLOYEE3_CORE_LINE_BREAKOUT_SCREEN_V1_20260531"
+BOOT = "EMPLOYEE3_CORE_LINE_BREAKOUT_DEEP_SCREEN_V2_20260531"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee3_reports"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -76,7 +76,7 @@ ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK", "0") ==
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE3_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE3_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
-PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "1") != "0" and not os.getenv("NO_COLOR")
+PROGRESS_COLOR = os.getenv("EMPLOYEE3_PROGRESS_COLOR", "0") == "1" and not os.getenv("NO_COLOR")
 PROGRESS_WIDTH = int(os.getenv("EMPLOYEE3_PROGRESS_WIDTH", "34"))
 PROGRESS_DIAG_CODE_RAW = os.getenv("EMPLOYEE3_DIAG_CODE", "")
 _m_diag_code = re.search(r"(\d{6})", str(PROGRESS_DIAG_CODE_RAW))
@@ -96,6 +96,14 @@ OUTPUT_MD = REPORT_DIR / "core_line_breakout_screen.md"
 OUTPUT_CSV = REPORT_DIR / "core_line_breakout_screen.csv"
 OUTPUT_JSON = REPORT_DIR / "core_line_breakout_screen.json"
 SELF_CHECK_JSON = REPORT_DIR / "employee3_self_check.json"
+
+# 三号员工深度筛选：只使用当前日线缓存可落地字段，不写概念分、不写伪代码。
+DEEP_DEFENSE_BUFFER_PCT = float(os.getenv("EMPLOYEE3_DEEP_DEFENSE_BUFFER_PCT", "0.015"))
+DEEP_NEAR_LINE_PCT = float(os.getenv("EMPLOYEE3_DEEP_NEAR_LINE_PCT", "0.03"))
+DEEP_OVEREXTEND_PCT = float(os.getenv("EMPLOYEE3_DEEP_OVEREXTEND_PCT", "0.18"))
+DEEP_RECENT_HOT_20D_PCT = float(os.getenv("EMPLOYEE3_DEEP_RECENT_HOT_20D_PCT", "25"))
+DEEP_TOP_REPORT_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_TOP_REPORT_LIMIT", "80"))
+DEEP_MIN_FORMAL_SCORE = float(os.getenv("EMPLOYEE3_DEEP_MIN_FORMAL_SCORE", "75"))
 
 
 def now_bj() -> datetime:
@@ -179,24 +187,29 @@ def fmt_seconds(seconds: float) -> str:
     return f"{seconds / 3600:.1f}小时"
 
 
-def stage_label(stage: str) -> str:
-    if stage == "cache":
-        return "阶段一：缓存读取"
-    if stage == "refresh":
-        return "阶段二：BaoStock补拉"
-    if stage == "screen":
-        return "阶段三：核心线海选"
-    return stage
+def progress_color_enabled() -> bool:
+    return os.getenv("EMPLOYEE3_PROGRESS_COLOR", "1") != "0" and os.getenv("NO_COLOR", "") == ""
 
 
-def stage_icon(stage: str) -> str:
+def ansi(text: str, code: str) -> str:
+    # GitHub Actions 对 ANSI 颜色支持不稳定；保留开关但进度主体不依赖它。
+    if not progress_color_enabled():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def stage_style(stage: str) -> Dict[str, Any]:
+    # 固定圆点方案：不用方块、不用复杂边框，GitHub Actions 日志最稳定。
+    # 缓存浅绿、补拉橙色、核心海选紫色、深度筛选金色。
     if stage == "cache":
-        return "📁"
+        return {"icon": "🟢", "name": "缓存读取", "dot": "🟢"}
     if stage == "refresh":
-        return "☁️"
+        return {"icon": "🟠", "name": "数据补拉", "dot": "🟠"}
     if stage == "screen":
-        return "🚀"
-    return "🟣"
+        return {"icon": "🟣", "name": "核心海选", "dot": "🟣"}
+    if stage == "deep":
+        return {"icon": "🟡", "name": "深度筛选", "dot": "🟡"}
+    return {"icon": "⚪", "name": stage, "dot": "⚪"}
 
 
 def parse_progress_extra(extra: str) -> Dict[str, str]:
@@ -208,66 +221,13 @@ def parse_progress_extra(extra: str) -> Dict[str, str]:
     return out
 
 
-def ansi(text: str, color: str = "magenta", bold: bool = True) -> str:
-    """GitHub Actions 支持 ANSI 时显示彩色；不支持时仍保持干净单行。"""
-    if not PROGRESS_COLOR:
-        return text
-    codes = {
-        "cyan": "36",
-        "blue": "34",
-        "magenta": "35",
-        "purple": "95",
-        "yellow": "33",
-        "orange": "33",
-        "green": "32",
-        "red": "31",
-        "dim": "2",
-        "white": "37",
-    }
-    if color == "dim":
-        return f"\033[2m{text}\033[0m"
-    prefix = "1;" if bold else ""
-    return f"\033[{prefix}{codes.get(color, '35')}m{text}\033[0m"
-
-
-def stage_skin(stage: str) -> Dict[str, str]:
-    # 不照搬五号员工；只借鉴“一行、短、清楚、有颜色”的节奏。
-    if stage == "cache":
-        return {"icon": "🔎", "label": "缓存读取", "color": "cyan", "metric": "命中缓存"}
-    if stage == "refresh":
-        return {"icon": "🔄", "label": "数据补拉", "color": "yellow", "metric": "已保存"}
-    if stage == "screen":
-        return {"icon": "⚡", "label": "核心线海选", "color": "purple", "metric": "命中股票"}
-    return {"icon": "▶", "label": stage_label(stage), "color": "magenta", "metric": "进度"}
-
-
-def progress_bar(pct: float, width: int = PROGRESS_WIDTH, color: str = "purple") -> str:
-    width = max(18, min(width, 38))
-    ratio = max(0.0, min(100.0, pct)) / 100.0
-    filled = int(round(width * ratio))
+def circle_bar(pct: float, stage: str, width: int = PROGRESS_WIDTH) -> str:
+    width = max(12, min(width, 36))
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(width * pct / 100.0))
     filled = max(0, min(width, filled))
-    if filled <= 0:
-        return ansi("░" * width, "dim", False)
-    full = "█" * filled
-    empty = "░" * (width - filled)
-
-    # 渐变感：同一条进度内用亮色 + 主色 + 淡色三段；GitHub 支持 ANSI 时会比普通单色更有层次。
-    if color == "cyan":
-        a, b, c = "cyan", "blue", "purple"
-    elif color == "yellow":
-        a, b, c = "yellow", "orange", "magenta"
-    elif color == "purple":
-        a, b, c = "purple", "magenta", "cyan"
-    else:
-        a, b, c = color, color, color
-
-    n1 = max(0, min(filled, filled // 3))
-    n2 = max(0, min(filled - n1, filled // 3))
-    n3 = max(0, filled - n1 - n2)
-    bar = ansi("█" * n1, a) + ansi("█" * n2, b) + ansi("█" * n3, c)
-    if empty:
-        bar += ansi(empty, "dim", False)
-    return bar
+    dot = stage_style(stage)["dot"]
+    return dot * filled + "⚪" * (width - filled)
 
 
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
@@ -278,34 +238,28 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     eta = (total - done) / speed if speed > 0 else 0.0
     pct = min(max(done / total, 0.0), 1.0) * 100.0
     info = parse_progress_extra(extra)
-    skin = stage_skin(stage)
+    style = stage_style(stage)
 
-    current = info.get("current", "") or "-"
+    current = info.get("current", "-") or "-"
     hit = info.get("hit", "0")
     bad = info.get("bad", "0")
     short = info.get("short", "0")
     saved = info.get("saved", "0")
     failed = info.get("failed", "0")
 
+    bar = circle_bar(pct, stage)
     if stage == "cache":
-        tail = f"{skin['metric']} {hit}｜坏文件 {bad}｜数据过短 {short}"
+        tail = f"命中{hit}｜坏{bad}｜短{short}｜当前{current}"
     elif stage == "refresh":
-        tail = f"{skin['metric']} {saved}｜失败 {failed}"
-    elif stage == "screen":
-        tail = f"{skin['metric']} {hit}"
+        tail = f"保存{saved}｜失败{failed}｜当前{current}"
+    elif stage in {"screen", "deep"}:
+        tail = f"命中{hit}｜当前{current}"
     else:
         tail = extra
 
-    head = ansi(f"{skin['icon']} {skin['label']}", skin["color"])
-    bar = progress_bar(pct, color=skin["color"])
     msg = (
-        f"{head} {bar} "
-        f"{ansi(f'{pct:5.1f}%', skin['color'])}｜"
-        f"已处理 {done:,}/{total:,}只｜"
-        f"速度 {speed:.2f}只/秒｜"
-        f"已用 {fmt_seconds(elapsed)}｜"
-        f"剩余 {fmt_seconds(eta)}｜"
-        f"当前 {current}｜{tail}"
+        f"{style['icon']} {style['name']} {bar} {pct:5.1f}%｜"
+        f"已处理{done:,}/{total:,}｜速度{speed:.2f}只/秒｜已用{fmt_seconds(elapsed)}｜剩余{fmt_seconds(eta)}｜{tail}"
     )
     print(msg, flush=True)
 
@@ -832,18 +786,338 @@ def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
     return best
 
 
+
+def clamp(x: Any, lo: float = 0.0, hi: float = 100.0) -> float:
+    v = sf(x)
+    if math.isnan(v) or math.isinf(v):
+        v = 0.0
+    return max(lo, min(hi, v))
+
+
+def pct_change(a: float, b: float) -> float:
+    return (a / b - 1.0) * 100.0 if b and b > 0 else 0.0
+
+
+def kline_features(r: Any, prev_close: float = 0.0, line: float = 0.0) -> Dict[str, float]:
+    open_ = sf(getattr(r, "open", 0.0)) if hasattr(r, "open") else sf(r.get("open", 0.0))
+    high = sf(getattr(r, "high", 0.0)) if hasattr(r, "high") else sf(r.get("high", 0.0))
+    low = sf(getattr(r, "low", 0.0)) if hasattr(r, "low") else sf(r.get("low", 0.0))
+    close = sf(getattr(r, "close", 0.0)) if hasattr(r, "close") else sf(r.get("close", 0.0))
+    rng = max(high - low, 1e-9)
+    body_top = max(open_, close)
+    body_bottom = min(open_, close)
+    body_abs = abs(close - open_)
+    body_ratio = body_abs / rng
+    close_pos = (close - low) / rng
+    upper_shadow_ratio = (high - body_top) / rng
+    lower_shadow_ratio = (body_bottom - low) / rng
+    body_pct = body_abs / max(prev_close, 1e-9) if prev_close > 0 else 0.0
+    entity_above_line_ratio = 0.0
+    if line > 0 and body_abs > 0:
+        entity_above_line_ratio = max(0.0, body_top - max(body_bottom, line)) / body_abs
+    return {
+        "open": rd(open_), "high": rd(high), "low": rd(low), "close": rd(close),
+        "body_ratio": rd(body_ratio), "close_pos": rd(close_pos),
+        "upper_shadow_ratio": rd(upper_shadow_ratio), "lower_shadow_ratio": rd(lower_shadow_ratio),
+        "body_pct": rd(body_pct), "entity_above_line_ratio": rd(entity_above_line_ratio),
+    }
+
+
+def deep_grade(score: float) -> str:
+    s = sf(score)
+    if s >= 88:
+        return "S"
+    if s >= 78:
+        return "A"
+    if s >= 68:
+        return "B"
+    if s >= 58:
+        return "C"
+    return "D"
+
+
+def action_by_grade_state(grade: str, state: str, risk_flags: List[str]) -> str:
+    if grade in {"S", "A"} and not any("失败" in x or "过远" in x for x in risk_flags):
+        if "回踩确认" in state:
+            return "优先深看｜回踩承接型"
+        if "接受" in state:
+            return "优先深看｜线上接受型"
+        return "优先深看"
+    if grade == "B":
+        return "观察等待｜需要二次确认"
+    if "失败" in state:
+        return "剔除｜跌回核心线下"
+    if "过远" in state:
+        return "降级｜突破过远不追"
+    return "低优先级观察"
+
+
+def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, core: Dict[str, Any], br: Dict[str, Any]) -> Dict[str, Any]:
+    d = normalize_hist(df)
+    L = sf(line)
+    empty = {
+        "deep_score": 0.0, "deep_grade": "D", "deep_state": "数据不足", "trade_action": "剔除｜数据不足",
+        "deep_positive_reasons": "", "deep_negative_reasons": "数据不足", "risk_flags": "数据不足",
+    }
+    if d.empty or L <= 0 or not br.get("hit"):
+        return empty
+
+    d = d.reset_index(drop=True)
+    br_date = ss(br.get("date"))
+    bidx_list = d.index[d["date"].astype(str) == br_date].tolist()
+    if not bidx_list:
+        return {**empty, "deep_negative_reasons": "找不到突破日期", "risk_flags": "突破日期缺失"}
+    bidx = int(bidx_list[-1])
+    if bidx <= 0 or bidx >= len(d):
+        return {**empty, "deep_negative_reasons": "突破位置异常", "risk_flags": "突破位置异常"}
+
+    last = d.iloc[-1]
+    prev = d.iloc[bidx - 1]
+    b = d.iloc[bidx]
+    post = d.iloc[bidx:].reset_index(drop=True)
+    before = d.iloc[max(0, bidx - 260):bidx].reset_index(drop=True)
+    recent20 = d.tail(20).reset_index(drop=True)
+    recent10 = d.tail(10).reset_index(drop=True)
+    recent5 = d.tail(5).reset_index(drop=True)
+
+    last_close = sf(last.close)
+    last_high = sf(last.high)
+    last_low = sf(last.low)
+    days_since = len(d) - 1 - bidx
+    distance_line_pct = pct_change(last_close, L)
+    current_above_line = last_close >= L * (1.0 + BREAK_CLOSE_ABOVE_PCT)
+    below_close_count = int((post["close"] < L * (1.0 - 0.003)).sum())
+    last3_below_count = int((post.tail(3)["close"] < L * (1.0 - 0.003)).sum())
+    min_post_close_pct = pct_change(sf(post["close"].min()), L)
+    min_post_low_pct = pct_change(sf(post["low"].min()), L)
+    max_post_high = sf(post["high"].max())
+    drawdown_from_post_high_pct = pct_change(last_close, max_post_high) if max_post_high > 0 else 0.0
+    pullback_touched_line = bool((post["low"] <= L * (1.0 + DEEP_NEAR_LINE_PCT)).any())
+    pullback_close_not_broken = bool((post["close"] >= L * (1.0 - 0.008)).all())
+    near_line_now = abs(distance_line_pct) <= DEEP_NEAR_LINE_PCT * 100.0
+    overextended = distance_line_pct >= DEEP_OVEREXTEND_PCT * 100.0
+
+    prev_close = sf(prev.close)
+    bfeat = kline_features(b, prev_close=prev_close, line=L)
+    last_feat = kline_features(last, prev_close=sf(d.iloc[-2].close) if len(d) >= 2 else 0.0, line=L)
+    median_vol_before20 = sf(before.tail(20)["volume"].median()) if not before.empty else 0.0
+    breakout_vol = sf(b.volume)
+    breakout_volume_ratio = breakout_vol / median_vol_before20 if median_vol_before20 > 0 else 0.0
+
+    recent20_pct = pct_change(last_close, sf(recent20.iloc[0].close)) if len(recent20) >= 2 else 0.0
+    recent10_pct = pct_change(last_close, sf(recent10.iloc[0].close)) if len(recent10) >= 2 else 0.0
+    recent5_pct = pct_change(last_close, sf(recent5.iloc[0].close)) if len(recent5) >= 2 else 0.0
+    recent20_max_close = sf(recent20["close"].max()) if not recent20.empty else last_close
+    recent20_drawdown_pct = pct_change(last_close, recent20_max_close) if recent20_max_close > 0 else 0.0
+
+    defense_price = L * (1.0 - DEEP_DEFENSE_BUFFER_PCT)
+    risk_pct = pct_change(last_close, defense_price) if defense_price > 0 else 0.0
+    prior_high_250 = sf(before.tail(250)["high"].max()) if not before.empty else 0.0
+    recent_high_120 = sf(d.tail(120)["high"].max()) if len(d) else 0.0
+    if prior_high_250 > last_close * 1.02:
+        target_price = prior_high_250
+        target_type = "前250日压力"
+    elif recent_high_120 > last_close * 1.02:
+        target_price = recent_high_120
+        target_type = "近120日压力"
+    else:
+        target_price = last_close * 1.15
+        target_type = "无近端压力按15%空间估算"
+    space_pct = max(0.0, pct_change(target_price, last_close))
+    rr = space_pct / risk_pct if risk_pct > 0 else 0.0
+
+    if last_close < L * (1.0 - 0.012) or last3_below_count >= 2:
+        state = "跌回线下/突破失败"
+    elif overextended:
+        state = "突破过远/追高风险"
+    elif pullback_touched_line and pullback_close_not_broken and current_above_line and days_since >= 2:
+        state = "回踩确认/线附近承接"
+    elif current_above_line and below_close_count == 0 and days_since >= 2:
+        state = "突破后接受"
+    elif near_line_now and last_close >= L * (1.0 - 0.008):
+        state = "线附近震荡"
+    elif current_above_line:
+        state = "线上观察"
+    else:
+        state = "突破后未确认"
+
+    pos: List[str] = []
+    neg: List[str] = []
+    risk_flags: List[str] = []
+
+    core_res = int(sf(core.get("effective_resonance_count")))
+    core_vol_res = int(sf(core.get("volume_resonance_count")))
+    core_cut = int(sf(core.get("entity_cut_count")))
+    core_vol_cut = int(sf(core.get("volume_entity_cut_count")))
+    core_entity_accept = int(sf(core.get("entity_accept_count")))
+    core_score = clamp(core_res * 2.8 + core_vol_res * 1.6 + min(core_entity_accept, 8) * 0.25 - core_cut * 0.45 - core_vol_cut * 0.9, 0, 18)
+    if core_res >= 5:
+        pos.append(f"核心线共振{core_res}次")
+    if core_vol_res > 0:
+        pos.append(f"带量共振{core_vol_res}次")
+    if core_cut >= 6:
+        neg.append(f"核心线切实体偏多{core_cut}次")
+        risk_flags.append("核心线切实体偏多")
+
+    k_score = 0.0
+    k_score += 4.0 if sf(bfeat.get("entity_above_line_ratio")) >= 0.70 else 2.5 if sf(bfeat.get("entity_above_line_ratio")) >= 0.45 else 1.0
+    k_score += 4.0 if sf(bfeat.get("close_pos")) >= 0.80 else 2.8 if sf(bfeat.get("close_pos")) >= 0.65 else 1.0
+    k_score += 3.0 if sf(bfeat.get("upper_shadow_ratio")) <= 0.18 else 2.0 if sf(bfeat.get("upper_shadow_ratio")) <= 0.35 else 0.5
+    k_score += 3.0 if sf(bfeat.get("body_ratio")) >= 0.45 else 2.0 if sf(bfeat.get("body_ratio")) >= 0.25 else 0.5
+    k_score += 2.0 if sf(bfeat.get("body_pct")) >= 0.015 else 1.0 if sf(bfeat.get("body_pct")) >= 0.005 else 0.0
+    k_score += 2.0 if sf(br.get("pct_chg")) >= 3.0 else 1.0 if sf(br.get("pct_chg")) >= 1.0 else 0.0
+    k_score = clamp(k_score, 0, 18)
+    if sf(bfeat.get("entity_above_line_ratio")) >= 0.5:
+        pos.append("突破K实体有效站上核心线")
+    if sf(bfeat.get("upper_shadow_ratio")) > 0.35:
+        neg.append("突破K上影偏长")
+        risk_flags.append("突破上影风险")
+
+    state_score_map = {
+        "回踩确认/线附近承接": 22.0,
+        "突破后接受": 20.0,
+        "线附近震荡": 16.0,
+        "线上观察": 14.0,
+        "突破后未确认": 8.0,
+        "突破过远/追高风险": 7.0,
+        "跌回线下/突破失败": 0.0,
+    }
+    state_score = state_score_map.get(state, 8.0)
+    if state in {"回踩确认/线附近承接", "突破后接受", "线附近震荡"}:
+        pos.append(state)
+    if "失败" in state:
+        neg.append("突破后跌回核心线下")
+        risk_flags.append("突破失败")
+    if "过远" in state:
+        neg.append(f"当前距核心线{distance_line_pct:.1f}%偏远")
+        risk_flags.append("突破过远")
+
+    position_score = 0.0
+    position_score += 5.0 if risk_pct <= 6.0 else 3.5 if risk_pct <= 10.0 else 1.0 if risk_pct <= 15.0 else 0.0
+    position_score += 5.0 if rr >= 2.0 else 3.0 if rr >= 1.3 else 1.0 if rr >= 0.8 else 0.0
+    position_score += 4.0 if space_pct >= 15.0 else 2.5 if space_pct >= 8.0 else 0.5
+    position_score += 4.0 if 0.0 <= distance_line_pct <= 8.0 else 2.0 if -1.0 <= distance_line_pct < 0.0 or 8.0 < distance_line_pct <= 15.0 else 0.5
+    position_score = clamp(position_score, 0, 18)
+    if risk_pct <= 10.0:
+        pos.append(f"距离防守位{risk_pct:.1f}%可控")
+    else:
+        neg.append(f"距离防守位{risk_pct:.1f}%偏远")
+        risk_flags.append("防守距离偏远")
+    if rr >= 1.3:
+        pos.append(f"估算赔率{rr:.2f}")
+    else:
+        neg.append(f"估算赔率{rr:.2f}不足")
+
+    volume_heat_score = 0.0
+    volume_heat_score += 5.0 if 1.2 <= breakout_volume_ratio <= 3.2 else 3.0 if 0.8 <= breakout_volume_ratio < 1.2 or 3.2 < breakout_volume_ratio <= 5.0 else 1.0
+    volume_heat_score += 3.0 if -5.0 <= recent5_pct <= 12.0 else 1.0
+    volume_heat_score += 3.0 if recent20_pct <= DEEP_RECENT_HOT_20D_PCT else 0.5
+    volume_heat_score += 3.0 if recent20_drawdown_pct >= -12.0 else 1.0
+    volume_heat_score = clamp(volume_heat_score, 0, 14)
+    if 1.2 <= breakout_volume_ratio <= 3.2:
+        pos.append(f"突破量能健康{breakout_volume_ratio:.2f}倍")
+    elif breakout_volume_ratio > 5.0:
+        neg.append(f"突破量能过大{breakout_volume_ratio:.2f}倍")
+        risk_flags.append("爆量风险")
+    if recent20_pct > DEEP_RECENT_HOT_20D_PCT:
+        neg.append(f"近20日涨幅{recent20_pct:.1f}%偏热")
+        risk_flags.append("短线过热")
+
+    risk_score = 10.0
+    risk_score -= min(5.0, below_close_count * 1.2)
+    risk_score -= 2.0 if min_post_close_pct < -2.0 else 0.0
+    risk_score -= 1.5 if sf(last_feat.get("upper_shadow_ratio")) > 0.45 else 0.0
+    risk_score -= 1.5 if drawdown_from_post_high_pct < -12.0 else 0.0
+    risk_score = clamp(risk_score, 0, 10)
+    if below_close_count > 0:
+        neg.append(f"突破后收盘跌回线下{below_close_count}次")
+    if drawdown_from_post_high_pct < -12.0:
+        neg.append(f"突破后回撤{drawdown_from_post_high_pct:.1f}%偏深")
+        risk_flags.append("突破后回撤偏深")
+
+    total = clamp(core_score + k_score + state_score + position_score + volume_heat_score + risk_score, 0, 100)
+    grade = deep_grade(total)
+    action = action_by_grade_state(grade, state, risk_flags)
+    if total >= DEEP_MIN_FORMAL_SCORE:
+        pool = "深度候选"
+    elif total >= 65:
+        pool = "观察候选"
+    else:
+        pool = "低优先级"
+
+    return {
+        "deep_score": rd(total, 2),
+        "deep_grade": grade,
+        "deep_state": state,
+        "trade_action": action,
+        "deep_pool": pool,
+        "deep_positive_reasons": "；".join(pos[:6]) or "无明显加分项",
+        "deep_negative_reasons": "；".join(neg[:6]) or "暂无明显扣分项",
+        "risk_flags": "；".join(risk_flags[:6]) or "无",
+        "days_since_breakout": int(days_since),
+        "current_close": rd(last_close, 3),
+        "distance_line_pct": rd(distance_line_pct, 2),
+        "defense_price": rd(defense_price, 3),
+        "defense_distance_pct": rd(risk_pct, 2),
+        "target_price": rd(target_price, 3),
+        "target_type": target_type,
+        "space_pct": rd(space_pct, 2),
+        "rr_estimate": rd(rr, 2),
+        "breakout_volume_ratio": rd(breakout_volume_ratio, 2),
+        "breakout_entity_above_line_ratio": rd(sf(bfeat.get("entity_above_line_ratio")), 3),
+        "breakout_close_pos": rd(sf(bfeat.get("close_pos")), 3),
+        "breakout_upper_shadow_ratio": rd(sf(bfeat.get("upper_shadow_ratio")), 3),
+        "min_post_close_pct": rd(min_post_close_pct, 2),
+        "min_post_low_pct": rd(min_post_low_pct, 2),
+        "recent5_pct": rd(recent5_pct, 2),
+        "recent10_pct": rd(recent10_pct, 2),
+        "recent20_pct": rd(recent20_pct, 2),
+        "post_drawdown_pct": rd(drawdown_from_post_high_pct, 2),
+        "score_core_line": rd(core_score, 2),
+        "score_breakout_k": rd(k_score, 2),
+        "score_post_state": rd(state_score, 2),
+        "score_position_rr": rd(position_score, 2),
+        "score_volume_heat": rd(volume_heat_score, 2),
+        "score_risk_control": rd(risk_score, 2),
+    }
+
+
 def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
     core = choose_core_line(df)
     line = sf(core.get("line")) if core.get("line") is not None else 0.0
     br = daily_breakout_quality(df, line)
     if not br.get("hit"):
         return {}
-    return {
+    deep = deep_status_and_score(code, name, df, line, core, br)
+    row = {
         "股票代码": code,
         "股票中文名称": name or code,
         "核心线价位": rd(line, 3),
         "高质量突破日期": br.get("date", ""),
-        # 以下字段只进CSV/JSON审计，不进Telegram正文。
+        "深度等级": deep.get("deep_grade", "D"),
+        "深度得分": deep.get("deep_score", 0),
+        "当前状态": deep.get("deep_state", ""),
+        "操作建议": deep.get("trade_action", ""),
+        "候选池": deep.get("deep_pool", ""),
+        "加分原因": deep.get("deep_positive_reasons", ""),
+        "扣分原因": deep.get("deep_negative_reasons", ""),
+        "风险标签": deep.get("risk_flags", ""),
+        "当前收盘": deep.get("current_close", 0),
+        "距核心线%": deep.get("distance_line_pct", 0),
+        "交易防守位": deep.get("defense_price", 0),
+        "防守距离%": deep.get("defense_distance_pct", 0),
+        "目标/压力价": deep.get("target_price", 0),
+        "上方空间%": deep.get("space_pct", 0),
+        "估算赔率": deep.get("rr_estimate", 0),
+        "突破量比": deep.get("breakout_volume_ratio", 0),
+        "突破实体在线上比例": deep.get("breakout_entity_above_line_ratio", 0),
+        "突破收盘位置": deep.get("breakout_close_pos", 0),
+        "突破上影比例": deep.get("breakout_upper_shadow_ratio", 0),
+        "突破后天数": deep.get("days_since_breakout", 0),
+        "近5日涨幅%": deep.get("recent5_pct", 0),
+        "近10日涨幅%": deep.get("recent10_pct", 0),
+        "近20日涨幅%": deep.get("recent20_pct", 0),
+        # 以下字段进CSV/JSON审计。
         "core_line_score": core.get("net_score", 0),
         "core_line_resonance_count": core.get("effective_resonance_count", 0),
         "core_line_volume_resonance_count": core.get("volume_resonance_count", 0),
@@ -852,13 +1126,17 @@ def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
         "breakout_quality": br.get("quality", 0),
         "breakout_close": br.get("close", 0),
     }
+    for key, val in deep.items():
+        if key not in row:
+            row[key] = val
+    return row
 
 
 def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     items = list(hist.items())
     start = time.time()
-    progress("screen", 0, len(items), start, "start")
+    progress("deep", 0, len(items), start, "start")
     for i, (code, df) in enumerate(items, 1):
         name = names.get(code, "")
         if not name and df is not None and not df.empty and "name" in df.columns:
@@ -871,29 +1149,25 @@ def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dic
         except Exception as exc:
             print(f"screen failed code={code} err={str(exc)[:120]}", flush=True)
         if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
-            progress("screen", i, len(items), start, f"hit={len(rows)} current={code}")
-    rows = sorted(rows, key=lambda x: (ss(x.get("高质量突破日期")), sf(x.get("breakout_quality")), sf(x.get("core_line_score"))), reverse=True)
+            progress("deep", i, len(items), start, f"hit={len(rows)} current={code}")
+    rows = sorted(rows, key=lambda x: (sf(x.get("深度得分")), ss(x.get("高质量突破日期")), sf(x.get("breakout_quality")), sf(x.get("core_line_score"))), reverse=True)
     return rows
 
 
-def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
-    lines = [
-        "# 三号员工：核心线突破海选",
-        f"- 运行日期：{TARGET}",
-        f"- 使用K线截止日：{TARGET_DASH or '未知'}",
-        f"- 缓存命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
-        f"- 海选口径：{AGG_WINDOW}日聚合K核心线；最近{BREAKOUT_LOOKBACK_DAYS}个交易日内日K收盘高质量突破核心线",
-        "",
-    ]
-    if not rows:
-        lines.append("无符合条件股票。")
-        return "\n".join(lines)
-    lines.append("| 股票代码 | 股票中文名称 | 核心线价位 | 高质量突破日期 |")
-    lines.append("|---|---|---:|---|")
-    for r in rows:
-        lines.append(f"| {r.get('股票代码','')} | {r.get('股票中文名称','')} | {r.get('核心线价位',0)} | {r.get('高质量突破日期','')} |")
-    return "\n".join(lines)
 
+def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
+    if not rows:
+        return "无符合条件股票。"
+    show_rows = rows[:max(1, DEEP_TOP_REPORT_LIMIT)]
+    lines = [
+        "| 股票代码 | 股票简称 | 核心线价格 | 最终评级 |",
+        "|---|---|---:|---|",
+    ]
+    for r in show_rows:
+        lines.append(
+            f"| {r.get('股票代码','')} | {r.get('股票中文名称','')} | {r.get('核心线价位',0)} | {r.get('深度等级','')} |"
+        )
+    return "\n".join(lines)
 
 def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], self_check: Dict[str, Any]) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -908,6 +1182,8 @@ def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], sel
             "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
             "core_line_tol": CORE_LINE_TOL,
             "min_core_resonance": MIN_CORE_RESONANCE,
+            "deep_min_formal_score": DEEP_MIN_FORMAL_SCORE,
+            "deep_defense_buffer_pct": DEEP_DEFENSE_BUFFER_PCT,
         },
         "stat": stat,
         "self_check": self_check,
@@ -998,9 +1274,10 @@ def run_self_check() -> Dict[str, Any]:
     try:
         row = screen_one_stock("000001", "测试股", synthetic_coreline_df())
         md = build_report([row] if row else [], {"cache_hit": 1, "cache_files": 1})
-        required = ["股票代码", "股票中文名称", "核心线价位", "高质量突破日期"]
-        ok = all(x in row for x in required) and "core_line_score" not in md and "breakout_quality" not in md
-        checks.append({"round": 3, "name": "输出字段与报告口径", "ok": bool(ok), "detail": {"row_keys": list(row.keys()), "md_preview": md[:300]}})
+        required = ["股票代码", "股票中文名称", "核心线价位", "深度等级"]
+        report_has_only_simple_columns = ("| 股票代码 | 股票简称 | 核心线价格 | 最终评级 |" in md and "深度得分" not in md and "当前状态" not in md and "操作建议" not in md and "core_line_score" not in md)
+        ok = all(x in row for x in required) and report_has_only_simple_columns
+        checks.append({"round": 3, "name": "深度筛选输出字段与报告口径", "ok": bool(ok), "detail": {"row_keys": list(row.keys()), "md_preview": md[:500]}})
         ok_all = ok_all and bool(ok)
     except Exception as exc:
         checks.append({"round": 3, "name": "输出字段与报告口径", "ok": False, "error": str(exc)})
@@ -1017,7 +1294,7 @@ def main() -> None:
     print(BOOT, flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
-    print(f"progress_color_enabled={PROGRESS_COLOR} 紫色赛博仪表盘=True", flush=True)
+    print(f"progress_color_enabled={PROGRESS_COLOR} 圆点进度=True", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
     self_check = run_self_check()
     print(f"self_check_overall_ok={self_check.get('overall_ok')}", flush=True)
