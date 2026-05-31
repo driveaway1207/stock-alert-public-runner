@@ -167,6 +167,7 @@ def bs_code(code: str) -> str:
     return c
 
 
+
 def fmt_seconds(seconds: float) -> str:
     if seconds <= 0 or math.isnan(seconds) or math.isinf(seconds):
         return "0秒"
@@ -179,12 +180,22 @@ def fmt_seconds(seconds: float) -> str:
 
 def stage_label(stage: str) -> str:
     if stage == "cache":
-        return "缓存读取"
+        return "阶段一：缓存读取"
     if stage == "refresh":
-        return "BaoStock补拉"
+        return "阶段二：BaoStock补拉"
     if stage == "screen":
-        return "核心线海选"
+        return "阶段三：核心线海选"
     return stage
+
+
+def stage_icon(stage: str) -> str:
+    if stage == "cache":
+        return "📁"
+    if stage == "refresh":
+        return "☁️"
+    if stage == "screen":
+        return "🚀"
+    return "🟣"
 
 
 def parse_progress_extra(extra: str) -> Dict[str, str]:
@@ -197,16 +208,20 @@ def parse_progress_extra(extra: str) -> Dict[str, str]:
 
 
 def purple(text: str) -> str:
-    if not PROGRESS_COLOR:
-        return text
-    return f"[95m{text}[0m"
+    # GitHub Actions 对 ANSI 色彩支持不稳定；这里不用 ANSI，直接用紫色符号保证可见。
+    return text
 
 
 def progress_bar(pct: float, width: int = PROGRESS_WIDTH) -> str:
-    width = max(12, min(width, 60))
+    width = max(18, min(width, 48))
     filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
     filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
+    return "🟪" * filled + "⬛" * (width - filled)
+
+
+def mini_bar(pct: float, width: int = 12) -> str:
+    filled = int(round(width * max(0.0, min(100.0, pct)) / 100.0))
+    return "🟣" * filled + "⚫" * (width - filled)
 
 
 def progress(stage: str, done: int, total: int, start: float, extra: str = "") -> None:
@@ -217,40 +232,42 @@ def progress(stage: str, done: int, total: int, start: float, extra: str = "") -
     eta = (total - done) / speed if speed > 0 else 0.0
     pct = min(max(done / total, 0.0), 1.0) * 100.0
     label = stage_label(stage)
+    icon = stage_icon(stage)
     info = parse_progress_extra(extra)
 
-    current = info.get("current", "")
-    hit = info.get("hit", "")
-    bad = info.get("bad", "")
-    short = info.get("short", "")
-    saved = info.get("saved", "")
-    failed = info.get("failed", "")
+    current = info.get("current", "") or "-"
+    hit = info.get("hit", "0")
+    bad = info.get("bad", "0")
+    short = info.get("short", "0")
+    saved = info.get("saved", "0")
+    failed = info.get("failed", "0")
 
-    top = "╔" + "═" * 76 + "╗"
-    mid = "╠" + "═" * 76 + "╣"
-    bottom = "╚" + "═" * 76 + "╝"
     bar = progress_bar(pct)
+    pulse = mini_bar(pct)
+    border = "✨" + "═" * 74 + "✨"
+    divider = "🌌" + "─" * 74 + "🌌"
 
     lines = [
-        top,
-        f"║ 🟪 三号员工 · {label:<12} {pct:6.2f}%".ljust(77) + "║",
-        f"║ {bar}".ljust(77) + "║",
-        mid,
-        f"║ 已处理：{done:,}/{total:,}   处理速度：{speed:.2f}只/秒   已用时间：{fmt_seconds(elapsed)}".ljust(77) + "║",
-        f"║ 剩余时间：{fmt_seconds(eta)}   当前股票：{current or '-'}".ljust(77) + "║",
+        border,
+        f"┃ 🛸 三号员工 · 核心线突破海选 V1        {icon} {label}        {pct:6.2f}% ┃",
+        f"┃ {bar} ┃",
+        f"┃ 进度脉冲：{pulse} ┃",
+        divider,
+        f"┃ 🧮 已处理：{done:,} / {total:,} 只     ⚡ 处理速度：{speed:.2f} 只/秒     ⏱ 已用时间：{fmt_seconds(elapsed)} ┃",
+        f"┃ ⌛ 剩余时间：{fmt_seconds(eta)}        🎯 当前股票：{current} ┃",
     ]
 
     if stage == "cache":
-        lines.append(f"║ 命中缓存：{hit or '0'}   坏文件：{bad or '0'}   数据过短：{short or '0'}".ljust(77) + "║")
+        lines.append(f"┃ 💾 命中缓存：{hit}      🧨 坏文件：{bad}      📉 数据过短：{short} ┃")
     elif stage == "refresh":
-        lines.append(f"║ 已保存：{saved or '0'}   失败：{failed or '0'}".ljust(77) + "║")
+        lines.append(f"┃ ☁️ 已保存：{saved}      ⚠️ 失败：{failed} ┃")
     elif stage == "screen":
-        lines.append(f"║ 命中股票：{hit or '0'}".ljust(77) + "║")
+        lines.append(f"┃ 🎯 命中股票：{hit}      🔎 状态：正在扫描核心线突破候选 ┃")
     elif extra:
-        lines.append(f"║ 备注：{extra}".ljust(77) + "║")
+        lines.append(f"┃ 📝 备注：{extra} ┃")
 
-    lines.append(bottom)
-    print(purple("\n".join(lines)), flush=True)
+    lines.append("🚀" + "═" * 74 + "🚀")
+    print("\n".join(lines), flush=True)
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -898,7 +915,7 @@ def main() -> None:
     print(BOOT, flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
-    print(f"progress_color_enabled={PROGRESS_COLOR} 紫色仪表盘进度=True", flush=True)
+    print(f"progress_color_enabled={PROGRESS_COLOR} 紫色赛博仪表盘=True", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
     self_check = run_self_check()
     print(f"self_check_overall_ok={self_check.get('overall_ok')}", flush=True)
