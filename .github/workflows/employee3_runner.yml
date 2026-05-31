@@ -1,130 +1,71 @@
-name: 三号员工核心线海选
+name: 三号员工
 
 on:
   workflow_dispatch:
     inputs:
       target_date:
-        description: "目标交易日，可填 2026-05-29 或 20260529；留空则按脚本自动判断"
+        description: "目标交易日，可空。格式：2026-05-31 或 20260531"
         required: false
         default: ""
-      enable_telegram:
-        description: "是否发送 Telegram：1=发送，0=只生成报告"
+      send_telegram:
+        description: "是否发送Telegram：1发送，0不发送"
         required: false
         default: "1"
-      max_stocks:
-        description: "最多扫描股票数；0=全市场"
-        required: false
-        default: "0"
-      allow_baostock_fallback:
-        description: "是否允许 BaoStock 近期补拉：1=允许，0=只读缓存"
-        required: false
-        default: "0"
-  schedule:
-    # UTC 09:45 = 北京时间 17:45，避开A股收盘后缓存更新窗口；可按仓库实际数据更新时间调整。
-    - cron: "45 9 * * 1-5"
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: employee3-core-line-breakout-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
-  employee3-core-line-breakout:
-    name: 三号员工｜核心线海选
+  run:
+    name: 三号员工
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     env:
-      # Telegram：沿用一号/五号员工常用密钥名，不新造凭证字段。
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      NO_COLOR: ""
+
+      EMPLOYEE3_TARGET_DATE: ${{ github.event.inputs.target_date }}
+      SELECTION_TRADE_DATE: ${{ github.event.inputs.target_date }}
+      TARGET_TRADE_DATE: ${{ github.event.inputs.target_date }}
+      DATA_GATE_TARGET_DATE: ${{ github.event.inputs.target_date }}
+
+      ENABLE_TELEGRAM: ${{ github.event.inputs.send_telegram }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      ENABLE_TELEGRAM: ${{ github.event.inputs.enable_telegram || '1' }}
 
-      # 目标日：兼容一号员工和五号员工变量名；脚本内部统一裁剪到该日及以前。
-      EMPLOYEE3_TARGET_DATE: ${{ github.event.inputs.target_date || vars.EMPLOYEE3_TARGET_DATE || '' }}
-      EMPLOYEE5_TARGET_DATE: ${{ github.event.inputs.target_date || vars.EMPLOYEE5_TARGET_DATE || '' }}
-      SELECTION_TRADE_DATE: ${{ github.event.inputs.target_date || vars.SELECTION_TRADE_DATE || '' }}
-      DATA_GATE_TARGET_DATE: ${{ github.event.inputs.target_date || vars.DATA_GATE_TARGET_DATE || '' }}
-      TARGET_TRADE_DATE: ${{ github.event.inputs.target_date || vars.TARGET_TRADE_DATE || '' }}
-      LAST_TRADE_DAY_OVERRIDE: ${{ github.event.inputs.target_date || vars.LAST_TRADE_DAY_OVERRIDE || '' }}
-      REQUIRED_CACHE_DATE: ${{ github.event.inputs.target_date || vars.REQUIRED_CACHE_DATE || '' }}
-
-      # 缓存：兼容一号员工扁平/分层缓存与五号员工公共缓存。
-      CACHE_DIR: kline_cache
-      FULL_HISTORY_CACHE_DIR: kline_cache
-      MODEL_UNIVERSE_FILE: ${{ vars.MODEL_UNIVERSE_FILE || '' }}
-      EMPLOYEE3_EXTRA_CACHE_DIRS: "employee5_kline_cache:data/kline_cache:cache/kline_cache"
-
-      # 三号员工海选口径。这里只是参数，不是包装模块。
-      EMPLOYEE3_AGG_WINDOW: "20"
-      EMPLOYEE3_BREAKOUT_LOOKBACK_DAYS: "20"
-      EMPLOYEE3_CORE_LINE_TOL: "0.01"
-      EMPLOYEE3_CORE_LINE_BAND_TOL: "0.015"
-      EMPLOYEE3_MIN_CORE_RESONANCE: "3"
-      EMPLOYEE3_MIN_CACHE_ROWS: "80"
-      EMPLOYEE3_CACHE_SCAN_PROGRESS_EVERY: "500"
-      EMPLOYEE3_SCREEN_PROGRESS_EVERY: "200"
       EMPLOYEE3_PROGRESS_COLOR: "1"
-      MAX_STOCKS: ${{ github.event.inputs.max_stocks || '0' }}
-
-      # 默认只读缓存；显式手动开启才允许 BaoStock 近期补拉，避免影响其他员工生产缓存。
-      EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ github.event.inputs.allow_baostock_fallback || '0' }}
-      EMPLOYEE3_RECENT_REFRESH_DAYS: "10"
-      EMPLOYEE3_RECENT_REFRESH_BUDGET_MIN: "35"
-      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: 拉取仓库代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python 运行环境
+      - name: 配置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: 安装三号员工依赖
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests baostock
+          pip install pandas numpy requests baostock
 
-      - name: 打印运行口径
-        run: |
-          echo "三号员工核心线海选启动"
-          echo "目标交易日：${EMPLOYEE3_TARGET_DATE:-${DATA_GATE_TARGET_DATE:-自动判断}}"
-          echo "缓存目录：$CACHE_DIR / $FULL_HISTORY_CACHE_DIR / $EMPLOYEE3_EXTRA_CACHE_DIRS"
-          echo "Telegram发送：$ENABLE_TELEGRAM"
-          echo "最多扫描：$MAX_STOCKS"
-          echo "BaoStock补拉：$EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK"
-
-      - name: 运行三号员工核心线海选
+      - name: 运行三号员工
         run: |
           python employee3_runner.py
 
-      - name: 写入 GitHub 摘要框
+      - name: 写入运行摘要
         if: always()
         run: |
-          echo "# 三号员工核心线海选" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 三号员工" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f employee3_reports/core_line_breakout_screen.md ]; then
-            cat employee3_reports/core_line_breakout_screen.md >> "$GITHUB_STEP_SUMMARY"
+            cat employee3_reports/core_line_breakout_screen.md >> $GITHUB_STEP_SUMMARY
           else
-            echo "未找到 employee3_reports/core_line_breakout_screen.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "未生成三号员工报告。" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: 上传三号员工报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 三号员工核心线海选报告
-          path: |
-            employee3_reports/core_line_breakout_screen.md
-            employee3_reports/core_line_breakout_screen.csv
-            employee3_reports/core_line_breakout_screen.json
-            employee3_reports/employee3_self_check.json
-          if-no-files-found: warn
-          retention-days: 30
+          name: 三号员工报告
+          path: employee3_reports/
