@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线报告（V101）
+"""五号员工：涨停核心线报告（V102）
 
 核心口径：
 1. 只读一号员工公共 kline_cache；默认不做全市场历史重建。
@@ -9,7 +9,7 @@ from __future__ import annotations
 3. 核心线只用前复权 20日聚合K（月线口径）计算。
 4. 候选线来自两类锚点：20日聚合K最高价、阳线放量20日聚合K收盘价。
 5. 净分 = 有效共振数；无扣分体系；成交量只用于识别“阳线放量收盘价锚点”，不参与加减分。
-6. 报告默认输出最终核心线 + Top3候选线，便于核对为什么选它。
+6. 报告默认输出最终核心线 + Top5候选线，并给每条候选线的命中类型和命中日期短表，避免只看总数。
 """
 
 import json
@@ -34,7 +34,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V101_TOP3_CANDIDATES"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V102_CANDIDATE_EVIDENCE"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -54,6 +54,8 @@ LIMIT_UP_TOL = float(os.getenv("EMPLOYEE5_LIMIT_UP_TOL", "0.15"))
 MIN_ROWS = int(os.getenv("EMPLOYEE5_MIN_CACHE_ROWS", "22"))
 MIN_CORE_HIT_COUNT = int(os.getenv("EMPLOYEE5_MIN_CORE_HIT_COUNT", "3"))
 CORELINE_PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_CORELINE_PROGRESS_EVERY", "10"))
+TOP_CANDIDATE_SHOW = int(os.getenv("EMPLOYEE5_TOP_CANDIDATE_SHOW", "5"))
+CANDIDATE_HIT_DETAIL_LIMIT = int(os.getenv("EMPLOYEE5_CANDIDATE_HIT_DETAIL_LIMIT", "18"))
 CACHE_SCAN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE5_CACHE_SCAN_PROGRESS_EVERY", "500"))
 ALLOW_BAOSTOCK_FALLBACK = os.getenv("EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK", "0") == "1"
 INCREMENTAL_REFRESH = os.getenv("EMPLOYEE5_INCREMENTAL_REFRESH", "1") != "0"
@@ -452,31 +454,69 @@ def line_candidates(k: pd.DataFrame) -> List[float]:
     return sorted(line_candidate_sources(k))
 
 
-def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
+def score_line(k: pd.DataFrame, line: float, keep_events: bool = False) -> Dict[str, Any]:
+    """给一条候选线统计有效共振。
+
+    有效共振只统计：最高价贴线、上影线打到、实体顶贴线、收盘贴线。
+    实体内部穿线、实体整体在线上方只记录，不计共振、不扣分。
+    一根20日聚合K最多贡献1个共振。
+    """
     L = sf(line)
     hit = high_touch = upper_hit = body_top_touch = close_touch = inside_neutral = accept_count = 0
+    hit_events: List[Dict[str, Any]] = []
+    inside_events: List[Dict[str, Any]] = []
+    accept_events: List[Dict[str, Any]] = []
+
     for _, r in k.iterrows():
         hi, bt, bb, cl = sf(r.high), sf(r.body_top), sf(r.body_bottom), sf(r.close)
         if L <= 0 or hi <= 0 or bt <= 0 or bb <= 0:
             continue
+        event_base = {
+            "start": ss(r.start),
+            "end": ss(r.end),
+            "open": rd(r.open),
+            "high": rd(r.high),
+            "low": rd(r.low),
+            "close": rd(r.close),
+            "body_bottom": rd(bb),
+            "body_top": rd(bt),
+        }
+
         if bb > L:
             accept_count += 1
+            if keep_events:
+                accept_events.append({**event_base, "reason": "实体整体在线上方"})
             continue
         if bb < L < bt:
             inside_neutral += 1
+            if keep_events:
+                inside_events.append({**event_base, "reason": "线在实体内部"})
             continue
+
+        reasons: List[str] = []
         is_high = near(hi, L)
         is_upper = bool(bt <= L <= hi * (1 + TOL))
         is_body_top = near(bt, L)
         is_close = near(cl, L)
-        if is_high or is_upper or is_body_top or is_close:
+        if is_high:
+            reasons.append("最高价贴线")
+        if is_upper:
+            reasons.append("上影线打到")
+        if is_body_top:
+            reasons.append("实体顶贴线")
+        if is_close:
+            reasons.append("收盘贴线")
+        if reasons:
             hit += 1
             high_touch += int(is_high)
             upper_hit += int(is_upper and not is_body_top)
             body_top_touch += int(is_body_top)
             close_touch += int(is_close)
+            if keep_events:
+                hit_events.append({**event_base, "reason": "/".join(reasons)})
+
     level = "核心线候选" if hit >= MIN_CORE_HIT_COUNT else "未成线"
-    return {
+    out = {
         "line": rd(L),
         "score": hit,
         "net_score": hit,
@@ -492,6 +532,35 @@ def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
         "timeframe": "20日聚合K",
         "current_state": "实体接受记录" if accept_count else "未被实体整体接受",
     }
+    if keep_events:
+        out["hit_events"] = hit_events
+        out["inside_events"] = inside_events
+        out["accept_events"] = accept_events
+    return out
+
+
+def compact_event(e: Dict[str, Any]) -> str:
+    return f"{e.get('start')}~{e.get('end')}({e.get('reason')})"
+
+
+def candidate_brief(x: Dict[str, Any], detail_limit: int = CANDIDATE_HIT_DETAIL_LIMIT) -> str:
+    events = x.get("hit_events") or []
+    shown = events[:max(0, detail_limit)]
+    date_part = "；".join(compact_event(e) for e in shown)
+    if len(events) > len(shown):
+        date_part += f"；...共{len(events)}条"
+    parts = [
+        f"{x.get('line')} 共振{x.get('effective_resonance_count')} 来源{x.get('source', '')}",
+        f"高点{x.get('high_touch_count', 0)}",
+        f"上影{x.get('upper_shadow_hit_count', 0)}",
+        f"实顶{x.get('body_top_touch_count', 0)}",
+        f"收盘{x.get('close_touch_count', 0)}",
+        f"实体内{x.get('entity_inside_neutral_count', 0)}",
+        f"接受{x.get('entity_accept_count', 0)}",
+    ]
+    if date_part:
+        parts.append(f"命中：{date_part}")
+    return "｜".join(parts)
 
 
 def parse_audit_lines(raw: str) -> List[float]:
@@ -616,14 +685,13 @@ def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
     band_winners = [max(g, key=rank_key) for g in group_by_band(scored)]
     ranked = sorted(band_winners, key=rank_key, reverse=True)
     best = ranked[0]
-    best["top_candidates"] = [
-        {
-            "line": x.get("line"),
-            "resonance": x.get("effective_resonance_count"),
-            "source": x.get("source", ""),
-        }
-        for x in ranked[:3]
-    ]
+    detailed_top = []
+    for x in ranked[:TOP_CANDIDATE_SHOW]:
+        d = score_line(completed, sf(x.get("line")), keep_events=True)
+        d["source"] = x.get("source", "")
+        detailed_top.append(d)
+    best = detailed_top[0] if detailed_top else best
+    best["top_candidates"] = detailed_top
     best["all_candidates_count"] = len(scored)
     best["excluded_current_bar"] = raw_k.iloc[-1].to_dict()
     return best
@@ -637,7 +705,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
         f"- 运行日期：{TARGET}",
         f"- 样本交易日：{trade_date or '无'}",
         f"- 缓存命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
-        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价、阳线放量20日聚合K收盘价；净分=有效共振数；误差±1%；默认展示Top3候选线。",
+        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价、阳线放量20日聚合K收盘价；净分=有效共振数；误差±1%；默认展示Top5候选线和每条候选线的命中短表。",
         "",
     ]
     if samples.empty:
@@ -656,11 +724,9 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
             )
             top = cl.get("top_candidates") or []
             if top:
-                brief = "；".join(
-                    f"{i}. {x.get('line')} 共振{x.get('resonance')} 来源{x.get('source', '')}"
-                    for i, x in enumerate(top, 1)
-                )
-                lines.append(f"   Top3候选线：{brief}")
+                lines.append("   Top候选线证据：")
+                for i, x in enumerate(top, 1):
+                    lines.append(f"   {i}. {candidate_brief(x)}")
         if pos == 1 or pos % CORELINE_PROGRESS_EVERY == 0 or pos == len(samples):
             progress("coreline", pos, len(samples), start, f"current={code} line={cl.get('line')}")
     lines.extend(audit_compare_lines(hist))
