@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线报告（V98-clean）
+"""五号员工：涨停核心线报告（V99）
 
 核心口径：
 1. 只读一号员工公共 kline_cache；默认不做全市场历史重建。
 2. 只扫描样本交易日涨停股。
 3. 核心线只用前复权 20日聚合K（月线口径）计算。
-4. 候选线只来自 20日聚合K最高价。
+4. 候选线来自两类锚点：20日聚合K最高价、阳线放量20日聚合K收盘价。
 5. 净分 = 有效共振数；无扣分体系；成交量不参与加减分。
 6. 报告只输出核心线摘要，不展开共振明细。
 """
@@ -34,7 +34,7 @@ try:
 except Exception:
     bs = None
 
-BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V98_CLEAN_MONTHLY_CORE"
+BOOT = "EMPLOYEE5_PUBLIC_BOOT_20260530_V100_LINE_COMPARE_AUDIT"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee5_reports"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -60,6 +60,8 @@ INCREMENTAL_REFRESH = os.getenv("EMPLOYEE5_INCREMENTAL_REFRESH", "1") != "0"
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE5_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE5_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
+AUDIT_CODE = code_of(os.getenv("EMPLOYEE5_AUDIT_CODE", ""))
+AUDIT_LINES_RAW = os.getenv("EMPLOYEE5_AUDIT_LINES", "").strip()
 
 
 def _now_bj() -> datetime:
@@ -417,8 +419,29 @@ def near(a: float, b: float, tol: float = TOL) -> bool:
 
 
 def line_candidates(k: pd.DataFrame) -> List[float]:
-    xs = sorted({rd(x) for x in k.high.tolist() if sf(x) > 0})
-    return xs
+    """候选线两类来源：
+    1）每根20日聚合K最高价；
+    2）阳线且相较前一根20日聚合K放量时，该阳线20日聚合K收盘价。
+
+    放量口径：当前20日聚合K成交量 > 前一根20日聚合K成交量。
+    """
+    candidates = set()
+
+    for _, r in k.iterrows():
+        high = rd(r.get("high"))
+        if high > 0:
+            candidates.add(high)
+
+    prev_volume = k.volume.shift(1) if "volume" in k.columns else pd.Series([0.0] * len(k))
+    for idx, r in k.iterrows():
+        close = sf(r.get("close"))
+        open_ = sf(r.get("open"))
+        volume = sf(r.get("volume"))
+        pv = sf(prev_volume.iloc[idx] if idx < len(prev_volume) else 0.0)
+        if close > open_ and volume > pv and close > 0:
+            candidates.add(rd(close))
+
+    return sorted(candidates)
 
 
 def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
@@ -461,6 +484,86 @@ def score_line(k: pd.DataFrame, line: float) -> Dict[str, Any]:
         "timeframe": "20日聚合K",
         "current_state": "实体接受记录" if accept_count else "未被实体整体接受",
     }
+
+
+def parse_audit_lines(raw: str) -> List[float]:
+    out: List[float] = []
+    for part in re.split(r"[,;，；\s]+", raw or ""):
+        v = sf(part, 0.0)
+        if v > 0:
+            out.append(rd(v, 4))
+    return out
+
+
+def audit_line_events(k: pd.DataFrame, line: float) -> Dict[str, Any]:
+    """用当前正式共振口径，逐根列出指定线命中明细。"""
+    L = sf(line)
+    hits: List[str] = []
+    inside: List[str] = []
+    accepts: List[str] = []
+    for _, r in k.iterrows():
+        hi, bt, bb, cl = sf(r.high), sf(r.body_top), sf(r.body_bottom), sf(r.close)
+        if L <= 0 or hi <= 0 or bt <= 0 or bb <= 0:
+            continue
+        base = (
+            f"{r.start}~{r.end}｜开{rd(r.open)} 高{rd(r.high)} 低{rd(r.low)} 收{rd(r.close)}｜"
+            f"实体{rd(bb)}~{rd(bt)}"
+        )
+        if bb > L:
+            accepts.append(base + "｜实体整体在线上方，记接受，不算共振")
+            continue
+        if bb < L < bt:
+            inside.append(base + "｜线在实体内部，不算共振")
+            continue
+        reasons: List[str] = []
+        if near(hi, L):
+            reasons.append("最高价贴线")
+        if bt <= L <= hi * (1 + TOL):
+            reasons.append("上影线打到")
+        if near(bt, L):
+            reasons.append("实体顶贴线")
+        if near(cl, L):
+            reasons.append("收盘贴线")
+        if reasons:
+            hits.append(base + "｜" + "/".join(reasons))
+    return {
+        "line": rd(L, 4),
+        "hit_count": len(hits),
+        "inside_count": len(inside),
+        "accept_count": len(accepts),
+        "hits": hits,
+        "inside": inside,
+        "accepts": accepts,
+    }
+
+
+def audit_compare_lines(hist: Dict[str, pd.DataFrame]) -> List[str]:
+    if not AUDIT_CODE or not AUDIT_LINES_RAW:
+        return []
+    df = hist.get(AUDIT_CODE, pd.DataFrame())
+    if df is None or df.empty:
+        return ["", "## 指定线对比审计", f"- {AUDIT_CODE}：缓存缺失或数据为空。"]
+    raw_k = aggregate_bars(df, 20)
+    if raw_k.empty or len(raw_k) < 3:
+        return ["", "## 指定线对比审计", f"- {AUDIT_CODE}：20日聚合K不足。"]
+    completed = raw_k.iloc[:-1].reset_index(drop=True)
+    out = ["", "## 指定线对比审计", f"- 股票：{AUDIT_CODE}", f"- 口径：20日聚合K，误差±{rd(TOL * 100, 2)}%，一根K最多算一次共振。"]
+    for line in parse_audit_lines(AUDIT_LINES_RAW):
+        info = audit_line_events(completed, line)
+        out += [
+            "",
+            f"### 线位 {info['line']}｜共振 {info['hit_count']}｜实体内部 {info['inside_count']}｜实体接受 {info['accept_count']}",
+            "共振明细：",
+        ]
+        if info["hits"]:
+            out += [f"{i}. {x}" for i, x in enumerate(info["hits"], 1)]
+        else:
+            out.append("- 无")
+        out.append("实体内部穿线（不算共振）：")
+        out += [f"{i}. {x}" for i, x in enumerate(info["inside"], 1)] if info["inside"] else ["- 无"]
+        out.append("实体接受（不算共振）：")
+        out += [f"{i}. {x}" for i, x in enumerate(info["accepts"], 1)] if info["accepts"] else ["- 无"]
+    return out
 
 
 def group_by_band(scored: List[Dict[str, Any]], tol: float = 0.015) -> List[List[Dict[str, Any]]]:
@@ -512,7 +615,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
         f"- 运行日期：{TARGET}",
         f"- 样本交易日：{trade_date or '无'}",
         f"- 缓存命中：{stat.get('cache_hit', 0)} / 文件数 {stat.get('cache_files', 0)}",
-        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价；净分=有效共振数；误差±1%；不展开共振明细。",
+        "- 核心线口径：20日聚合K；候选线取20日聚合K最高价、阳线放量20日聚合K收盘价；净分=有效共振数；误差±1%；不展开共振明细。",
         "",
     ]
     if samples.empty:
@@ -531,6 +634,7 @@ def build_report(hist: Dict[str, pd.DataFrame], stat: Dict[str, Any]) -> str:
             )
         if pos == 1 or pos % CORELINE_PROGRESS_EVERY == 0 or pos == len(samples):
             progress("coreline", pos, len(samples), start, f"current={code} line={cl.get('line')}")
+    lines.extend(audit_compare_lines(hist))
     return "\n".join(lines)
 
 
