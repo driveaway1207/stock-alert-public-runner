@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""五号员工：涨停核心线报告（V99）
+"""五号员工：涨停核心线报告（V100修正版）
 
 核心口径：
 1. 只读一号员工公共 kline_cache；默认不做全市场历史重建。
@@ -60,10 +60,6 @@ INCREMENTAL_REFRESH = os.getenv("EMPLOYEE5_INCREMENTAL_REFRESH", "1") != "0"
 RECENT_REFRESH_DAYS = int(os.getenv("EMPLOYEE5_RECENT_REFRESH_DAYS", "10"))
 RECENT_REFRESH_BUDGET_MIN = float(os.getenv("EMPLOYEE5_RECENT_REFRESH_BUDGET_MIN", "35"))
 QFQ_ADJUSTFLAG = "2"
-AUDIT_CODE = code_of(os.getenv("EMPLOYEE5_AUDIT_CODE", ""))
-AUDIT_LINES_RAW = os.getenv("EMPLOYEE5_AUDIT_LINES", "").strip()
-
-
 def _now_bj() -> datetime:
     return datetime.now(timezone(timedelta(hours=8)))
 
@@ -123,6 +119,10 @@ def code_of(x: Any) -> str:
     s = x.stem if isinstance(x, Path) else ss(x)
     m = re.search(r"(\d{6})", s)
     return m.group(1) if m else ""
+
+
+AUDIT_CODE = code_of(os.getenv("EMPLOYEE5_AUDIT_CODE", ""))
+AUDIT_LINES_RAW = os.getenv("EMPLOYEE5_AUDIT_LINES", "").strip()
 
 
 def valid_code(code: str) -> bool:
