@@ -102,8 +102,14 @@ DEEP_DEFENSE_BUFFER_PCT = float(os.getenv("EMPLOYEE3_DEEP_DEFENSE_BUFFER_PCT", "
 DEEP_NEAR_LINE_PCT = float(os.getenv("EMPLOYEE3_DEEP_NEAR_LINE_PCT", "0.03"))
 DEEP_OVEREXTEND_PCT = float(os.getenv("EMPLOYEE3_DEEP_OVEREXTEND_PCT", "0.18"))
 DEEP_RECENT_HOT_20D_PCT = float(os.getenv("EMPLOYEE3_DEEP_RECENT_HOT_20D_PCT", "25"))
-DEEP_TOP_REPORT_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_TOP_REPORT_LIMIT", "80"))
-DEEP_MIN_FORMAL_SCORE = float(os.getenv("EMPLOYEE3_DEEP_MIN_FORMAL_SCORE", "75"))
+
+# 正式报告口径：海选层只负责召回，不输出评级；所有海选命中票全部完成深度评分。
+# Telegram/Markdown 只输出最终深度精选 TopN；A级/S级不足时，用未硬剔除的最高分票补足并明示。
+# 全量海选与全量深度字段继续写入 CSV/JSON，便于审计和复盘。
+DEEP_FINAL_PICK_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_FINAL_PICK_LIMIT", os.getenv("EMPLOYEE3_DEEP_TOP_REPORT_LIMIT", "3")))
+DEEP_WATCH_REPORT_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_WATCH_REPORT_LIMIT", "3"))
+DEEP_MIN_FORMAL_SCORE = float(os.getenv("EMPLOYEE3_DEEP_MIN_FORMAL_SCORE", "78"))
+DEEP_FORMAL_GRADES = tuple(x.strip() for x in os.getenv("EMPLOYEE3_DEEP_FORMAL_GRADES", "S,A").split(",") if x.strip())
 
 
 def now_bj() -> datetime:
@@ -1655,18 +1661,138 @@ def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dic
 
 
 
+def grade_rank(grade: Any) -> int:
+    order = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    return order.get(ss(grade).upper(), 0)
+
+
+def is_hard_rejected_row(r: Dict[str, Any]) -> bool:
+    action = ss(r.get("操作建议") or r.get("trade_action"))
+    pool = ss(r.get("候选池") or r.get("deep_pool"))
+    if "剔除" in action or pool == "剔除":
+        return True
+    if bool(r.get("risk_block")):
+        return True
+    if "突破失败" in action or "硬风险" in action:
+        return True
+    return False
+
+
+def featured_sort_key(r: Dict[str, Any]) -> Tuple[int, float, int, float, float, float]:
+    grade = ss(r.get("深度等级") or r.get("deep_grade")).upper()
+    score = sf(r.get("深度得分") or r.get("deep_score"))
+    trade_ok = 1 if bool(r.get("trade_pricing_ok")) else 0
+    primary = sf(r.get("primary_setup_score"))
+    rr = sf(r.get("估算赔率") or r.get("rr_estimate"))
+    risk_penalty = sf(r.get("risk_penalty"))
+    return (grade_rank(grade), score, trade_ok, primary, rr, -risk_penalty)
+
+
+def select_featured_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """海选只召回；深度层统一评级；最终报告最多输出TopN。
+
+    规则：
+    1）所有海选命中票已经在 screen_one_stock 内完成深度评分；
+    2）正式精选优先取 S/A 且分数达到 DEEP_MIN_FORMAL_SCORE 的票；
+    3）S/A 不足 TopN 时，不再空着，也不再推海选大表，而是从未硬剔除票里按深度质量补足；
+    4）硬剔除票包括突破失败跌回线下、风险阻断、交易动作明确剔除等，不允许补位。
+    """
+    limit = max(1, DEEP_FINAL_PICK_LIMIT)
+    usable = sorted([r for r in rows if not is_hard_rejected_row(r)], key=featured_sort_key, reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    seen = set()
+
+    formal = [
+        r for r in usable
+        if ss(r.get("深度等级") or r.get("deep_grade")).upper() in DEEP_FORMAL_GRADES
+        and sf(r.get("深度得分") or r.get("deep_score")) >= DEEP_MIN_FORMAL_SCORE
+    ]
+    for r in formal:
+        code = ss(r.get("股票代码"))
+        if code and code not in seen:
+            r["最终入选性质"] = "A级/S级深度精选"
+            selected.append(r)
+            seen.add(code)
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < limit:
+        for r in usable:
+            code = ss(r.get("股票代码"))
+            if code and code not in seen:
+                r["最终入选性质"] = "A级不足补位｜相对最优观察"
+                selected.append(r)
+                seen.add(code)
+            if len(selected) >= limit:
+                break
+
+    watch = [r for r in usable if ss(r.get("股票代码")) not in seen]
+    watch = watch[:max(0, DEEP_WATCH_REPORT_LIMIT)]
+    return selected, watch
+
+
+def selected_quality_note(selected: List[Dict[str, Any]]) -> str:
+    if not selected:
+        return "今日无可用精选：海选命中票全部被硬风险或突破失败剔除。"
+    formal_count = sum(
+        1 for r in selected
+        if ss(r.get("最终入选性质")) == "A级/S级深度精选"
+    )
+    if formal_count == len(selected):
+        return "今日精选质量：A级/S级满足数量，直接输出深度精选。"
+    if formal_count > 0:
+        return f"今日精选质量：A级/S级仅{formal_count}只，其余按深度得分补入相对最优观察，不伪装成A级。"
+    return "今日精选质量：无A级/S级，输出未硬剔除票中的相对最优Top3，只能按观察处理。"
+
+def short_reason(text: Any, max_len: int = 90) -> str:
+    s = ss(text).replace("\n", "；")
+    return s if len(s) <= max_len else s[:max_len - 1] + "…"
+
+
 def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
     if not rows:
-        return "无符合条件股票。"
-    show_rows = rows[:max(1, DEEP_TOP_REPORT_LIMIT)]
+        return "三号员工：今日无核心线突破海选命中。"
+
+    selected, watch = select_featured_rows(rows)
+    hard_rejected = len([r for r in rows if is_hard_rejected_row(r)])
     lines = [
-        "| 股票代码 | 股票简称 | 核心线价格 | 最终评级 |",
-        "|---|---|---:|---|",
+        f"三号员工最终深度精选｜{TARGET_DASH or TARGET}",
+        f"海选召回：{len(rows)}只；完成深度评分：{len(rows)}只；硬剔除：{hard_rejected}只；最终输出：{len(selected)}只。",
+        selected_quality_note(selected),
+        "全量海选/深度评分明细已写入 CSV/JSON 审计，Telegram 只推最终精选，不再推海选大表。",
+        "",
     ]
-    for r in show_rows:
-        lines.append(
-            f"| {r.get('股票代码','')} | {r.get('股票中文名称','')} | {r.get('核心线价位',0)} | {r.get('深度等级','')} |"
-        )
+
+    if selected:
+        lines.extend([
+            "| 排名 | 股票代码 | 股票简称 | 核心线 | 突破日 | 深度评级 | 得分 | 入选性质 | 状态 | 防守位 | RR | 操作 |",
+            "|---:|---|---|---:|---|---|---:|---|---|---:|---:|---|",
+        ])
+        for idx, r in enumerate(selected, 1):
+            lines.append(
+                f"| {idx} | {r.get('股票代码','')} | {r.get('股票中文名称','')} | {r.get('核心线价位',0)} | "
+                f"{r.get('高质量突破日期','')} | {r.get('深度等级','')} | {r.get('深度得分',0)} | "
+                f"{short_reason(r.get('最终入选性质',''), 22)} | {short_reason(r.get('当前状态',''), 18)} | "
+                f"{r.get('交易防守位',0)} | {r.get('估算赔率',0)} | {short_reason(r.get('操作建议',''), 24)} |"
+            )
+        lines.append("")
+        for idx, r in enumerate(selected, 1):
+            lines.extend([
+                f"{idx}）{r.get('股票代码','')} {r.get('股票中文名称','')}",
+                f"- 入选性质：{ss(r.get('最终入选性质')) or '深度精选'}",
+                f"- 选中原因：{short_reason(r.get('加分原因',''), 180)}",
+                f"- 扣分/风险：{short_reason(r.get('扣分原因',''), 160)}",
+                f"- 确认条件：{short_reason(r.get('confirm_condition',''), 120)}",
+                f"- 放弃条件：{short_reason(r.get('giveup_condition',''), 120)}",
+            ])
+    else:
+        lines.append("今日无三号员工最终精选：所有海选票均被硬风险、突破失败或数据异常剔除。")
+
+    # 未入前三的深度候选不进入 Telegram/Markdown 正文，避免把海选/观察池误当精选。
+    # 全量 rows 已写入 CSV/JSON，复盘时看审计文件。
+
+
     return "\n".join(lines)
 
 def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], self_check: Dict[str, Any]) -> None:
@@ -1770,17 +1896,40 @@ def run_self_check() -> Dict[str, Any]:
         checks.append({"round": 2, "name": "20日内日K高质量突破确认", "ok": False, "error": str(exc)})
         ok_all = False
 
-    # 第3遍：推送字段必须只有四列，审计字段只能进CSV/JSON。
+    # 第3遍：海选层不评级，所有命中票深度评分后，最终只输出Top3；A级不足时用最高分补足。
     try:
-        row = screen_one_stock("000001", "测试股", synthetic_coreline_df())
-        md = build_report([row] if row else [], {"cache_hit": 1, "cache_files": 1})
-        required = ["股票代码", "股票中文名称", "核心线价位", "深度等级"]
-        report_has_only_simple_columns = ("| 股票代码 | 股票简称 | 核心线价格 | 最终评级 |" in md and "深度得分" not in md and "当前状态" not in md and "操作建议" not in md and "core_line_score" not in md)
-        ok = all(x in row for x in required) and report_has_only_simple_columns
-        checks.append({"round": 3, "name": "深度筛选输出字段与报告口径", "ok": bool(ok), "detail": {"row_keys": list(row.keys()), "md_preview": md[:500]}})
+        base = {
+            "股票中文名称": "测试股", "核心线价位": 10.0, "高质量突破日期": "2024-05-01",
+            "当前状态": "供应吸收后突破", "交易防守位": 9.8, "估算赔率": 2.0,
+            "操作建议": "正式买入池｜轻仓/确认候选", "候选池": "正式候选",
+            "加分原因": "测试加分", "扣分原因": "暂无明显扣分项",
+            "confirm_condition": "站稳核心线", "giveup_condition": "跌破防守位",
+            "trade_pricing_ok": True, "primary_setup_score": 42, "risk_penalty": 0,
+        }
+        fake_rows = []
+        for i, (code, grade, score) in enumerate([
+            ("000001", "A", 81), ("000002", "S", 90), ("000003", "B", 72),
+            ("000004", "C", 62), ("000005", "D", 40),
+        ], 1):
+            r = dict(base)
+            r.update({"股票代码": code, "股票中文名称": f"测试股{i}", "深度等级": grade, "深度得分": score})
+            fake_rows.append(r)
+        md = build_report(fake_rows, {"cache_hit": 5, "cache_files": 5})
+        ok = (
+            "三号员工最终深度精选" in md
+            and "海选召回：5只" in md
+            and "完成深度评分：5只" in md
+            and "| 1 | 000002" in md
+            and "| 2 | 000001" in md
+            and "| 3 | 000003" in md
+            and "000004" not in md
+            and "000005" not in md
+            and "Telegram 只推最终精选" in md
+        )
+        checks.append({"round": 3, "name": "海选不评级，全量深评后只推Top3", "ok": bool(ok), "detail": {"md_preview": md[:900]}})
         ok_all = ok_all and bool(ok)
     except Exception as exc:
-        checks.append({"round": 3, "name": "输出字段与报告口径", "ok": False, "error": str(exc)})
+        checks.append({"round": 3, "name": "海选不评级，全量深评后只推Top3", "ok": False, "error": str(exc)})
         ok_all = False
 
     return {
