@@ -543,21 +543,44 @@ def build_data_gate_header_lines():
     return lines
 
 
-def format_seconds(seconds):
+PROGRESS_COLOR_RESET = "\033[0m"
+PROGRESS_COLOR_BLUE = "\033[94m"
+PROGRESS_COLOR_CYAN = "\033[96m"
+PROGRESS_COLOR_GREEN = "\033[92m"
+PROGRESS_COLOR_YELLOW = "\033[93m"
+PROGRESS_COLOR_RED = "\033[91m"
+PROGRESS_COLOR_MAGENTA = "\033[95m"
+PROGRESS_COLOR_DIM = "\033[90m"
+
+
+def _progress_color(pct):
     try:
-        seconds = int(max(0, seconds))
+        pct = float(pct)
     except Exception:
-        return "未知"
+        pct = 0.0
+    if pct < 25:
+        return PROGRESS_COLOR_BLUE
+    if pct < 50:
+        return PROGRESS_COLOR_CYAN
+    if pct < 75:
+        return PROGRESS_COLOR_YELLOW
+    if pct < 95:
+        return PROGRESS_COLOR_GREEN
+    return PROGRESS_COLOR_MAGENTA
 
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
 
-    if h > 0:
-        return f"{h}小时{m}分{s}秒"
-    if m > 0:
-        return f"{m}分{s}秒"
-    return f"{s}秒"
+def build_progress_bar(done, total, width=24):
+    try:
+        done = int(max(0, done))
+        total = int(max(0, total))
+    except Exception:
+        done, total = 0, 0
+    pct = done / total if total else 0.0
+    pct = max(0.0, min(1.0, pct))
+    filled = int(round(width * pct))
+    color = _progress_color(pct * 100)
+    bar = "█" * filled + "░" * max(0, width - filled)
+    return f"{color}{bar}{PROGRESS_COLOR_RESET}"
 
 
 def progress_line(stage, done, total, start_ts, success=0, fail=0):
@@ -566,15 +589,17 @@ def progress_line(stage, done, total, start_ts, success=0, fail=0):
 
     if speed > 0 and total and done > 0:
         eta = (total - done) / speed
-        eta_text = format_seconds(eta)
+        eta_text = fmt_seconds(eta)
     else:
         eta_text = "未知"
 
     pct = done / total * 100 if total else 0
+    bar = build_progress_bar(done, total)
     print(
-        f"{stage}进度：{done}/{total} ({pct:.1f}%) | "
-        f"成功：{success} | 失败：{fail} | "
-        f"已耗时：{format_seconds(elapsed)} | 预计剩余：{eta_text}"
+        f"{stage}进度：{bar} {done}/{total} ({pct:.1f}%) | "
+        f"成功：{PROGRESS_COLOR_GREEN}{success}{PROGRESS_COLOR_RESET} | "
+        f"失败：{PROGRESS_COLOR_RED}{fail}{PROGRESS_COLOR_RESET} | "
+        f"已耗时：{fmt_seconds(elapsed)} | 预计剩余：{eta_text}"
     )
 
 
@@ -15832,7 +15857,7 @@ def run_v25_walk_forward_backtest():
             elapsed = time.time() - t0
             avg = elapsed / max(idx - 1, 1)
             remain = avg * max(len(dates) - idx + 1, 0)
-            print(f"V25回测进度：{idx}/{len(dates)} date={date} 已耗时={fmt_seconds(elapsed)} 预计剩余={fmt_seconds(remain)}", flush=True)
+            print(f"V25回测进度：{build_progress_bar(idx, len(dates))} {idx}/{len(dates)} ({idx / max(len(dates), 1) * 100:.1f}%) | date={date} | 已耗时={fmt_seconds(elapsed)} | 预计剩余={fmt_seconds(remain)}", flush=True)
         try:
             base_rows, deep_rows, final_signals, failed, bucket_stats = v25_run_one_day(date, stock_list, cache)
             all_failed.extend(failed)
@@ -16085,10 +16110,12 @@ def main():
                 avg_deep = elapsed_deep / max(idx - 1, 1)
                 remain_deep = avg_deep * max(len(deep_targets) - idx + 1, 0)
                 print(
-                    f"深度评分进度：{idx}/{len(deep_targets)} "
+                    f"深度评分进度：{build_progress_bar(idx, len(deep_targets))} {idx}/{len(deep_targets)} "
                     f"({idx / max(len(deep_targets), 1) * 100:.1f}%) | "
                     f"当前={r.get('code', '')} {r.get('name', '')} | "
-                    f"成功={deep_success} 失败={deep_fail} 跳过={deep_skip} | "
+                    f"成功={PROGRESS_COLOR_GREEN}{deep_success}{PROGRESS_COLOR_RESET} "
+                    f"失败={PROGRESS_COLOR_RED}{deep_fail}{PROGRESS_COLOR_RESET} "
+                    f"跳过={PROGRESS_COLOR_YELLOW}{deep_skip}{PROGRESS_COLOR_RESET} | "
                     f"已耗时={fmt_seconds(elapsed_deep)} | 预计剩余={fmt_seconds(remain_deep)}",
                     flush=True
                 )
