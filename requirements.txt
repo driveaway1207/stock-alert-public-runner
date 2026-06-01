@@ -1,0 +1,11 @@
+pandas
+numpy
+requests
+tqdm
+akshare
+baostock
+openpyxl
+lxml
+beautifulsoup4
+html5lib
+matplotlib
