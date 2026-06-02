@@ -1,0 +1,84 @@
+name: 粘合K线选股
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: '周期：daily=日线；week=周线；month=月线'
+        required: true
+        default: 'month'
+        type: choice
+        options:
+          - daily
+          - week
+          - month
+      window:
+        description: '粘合窗口；空=按周期默认：日20/周16/月9'
+        required: false
+        default: ''
+      min_score:
+        description: '最低粘合分'
+        required: false
+        default: '70'
+      topn:
+        description: '最多输出数量'
+        required: false
+        default: '100'
+
+jobs:
+  sticky-select:
+    name: 运行粘合K线选股
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      PYTHONUNBUFFERED: '1'
+      STICKY_PERIOD: ${{ github.event.inputs.period }}
+      STICKY_WINDOW: ${{ github.event.inputs.window }}
+      STICKY_MIN_SCORE: ${{ github.event.inputs.min_score }}
+      STICKY_TOPN: ${{ github.event.inputs.topn }}
+
+    steps:
+      - name: 下载仓库代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy tabulate
+
+      - name: 恢复K线缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: sticky-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+
+      - name: 运行粘合K线选股
+        shell: bash
+        run: |
+          mkdir -p outputs
+          echo "缓存CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l)"
+          python -u run_sticky_select.py
+
+      - name: 上传粘合选股结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: 粘合K线选股结果
+          path: |
+            outputs/sticky_select_*.csv
+            outputs/sticky_select_*.md
+          if-no-files-found: error
+          retention-days: 14
