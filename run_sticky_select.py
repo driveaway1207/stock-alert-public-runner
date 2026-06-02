@@ -1,5 +1,7 @@
 import os
+import re
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -28,7 +30,7 @@ def norm_cols(df):
 
 
 def parse_trade_date_series(s):
-    """兼容 20250603 / 2025-06-03 / 2025/06/03。避免整数日期被 pandas 当成纳秒时间。"""
+    """兼容 20250603 / 2025-06-03 / 2025/06/03，避免整数日期被 pandas 当成纳秒。"""
     def one(x):
         if pd.isna(x):
             return pd.NaT
@@ -101,6 +103,114 @@ def to_period(df, period):
     return out.reset_index()
 
 
+def normalize_stock_code(raw):
+    s = str(raw).strip().lower().replace('.csv', '')
+    m = re.search(r'(?:sh|sz|bj)[\.\-_]?(\d{6})', s)
+    if m:
+        code = m.group(1)
+    else:
+        m = re.search(r'(\d{6})', s)
+        if not m:
+            return None
+        code = m.group(1)
+
+    if code.startswith(('60', '68', '90')):
+        return f'sh.{code}'
+    if code.startswith(('00', '30', '20')):
+        return f'sz.{code}'
+    if code.startswith(('43', '83', '87', '88', '92')):
+        return f'bj.{code}'
+    return f'sh.{code}'
+
+
+def score_period_df(dfp, window):
+    if len(dfp) < max(8, window // 2):
+        return None
+    r = calc_one_sticky(dfp, window=window)
+    if not r:
+        return None
+    r['code'] = str(dfp['code'].iloc[-1])
+    r['name'] = str(dfp['name'].iloc[-1]) if 'name' in dfp.columns else ''
+    return r
+
+
+def fetch_baostock_daily(bs, code, start_date):
+    rs = bs.query_history_k_data_plus(
+        code,
+        'date,code,open,high,low,close,volume,amount',
+        start_date=start_date,
+        end_date=datetime.now().strftime('%Y-%m-%d'),
+        frequency='d',
+        adjustflag='3',
+    )
+    if rs.error_code != '0':
+        return None
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=rs.fields)
+    df['date'] = parse_trade_date_series(df['date'])
+    for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df['name'] = ''
+    df = df.dropna(subset=['date', 'open', 'high', 'low', 'close']).sort_values('date')
+    return df if not df.empty else None
+
+
+def fallback_fetch_and_score(files, period, window, stats, outputs):
+    """缓存无法产生任何周期候选时，直接用 BaoStock 临时拉取日K重采样。"""
+    try:
+        import baostock as bs
+    except Exception as e:
+        (outputs / 'sticky_select_error.txt').write_text(f'baostock import failed: {e}\n', encoding='utf-8')
+        return []
+
+    start_date = '2022-01-01' if period == 'month' else '2023-01-01'
+    max_fetch = int(os.environ.get('STICKY_FALLBACK_MAX_FETCH') or '6000')
+    rows = []
+    seen = set()
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        (outputs / 'sticky_select_error.txt').write_text(f'baostock login failed: {lg.error_msg}\n', encoding='utf-8')
+        return rows
+
+    try:
+        for idx, p in enumerate(files[:max_fetch], start=1):
+            code = normalize_stock_code(p.stem)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            try:
+                df = fetch_baostock_daily(bs, code, start_date)
+                if df is None or len(df) < 60:
+                    stats['fallback_too_short'] = stats.get('fallback_too_short', 0) + 1
+                    continue
+                dfp = to_period(df, period)
+                r = score_period_df(dfp, window)
+                if r is not None:
+                    rows.append(r)
+                else:
+                    stats['fallback_score_none'] = stats.get('fallback_score_none', 0) + 1
+            except Exception:
+                stats['fallback_error'] = stats.get('fallback_error', 0) + 1
+                if stats['fallback_error'] <= 5:
+                    with open(outputs / 'sticky_select_error.txt', 'a', encoding='utf-8') as f:
+                        f.write(f'FALLBACK_ERROR={code}\n')
+                        f.write(traceback.format_exc())
+                        f.write('\n')
+            if idx % 200 == 0:
+                print(f'BaoStock fallback progress: {idx}/{min(len(files), max_fetch)}, rows={len(rows)}')
+    finally:
+        bs.logout()
+
+    stats['fallback_seen_codes'] = len(seen)
+    stats['fallback_rows'] = len(rows)
+    return rows
+
+
 def write_empty_report(outputs, period, window, min_score, file_count, msg):
     res = pd.DataFrame(columns=[
         'code', 'name', 'date', 'close', 'sticky_score', 'sticky_state',
@@ -157,10 +267,11 @@ def main():
         'too_short_period': 0,
         'calc_none': 0,
         'calc_error': 0,
+        'fallback_used': 0,
     }
 
     if not files:
-        write_empty_report(outputs, period, window, min_score, 0, '没有找到 kline_cache 缓存CSV。请先运行一号员工或缓存补拉任务，生成/恢复K线缓存后再跑本任务。')
+        write_empty_report(outputs, period, window, min_score, 0, '没有找到 kline_cache 缓存CSV。')
         (outputs / 'sticky_select_debug.txt').write_text(str(stats), encoding='utf-8')
         return
 
@@ -183,12 +294,10 @@ def main():
             if len(dfp) < max(8, window // 2):
                 stats['too_short_period'] += 1
                 continue
-            r = calc_one_sticky(dfp, window=window)
+            r = score_period_df(dfp, window)
             if not r:
                 stats['calc_none'] += 1
                 continue
-            r['code'] = str(dfp['code'].iloc[-1])
-            r['name'] = str(dfp['name'].iloc[-1]) if 'name' in dfp.columns else ''
             rows.append(r)
         except Exception:
             stats['calc_error'] += 1
@@ -197,6 +306,11 @@ def main():
                     f.write(f'ERROR_FILE={p}\n')
                     f.write(traceback.format_exc())
                     f.write('\n')
+
+    if len(rows) == 0 and period in ('month', 'week'):
+        stats['fallback_used'] = 1
+        print('缓存无法产生任何周期候选，启用 BaoStock 临时拉取兜底。')
+        rows = fallback_fetch_and_score(files, period, window, stats, outputs)
 
     res = pd.DataFrame(rows)
     before_filter = len(res)
@@ -217,11 +331,12 @@ def main():
     lines.append(f'- min_score: {min_score}')
     lines.append(f'- scanned_csv_files: {len(files)}')
     lines.append(f'- readable_csv_files: {stats["read_ok"]}')
+    lines.append(f'- fallback_used: {stats.get("fallback_used", 0)}')
     lines.append(f'- candidates_before_filter: {before_filter}')
     lines.append(f'- selected_count: {len(res)}')
     lines.append('')
     if res.empty:
-        lines.append('没有选出符合条件的粘合股票。若 candidates_before_filter 仍为0，请查看 sticky_select_debug.txt 的 too_short_period 和日期样本。')
+        lines.append('没有选出符合条件的粘合股票。请查看 Artifact 里的 sticky_select_debug.txt。')
     else:
         show_cols = ['code', 'name', 'date', 'close', 'sticky_score', 'sticky_state', 'sticky_band_low', 'sticky_band_high', 'close_in_band', 'body_touch_band', 'center_drift', 'low_drift', 'dislocation_ratio']
         show_cols = [c for c in show_cols if c in res.columns]
