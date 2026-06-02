@@ -27,6 +27,24 @@ def norm_cols(df):
     return df.rename(columns=rename)
 
 
+def parse_trade_date_series(s):
+    """兼容 20250603 / 2025-06-03 / 2025/06/03。避免整数日期被 pandas 当成纳秒时间。"""
+    def one(x):
+        if pd.isna(x):
+            return pd.NaT
+        v = str(x).strip()
+        if not v:
+            return pd.NaT
+        if v.endswith('.0'):
+            v = v[:-2]
+        v = v.replace('/', '-').replace('.', '-')
+        digits = ''.join(ch for ch in v if ch.isdigit())
+        if len(digits) == 8:
+            return pd.to_datetime(f'{digits[:4]}-{digits[4:6]}-{digits[6:8]}', errors='coerce')
+        return pd.to_datetime(v, errors='coerce')
+    return s.map(one)
+
+
 def read_one_csv(path):
     try:
         df = pd.read_csv(path, encoding='utf-8-sig')
@@ -42,7 +60,7 @@ def read_one_csv(path):
         return None, 'missing_ohlc'
 
     df = df.copy()
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['date'] = parse_trade_date_series(df['date'])
     for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -123,7 +141,7 @@ def main():
     default_window = {'daily': 20, 'week': 16, 'month': 9}[period]
     raw_window = (os.environ.get('STICKY_WINDOW') or '').strip()
     window = int(raw_window) if raw_window else default_window
-    min_score = float(os.environ.get('STICKY_MIN_SCORE') or 60)
+    min_score = float(os.environ.get('STICKY_MIN_SCORE') or 55)
     topn = int(os.environ.get('STICKY_TOPN') or 100)
 
     cache_dir = Path('kline_cache')
@@ -146,12 +164,16 @@ def main():
         (outputs / 'sticky_select_debug.txt').write_text(str(stats), encoding='utf-8')
         return
 
+    sample_ranges = []
     for p in files:
         df, status = read_one_csv(p)
         if status != 'ok':
             stats[status] = stats.get(status, 0) + 1
             continue
         stats['read_ok'] += 1
+
+        if len(sample_ranges) < 5:
+            sample_ranges.append(f'{p.name}: rows={len(df)}, {df["date"].min().date()}~{df["date"].max().date()}')
 
         if len(df) < max(30, window):
             stats['too_short_daily'] += 1
@@ -199,7 +221,7 @@ def main():
     lines.append(f'- selected_count: {len(res)}')
     lines.append('')
     if res.empty:
-        lines.append('没有选出符合条件的粘合股票。可以先把 min_score 降到 55，或改跑 week/daily。')
+        lines.append('没有选出符合条件的粘合股票。若 candidates_before_filter 仍为0，请查看 sticky_select_debug.txt 的 too_short_period 和日期样本。')
     else:
         show_cols = ['code', 'name', 'date', 'close', 'sticky_score', 'sticky_state', 'sticky_band_low', 'sticky_band_high', 'close_in_band', 'body_touch_band', 'center_drift', 'low_drift', 'dislocation_ratio']
         show_cols = [c for c in show_cols if c in res.columns]
@@ -207,6 +229,7 @@ def main():
     md_path.write_text('\n'.join(lines), encoding='utf-8')
 
     debug_lines = [f'{k}: {v}' for k, v in stats.items()]
+    debug_lines.extend(sample_ranges)
     debug_lines.append(f'before_filter: {before_filter}')
     debug_lines.append(f'after_filter: {len(res)}')
     (outputs / 'sticky_select_debug.txt').write_text('\n'.join(debug_lines), encoding='utf-8')
