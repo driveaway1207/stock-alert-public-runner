@@ -86,7 +86,7 @@ def to_period(df, period):
 def write_empty_report(outputs, period, window, min_score, file_count, msg):
     res = pd.DataFrame(columns=[
         'code', 'name', 'date', 'close', 'sticky_score', 'sticky_state',
-        'sticky_band_low', 'sticky_band_high', 'center_drift', 'low_drift', 'dislocation_ratio'
+        'sticky_band_low', 'sticky_band_high', 'close_in_band', 'body_touch_band', 'dislocation_ratio'
     ])
     csv_path = outputs / f'sticky_select_{period}.csv'
     md_path = outputs / f'sticky_select_{period}.md'
@@ -123,7 +123,7 @@ def main():
     default_window = {'daily': 20, 'week': 16, 'month': 9}[period]
     raw_window = (os.environ.get('STICKY_WINDOW') or '').strip()
     window = int(raw_window) if raw_window else default_window
-    min_score = float(os.environ.get('STICKY_MIN_SCORE') or 70)
+    min_score = float(os.environ.get('STICKY_MIN_SCORE') or 60)
     topn = int(os.environ.get('STICKY_TOPN') or 100)
 
     cache_dir = Path('kline_cache')
@@ -179,7 +179,8 @@ def main():
     res = pd.DataFrame(rows)
     before_filter = len(res)
     if not res.empty:
-        res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'] == 'STICKY_UP')]
+        valid_states = ['STICKY', 'STICKY_STRONG', 'STICKY_UP', 'STICKY_BASE', 'STICKY_FLAT']
+        res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'].isin(valid_states))]
         res = res.sort_values('sticky_score', ascending=False).head(topn).reset_index(drop=True)
 
     csv_path = outputs / f'sticky_select_{period}.csv'
@@ -198,9 +199,9 @@ def main():
     lines.append(f'- selected_count: {len(res)}')
     lines.append('')
     if res.empty:
-        lines.append('没有选出符合条件的粘合上移股票。可以先把 min_score 降到 65，或改跑 week/daily。')
+        lines.append('没有选出符合条件的粘合股票。可以先把 min_score 降到 55，或改跑 week/daily。')
     else:
-        show_cols = ['code', 'name', 'date', 'close', 'sticky_score', 'sticky_state', 'sticky_band_low', 'sticky_band_high', 'center_drift', 'low_drift', 'dislocation_ratio']
+        show_cols = ['code', 'name', 'date', 'close', 'sticky_score', 'sticky_state', 'sticky_band_low', 'sticky_band_high', 'close_in_band', 'body_touch_band', 'center_drift', 'low_drift', 'dislocation_ratio']
         show_cols = [c for c in show_cols if c in res.columns]
         lines.append(res[show_cols].to_markdown(index=False))
     md_path.write_text('\n'.join(lines), encoding='utf-8')
