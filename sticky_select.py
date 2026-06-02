@@ -97,15 +97,29 @@ def calc_one_sticky(df, window=20):
         score = min(score, 60)
     score = round(max(0, min(100, score)), 2)
 
+    # 状态分两类：
+    # STICKY_UP = 粘合上移；
+    # STICKY_BASE = 类似用户截图这种底部/低位粘合横盘，实体和收盘黏住，但还没明显上移。
+    sticky_core_ok = (
+        score >= 60
+        and close_in_band >= 0.45
+        and body_touch_band >= 0.55
+        and dislocation_ratio <= 0.35
+        and not dead_flag
+        and not distribution_flag
+    )
+
     if dead_flag:
         state = 'DEAD_STICKY'
     elif distribution_flag:
         state = 'DISTRIBUTION_STICKY'
-    elif dislocation_ratio > 0.25:
+    elif dislocation_ratio > 0.35:
         state = 'LOOSE_VOLATILE'
     elif score >= 70 and center_drift > 0.015 and low_drift > -0.005:
         state = 'STICKY_UP'
-    elif score >= 60:
+    elif sticky_core_ok:
+        state = 'STICKY_BASE'
+    elif score >= 58:
         state = 'STICKY_FLAT'
     else:
         state = 'NOT_STICKY'
@@ -119,6 +133,8 @@ def calc_one_sticky(df, window=20):
         'sticky_band_high': round(band_high, 3),
         'body_overlap': round(float(body_overlap), 3),
         'close_mad_pct': round(float(close_mad_pct), 4),
+        'close_in_band': round(float(close_in_band), 3),
+        'body_touch_band': round(float(body_touch_band), 3),
         'wick_recall': round(float(wick_recall), 3),
         'center_drift': round(float(center_drift), 4),
         'low_drift': round(float(low_drift), 4),
@@ -128,7 +144,7 @@ def calc_one_sticky(df, window=20):
     }
 
 
-def select_sticky_stocks(panel, window=20, min_score=70, topn=100):
+def select_sticky_stocks(panel, window=20, min_score=60, topn=100):
     rows = []
     for code, g in panel.groupby('code'):
         r = calc_one_sticky(g, window=window)
@@ -143,5 +159,6 @@ def select_sticky_stocks(panel, window=20, min_score=70, topn=100):
     if res.empty:
         return res
 
-    res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'] == 'STICKY_UP')]
+    valid_states = ['STICKY_UP', 'STICKY_BASE']
+    res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'].isin(valid_states))]
     return res.sort_values('sticky_score', ascending=False).head(topn).reset_index(drop=True)
