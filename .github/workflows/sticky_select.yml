@@ -29,7 +29,7 @@ jobs:
   sticky-select:
     name: 运行粘合K线选股
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
 
     env:
       PYTHONUNBUFFERED: '1'
@@ -37,6 +37,15 @@ jobs:
       STICKY_WINDOW: ${{ github.event.inputs.window }}
       STICKY_MIN_SCORE: ${{ github.event.inputs.min_score }}
       STICKY_TOPN: ${{ github.event.inputs.topn }}
+      FULL_REBUILD: '0'
+      MIN_CACHE_FILES_REQUIRED: '1000'
+      MAX_RUNTIME_MINUTES: '260'
+      SOFT_STOP_BUFFER_MINUTES: '20'
+      EASTMONEY_TIMEOUT: '20'
+      AKSHARE_TIMEOUT: '35'
+      BAOSTOCK_TIMEOUT: '45'
+      SOURCE_FAIL_THRESHOLD: '5'
+      SOURCE_COOLDOWN_SECONDS: '900'
 
     steps:
       - name: 下载仓库代码
@@ -52,7 +61,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy tabulate
+          pip install pandas numpy tabulate requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
       - name: 恢复K线缓存
         uses: actions/cache/restore@v4
@@ -60,11 +69,57 @@ jobs:
           path: kline_cache
           key: sticky-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            sticky-kline-cache-${{ github.ref_name }}-
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
             full-kline-cache-${{ runner.os }}-
             full-kline-cache-
+
+      - name: 检查粘合选股所需缓存深度
+        id: sticky_cache_audit
+        shell: bash
+        run: |
+          mkdir -p outputs kline_cache
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import csv
+          from pathlib import Path
+
+          files = [p for p in Path('kline_cache').rglob('*.csv') if not p.name.startswith('_')]
+          enough = 0
+          checked = 0
+          min_rows = 180
+          for p in files:
+              try:
+                  with open(p, 'r', encoding='utf-8-sig', newline='') as f:
+                      row_count = sum(1 for _ in f) - 1
+                  checked += 1
+                  if row_count >= min_rows:
+                      enough += 1
+              except Exception:
+                  pass
+          need_backfill = enough < 1000
+          print(f'cache_files={len(files)}')
+          print(f'checked_files={checked}')
+          print(f'enough_history_files={enough}')
+          print(f'need_backfill={str(need_backfill).lower()}')
+          Path('outputs/sticky_cache_audit.txt').write_text(
+              f'cache_files={len(files)}\nchecked_files={checked}\nenough_history_files={enough}\nneed_backfill={need_backfill}\n',
+              encoding='utf-8'
+          )
+          PY
+          echo "缓存CSV数量：${{ steps.sticky_cache_audit.outputs.cache_files }}"
+          echo "历史足够的CSV数量：${{ steps.sticky_cache_audit.outputs.enough_history_files }}"
+          echo "是否需要补拉：${{ steps.sticky_cache_audit.outputs.need_backfill }}"
+
+      - name: 缓存深度不足时补拉全历史K线
+        if: ${{ steps.sticky_cache_audit.outputs.need_backfill == 'true' }}
+        shell: bash
+        run: |
+          echo "当前缓存历史深度不足，开始补拉全历史K线。"
+          echo "补拉前CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l || true)"
+          python -u tools/export_neckline_candidates.py
+          echo "补拉后CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l || true)"
 
       - name: 运行粘合K线选股
         shell: bash
@@ -73,6 +128,13 @@ jobs:
           COUNT=$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l || true)
           echo "缓存CSV数量：$COUNT"
           python -u run_sticky_select.py
+
+      - name: 保存粘合任务K线缓存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: kline_cache
+          key: sticky-kline-cache-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: 推送粘合选股结果到Telegram
         if: always()
@@ -125,5 +187,7 @@ jobs:
             outputs/sticky_select_*.md
             outputs/sticky_select_debug.txt
             outputs/sticky_select_error.txt
+            outputs/sticky_cache_audit.txt
+            outputs/**
           if-no-files-found: warn
           retention-days: 14
