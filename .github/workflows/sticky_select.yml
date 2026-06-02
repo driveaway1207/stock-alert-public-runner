@@ -69,16 +69,20 @@ jobs:
       - name: 运行粘合K线选股
         shell: bash
         run: |
-          mkdir -p outputs
-          echo "缓存CSV数量：$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l)"
+          mkdir -p outputs kline_cache
+          COUNT=$(find kline_cache -type f -name '*.csv' ! -name '_*.csv' | wc -l || true)
+          echo "缓存CSV数量：$COUNT"
           python -u run_sticky_select.py
 
       - name: 上传粘合选股结果
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: 粘合K线选股结果
           path: |
             outputs/sticky_select_*.csv
             outputs/sticky_select_*.md
-          if-no-files-found: error
+            outputs/sticky_select_debug.txt
+            outputs/sticky_select_error.txt
+          if-no-files-found: warn
           retention-days: 14
