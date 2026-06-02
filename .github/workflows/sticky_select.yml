@@ -19,7 +19,7 @@ on:
       min_score:
         description: '最低粘合分'
         required: false
-        default: '70'
+        default: '55'
       topn:
         description: '最多输出数量'
         required: false
