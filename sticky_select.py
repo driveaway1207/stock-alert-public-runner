@@ -15,7 +15,27 @@ def _clip01(x):
     return max(0.0, min(1.0, float(x)))
 
 
+def _low_better(x, good, bad):
+    if not np.isfinite(x):
+        return 0.0
+    if x <= good:
+        return 1.0
+    if x >= bad:
+        return 0.0
+    return (bad - x) / max(bad - good, 1e-9)
+
+
 def calc_one_sticky(df, window=20):
+    """
+    纯K线粘合识别：只看K线是否黏在同一区域，不要求重心上移。
+
+    核心：
+    1）实体互相咬合；
+    2）收盘集中；
+    3）实体/收盘反复回到同一粘合带；
+    4）长影线后能吸回；
+    5）脱节少。
+    """
     df = df.sort_values('date').tail(window).copy()
     if len(df) < max(8, window // 2):
         return None
@@ -32,80 +52,83 @@ def calc_one_sticky(df, window=20):
     if price <= 0:
         return None
 
+    # 1）实体咬合：相邻实体交集/并集。十字小实体用价格底座防止虚高。
     overlaps = []
     for i in range(1, len(df)):
-        inter = max(0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
+        inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
         union = max(body_high[i], body_high[i - 1]) - min(body_low[i], body_low[i - 1])
         overlaps.append(inter / max(union, price * 0.004))
-    body_overlap = np.nanmean(overlaps)
+    body_overlap = float(np.nanmean(overlaps)) if overlaps else 0.0
+    body_overlap_score = _clip01(body_overlap)
 
+    # 2）收盘集中：这是粘合的核心。越集中，分越高。
     close_mad_pct = _mad(c) / price
-    close_cluster_score = 1 - _clip01((close_mad_pct - 0.015) / 0.04)
+    close_cluster_score = _low_better(close_mad_pct, good=0.018, bad=0.070)
 
-    band_half = max(price * 0.025, _mad(c) * 1.8)
+    # 3）粘合带：用收盘中位数做中心，带宽允许覆盖正常月K/周K粘合。
+    # 不用重心上移，不用压力位，只问多数K线是否反复回到这一带。
+    avg_range_pct = float(np.mean((h - l) / np.maximum(c, 1e-9)))
+    band_half = max(price * 0.030, _mad(c) * 2.0, price * avg_range_pct * 0.20)
     band_low = price - band_half
     band_high = price + band_half
 
-    close_in_band = np.mean((c >= band_low) & (c <= band_high))
-    body_touch_band = np.mean((body_high >= band_low) & (body_low <= band_high))
+    close_in_band = float(np.mean((c >= band_low) & (c <= band_high)))
+    body_touch_band = float(np.mean((body_high >= band_low) & (body_low <= band_high)))
 
+    # 4）影线吸回：长影线后收盘回到粘合带，说明月内乱动但最终仍被吸回。
     upper_wick = (h - body_high) / rng
     lower_wick = (body_low - l) / rng
     long_wick = (upper_wick >= 0.35) | (lower_wick >= 0.35)
     if long_wick.sum() > 0:
-        wick_recall = np.mean(((c >= band_low) & (c <= band_high))[long_wick])
+        wick_recall = float(np.mean(((c >= band_low) & (c <= band_high))[long_wick]))
     else:
         wick_recall = 0.55
 
-    half = len(df) // 2
-    center_drift = np.median(c[half:]) / max(np.median(c[:half]), 1e-9) - 1
-    low_drift = np.median(l[half:]) / max(np.median(l[:half]), 1e-9) - 1
-    up_score = _clip01(center_drift / 0.08) if center_drift <= 0.18 else 0.4
-    low_score = _clip01((low_drift + 0.005) / 0.06)
-    drift_score = 0.65 * up_score + 0.35 * low_score
-
+    # 5）脱节：相邻实体不咬合，且收盘/实体远离粘合带。
     dislocated = []
     for i in range(1, len(df)):
         entity_overlap = min(body_high[i], body_high[i - 1]) >= max(body_low[i], body_low[i - 1])
-        close_far = abs(c[i] - price) / price > 0.045
+        close_far = abs(c[i] - price) / price > 0.055
         body_far = body_high[i] < band_low or body_low[i] > band_high
         dislocated.append((not entity_overlap and close_far) or body_far)
-    dislocation_ratio = np.mean(dislocated)
+    dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
+    no_dislocation_score = _low_better(dislocation_ratio, good=0.10, bad=0.45)
 
-    avg_range = np.mean((h - l) / c)
-    avg_body = np.mean(np.abs(c - o) / c)
-    dead_flag = avg_range < 0.018 and avg_body < 0.008 and center_drift < 0.015
+    # 6）重心变化只输出，不参与粘合筛选。
+    half = len(df) // 2
+    center_drift = np.median(c[half:]) / max(np.median(c[:half]), 1e-9) - 1
+    low_drift = np.median(l[half:]) / max(np.median(l[:half]), 1e-9) - 1
+
+    # 7）死股/出货标记。注意：标记只是降级，不因为“不上移”就淘汰。
+    avg_body_pct = float(np.mean(np.abs(c - o) / np.maximum(c, 1e-9)))
+    dead_flag = avg_range_pct < 0.012 and avg_body_pct < 0.005
 
     close_pos = (c - l) / rng
-    upper_supply_count = np.sum((upper_wick >= 0.35) & (close_pos <= 0.55))
-    distribution_flag = upper_supply_count >= max(4, len(df) // 3) and center_drift <= 0.01
+    upper_supply_count = int(np.sum((upper_wick >= 0.45) & (close_pos <= 0.45)))
+    distribution_flag = bool(upper_supply_count >= max(5, len(df) // 2) and center_drift < -0.015)
 
+    # 8）纯粘合分：不含上移分。
     score = (
-        20 * _clip01(body_overlap)
-        + 20 * close_cluster_score
-        + 15 * close_in_band
-        + 15 * body_touch_band
-        + 15 * wick_recall
-        + 15 * drift_score
+        18 * body_overlap_score
+        + 28 * close_cluster_score
+        + 22 * close_in_band
+        + 22 * body_touch_band
+        + 6 * wick_recall
+        + 4 * no_dislocation_score
     )
-    score -= dislocation_ratio * 35
+
+    score -= dislocation_ratio * 22
     if dead_flag:
-        score = min(score, 55)
+        score = min(score, 58)
     if distribution_flag:
         score = min(score, 55)
-    if center_drift < -0.01:
-        score = min(score, 60)
     score = round(max(0, min(100, score)), 2)
 
-    # 状态分两类：
-    # STICKY_UP = 粘合上移；
-    # STICKY_BASE = 类似用户截图这种底部/低位粘合横盘，实体和收盘黏住，但还没明显上移。
     sticky_core_ok = (
-        score >= 60
+        score >= 55
         and close_in_band >= 0.45
         and body_touch_band >= 0.55
-        and dislocation_ratio <= 0.35
-        and not dead_flag
+        and dislocation_ratio <= 0.45
         and not distribution_flag
     )
 
@@ -113,14 +136,14 @@ def calc_one_sticky(df, window=20):
         state = 'DEAD_STICKY'
     elif distribution_flag:
         state = 'DISTRIBUTION_STICKY'
-    elif dislocation_ratio > 0.35:
+    elif dislocation_ratio > 0.45:
         state = 'LOOSE_VOLATILE'
-    elif score >= 70 and center_drift > 0.015 and low_drift > -0.005:
-        state = 'STICKY_UP'
+    elif sticky_core_ok and score >= 75:
+        state = 'STICKY_STRONG'
     elif sticky_core_ok:
-        state = 'STICKY_BASE'
-    elif score >= 58:
-        state = 'STICKY_FLAT'
+        state = 'STICKY'
+    elif score >= 50:
+        state = 'STICKY_WEAK'
     else:
         state = 'NOT_STICKY'
 
@@ -144,7 +167,7 @@ def calc_one_sticky(df, window=20):
     }
 
 
-def select_sticky_stocks(panel, window=20, min_score=60, topn=100):
+def select_sticky_stocks(panel, window=20, min_score=55, topn=100):
     rows = []
     for code, g in panel.groupby('code'):
         r = calc_one_sticky(g, window=window)
@@ -159,6 +182,6 @@ def select_sticky_stocks(panel, window=20, min_score=60, topn=100):
     if res.empty:
         return res
 
-    valid_states = ['STICKY_UP', 'STICKY_BASE']
+    valid_states = ['STICKY_STRONG', 'STICKY']
     res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'].isin(valid_states))]
     return res.sort_values('sticky_score', ascending=False).head(topn).reset_index(drop=True)
