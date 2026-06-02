@@ -1,4 +1,5 @@
 import os
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -33,12 +34,12 @@ def read_one_csv(path):
         try:
             df = pd.read_csv(path)
         except Exception:
-            return None
+            return None, 'read_fail'
 
     df = norm_cols(df)
     need = ['date', 'open', 'high', 'low', 'close']
     if any(c not in df.columns for c in need):
-        return None
+        return None, 'missing_ohlc'
 
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -48,7 +49,7 @@ def read_one_csv(path):
 
     df = df.dropna(subset=['date', 'open', 'high', 'low', 'close'])
     if df.empty:
-        return None
+        return None, 'empty_after_clean'
 
     if 'code' not in df.columns:
         df['code'] = path.stem
@@ -57,7 +58,7 @@ def read_one_csv(path):
 
     if 'name' not in df.columns:
         df['name'] = ''
-    return df.sort_values('date')
+    return df.sort_values('date'), 'ok'
 
 
 def to_period(df, period):
@@ -79,11 +80,36 @@ def to_period(df, period):
         agg['amount'] = 'sum'
 
     out = df.set_index('date').resample(rule).agg(agg).dropna(subset=['open', 'high', 'low', 'close'])
-    out = out.reset_index()
-    return out
+    return out.reset_index()
+
+
+def write_empty_report(outputs, period, window, min_score, file_count, msg):
+    res = pd.DataFrame(columns=[
+        'code', 'name', 'date', 'close', 'sticky_score', 'sticky_state',
+        'sticky_band_low', 'sticky_band_high', 'center_drift', 'low_drift', 'dislocation_ratio'
+    ])
+    csv_path = outputs / f'sticky_select_{period}.csv'
+    md_path = outputs / f'sticky_select_{period}.md'
+    res.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    lines = [
+        f'# 粘合K线选股结果 - {period}',
+        '',
+        f'- period: {period}',
+        f'- window: {window}',
+        f'- min_score: {min_score}',
+        f'- scanned_csv_files: {file_count}',
+        '- selected_count: 0',
+        '',
+        msg,
+    ]
+    md_path.write_text('\n'.join(lines), encoding='utf-8')
+    print('\n'.join(lines))
 
 
 def main():
+    outputs = Path('outputs')
+    outputs.mkdir(exist_ok=True)
+
     period = os.environ.get('STICKY_PERIOD', 'month').strip().lower()
     if period in ('monthly', 'm'):
         period = 'month'
@@ -95,32 +121,63 @@ def main():
         raise SystemExit('STICKY_PERIOD must be daily/week/month')
 
     default_window = {'daily': 20, 'week': 16, 'month': 9}[period]
-    window = int(os.environ.get('STICKY_WINDOW') or default_window)
+    raw_window = (os.environ.get('STICKY_WINDOW') or '').strip()
+    window = int(raw_window) if raw_window else default_window
     min_score = float(os.environ.get('STICKY_MIN_SCORE') or 70)
     topn = int(os.environ.get('STICKY_TOPN') or 100)
 
     cache_dir = Path('kline_cache')
-    outputs = Path('outputs')
-    outputs.mkdir(exist_ok=True)
-
     files = [p for p in cache_dir.rglob('*.csv') if not p.name.startswith('_')] if cache_dir.exists() else []
     rows = []
+    stats = {
+        'files': len(files),
+        'read_ok': 0,
+        'read_fail': 0,
+        'missing_ohlc': 0,
+        'empty_after_clean': 0,
+        'too_short_daily': 0,
+        'too_short_period': 0,
+        'calc_none': 0,
+        'calc_error': 0,
+    }
+
+    if not files:
+        write_empty_report(outputs, period, window, min_score, 0, '没有找到 kline_cache 缓存CSV。请先运行一号员工或缓存补拉任务，生成/恢复K线缓存后再跑本任务。')
+        (outputs / 'sticky_select_debug.txt').write_text(str(stats), encoding='utf-8')
+        return
 
     for p in files:
-        df = read_one_csv(p)
-        if df is None or len(df) < max(30, window):
+        df, status = read_one_csv(p)
+        if status != 'ok':
+            stats[status] = stats.get(status, 0) + 1
             continue
-        dfp = to_period(df, period)
-        if len(dfp) < max(8, window // 2):
+        stats['read_ok'] += 1
+
+        if len(df) < max(30, window):
+            stats['too_short_daily'] += 1
             continue
-        r = calc_one_sticky(dfp, window=window)
-        if not r:
-            continue
-        r['code'] = str(dfp['code'].iloc[-1])
-        r['name'] = str(dfp['name'].iloc[-1]) if 'name' in dfp.columns else ''
-        rows.append(r)
+        try:
+            dfp = to_period(df, period)
+            if len(dfp) < max(8, window // 2):
+                stats['too_short_period'] += 1
+                continue
+            r = calc_one_sticky(dfp, window=window)
+            if not r:
+                stats['calc_none'] += 1
+                continue
+            r['code'] = str(dfp['code'].iloc[-1])
+            r['name'] = str(dfp['name'].iloc[-1]) if 'name' in dfp.columns else ''
+            rows.append(r)
+        except Exception:
+            stats['calc_error'] += 1
+            if stats['calc_error'] <= 5:
+                with open(outputs / 'sticky_select_error.txt', 'a', encoding='utf-8') as f:
+                    f.write(f'ERROR_FILE={p}\n')
+                    f.write(traceback.format_exc())
+                    f.write('\n')
 
     res = pd.DataFrame(rows)
+    before_filter = len(res)
     if not res.empty:
         res = res[(res['sticky_score'] >= min_score) & (res['sticky_state'] == 'STICKY_UP')]
         res = res.sort_values('sticky_score', ascending=False).head(topn).reset_index(drop=True)
@@ -136,17 +193,27 @@ def main():
     lines.append(f'- window: {window}')
     lines.append(f'- min_score: {min_score}')
     lines.append(f'- scanned_csv_files: {len(files)}')
+    lines.append(f'- readable_csv_files: {stats["read_ok"]}')
+    lines.append(f'- candidates_before_filter: {before_filter}')
     lines.append(f'- selected_count: {len(res)}')
     lines.append('')
     if res.empty:
-        lines.append('没有选出符合条件的粘合上移股票。')
+        lines.append('没有选出符合条件的粘合上移股票。可以先把 min_score 降到 65，或改跑 week/daily。')
     else:
         show_cols = ['code', 'name', 'date', 'close', 'sticky_score', 'sticky_state', 'sticky_band_low', 'sticky_band_high', 'center_drift', 'low_drift', 'dislocation_ratio']
         show_cols = [c for c in show_cols if c in res.columns]
         lines.append(res[show_cols].to_markdown(index=False))
     md_path.write_text('\n'.join(lines), encoding='utf-8')
 
+    debug_lines = [f'{k}: {v}' for k, v in stats.items()]
+    debug_lines.append(f'before_filter: {before_filter}')
+    debug_lines.append(f'after_filter: {len(res)}')
+    (outputs / 'sticky_select_debug.txt').write_text('\n'.join(debug_lines), encoding='utf-8')
+
     print('\n'.join(lines))
+    print('')
+    print('Debug:')
+    print('\n'.join(debug_lines))
     print(f'CSV saved: {csv_path}')
     print(f'MD saved: {md_path}')
 
