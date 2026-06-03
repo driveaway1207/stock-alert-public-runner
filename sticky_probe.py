@@ -3,7 +3,7 @@
 单股K线粘合验证器
 
 只用于验证“某一只股票最近N根K线是否粘合”。
-不接入 stock_alert.py，不建 workflow，不发 Telegram，不扫全市场。
+不接入 stock_alert.py，不发 Telegram，不扫全市场。
 
 默认验证：301376，月线，最近9根。
 
@@ -13,7 +13,6 @@
 """
 
 import argparse
-import math
 import re
 from pathlib import Path
 
@@ -129,7 +128,6 @@ def find_code_csv(root, code):
     if name_hits:
         return sorted(name_hits, key=lambda p: len(str(p)))[0]
 
-    # 文件名找不到时，只抽查CSV内部 code 列；这是单股验证脚本，不做全市场重计算。
     for p in csv_files:
         try:
             raw = pd.read_csv(p, nrows=5, encoding="utf-8-sig")
@@ -150,7 +148,8 @@ def find_code_csv(root, code):
 def to_period(df, period):
     if period == "daily":
         return df.copy()
-    rule = "W-FRI" if period == "week" else "M"
+    # pandas 新版本不再支持 M，月末重采样要用 ME。
+    rule = "W-FRI" if period == "week" else "ME"
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
         agg["volume"] = "sum"
@@ -180,7 +179,6 @@ def calc_sticky(df, window=9):
     center = float(np.median(c))
     close_mad_pct = mad(c) / max(center, 1e-9)
 
-    # 粘合带：用收盘中位数做中心。带宽稍微放宽，因为月K有影线，但收盘/实体应反复回到同一区域。
     band_half = max(center * 0.035, mad(c) * 2.0)
     band_low = center - band_half
     band_high = center + band_half
