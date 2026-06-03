@@ -253,20 +253,24 @@ def calc_sticky(df, window=9):
     )
     score = round(max(0.0, min(100.0, score)), 2)
 
-    if (
-        score >= 70
-        and range_overlap_avg >= 0.50
-        and reverse_open_ratio >= 0.35
-        and body_touch_band >= 0.65
-        and dislocation_ratio <= 0.35
-    ):
-        state = "STICKY"
-    elif (
-        score >= 55
-        and range_overlap_avg >= 0.40
-        and body_touch_band >= 0.55
+    # 核心条件主导：只要“阳线低开/阴线高开 + K线区间重合 + 实体碰粘合带 + 脱节少”成立，
+    # 就判为粘合，不再被综合分硬卡死。
+    core_sticky = (
+        range_overlap_avg >= 0.60
+        and reverse_open_ratio >= 0.45
+        and body_touch_band >= 0.75
+        and dislocation_ratio <= 0.30
+    )
+    loose_sticky = (
+        range_overlap_avg >= 0.45
+        and reverse_open_ratio >= 0.30
+        and body_touch_band >= 0.60
         and dislocation_ratio <= 0.45
-    ):
+    )
+
+    if core_sticky:
+        state = "STICKY"
+    elif loose_sticky or score >= 55:
         state = "WEAK_STICKY"
     else:
         state = "NOT_STICKY"
