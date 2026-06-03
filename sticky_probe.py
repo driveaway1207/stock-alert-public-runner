@@ -5,6 +5,12 @@
 只用于验证“某一只股票最近N根K线是否粘合”。
 不接入 stock_alert.py，不发 Telegram，不扫全市场。
 
+当前“粘合”口径：
+1）阳线经常低开后拉回；
+2）阴线经常高开后压回；
+3）多根K线高低区间、实体、收盘反复重合在同一价格带；
+4）脱节K线少。
+
 默认验证：301376，月线，最近9根。
 
 用法示例：
@@ -148,7 +154,6 @@ def find_code_csv(root, code):
 def to_period(df, period):
     if period == "daily":
         return df.copy()
-    # pandas 新版本不再支持 M，月末重采样要用 ME。
     rule = "W-FRI" if period == "week" else "ME"
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
@@ -179,6 +184,7 @@ def calc_sticky(df, window=9):
     center = float(np.median(c))
     close_mad_pct = mad(c) / max(center, 1e-9)
 
+    # 粘合带：不是压力位，只是“这几根K反复黏住的中枢带”。
     band_half = max(center * 0.035, mad(c) * 2.0)
     band_low = center - band_half
     band_high = center + band_half
@@ -186,20 +192,47 @@ def calc_sticky(df, window=9):
     close_in_band = float(np.mean((c >= band_low) & (c <= band_high)))
     body_touch_band = float(np.mean((body_high >= band_low) & (body_low <= band_high)))
 
-    overlaps = []
-    for i in range(1, len(k)):
-        inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
-        union = max(body_high[i], body_high[i - 1]) - min(body_low[i], body_low[i - 1])
-        overlaps.append(inter / max(union, center * 0.004))
-    body_overlap = float(np.mean(overlaps)) if overlaps else 0.0
-
+    # K线之间重合：看相邻整根K线区间高低点是否大面积重叠。
+    range_overlaps = []
+    body_overlaps = []
     dislocated = []
     for i in range(1, len(k)):
-        entity_overlap = min(body_high[i], body_high[i - 1]) >= max(body_low[i], body_low[i - 1])
-        close_far = abs(c[i] - center) / max(center, 1e-9) > 0.065
+        range_inter = max(0.0, min(h[i], h[i - 1]) - max(l[i], l[i - 1]))
+        range_base = max(min(h[i] - l[i], h[i - 1] - l[i - 1]), center * 0.01)
+        range_overlap = range_inter / range_base
+        range_overlaps.append(range_overlap)
+
+        body_inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
+        body_union = max(body_high[i], body_high[i - 1]) - min(body_low[i], body_low[i - 1])
+        body_overlaps.append(body_inter / max(body_union, center * 0.004))
+
+        close_far = abs(c[i] - center) / max(center, 1e-9) > 0.075
         body_far = body_high[i] < band_low or body_low[i] > band_high
-        dislocated.append((not entity_overlap and close_far) or body_far)
+        poor_range_overlap = range_overlap < 0.25
+        dislocated.append((close_far and body_far) or poor_range_overlap)
+
+    range_overlap_avg = float(np.mean(range_overlaps)) if range_overlaps else 0.0
+    body_overlap = float(np.mean(body_overlaps)) if body_overlaps else 0.0
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
+
+    # 阳线低开、阴线高开：这是你定义的“粘合感”的核心之一。
+    # 阳线如果经常从前收下方/附近开出再拉回；阴线如果经常从前收上方/附近开出再压回，说明K线在互相咬。
+    reverse_open_hits = 0
+    directional_count = 0
+    eps = 0.002
+    for i in range(1, len(k)):
+        prev_close = c[i - 1]
+        is_up = c[i] > o[i] * (1 + eps)
+        is_down = c[i] < o[i] * (1 - eps)
+        if is_up:
+            directional_count += 1
+            if o[i] <= prev_close * (1 + eps):
+                reverse_open_hits += 1
+        elif is_down:
+            directional_count += 1
+            if o[i] >= prev_close * (1 - eps):
+                reverse_open_hits += 1
+    reverse_open_ratio = reverse_open_hits / directional_count if directional_count else 0.0
 
     upper_wick = (h - body_high) / rng
     lower_wick = (body_low - l) / rng
@@ -210,18 +243,30 @@ def calc_sticky(df, window=9):
         wick_recall = 0.55
 
     score = (
-        30 * low_better(close_mad_pct, 0.018, 0.075)
-        + 25 * body_touch_band
-        + 20 * close_in_band
-        + 15 * clip01(body_overlap)
+        30 * clip01(range_overlap_avg)
+        + 25 * reverse_open_ratio
+        + 20 * body_touch_band
+        + 10 * close_in_band
         + 10 * wick_recall
-        - 25 * dislocation_ratio
+        + 5 * low_better(close_mad_pct, 0.025, 0.085)
+        - 20 * dislocation_ratio
     )
     score = round(max(0.0, min(100.0, score)), 2)
 
-    if score >= 75 and close_in_band >= 0.55 and body_touch_band >= 0.65 and dislocation_ratio <= 0.35:
+    if (
+        score >= 70
+        and range_overlap_avg >= 0.50
+        and reverse_open_ratio >= 0.35
+        and body_touch_band >= 0.65
+        and dislocation_ratio <= 0.35
+    ):
         state = "STICKY"
-    elif score >= 60 and close_in_band >= 0.45 and body_touch_band >= 0.55 and dislocation_ratio <= 0.45:
+    elif (
+        score >= 55
+        and range_overlap_avg >= 0.40
+        and body_touch_band >= 0.55
+        and dislocation_ratio <= 0.45
+    ):
         state = "WEAK_STICKY"
     else:
         state = "NOT_STICKY"
@@ -231,6 +276,10 @@ def calc_sticky(df, window=9):
         "score": score,
         "band_low": round(band_low, 3),
         "band_high": round(band_high, 3),
+        "range_overlap_avg": round(range_overlap_avg, 3),
+        "reverse_open_ratio": round(reverse_open_ratio, 3),
+        "reverse_open_hits": int(reverse_open_hits),
+        "directional_count": int(directional_count),
         "close_mad_pct": round(float(close_mad_pct), 4),
         "close_in_band": round(close_in_band, 3),
         "body_touch_band": round(body_touch_band, 3),
@@ -270,11 +319,11 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线。")
+        print("符合粘合K线：阳线低开/阴线高开特征明显，K线之间重合度高。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合，需要人工看图确认。")
+        print("弱粘合：有粘合迹象，但反向开盘或K线重合度还需要人工确认。")
     else:
-        print("不符合当前粘合规则。若肉眼认为粘合，请优先看 close_mad_pct、body_touch_band、dislocation_ratio 三项。")
+        print("不符合当前粘合规则。重点看 range_overlap_avg、reverse_open_ratio、body_touch_band、dislocation_ratio。")
 
 
 if __name__ == "__main__":
