@@ -9,7 +9,8 @@
 1）阳线经常低开后拉回；
 2）阴线经常高开后压回；
 3）多根K线高低区间、实体、收盘反复重合在同一价格带；
-4）脱节K线少。
+4）脱节K线少；
+5）不能是最近N根K线单边反弹/下跌推进，趋势推进不算真正粘合。
 
 默认验证：301376，月线，最近9根。
 
@@ -216,7 +217,6 @@ def calc_sticky(df, window=9):
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
 
     # 阳线低开、阴线高开：这是你定义的“粘合感”的核心之一。
-    # 阳线如果经常从前收下方/附近开出再拉回；阴线如果经常从前收上方/附近开出再压回，说明K线在互相咬。
     reverse_open_hits = 0
     directional_count = 0
     eps = 0.002
@@ -233,6 +233,17 @@ def calc_sticky(df, window=9):
             if o[i] >= prev_close * (1 - eps):
                 reverse_open_hits += 1
     reverse_open_ratio = reverse_open_hits / directional_count if directional_count else 0.0
+
+    # 趋势推进过滤：如果最近N根K线本质是在从低位一路反弹/下跌，哪怕互相有重叠，也不算“原地粘合”。
+    net_close_change = c[-1] / max(c[0], 1e-9) - 1
+    half = len(k) // 2
+    first_half_center = float(np.median(c[:half])) if half > 0 else float(np.median(c))
+    second_half_center = float(np.median(c[half:])) if half > 0 else float(np.median(c))
+    half_center_drift = second_half_center / max(first_half_center, 1e-9) - 1
+    trend_push_flag = (
+        abs(net_close_change) >= 0.25
+        or (abs(net_close_change) >= 0.18 and abs(half_center_drift) >= 0.08)
+    )
 
     upper_wick = (h - body_high) / rng
     lower_wick = (body_low - l) / rng
@@ -251,24 +262,28 @@ def calc_sticky(df, window=9):
         + 5 * low_better(close_mad_pct, 0.025, 0.085)
         - 20 * dislocation_ratio
     )
+    if trend_push_flag:
+        score -= 18
     score = round(max(0.0, min(100.0, score)), 2)
 
-    # 核心条件主导：只要“阳线低开/阴线高开 + K线区间重合 + 实体碰粘合带 + 脱节少”成立，
-    # 就判为粘合，不再被综合分硬卡死。
     core_sticky = (
         range_overlap_avg >= 0.60
         and reverse_open_ratio >= 0.45
         and body_touch_band >= 0.75
         and dislocation_ratio <= 0.30
+        and not trend_push_flag
     )
     loose_sticky = (
         range_overlap_avg >= 0.45
         and reverse_open_ratio >= 0.30
         and body_touch_band >= 0.60
         and dislocation_ratio <= 0.45
+        and not trend_push_flag
     )
 
-    if core_sticky:
+    if trend_push_flag:
+        state = "TREND_PUSH"
+    elif core_sticky:
         state = "STICKY"
     elif loose_sticky or score >= 55:
         state = "WEAK_STICKY"
@@ -284,6 +299,9 @@ def calc_sticky(df, window=9):
         "reverse_open_ratio": round(reverse_open_ratio, 3),
         "reverse_open_hits": int(reverse_open_hits),
         "directional_count": int(directional_count),
+        "net_close_change": round(float(net_close_change), 4),
+        "half_center_drift": round(float(half_center_drift), 4),
+        "trend_push_flag": bool(trend_push_flag),
         "close_mad_pct": round(float(close_mad_pct), 4),
         "close_in_band": round(close_in_band, 3),
         "body_touch_band": round(body_touch_band, 3),
@@ -323,11 +341,13 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：阳线低开/阴线高开特征明显，K线之间重合度高。")
+        print("符合粘合K线：阳线低开/阴线高开特征明显，K线之间重合度高，且不是单边趋势推进。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合：有粘合迹象，但反向开盘或K线重合度还需要人工确认。")
+        print("弱粘合：有粘合迹象，但反向开盘、K线重合度或稳定性还需要人工确认。")
+    elif result["state"] == "TREND_PUSH":
+        print("不算粘合：最近窗口更像单边反弹/下跌推进，虽然K线有重叠，但不是原地互相咬合。")
     else:
-        print("不符合当前粘合规则。重点看 range_overlap_avg、reverse_open_ratio、body_touch_band、dislocation_ratio。")
+        print("不符合当前粘合规则。重点看 range_overlap_avg、reverse_open_ratio、body_touch_band、dislocation_ratio、trend_push_flag。")
 
 
 if __name__ == "__main__":
