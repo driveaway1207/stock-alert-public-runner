@@ -1,23 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-单股K线粘合验证器
+"""单股K线粘合验证器。
 
-只用于验证“某一只股票最近N根K线是否粘合”。
-不接入 stock_alert.py，不发 Telegram，不扫全市场。
+只验证单只股票，不接入 stock_alert.py，不发 Telegram，不扫全市场。
 
-当前“粘合”口径：
-1）阳线经常低开后拉回；
-2）阴线经常高开后压回；
-3）至少80%的K线实体必须覆盖同一个实体重合价格带；
-4）多根K线的实体中心不能离散太大；
-5）影线重合只能辅助，不能作为粘合核心；
-6）单边反弹/下跌推进不算真正粘合。
-
-默认验证：301376，月线，最近9根。
-
-用法示例：
-    python sticky_probe.py --code 301376 --period month --window 9
-    python sticky_probe.py --csv path/to/301376.csv --period month --window 9
+强粘合口径：最近N根K线中，至少70%的K线实体覆盖同一个实体重合价位；
+影线重合只做参考，不作为粘合核心。
 """
 
 import argparse
@@ -26,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 
 COL_MAP = {
     "日期": "date", "交易日期": "date", "trade_date": "date",
@@ -49,12 +35,6 @@ def mad(values):
     return float(np.median(np.abs(arr - med)))
 
 
-def clip01(x):
-    if not np.isfinite(x):
-        return 0.0
-    return max(0.0, min(1.0, float(x)))
-
-
 def low_better(x, good, bad):
     if not np.isfinite(x):
         return 0.0
@@ -66,11 +46,7 @@ def low_better(x, good, bad):
 
 
 def normalize_columns(df):
-    rename = {}
-    for col in df.columns:
-        s = str(col).strip()
-        rename[col] = COL_MAP.get(s, s.lower())
-    return df.rename(columns=rename)
+    return df.rename(columns={c: COL_MAP.get(str(c).strip(), str(c).strip().lower()) for c in df.columns})
 
 
 def parse_date_series(s):
@@ -78,8 +54,6 @@ def parse_date_series(s):
         if pd.isna(x):
             return pd.NaT
         v = str(x).strip()
-        if not v:
-            return pd.NaT
         if v.endswith(".0"):
             v = v[:-2]
         digits = "".join(ch for ch in v if ch.isdigit())
@@ -91,27 +65,26 @@ def parse_date_series(s):
 
 def read_csv(path):
     last_error = None
+    df = None
     for enc in ("utf-8-sig", "utf-8", "gbk"):
         try:
             df = pd.read_csv(path, encoding=enc)
             break
         except Exception as exc:
-            df = None
             last_error = exc
     if df is None:
         raise RuntimeError(f"读取CSV失败: {path}; {last_error}")
 
     df = normalize_columns(df)
-    need = ["date", "open", "high", "low", "close"]
-    missing = [c for c in need if c not in df.columns]
+    missing = [c for c in ("date", "open", "high", "low", "close") if c not in df.columns]
     if missing:
         raise RuntimeError(f"CSV字段不完整，缺少 {missing}; 当前字段={list(df.columns)}")
 
     df = df.copy()
     df["date"] = parse_date_series(df["date"])
-    for c in ["open", "high", "low", "close", "volume", "amount"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    for col in ("open", "high", "low", "close", "volume", "amount"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date")
     if df.empty:
         raise RuntimeError(f"CSV清洗后为空: {path}")
@@ -145,10 +118,7 @@ def find_code_csv(root, code):
             except Exception:
                 continue
         raw = normalize_columns(raw)
-        if "code" not in raw.columns:
-            continue
-        vals = " ".join(raw["code"].dropna().astype(str).tolist())
-        if target in vals:
+        if "code" in raw.columns and target in " ".join(raw["code"].dropna().astype(str).tolist()):
             return p
     raise RuntimeError(f"没有在 {root} 里找到代码 {target} 对应CSV")
 
@@ -166,24 +136,25 @@ def to_period(df, period):
         agg["code"] = "last"
     if "name" in df.columns:
         agg["name"] = "last"
-    out = df.set_index("date").resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).reset_index()
-    return out
+    return df.set_index("date").resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).reset_index()
 
 
 def calc_body_stack_ratio(body_low, body_high, center):
-    """实体重合度：找一条价格线，看有多少根K线实体同时覆盖它。"""
+    """返回最大实体覆盖比例：某一价格线被多少根K线实体同时覆盖。"""
     lo = float(np.nanmin(body_low))
     hi = float(np.nanmax(body_high))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return 0.0, 0.0
+
     grid = np.linspace(lo, hi, 200)
     coverage = np.zeros_like(grid)
     for bl, bh in zip(body_low, body_high):
-        min_half = center * 0.0015
         mid = (bl + bh) / 2.0
+        min_half = center * 0.0015
         adj_low = min(bl, mid - min_half)
         adj_high = max(bh, mid + min_half)
         coverage += ((grid >= adj_low) & (grid <= adj_high)).astype(float)
+
     stack_ratio = float(np.max(coverage) / max(len(body_low), 1))
     dense_ratio = float(np.mean(coverage >= max(3, int(np.ceil(len(body_low) * 0.45)))))
     return stack_ratio, dense_ratio
@@ -192,7 +163,7 @@ def calc_body_stack_ratio(body_low, body_high, center):
 def calc_sticky(df, window=9):
     k = df.tail(window).copy()
     if len(k) < max(6, window // 2):
-        raise RuntimeError(f"周期K数量不足: 当前={len(k)}, 需要至少={max(6, window // 2)}")
+        raise RuntimeError(f"周期K数量不足: 当前={len(k)}")
 
     o = k["open"].astype(float).to_numpy()
     h = k["high"].astype(float).to_numpy()
@@ -202,13 +173,11 @@ def calc_sticky(df, window=9):
     body_low = np.minimum(o, c)
     body_high = np.maximum(o, c)
     body_mid = (body_low + body_high) / 2.0
-    rng = np.maximum(h - l, 1e-9)
     center = float(np.median(c))
     close_mad_pct = mad(c) / max(center, 1e-9)
     body_mid_mad_pct = mad(body_mid) / max(center, 1e-9)
     body_stack_ratio, body_dense_zone_ratio = calc_body_stack_ratio(body_low, body_high, center)
 
-    # 粘合带：由实体中位数和实体离散度定义；不是压力位。
     body_center = float(np.median(body_mid))
     band_half = max(center * 0.020, mad(body_mid) * 1.6)
     band_low = body_center - band_half
@@ -217,15 +186,13 @@ def calc_sticky(df, window=9):
     close_in_band = float(np.mean((c >= band_low) & (c <= band_high)))
     body_touch_band = float(np.mean((body_high >= band_low) & (body_low <= band_high)))
 
-    # 影线区间重合只作为参考输出，不再作为粘合核心。
     range_overlaps = []
     body_overlaps = []
     dislocated = []
     for i in range(1, len(k)):
         range_inter = max(0.0, min(h[i], h[i - 1]) - max(l[i], l[i - 1]))
         range_base = max(min(h[i] - l[i], h[i - 1] - l[i - 1]), center * 0.01)
-        range_overlap = range_inter / range_base
-        range_overlaps.append(range_overlap)
+        range_overlaps.append(range_inter / range_base)
 
         body_inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
         body_union = max(body_high[i], body_high[i - 1]) - min(body_low[i], body_low[i - 1])
@@ -240,7 +207,6 @@ def calc_sticky(df, window=9):
     body_overlap = float(np.mean(body_overlaps)) if body_overlaps else 0.0
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
 
-    # 阳线低开、阴线高开：这是粘合感的辅助条件，不替代80%实体重合硬条件。
     reverse_open_hits = 0
     directional_count = 0
     eps = 0.002
@@ -258,24 +224,12 @@ def calc_sticky(df, window=9):
                 reverse_open_hits += 1
     reverse_open_ratio = reverse_open_hits / directional_count if directional_count else 0.0
 
-    # 趋势推进过滤：最近N根K线明显单边推进，不算真正粘合。
     net_close_change = c[-1] / max(c[0], 1e-9) - 1
     half = len(k) // 2
     first_half_center = float(np.median(c[:half])) if half > 0 else float(np.median(c))
     second_half_center = float(np.median(c[half:])) if half > 0 else float(np.median(c))
     half_center_drift = second_half_center / max(first_half_center, 1e-9) - 1
-    trend_push_flag = (
-        abs(net_close_change) >= 0.25
-        or (abs(net_close_change) >= 0.18 and abs(half_center_drift) >= 0.08)
-    )
-
-    upper_wick = (h - body_high) / rng
-    lower_wick = (body_low - l) / rng
-    long_wick = (upper_wick >= 0.35) | (lower_wick >= 0.35)
-    if long_wick.sum() > 0:
-        wick_recall = float(np.mean(((c >= band_low) & (c <= band_high))[long_wick]))
-    else:
-        wick_recall = 0.55
+    trend_push_flag = abs(net_close_change) >= 0.25 or (abs(net_close_change) >= 0.18 and abs(half_center_drift) >= 0.08)
 
     score = (
         50 * body_stack_ratio
@@ -291,17 +245,17 @@ def calc_sticky(df, window=9):
     score = round(max(0.0, min(100.0, score)), 2)
 
     core_sticky = (
-        body_stack_ratio >= 0.80
+        body_stack_ratio >= 0.70
         and body_mid_mad_pct <= 0.035
-        and body_touch_band >= 0.80
+        and body_touch_band >= 0.70
         and reverse_open_ratio >= 0.30
         and dislocation_ratio <= 0.25
         and not trend_push_flag
     )
     loose_sticky = (
-        body_stack_ratio >= 0.65
+        body_stack_ratio >= 0.60
         and body_mid_mad_pct <= 0.050
-        and body_touch_band >= 0.65
+        and body_touch_band >= 0.60
         and reverse_open_ratio >= 0.25
         and dislocation_ratio <= 0.40
         and not trend_push_flag
@@ -335,7 +289,6 @@ def calc_sticky(df, window=9):
         "close_mad_pct": round(float(close_mad_pct), 4),
         "close_in_band": round(close_in_band, 3),
         "body_touch_band": round(body_touch_band, 3),
-        "wick_recall": round(wick_recall, 3),
         "dislocation_ratio": round(dislocation_ratio, 3),
         "start_date": str(k["date"].iloc[0].date()),
         "end_date": str(k["date"].iloc[-1].date()),
@@ -365,18 +318,18 @@ def main():
     print(f"period: {args.period}")
     print(f"period_rows: {len(period_df)}")
     print(f"window: {args.window}")
-    for k, v in result.items():
-        print(f"{k}: {v}")
+    for key, value in result.items():
+        print(f"{key}: {value}")
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：80%以上K线实体覆盖同一实体重合带，且不是单边趋势推进。")
+        print("符合粘合K线：70%以上K线实体覆盖同一实体重合带，且不是单边趋势推进。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合：实体有部分重合，但没有达到80%以上实体粘合的强标准。")
+        print("弱粘合：实体有部分重合，但没有达到70%以上实体粘合的强标准。")
     elif result["state"] == "TREND_PUSH":
         print("不算粘合：最近窗口更像单边反弹/下跌推进，虽然K线可能有重叠，但不是实体原地互相咬合。")
     else:
-        print("不符合当前粘合规则。强粘合必须看 body_stack_ratio 是否达到0.80。")
+        print("不符合当前粘合规则。强粘合必须看 body_stack_ratio 是否达到0.70。")
 
 
 if __name__ == "__main__":
