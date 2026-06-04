@@ -8,8 +8,8 @@
 当前“粘合”口径：
 1）阳线经常低开后拉回；
 2）阴线经常高开后压回；
-3）多根K线的实体反复重合在同一价格带；
-4）脱节K线少；
+3）至少80%的K线实体必须覆盖同一个实体重合价格带；
+4）多根K线的实体中心不能离散太大；
 5）影线重合只能辅助，不能作为粘合核心；
 6）单边反弹/下跌推进不算真正粘合。
 
@@ -179,7 +179,6 @@ def calc_body_stack_ratio(body_low, body_high, center):
     grid = np.linspace(lo, hi, 200)
     coverage = np.zeros_like(grid)
     for bl, bh in zip(body_low, body_high):
-        # 极小实体给一个最小厚度，避免十字星完全失真，但仍以实体为核心。
         min_half = center * 0.0015
         mid = (bl + bh) / 2.0
         adj_low = min(bl, mid - min_half)
@@ -211,7 +210,7 @@ def calc_sticky(df, window=9):
 
     # 粘合带：由实体中位数和实体离散度定义；不是压力位。
     body_center = float(np.median(body_mid))
-    band_half = max(center * 0.025, mad(body_mid) * 2.0)
+    band_half = max(center * 0.020, mad(body_mid) * 1.6)
     band_low = body_center - band_half
     band_high = body_center + band_half
 
@@ -233,7 +232,7 @@ def calc_sticky(df, window=9):
         body_overlaps.append(body_inter / max(body_union, center * 0.004))
 
         body_far = body_high[i] < band_low or body_low[i] > band_high
-        body_mid_far = abs(body_mid[i] - body_center) / max(center, 1e-9) > 0.055
+        body_mid_far = abs(body_mid[i] - body_center) / max(center, 1e-9) > 0.050
         poor_body_overlap = body_inter <= center * 0.001 and body_mid_far
         dislocated.append(body_far or poor_body_overlap)
 
@@ -241,7 +240,7 @@ def calc_sticky(df, window=9):
     body_overlap = float(np.mean(body_overlaps)) if body_overlaps else 0.0
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
 
-    # 阳线低开、阴线高开：这是你定义的“粘合感”的辅助条件。
+    # 阳线低开、阴线高开：这是粘合感的辅助条件，不替代80%实体重合硬条件。
     reverse_open_hits = 0
     directional_count = 0
     eps = 0.002
@@ -279,11 +278,11 @@ def calc_sticky(df, window=9):
         wick_recall = 0.55
 
     score = (
-        35 * body_stack_ratio
-        + 20 * low_better(body_mid_mad_pct, 0.020, 0.060)
-        + 15 * body_touch_band
-        + 10 * reverse_open_ratio
-        + 10 * close_in_band
+        50 * body_stack_ratio
+        + 15 * low_better(body_mid_mad_pct, 0.018, 0.055)
+        + 12 * body_touch_band
+        + 8 * reverse_open_ratio
+        + 5 * close_in_band
         + 5 * low_better(close_mad_pct, 0.025, 0.085)
         - 25 * dislocation_ratio
     )
@@ -292,19 +291,19 @@ def calc_sticky(df, window=9):
     score = round(max(0.0, min(100.0, score)), 2)
 
     core_sticky = (
-        body_stack_ratio >= 0.56
+        body_stack_ratio >= 0.80
         and body_mid_mad_pct <= 0.035
-        and body_touch_band >= 0.70
-        and reverse_open_ratio >= 0.35
-        and dislocation_ratio <= 0.30
+        and body_touch_band >= 0.80
+        and reverse_open_ratio >= 0.30
+        and dislocation_ratio <= 0.25
         and not trend_push_flag
     )
     loose_sticky = (
-        body_stack_ratio >= 0.45
+        body_stack_ratio >= 0.65
         and body_mid_mad_pct <= 0.050
-        and body_touch_band >= 0.60
+        and body_touch_band >= 0.65
         and reverse_open_ratio >= 0.25
-        and dislocation_ratio <= 0.45
+        and dislocation_ratio <= 0.40
         and not trend_push_flag
     )
 
@@ -371,13 +370,13 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：实体重合度高，阳线低开/阴线高开有配合，且不是单边趋势推进。")
+        print("符合粘合K线：80%以上K线实体覆盖同一实体重合带，且不是单边趋势推进。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合：有部分实体重合，但实体重合密度、反向开盘或稳定性还需要人工确认。")
+        print("弱粘合：实体有部分重合，但没有达到80%以上实体粘合的强标准。")
     elif result["state"] == "TREND_PUSH":
         print("不算粘合：最近窗口更像单边反弹/下跌推进，虽然K线可能有重叠，但不是实体原地互相咬合。")
     else:
-        print("不符合当前粘合规则。重点看 body_stack_ratio、body_mid_mad_pct、body_touch_band、reverse_open_ratio、dislocation_ratio。")
+        print("不符合当前粘合规则。强粘合必须看 body_stack_ratio 是否达到0.80。")
 
 
 if __name__ == "__main__":
