@@ -39,12 +39,6 @@ def mad(values):
     return float(np.median(np.abs(arr - med)))
 
 
-def clip01(x):
-    if not np.isfinite(x):
-        return 0.0
-    return max(0.0, min(1.0, float(x)))
-
-
 def normalize_columns(df):
     return df.rename(columns={c: COL_MAP.get(str(c).strip(), str(c).strip().lower()) for c in df.columns})
 
@@ -140,7 +134,6 @@ def to_period(df, period):
 
 
 def adjusted_body(body_low, body_high, center):
-    """给极小实体一个很小厚度，避免十字星导致实体粘合被完全低估。"""
     adj_low = []
     adj_high = []
     min_half = center * 0.0015
@@ -152,7 +145,6 @@ def adjusted_body(body_low, body_high, center):
 
 
 def calc_same_price_stack_ratio(body_low, body_high, center):
-    """参考项：某一固定价格线最多能穿过多少根实体。它不是当前粘合主规则。"""
     lo = float(np.nanmin(body_low))
     hi = float(np.nanmax(body_high))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -186,6 +178,7 @@ def calc_sticky(df, window=9):
     body_pair_hits = []
     body_pair_strengths = []
     range_pair_strengths = []
+    wick_pair_hits = []
     dislocated = []
     for i in range(1, len(k)):
         body_inter = max(0.0, min(adj_body_high[i], adj_body_high[i - 1]) - max(adj_body_low[i], adj_body_low[i - 1]))
@@ -196,19 +189,20 @@ def calc_sticky(df, window=9):
 
         range_inter = max(0.0, min(h[i], h[i - 1]) - max(l[i], l[i - 1]))
         range_base = max(min(h[i] - l[i], h[i - 1] - l[i - 1]), center * 0.01)
-        range_pair_strengths.append(range_inter / range_base)
+        range_strength = range_inter / range_base
+        range_pair_strengths.append(range_strength)
+        wick_pair_hits.append(range_strength >= 0.35)
 
-        # 脱节：实体没有重合，而且实体中心距离也明显拉开。
         body_mid_far = abs(body_mid[i] - body_mid[i - 1]) / max(center, 1e-9) > 0.055
         dislocated.append((body_inter <= center * 0.001) and body_mid_far)
 
     body_pair_overlap_ratio = float(np.mean(body_pair_hits)) if body_pair_hits else 0.0
     body_pair_overlap_strength = float(np.mean(body_pair_strengths)) if body_pair_strengths else 0.0
     range_overlap_avg = float(np.mean(range_pair_strengths)) if range_pair_strengths else 0.0
+    wick_interlock_ratio = float(np.mean(wick_pair_hits)) if wick_pair_hits else 0.0
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
     same_price_body_stack_ratio = calc_same_price_stack_ratio(body_low, body_high, center)
 
-    # 阳线低开、阴线高开：判断K线之间是否互相咬住。
     reverse_open_hits = 0
     directional_count = 0
     eps = 0.002
@@ -236,9 +230,10 @@ def calc_sticky(df, window=9):
         45 * body_pair_overlap_ratio
         + 20 * min(body_pair_overlap_strength, 1.0)
         + 15 * reverse_open_ratio
-        + 10 * min(range_overlap_avg, 1.0)
-        + 5 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
-        + 5 * max(0.0, 1.0 - close_mad_pct / 0.10)
+        + 8 * min(range_overlap_avg, 1.0)
+        + 5 * wick_interlock_ratio
+        + 4 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
+        + 3 * max(0.0, 1.0 - close_mad_pct / 0.10)
         - 20 * dislocation_ratio
     )
     score = round(max(0.0, min(100.0, score)), 2)
@@ -272,6 +267,7 @@ def calc_sticky(df, window=9):
         "reverse_open_hits": int(reverse_open_hits),
         "directional_count": int(directional_count),
         "range_overlap_avg": round(range_overlap_avg, 3),
+        "wick_interlock_ratio": round(wick_interlock_ratio, 3),
         "same_price_body_stack_ratio": round(same_price_body_stack_ratio, 3),
         "body_mid_mad_pct": round(float(body_mid_mad_pct), 4),
         "close_mad_pct": round(float(close_mad_pct), 4),
@@ -311,7 +307,7 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：70%以上相邻K线实体互相重合，阳线低开/阴线高开有配合。")
+        print("符合粘合K线：70%以上相邻K线实体互相重合，阳线低开/阴线高开有配合；趋势方向不影响判断。")
     elif result["state"] == "WEAK_STICKY":
         print("弱粘合：实体有互相咬合，但没有达到强粘合标准。")
     else:
