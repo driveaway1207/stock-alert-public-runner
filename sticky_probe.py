@@ -4,11 +4,11 @@
 只验证单只股票，不接入 stock_alert.py，不发 Telegram，不扫全市场。
 
 当前粘合口径：
-1. 粘合不是横盘震荡，和整体上涨、下跌、震荡趋势无关；
+1. 粘合和整体上涨、下跌、震荡趋势无关；
 2. 核心是相邻K线实体之间经常互相重合、互相咬住；
-3. 阳线经常低开后拉回，阴线经常高开后压回；
+3. 阳线低开后拉回、阴线高开后压回，且高低开要有一定幅度；
 4. 上下影线互相咬合可以辅助，但不能替代实体粘合；
-5. 最近N根K线里，至少约70%的相邻K线对要出现实体重合，才算强粘合。
+5. 如果经常出现2%以上明显实体，而高低开不频繁/幅度不够、影线实体比也不够，则不能算强粘合。
 """
 
 import argparse
@@ -134,6 +134,7 @@ def to_period(df, period):
 
 
 def adjusted_body(body_low, body_high, center):
+    """给极小实体一个很小厚度，避免十字星导致实体重合被完全低估。"""
     adj_low = []
     adj_high = []
     min_half = center * 0.0015
@@ -145,6 +146,7 @@ def adjusted_body(body_low, body_high, center):
 
 
 def calc_same_price_stack_ratio(body_low, body_high, center):
+    """参考项：某一固定价格线最多能穿过多少根实体。它不是当前粘合主规则。"""
     lo = float(np.nanmin(body_low))
     hi = float(np.nanmax(body_high))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -175,6 +177,16 @@ def calc_sticky(df, window=9):
     body_mid_mad_pct = mad(body_mid) / max(center, 1e-9)
     adj_body_low, adj_body_high = adjusted_body(body_low, body_high, center)
 
+    rng = np.maximum(h - l, center * 0.001)
+    real_body = np.abs(c - o)
+    body_pct = real_body / np.maximum(np.r_[c[0], c[:-1]], center * 0.01)
+    large_body_ratio = float(np.mean(body_pct >= 0.020))
+    avg_body_pct = float(np.mean(body_pct))
+    wick_total = np.maximum((h - l) - real_body, 0.0)
+    wick_body_ratio_arr = wick_total / np.maximum(real_body, center * 0.003)
+    wick_body_ge1_ratio = float(np.mean(wick_body_ratio_arr >= 1.0))
+    avg_wick_body_ratio = float(np.mean(wick_body_ratio_arr))
+
     body_pair_hits = []
     body_pair_strengths = []
     range_pair_strengths = []
@@ -203,22 +215,37 @@ def calc_sticky(df, window=9):
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
     same_price_body_stack_ratio = calc_same_price_stack_ratio(body_low, body_high, center)
 
+    # 阳线低开/阴线高开必须看“是否发生”和“幅度是否够”，不能只看方向。
     reverse_open_hits = 0
+    effective_reverse_open_hits = 0
     directional_count = 0
+    reverse_degrees = []
     eps = 0.002
+    effective_eps = 0.004
     for i in range(1, len(k)):
         prev_close = c[i - 1]
         is_up = c[i] > o[i] * (1 + eps)
         is_down = c[i] < o[i] * (1 - eps)
         if is_up:
             directional_count += 1
+            degree = max((prev_close - o[i]) / max(prev_close, 1e-9), 0.0)
             if o[i] <= prev_close * (1 + eps):
                 reverse_open_hits += 1
+            if degree >= effective_eps:
+                effective_reverse_open_hits += 1
+            reverse_degrees.append(degree)
         elif is_down:
             directional_count += 1
+            degree = max((o[i] - prev_close) / max(prev_close, 1e-9), 0.0)
             if o[i] >= prev_close * (1 - eps):
                 reverse_open_hits += 1
+            if degree >= effective_eps:
+                effective_reverse_open_hits += 1
+            reverse_degrees.append(degree)
+
     reverse_open_ratio = reverse_open_hits / directional_count if directional_count else 0.0
+    effective_reverse_open_ratio = effective_reverse_open_hits / directional_count if directional_count else 0.0
+    avg_reverse_open_degree = float(np.mean(reverse_degrees)) if reverse_degrees else 0.0
 
     net_close_change = c[-1] / max(c[0], 1e-9) - 1
     half = len(k) // 2
@@ -226,32 +253,48 @@ def calc_sticky(df, window=9):
     second_half_center = float(np.median(c[half:])) if half > 0 else float(np.median(c))
     half_center_drift = second_half_center / max(first_half_center, 1e-9) - 1
 
-    score = (
-        45 * body_pair_overlap_ratio
-        + 20 * min(body_pair_overlap_strength, 1.0)
-        + 15 * reverse_open_ratio
-        + 8 * min(range_overlap_avg, 1.0)
-        + 5 * wick_interlock_ratio
-        + 4 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
-        + 3 * max(0.0, 1.0 - close_mad_pct / 0.10)
-        - 20 * dislocation_ratio
+    # 大实体多，但有效高低开少、影线实体比不足，说明不是“黏着走”，而更像普通推进/回撤。
+    body_push_flag = (
+        large_body_ratio >= 0.35
+        and effective_reverse_open_ratio < 0.40
+        and wick_body_ge1_ratio < 0.35
     )
+
+    score = (
+        36 * body_pair_overlap_ratio
+        + 20 * min(body_pair_overlap_strength, 1.0)
+        + 16 * effective_reverse_open_ratio
+        + 8 * min(avg_reverse_open_degree / 0.012, 1.0)
+        + 8 * min(range_overlap_avg, 1.0)
+        + 6 * wick_body_ge1_ratio
+        + 4 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
+        + 2 * max(0.0, 1.0 - close_mad_pct / 0.10)
+        - 18 * dislocation_ratio
+        - 14 * large_body_ratio * (1.0 - wick_body_ge1_ratio)
+    )
+    if body_push_flag:
+        score -= 18
     score = round(max(0.0, min(100.0, score)), 2)
 
     core_sticky = (
         body_pair_overlap_ratio >= 0.70
-        and body_pair_overlap_strength >= 0.18
-        and reverse_open_ratio >= 0.30
-        and dislocation_ratio <= 0.30
+        and body_pair_overlap_strength >= 0.28
+        and effective_reverse_open_ratio >= 0.35
+        and avg_reverse_open_degree >= 0.003
+        and dislocation_ratio <= 0.25
+        and not body_push_flag
     )
     loose_sticky = (
-        body_pair_overlap_ratio >= 0.55
-        and body_pair_overlap_strength >= 0.12
-        and reverse_open_ratio >= 0.20
-        and dislocation_ratio <= 0.45
+        body_pair_overlap_ratio >= 0.60
+        and body_pair_overlap_strength >= 0.18
+        and effective_reverse_open_ratio >= 0.25
+        and dislocation_ratio <= 0.40
+        and not body_push_flag
     )
 
-    if core_sticky:
+    if body_push_flag:
+        state = "BODY_PUSH"
+    elif core_sticky:
         state = "STICKY"
     elif loose_sticky:
         state = "WEAK_STICKY"
@@ -264,8 +307,16 @@ def calc_sticky(df, window=9):
         "body_pair_overlap_ratio": round(body_pair_overlap_ratio, 3),
         "body_pair_overlap_strength": round(body_pair_overlap_strength, 3),
         "reverse_open_ratio": round(reverse_open_ratio, 3),
+        "effective_reverse_open_ratio": round(effective_reverse_open_ratio, 3),
+        "avg_reverse_open_degree": round(avg_reverse_open_degree, 4),
         "reverse_open_hits": int(reverse_open_hits),
+        "effective_reverse_open_hits": int(effective_reverse_open_hits),
         "directional_count": int(directional_count),
+        "large_body_ratio": round(large_body_ratio, 3),
+        "avg_body_pct": round(avg_body_pct, 4),
+        "wick_body_ge1_ratio": round(wick_body_ge1_ratio, 3),
+        "avg_wick_body_ratio": round(avg_wick_body_ratio, 3),
+        "body_push_flag": bool(body_push_flag),
         "range_overlap_avg": round(range_overlap_avg, 3),
         "wick_interlock_ratio": round(wick_interlock_ratio, 3),
         "same_price_body_stack_ratio": round(same_price_body_stack_ratio, 3),
@@ -307,11 +358,13 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：70%以上相邻K线实体互相重合，阳线低开/阴线高开有配合；趋势方向不影响判断。")
+        print("符合粘合K线：相邻实体高频咬合，有效高低开有幅度，且不是大实体普通推进。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合：实体有互相咬合，但没有达到强粘合标准。")
+        print("弱粘合：有实体咬合，但高低开幅度、实体咬合强度或影线配合还不够强。")
+    elif result["state"] == "BODY_PUSH":
+        print("不算粘合：明显实体偏多，但有效高低开和影线实体比不足，更像普通推进/回撤。")
     else:
-        print("不符合当前粘合规则。重点看 body_pair_overlap_ratio 是否达到0.70。")
+        print("不符合当前粘合规则。重点看 effective_reverse_open_ratio、avg_reverse_open_degree、large_body_ratio、wick_body_ge1_ratio。")
 
 
 if __name__ == "__main__":
