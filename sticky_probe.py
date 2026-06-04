@@ -3,8 +3,12 @@
 
 只验证单只股票，不接入 stock_alert.py，不发 Telegram，不扫全市场。
 
-强粘合口径：最近N根K线中，至少70%的K线实体覆盖同一个实体重合价位；
-影线重合只做参考，不作为粘合核心。
+当前粘合口径：
+1. 粘合不是横盘震荡，和整体上涨、下跌、震荡趋势无关；
+2. 核心是相邻K线实体之间经常互相重合、互相咬住；
+3. 阳线经常低开后拉回，阴线经常高开后压回；
+4. 上下影线互相咬合可以辅助，但不能替代实体粘合；
+5. 最近N根K线里，至少约70%的相邻K线对要出现实体重合，才算强粘合。
 """
 
 import argparse
@@ -35,14 +39,10 @@ def mad(values):
     return float(np.median(np.abs(arr - med)))
 
 
-def low_better(x, good, bad):
+def clip01(x):
     if not np.isfinite(x):
         return 0.0
-    if x <= good:
-        return 1.0
-    if x >= bad:
-        return 0.0
-    return float((bad - x) / max(bad - good, 1e-9))
+    return max(0.0, min(1.0, float(x)))
 
 
 def normalize_columns(df):
@@ -139,25 +139,30 @@ def to_period(df, period):
     return df.set_index("date").resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).reset_index()
 
 
-def calc_body_stack_ratio(body_low, body_high, center):
-    """返回最大实体覆盖比例：某一价格线被多少根K线实体同时覆盖。"""
+def adjusted_body(body_low, body_high, center):
+    """给极小实体一个很小厚度，避免十字星导致实体粘合被完全低估。"""
+    adj_low = []
+    adj_high = []
+    min_half = center * 0.0015
+    for bl, bh in zip(body_low, body_high):
+        mid = (bl + bh) / 2.0
+        adj_low.append(min(bl, mid - min_half))
+        adj_high.append(max(bh, mid + min_half))
+    return np.asarray(adj_low, dtype=float), np.asarray(adj_high, dtype=float)
+
+
+def calc_same_price_stack_ratio(body_low, body_high, center):
+    """参考项：某一固定价格线最多能穿过多少根实体。它不是当前粘合主规则。"""
     lo = float(np.nanmin(body_low))
     hi = float(np.nanmax(body_high))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return 0.0, 0.0
-
+        return 0.0
     grid = np.linspace(lo, hi, 200)
     coverage = np.zeros_like(grid)
-    for bl, bh in zip(body_low, body_high):
-        mid = (bl + bh) / 2.0
-        min_half = center * 0.0015
-        adj_low = min(bl, mid - min_half)
-        adj_high = max(bh, mid + min_half)
-        coverage += ((grid >= adj_low) & (grid <= adj_high)).astype(float)
-
-    stack_ratio = float(np.max(coverage) / max(len(body_low), 1))
-    dense_ratio = float(np.mean(coverage >= max(3, int(np.ceil(len(body_low) * 0.45)))))
-    return stack_ratio, dense_ratio
+    adj_low, adj_high = adjusted_body(body_low, body_high, center)
+    for bl, bh in zip(adj_low, adj_high):
+        coverage += ((grid >= bl) & (grid <= bh)).astype(float)
+    return float(np.max(coverage) / max(len(body_low), 1))
 
 
 def calc_sticky(df, window=9):
@@ -176,37 +181,34 @@ def calc_sticky(df, window=9):
     center = float(np.median(c))
     close_mad_pct = mad(c) / max(center, 1e-9)
     body_mid_mad_pct = mad(body_mid) / max(center, 1e-9)
-    body_stack_ratio, body_dense_zone_ratio = calc_body_stack_ratio(body_low, body_high, center)
+    adj_body_low, adj_body_high = adjusted_body(body_low, body_high, center)
 
-    body_center = float(np.median(body_mid))
-    band_half = max(center * 0.020, mad(body_mid) * 1.6)
-    band_low = body_center - band_half
-    band_high = body_center + band_half
-
-    close_in_band = float(np.mean((c >= band_low) & (c <= band_high)))
-    body_touch_band = float(np.mean((body_high >= band_low) & (body_low <= band_high)))
-
-    range_overlaps = []
-    body_overlaps = []
+    body_pair_hits = []
+    body_pair_strengths = []
+    range_pair_strengths = []
     dislocated = []
     for i in range(1, len(k)):
+        body_inter = max(0.0, min(adj_body_high[i], adj_body_high[i - 1]) - max(adj_body_low[i], adj_body_low[i - 1]))
+        body_base = max(min(adj_body_high[i] - adj_body_low[i], adj_body_high[i - 1] - adj_body_low[i - 1]), center * 0.003)
+        body_strength = body_inter / body_base
+        body_pair_strengths.append(body_strength)
+        body_pair_hits.append(body_inter > center * 0.001)
+
         range_inter = max(0.0, min(h[i], h[i - 1]) - max(l[i], l[i - 1]))
         range_base = max(min(h[i] - l[i], h[i - 1] - l[i - 1]), center * 0.01)
-        range_overlaps.append(range_inter / range_base)
+        range_pair_strengths.append(range_inter / range_base)
 
-        body_inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
-        body_union = max(body_high[i], body_high[i - 1]) - min(body_low[i], body_low[i - 1])
-        body_overlaps.append(body_inter / max(body_union, center * 0.004))
+        # 脱节：实体没有重合，而且实体中心距离也明显拉开。
+        body_mid_far = abs(body_mid[i] - body_mid[i - 1]) / max(center, 1e-9) > 0.055
+        dislocated.append((body_inter <= center * 0.001) and body_mid_far)
 
-        body_far = body_high[i] < band_low or body_low[i] > band_high
-        body_mid_far = abs(body_mid[i] - body_center) / max(center, 1e-9) > 0.050
-        poor_body_overlap = body_inter <= center * 0.001 and body_mid_far
-        dislocated.append(body_far or poor_body_overlap)
-
-    range_overlap_avg = float(np.mean(range_overlaps)) if range_overlaps else 0.0
-    body_overlap = float(np.mean(body_overlaps)) if body_overlaps else 0.0
+    body_pair_overlap_ratio = float(np.mean(body_pair_hits)) if body_pair_hits else 0.0
+    body_pair_overlap_strength = float(np.mean(body_pair_strengths)) if body_pair_strengths else 0.0
+    range_overlap_avg = float(np.mean(range_pair_strengths)) if range_pair_strengths else 0.0
     dislocation_ratio = float(np.mean(dislocated)) if dislocated else 0.0
+    same_price_body_stack_ratio = calc_same_price_stack_ratio(body_low, body_high, center)
 
+    # 阳线低开、阴线高开：判断K线之间是否互相咬住。
     reverse_open_hits = 0
     directional_count = 0
     eps = 0.002
@@ -229,41 +231,32 @@ def calc_sticky(df, window=9):
     first_half_center = float(np.median(c[:half])) if half > 0 else float(np.median(c))
     second_half_center = float(np.median(c[half:])) if half > 0 else float(np.median(c))
     half_center_drift = second_half_center / max(first_half_center, 1e-9) - 1
-    trend_push_flag = abs(net_close_change) >= 0.25 or (abs(net_close_change) >= 0.18 and abs(half_center_drift) >= 0.08)
 
     score = (
-        50 * body_stack_ratio
-        + 15 * low_better(body_mid_mad_pct, 0.018, 0.055)
-        + 12 * body_touch_band
-        + 8 * reverse_open_ratio
-        + 5 * close_in_band
-        + 5 * low_better(close_mad_pct, 0.025, 0.085)
-        - 25 * dislocation_ratio
+        45 * body_pair_overlap_ratio
+        + 20 * min(body_pair_overlap_strength, 1.0)
+        + 15 * reverse_open_ratio
+        + 10 * min(range_overlap_avg, 1.0)
+        + 5 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
+        + 5 * max(0.0, 1.0 - close_mad_pct / 0.10)
+        - 20 * dislocation_ratio
     )
-    if trend_push_flag:
-        score -= 18
     score = round(max(0.0, min(100.0, score)), 2)
 
     core_sticky = (
-        body_stack_ratio >= 0.70
-        and body_mid_mad_pct <= 0.035
-        and body_touch_band >= 0.70
+        body_pair_overlap_ratio >= 0.70
+        and body_pair_overlap_strength >= 0.18
         and reverse_open_ratio >= 0.30
-        and dislocation_ratio <= 0.25
-        and not trend_push_flag
+        and dislocation_ratio <= 0.30
     )
     loose_sticky = (
-        body_stack_ratio >= 0.60
-        and body_mid_mad_pct <= 0.050
-        and body_touch_band >= 0.60
-        and reverse_open_ratio >= 0.25
-        and dislocation_ratio <= 0.40
-        and not trend_push_flag
+        body_pair_overlap_ratio >= 0.55
+        and body_pair_overlap_strength >= 0.12
+        and reverse_open_ratio >= 0.20
+        and dislocation_ratio <= 0.45
     )
 
-    if trend_push_flag:
-        state = "TREND_PUSH"
-    elif core_sticky:
+    if core_sticky:
         state = "STICKY"
     elif loose_sticky:
         state = "WEAK_STICKY"
@@ -273,23 +266,18 @@ def calc_sticky(df, window=9):
     return {
         "state": state,
         "score": score,
-        "band_low": round(band_low, 3),
-        "band_high": round(band_high, 3),
-        "body_stack_ratio": round(body_stack_ratio, 3),
-        "body_dense_zone_ratio": round(body_dense_zone_ratio, 3),
-        "body_mid_mad_pct": round(float(body_mid_mad_pct), 4),
-        "body_overlap": round(body_overlap, 3),
-        "range_overlap_avg": round(range_overlap_avg, 3),
+        "body_pair_overlap_ratio": round(body_pair_overlap_ratio, 3),
+        "body_pair_overlap_strength": round(body_pair_overlap_strength, 3),
         "reverse_open_ratio": round(reverse_open_ratio, 3),
         "reverse_open_hits": int(reverse_open_hits),
         "directional_count": int(directional_count),
+        "range_overlap_avg": round(range_overlap_avg, 3),
+        "same_price_body_stack_ratio": round(same_price_body_stack_ratio, 3),
+        "body_mid_mad_pct": round(float(body_mid_mad_pct), 4),
+        "close_mad_pct": round(float(close_mad_pct), 4),
+        "dislocation_ratio": round(dislocation_ratio, 3),
         "net_close_change": round(float(net_close_change), 4),
         "half_center_drift": round(float(half_center_drift), 4),
-        "trend_push_flag": bool(trend_push_flag),
-        "close_mad_pct": round(float(close_mad_pct), 4),
-        "close_in_band": round(close_in_band, 3),
-        "body_touch_band": round(body_touch_band, 3),
-        "dislocation_ratio": round(dislocation_ratio, 3),
         "start_date": str(k["date"].iloc[0].date()),
         "end_date": str(k["date"].iloc[-1].date()),
         "rows": len(k),
@@ -323,13 +311,11 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：70%以上K线实体覆盖同一实体重合带，且不是单边趋势推进。")
+        print("符合粘合K线：70%以上相邻K线实体互相重合，阳线低开/阴线高开有配合。")
     elif result["state"] == "WEAK_STICKY":
-        print("弱粘合：实体有部分重合，但没有达到70%以上实体粘合的强标准。")
-    elif result["state"] == "TREND_PUSH":
-        print("不算粘合：最近窗口更像单边反弹/下跌推进，虽然K线可能有重叠，但不是实体原地互相咬合。")
+        print("弱粘合：实体有互相咬合，但没有达到强粘合标准。")
     else:
-        print("不符合当前粘合规则。强粘合必须看 body_stack_ratio 是否达到0.70。")
+        print("不符合当前粘合规则。重点看 body_pair_overlap_ratio 是否达到0.70。")
 
 
 if __name__ == "__main__":
