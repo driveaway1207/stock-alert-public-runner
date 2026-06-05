@@ -8,7 +8,7 @@
 2. 核心是相邻K线实体之间经常互相重合、互相咬住；
 3. 阳线低开后拉回、阴线高开后压回，且高低开要有一定幅度；
 4. 上下影线互相咬合可以辅助，但不能替代实体粘合；
-5. 如果经常出现2%以上明显实体，而高低开不频繁/幅度不够、影线实体比也不够，则不能算强粘合。
+5. 如果最近N根K线里，2%以上明显实体出现次数达到30%以上，直接不算强粘合。
 """
 
 import argparse
@@ -177,7 +177,6 @@ def calc_sticky(df, window=9):
     body_mid_mad_pct = mad(body_mid) / max(center, 1e-9)
     adj_body_low, adj_body_high = adjusted_body(body_low, body_high, center)
 
-    rng = np.maximum(h - l, center * 0.001)
     real_body = np.abs(c - o)
     body_pct = real_body / np.maximum(np.r_[c[0], c[:-1]], center * 0.01)
     large_body_ratio = float(np.mean(body_pct >= 0.020))
@@ -253,12 +252,8 @@ def calc_sticky(df, window=9):
     second_half_center = float(np.median(c[half:])) if half > 0 else float(np.median(c))
     half_center_drift = second_half_center / max(first_half_center, 1e-9) - 1
 
-    # 大实体多，但有效高低开少、影线实体比不足，说明不是“黏着走”，而更像普通推进/回撤。
-    body_push_flag = (
-        large_body_ratio >= 0.35
-        and effective_reverse_open_ratio < 0.40
-        and wick_body_ge1_ratio < 0.35
-    )
+    # 硬过滤：2%以上明显实体出现次数达到30%以上，直接不算粘合。
+    body_push_flag = large_body_ratio >= 0.30
 
     score = (
         36 * body_pair_overlap_ratio
@@ -270,10 +265,10 @@ def calc_sticky(df, window=9):
         + 4 * max(0.0, 1.0 - body_mid_mad_pct / 0.08)
         + 2 * max(0.0, 1.0 - close_mad_pct / 0.10)
         - 18 * dislocation_ratio
-        - 14 * large_body_ratio * (1.0 - wick_body_ge1_ratio)
+        - 30 * large_body_ratio
     )
     if body_push_flag:
-        score -= 18
+        score -= 25
     score = round(max(0.0, min(100.0, score)), 2)
 
     core_sticky = (
@@ -358,13 +353,13 @@ def main():
 
     print("\n结论:")
     if result["state"] == "STICKY":
-        print("符合粘合K线：相邻实体高频咬合，有效高低开有幅度，且不是大实体普通推进。")
+        print("符合粘合K线：相邻实体高频咬合，有效高低开有幅度，且明显实体没有频繁出现。")
     elif result["state"] == "WEAK_STICKY":
         print("弱粘合：有实体咬合，但高低开幅度、实体咬合强度或影线配合还不够强。")
     elif result["state"] == "BODY_PUSH":
-        print("不算粘合：明显实体偏多，但有效高低开和影线实体比不足，更像普通推进/回撤。")
+        print("不算粘合：2%以上明显实体出现次数达到30%以上，属于普通推进/回撤，不是粘合。")
     else:
-        print("不符合当前粘合规则。重点看 effective_reverse_open_ratio、avg_reverse_open_degree、large_body_ratio、wick_body_ge1_ratio。")
+        print("不符合当前粘合规则。重点看 large_body_ratio、effective_reverse_open_ratio、body_pair_overlap_strength。")
 
 
 if __name__ == "__main__":
