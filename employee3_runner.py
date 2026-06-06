@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""三号员工：核心线突破海选器 V1
+"""三号员工：双线突破海选器 V2
 
 用途：
 1）读取现有日线前复权缓存；
-2）全市场逐票计算20日聚合K核心线；
-3）筛选最近20个交易日内日K线从下往上高质量突破核心线的股票；
-4）对海选命中股票做平铺式深度筛选，输出等级、得分、状态、交易防守位、赔率和归因。
+2）全市场逐票计算历史核心共振线；
+3）全市场逐票计算最近1000个交易日内的千日共振触发线；
+4）筛选最近20个交易日内日K线从下往上高质量突破任意一条线的股票；
+5）对所有海选命中股票直接做完整深度筛选，最终只推送深度质量最好的前5只。
 
 约束：
 - 不改 workflow 链路，不写入生产凭证，不运行时替换函数；
-- 实体接受不淘汰核心线，只输出状态字段；
-- 当前版本在海选后直接做深度筛选；只落地日线缓存可计算字段。
+- 实体接受不淘汰历史核心共振线或千日共振触发线，只输出状态字段；
+- 不设置300只预选池，海选命中后直接完整深度评测。
 """
 
 import json
@@ -37,7 +38,7 @@ try:
 except Exception:  # pragma: no cover
     bs = None
 
-BOOT = "EMPLOYEE3_CORE_LINE_BREAKOUT_DEEP_SCREEN_V2_20260531"
+BOOT = "EMPLOYEE3_DUAL_LINE_BREAKOUT_DEEP_SCREEN_V3_20260606"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "employee3_reports"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -69,6 +70,13 @@ CORE_LINE_TOL = float(os.getenv("EMPLOYEE3_CORE_LINE_TOL", os.getenv("EMPLOYEE5_
 CORE_LINE_BAND_TOL = float(os.getenv("EMPLOYEE3_CORE_LINE_BAND_TOL", "0.015"))
 MIN_CACHE_ROWS = int(os.getenv("EMPLOYEE3_MIN_CACHE_ROWS", "80"))
 MIN_CORE_RESONANCE = int(os.getenv("EMPLOYEE3_MIN_CORE_RESONANCE", "3"))
+# 三号员工只允许两种海选线名：历史核心共振线、千日共振触发线。
+THOUSAND_DAY_LOOKBACK = int(os.getenv("EMPLOYEE3_THOUSAND_DAY_LOOKBACK", "1000"))
+LINE_TOP_CANDIDATE_LIMIT = int(os.getenv("EMPLOYEE3_LINE_TOP_CANDIDATE_LIMIT", "12"))
+ASSESSMENT_LINE_MAX_ABOVE_PCT = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MAX_ABOVE_PCT", "0.18"))
+ASSESSMENT_LINE_MAX_BELOW_PCT = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MAX_BELOW_PCT", "0.025"))
+ASSESSMENT_LINE_MIN_SPACE_PCT = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MIN_SPACE_PCT", "6.0"))
+ASSESSMENT_LINE_MIN_RR = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MIN_RR", "1.05"))
 CACHE_SCAN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_CACHE_SCAN_PROGRESS_EVERY", "500"))
 SCREEN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_SCREEN_PROGRESS_EVERY", "200"))
 MAX_STOCKS = int(os.getenv("MAX_STOCKS", os.getenv("EMPLOYEE3_MAX_STOCKS", "0")))
@@ -106,7 +114,7 @@ DEEP_RECENT_HOT_20D_PCT = float(os.getenv("EMPLOYEE3_DEEP_RECENT_HOT_20D_PCT", "
 # 正式报告口径：海选层只负责召回，不输出评级；所有海选命中票全部完成深度评分。
 # Telegram/Markdown 只输出最终深度精选 TopN；A级/S级不足时，用未硬剔除的最高分票补足并明示。
 # 全量海选与全量深度字段继续写入 CSV/JSON，便于审计和复盘。
-DEEP_FINAL_PICK_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_FINAL_PICK_LIMIT", os.getenv("EMPLOYEE3_DEEP_TOP_REPORT_LIMIT", "3")))
+DEEP_FINAL_PICK_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_FINAL_PICK_LIMIT", os.getenv("EMPLOYEE3_DEEP_TOP_REPORT_LIMIT", "5")))
 DEEP_WATCH_REPORT_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_WATCH_REPORT_LIMIT", "3"))
 DEEP_MIN_FORMAL_SCORE = float(os.getenv("EMPLOYEE3_DEEP_MIN_FORMAL_SCORE", "78"))
 DEEP_FORMAL_GRADES = tuple(x.strip() for x in os.getenv("EMPLOYEE3_DEEP_FORMAL_GRADES", "S,A").split(",") if x.strip())
@@ -699,37 +707,196 @@ def rank_key(x: Dict[str, Any]) -> Tuple[float, int, int, float]:
     return (sf(x.get("net_score")), int(sf(x.get("effective_resonance_count"))), int(sf(x.get("volume_resonance_count"))), -sf(x.get("line")))
 
 
-def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    raw_k = aggregate_bars(df, AGG_WINDOW)
+
+def rank_key_historical_core_resonance_line(x: Dict[str, Any]) -> Tuple[float, int, int, float]:
+    return (sf(x.get("net_score")), int(sf(x.get("effective_resonance_count"))), int(sf(x.get("volume_resonance_count"))), -sf(x.get("line")))
+
+
+def rank_key_thousand_day_resonance_trigger_line(x: Dict[str, Any]) -> Tuple[int, int, float, float]:
+    return (int(sf(x.get("effective_resonance_count"))), int(sf(x.get("volume_resonance_count"))), sf(x.get("net_score")), -sf(x.get("line")))
+
+
+def choose_resonance_line(df: pd.DataFrame, line_label: str, lookback_days: int = 0, rank_mode: str = "historical") -> Dict[str, Any]:
+    d = normalize_hist(df)
+    if lookback_days > 0 and len(d) > lookback_days:
+        d = d.tail(lookback_days).reset_index(drop=True)
+    raw_k = aggregate_bars(d, AGG_WINDOW)
     if raw_k.empty or len(raw_k) < 3:
-        return {"line": None, "level": "数据不足", "reason": "历史K线不足"}
+        return {"line": None, "level": "数据不足", "reason": f"{line_label}历史K线不足", "line_label": line_label}
     completed = raw_k.iloc[:-1].reset_index(drop=True)
     if completed.empty:
-        return {"line": None, "level": "数据不足", "reason": "无已完成聚合K"}
-
+        return {"line": None, "level": "数据不足", "reason": f"{line_label}无已完成聚合K", "line_label": line_label}
     sources = line_candidate_sources(completed)
     if not sources:
-        return {"line": None, "level": "未识别", "reason": "未识别到候选核心线"}
-
-    # 核心优化：不改变核心线口径，不硬砍候选线。
-    # 仍然对所有候选线评分，但用矩阵批量计算；再按价格带合并，选每个价格带最优代表。
+        return {"line": None, "level": "未识别", "reason": f"{line_label}未识别到候选价位", "line_label": line_label}
     scored_all = batch_score_lines(completed, sources)
-    scored = [x for x in scored_all if sf(x.get("net_score")) > 0]
+    scored = [x for x in scored_all if ss(x.get("line_type")) == "core_line"]
     if not scored:
-        return {"line": None, "level": "未识别", "reason": "未识别到有效核心线"}
-
-    band_winners = [max(g, key=rank_key) for g in group_by_band(scored)]
-    ranked = sorted(band_winners, key=rank_key, reverse=True)
+        return {"line": None, "level": "未识别", "reason": f"{line_label}未识别到有效共振线", "line_label": line_label}
+    band_winners = [max(g, key=rank_key_historical_core_resonance_line) for g in group_by_band(scored)]
+    ranked = sorted(
+        band_winners,
+        key=rank_key_thousand_day_resonance_trigger_line if rank_mode == "thousand_day" else rank_key_historical_core_resonance_line,
+        reverse=True,
+    )
     best = dict(ranked[0])
+    best["line_label"] = line_label
+    best["lookback_days"] = int(lookback_days) if lookback_days > 0 else 0
+    best["rank_mode"] = rank_mode
     top_candidates = []
-    for item in ranked[:5]:
-        top_candidates.append({k: v for k, v in item.items() if k not in {"top_candidates", "excluded_current_bar"}})
+    for item in ranked[:max(3, LINE_TOP_CANDIDATE_LIMIT)]:
+        obj = {k: v for k, v in item.items() if k not in {"top_candidates", "excluded_current_bar"}}
+        obj["line_label"] = line_label
+        obj["lookback_days"] = int(lookback_days) if lookback_days > 0 else 0
+        obj["rank_mode"] = rank_mode
+        top_candidates.append(obj)
     best["top_candidates"] = top_candidates
     best["all_candidates_count"] = len(sources)
-    best["positive_candidates_count"] = len(scored)
+    best["effective_candidates_count"] = len(scored)
     best["band_candidates_count"] = len(band_winners)
     best["excluded_current_bar"] = {k: (rd(v, 3) if isinstance(v, (int, float)) else v) for k, v in raw_k.iloc[-1].to_dict().items()}
     return best
+
+
+def choose_historical_core_resonance_line(df: pd.DataFrame) -> Dict[str, Any]:
+    return choose_resonance_line(df, "历史核心共振线", lookback_days=0, rank_mode="historical")
+
+
+def choose_thousand_day_resonance_trigger_line(df: pd.DataFrame) -> Dict[str, Any]:
+    return choose_resonance_line(df, "千日共振触发线", lookback_days=THOUSAND_DAY_LOOKBACK, rank_mode="thousand_day")
+
+
+def first_real_pressure_before_breakout(d: pd.DataFrame, bidx: int, last_close: float) -> Dict[str, Any]:
+    if d.empty or bidx <= 0 or last_close <= 0:
+        return {"target_price": 0.0, "space_pct": 0.0, "pressure_found": False}
+    pre = d.iloc[max(0, bidx - 520):bidx].copy()
+    highs = pd.to_numeric(pre.get("high", pd.Series(dtype=float)), errors="coerce").dropna()
+    pressures = sorted([float(x) for x in highs.tolist() if float(x) >= last_close * 1.025])
+    target = pressures[0] if pressures else 0.0
+    space = pct_change(target, last_close) if target > 0 else 0.0
+    return {"target_price": rd(target, 3), "space_pct": rd(space, 2), "pressure_found": bool(target > 0)}
+
+
+def score_assessment_line_option(df: pd.DataFrame, line_info: Dict[str, Any], breakout: Dict[str, Any], line_type: str) -> Dict[str, Any]:
+    d = add_deep_indicators(df)
+    L = sf(line_info.get("line"))
+    out = {
+        "line_type": line_type,
+        "line": rd(L, 3),
+        "line_info": line_info,
+        "breakout": breakout,
+        "assessment_score": -999.0,
+        "assessment_reason": "未命中高质量突破",
+        "assessment_distance_pct": 0.0,
+        "assessment_risk_pct": 0.0,
+        "assessment_space_pct": 0.0,
+        "assessment_rr": 0.0,
+        "assessment_defense_price": 0.0,
+    }
+    if d.empty or L <= 0 or not bool(breakout.get("hit")):
+        return out
+    br_date = ss(breakout.get("date"))
+    idxs = d.index[d["date"].astype(str) == br_date].tolist()
+    if not idxs:
+        out["assessment_reason"] = "突破日期定位失败"
+        return out
+    bidx = int(idxs[-1])
+    if bidx <= 0 or bidx >= len(d):
+        out["assessment_reason"] = "突破位置异常"
+        return out
+    b = d.iloc[bidx]
+    last = d.iloc[-1]
+    last_close = sf(last.close)
+    if last_close <= 0:
+        out["assessment_reason"] = "当前收盘无效"
+        return out
+    distance = pct_change(last_close, L)
+    post = d.iloc[bidx:].copy().reset_index(drop=True)
+    below_after = int((post["close"] < L * 0.992).sum())
+    last3_below = int((post.tail(3)["close"] < L * 0.992).sum())
+    body_bottom = min(sf(b.open), sf(b.close))
+    support_floor = max(0.0, min(x for x in [L, body_bottom] if x > 0))
+    defense = support_floor * (1.0 - DEEP_DEFENSE_BUFFER_PCT) if support_floor > 0 else L * 0.985
+    risk_pct = pct_change(last_close, defense) if defense > 0 else 0.0
+    pressure = first_real_pressure_before_breakout(d, bidx, last_close)
+    space_pct = sf(pressure.get("space_pct"))
+    rr = space_pct / risk_pct if risk_pct > 0 and space_pct > 0 else 0.0
+    score = 0.0
+    reasons: List[str] = []
+    bq = sf(breakout.get("quality"))
+    score += min(18.0, bq * 3.0)
+    reasons.append(f"突破质量{bq:.2f}")
+    hit = int(sf(line_info.get("effective_resonance_count")))
+    vol_hit = int(sf(line_info.get("volume_resonance_count")))
+    net = sf(line_info.get("net_score"))
+    score += min(16.0, hit * 1.8 + vol_hit * 1.2 + max(0.0, net) * 0.25)
+    reasons.append(f"{line_type}共振{hit}次/带量{vol_hit}次")
+    if distance < -ASSESSMENT_LINE_MAX_BELOW_PCT * 100.0 or last3_below >= 2:
+        score -= 35.0
+        reasons.append("突破后重新跌回线下")
+    elif distance <= 6.0:
+        score += 14.0
+        reasons.append(f"距线{distance:.1f}%")
+    elif distance <= 12.0:
+        score += 8.0
+        reasons.append(f"距线{distance:.1f}%")
+    elif distance <= ASSESSMENT_LINE_MAX_ABOVE_PCT * 100.0:
+        score += 2.0
+        reasons.append(f"距线{distance:.1f}%偏远")
+    else:
+        score -= 12.0
+        reasons.append(f"距线{distance:.1f}%过远")
+    if risk_pct <= 6.0:
+        score += 8.0
+        reasons.append(f"防守距离{risk_pct:.1f}%")
+    elif risk_pct <= 10.5:
+        score += 4.0
+        reasons.append(f"防守距离{risk_pct:.1f}%")
+    else:
+        score -= 6.0
+        reasons.append(f"防守距离{risk_pct:.1f}%偏远")
+    if bool(pressure.get("pressure_found")):
+        if space_pct >= 18.0:
+            score += 8.0
+            reasons.append(f"上方空间{space_pct:.1f}%")
+        elif space_pct >= ASSESSMENT_LINE_MIN_SPACE_PCT:
+            score += 5.0
+            reasons.append(f"上方空间{space_pct:.1f}%")
+        else:
+            score -= 7.0
+            reasons.append(f"第一压力太近{space_pct:.1f}%")
+        if rr >= 2.0:
+            score += 8.0
+            reasons.append(f"RR={rr:.2f}")
+        elif rr >= ASSESSMENT_LINE_MIN_RR:
+            score += 4.0
+            reasons.append(f"RR={rr:.2f}")
+        else:
+            score -= 6.0
+            reasons.append(f"RR={rr:.2f}不足")
+    else:
+        reasons.append("无真实上方压力，不虚构空间")
+    if below_after > 0:
+        score -= min(10.0, below_after * 3.0)
+        reasons.append(f"突破后跌回线下{below_after}次")
+    out.update({
+        "assessment_score": rd(score, 3),
+        "assessment_reason": "；".join(reasons),
+        "assessment_distance_pct": rd(distance, 2),
+        "assessment_risk_pct": rd(risk_pct, 2),
+        "assessment_space_pct": rd(space_pct, 2),
+        "assessment_rr": rd(rr, 2),
+        "assessment_defense_price": rd(defense, 3),
+    })
+    return out
+
+
+def select_primary_assessment_line(df: pd.DataFrame, options: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scored = [score_assessment_line_option(df, x["line_info"], x["breakout"], x["line_type"]) for x in options]
+    if not scored:
+        return {}
+    return max(scored, key=lambda x: (sf(x.get("assessment_score")), sf(x.get("breakout", {}).get("quality")), -abs(sf(x.get("assessment_distance_pct")))))
+
 def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
     d = normalize_hist(df)
     L = sf(line)
@@ -789,6 +956,7 @@ def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
                     "body_ratio": rd(body_ratio),
                 }
     return best
+
 
 
 
@@ -882,46 +1050,65 @@ def add_deep_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def build_monthly_deep_df(df: pd.DataFrame) -> pd.DataFrame:
+
+def build_cycle_deep_df(df: pd.DataFrame, freq: str, min_daily_rows: int = 120) -> pd.DataFrame:
     d = add_deep_indicators(df)
-    if d.empty or len(d) < 120:
+    if d.empty or len(d) < min_daily_rows:
         return pd.DataFrame()
     x = d.copy()
     x["date"] = pd.to_datetime(x["date"], errors="coerce")
     x = x.dropna(subset=["date"]).set_index("date").sort_index()
-    m = pd.DataFrame()
-    m["open"] = x["open"].resample("ME").first()
-    m["high"] = x["high"].resample("ME").max()
-    m["low"] = x["low"].resample("ME").min()
-    m["close"] = x["close"].resample("ME").last()
-    m["volume"] = x["volume"].resample("ME").sum()
-    m["amount"] = x["amount"].resample("ME").sum() if "amount" in x.columns else 0.0
-    m = m.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index()
-    if m.empty:
-        return m
-    c = pd.to_numeric(m["close"], errors="coerce")
-    v = pd.to_numeric(m["volume"], errors="coerce").fillna(0.0)
-    m["ma3"] = c.rolling(3, min_periods=2).mean()
-    m["ma6"] = c.rolling(6, min_periods=3).mean()
-    m["ma12"] = c.rolling(12, min_periods=6).mean()
-    m["ma20"] = c.rolling(20, min_periods=10).mean()
-    m["ma24"] = c.rolling(24, min_periods=12).mean()
-    m["bbi"] = (m["ma3"] + m["ma6"] + m["ma12"] + m["ma24"]) / 4.0
-    m["boll_mid"] = m["ma20"]
-    m["boll_std"] = c.rolling(20, min_periods=10).std()
-    m["boll_upper"] = m["boll_mid"] + 2.0 * m["boll_std"]
-    m["boll_lower"] = m["boll_mid"] - 2.0 * m["boll_std"]
-    m["boll_width"] = (m["boll_upper"] - m["boll_lower"]) / m["boll_mid"].replace(0, np.nan)
-    ma_max = m[["ma3", "ma6", "ma12", "ma24"]].max(axis=1)
-    ma_min = m[["ma3", "ma6", "ma12", "ma24"]].min(axis=1)
-    m["bbi_dispersion"] = (ma_max - ma_min) / m["bbi"].replace(0, np.nan)
-    m["mid"] = m["bbi"].where(m["bbi"].notna(), m["boll_mid"])
-    m["body_pct"] = (m["close"] - m["open"]) / m["open"].replace(0, np.nan)
-    m["body_ratio"] = (m["close"] - m["open"]).abs() / (m["high"] - m["low"]).replace(0, np.nan)
-    m["close_pos"] = (m["close"] - m["low"]) / (m["high"] - m["low"]).replace(0, np.nan)
-    m["vol_pct_rank_60"] = v.rolling(60, min_periods=12).apply(lambda a: pd.Series(a).rank(pct=True).iloc[-1], raw=False)
-    return m
+    if x.empty:
+        return pd.DataFrame()
+    k = pd.DataFrame()
+    k["open"] = x["open"].resample(freq).first()
+    k["high"] = x["high"].resample(freq).max()
+    k["low"] = x["low"].resample(freq).min()
+    k["close"] = x["close"].resample(freq).last()
+    k["volume"] = x["volume"].resample(freq).sum()
+    k["amount"] = x["amount"].resample(freq).sum() if "amount" in x.columns else 0.0
+    k = k.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index()
+    if k.empty:
+        return k
+    c = pd.to_numeric(k["close"], errors="coerce")
+    v = pd.to_numeric(k["volume"], errors="coerce").fillna(0.0)
+    k["ma3"] = c.rolling(3, min_periods=2).mean()
+    k["ma6"] = c.rolling(6, min_periods=3).mean()
+    k["ma12"] = c.rolling(12, min_periods=6).mean()
+    k["ma20"] = c.rolling(20, min_periods=10).mean()
+    k["ma24"] = c.rolling(24, min_periods=12).mean()
+    ma_pack = k[["ma3", "ma6", "ma12", "ma24"]]
+    ma_valid_count = ma_pack.notna().sum(axis=1)
+    k["bbi"] = ma_pack.mean(axis=1, skipna=True)
+    k.loc[ma_valid_count < 2, "bbi"] = np.nan
+    k["boll_mid"] = k["ma20"]
+    k["boll_std"] = c.rolling(20, min_periods=10).std()
+    k["boll_upper"] = k["boll_mid"] + 2.0 * k["boll_std"]
+    k["boll_lower"] = k["boll_mid"] - 2.0 * k["boll_std"]
+    k["boll_width"] = (k["boll_upper"] - k["boll_lower"]) / k["boll_mid"].replace(0, np.nan)
+    ma_max = k[["ma3", "ma6", "ma12", "ma24"]].max(axis=1)
+    ma_min = k[["ma3", "ma6", "ma12", "ma24"]].min(axis=1)
+    k["bbi_dispersion"] = (ma_max - ma_min) / k["bbi"].replace(0, np.nan)
+    k["mid"] = k["bbi"].where(k["bbi"].notna(), k["boll_mid"])
+    k["body_pct"] = (k["close"] - k["open"]) / k["open"].replace(0, np.nan)
+    k["body_ratio"] = (k["close"] - k["open"]).abs() / (k["high"] - k["low"]).replace(0, np.nan)
+    k["close_pos"] = (k["close"] - k["low"]) / (k["high"] - k["low"]).replace(0, np.nan)
+    k["vol_ma6"] = v.rolling(6, min_periods=3).mean()
+    k["vol_ma12"] = v.rolling(12, min_periods=4).mean()
+    k["vol_pct_rank_60"] = v.rolling(60, min_periods=12).apply(lambda a: pd.Series(a).rank(pct=True).iloc[-1], raw=False)
+    return k
 
+
+def build_monthly_deep_df(df: pd.DataFrame) -> pd.DataFrame:
+    return build_cycle_deep_df(df, "ME", 120)
+
+
+def build_quarterly_deep_df(df: pd.DataFrame) -> pd.DataFrame:
+    return build_cycle_deep_df(df, "QE-DEC", 360)
+
+
+def build_yearly_deep_df(df: pd.DataFrame) -> pd.DataFrame:
+    return build_cycle_deep_df(df, "YE-DEC", 720)
 
 def _score_part(value: bool, score: float) -> float:
     return float(score) if bool(value) else 0.0
@@ -973,63 +1160,463 @@ def detect_event_tags(d: pd.DataFrame, idx: int) -> Dict[str, Any]:
     }
 
 
-def evaluate_major_cycle_pricing(d: pd.DataFrame, last_close: float) -> Dict[str, Any]:
-    m = build_monthly_deep_df(d)
-    if m.empty or len(m) < 18 or last_close <= 0:
-        return {"score": 0.0, "type": "无", "detail": "月线样本不足", "anchor_price": 0.0}
-    cur = m.iloc[-1]
-    mid = sf(cur.get("mid", 0.0))
+
+
+def cycle_mid_repair_params(cycle: str) -> Dict[str, Any]:
+    c = ss(cycle).lower()
+    if c == "quarter":
+        return {
+            "cycle": "quarter", "label": "季线", "lookback": 20, "min_len": 8, "min_valid": 7,
+            "stand_max_periods": 4, "support_min": 2, "support_max": 4,
+            "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.992,
+            "breakdown": 0.985, "touch": 1.018, "score_cap": 12.0,
+        }
+    if c == "year":
+        return {
+            "cycle": "year", "label": "年线", "lookback": 8, "min_len": 6, "min_valid": 5,
+            "stand_max_periods": 2, "support_min": 1, "support_max": 2,
+            "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.990,
+            "breakdown": 0.982, "touch": 1.020, "score_cap": 12.0,
+        }
+    return {
+        "cycle": "month", "label": "月线", "lookback": 36, "min_len": 24, "min_valid": 18,
+        "stand_max_periods": 6, "support_min": 3, "support_max": 5,
+        "close_above": 1.005, "soft_above": 1.002, "hold_close": 0.992,
+        "breakdown": 0.985, "touch": 1.018, "score_cap": 12.0,
+    }
+
+def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str, Any]:
+    params = cycle_mid_repair_params(cycle)
+    label = params["label"]
+    empty = {
+        "score": 0.0,
+        "type": "无",
+        "detail": f"{label}中轨修复样本不足",
+        "anchor_price": 0.0,
+        "tight_date": "",
+        "tight_idx": -1,
+        "repair_stage": "NO_SAMPLE",
+        "cycle": params["cycle"],
+        "label": label,
+        "sample_count": 0,
+        "available": False,
+        "first_above_date": "",
+        "first_above_periods_after_tight": 0,
+        "support_periods": 0,
+        "breakdown_date": "",
+        "current_mid": 0.0,
+        "current_close": 0.0,
+        "close_mid_ratio": 0.0,
+        "repair_volume_ratio": 0.0,
+    }
+    if k is None or k.empty or len(k) < int(params["min_len"]):
+        out = dict(empty)
+        out["sample_count"] = 0 if k is None or k.empty else int(len(k))
+        out["detail"] = f"{label}中轨修复样本不足：仅{out['sample_count']}根，至少需要{int(params['min_len'])}根"
+        return out
+
+    x = k.copy().reset_index(drop=True)
+    if "mid" not in x.columns:
+        bbi = x["bbi"] if "bbi" in x.columns else pd.Series(np.nan, index=x.index)
+        boll_mid = x["boll_mid"] if "boll_mid" in x.columns else pd.Series(np.nan, index=x.index)
+        x["mid"] = bbi.where(pd.notna(bbi), boll_mid)
+    for col in ["open", "high", "low", "close", "volume", "mid", "boll_width", "bbi_dispersion", "body_pct", "body_ratio", "close_pos", "vol_ma6", "vol_ma12"]:
+        if col not in x.columns:
+            x[col] = np.nan
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    cur = x.iloc[-1]
+    cur_mid = sf(cur.get("mid", 0.0))
+    cur_close = sf(cur.get("close", 0.0))
+    close_mid_ratio = cur_close / cur_mid if cur_mid > 0 else 0.0
+    if cur_mid <= 0 or cur_close <= 0:
+        out = dict(empty)
+        out["detail"] = f"当前{label}中轨无效"
+        return out
+
+    lookback = min(int(params["lookback"]), len(x))
+    recent = x.tail(lookback).copy()
+    valid = recent[(recent["mid"] > 0) & recent["close"].notna()].copy()
+    min_valid = int(params.get("min_valid", max(8, min(int(params["min_len"]) - 4, int(params["lookback"]) // 2))))
+    if len(valid) < min_valid:
+        out = dict(empty)
+        out["detail"] = f"可用{label}中轨样本不足"
+        out["anchor_price"] = rd(cur_mid, 3)
+        out["current_mid"] = rd(cur_mid, 3)
+        out["current_close"] = rd(cur_close, 3)
+        out["close_mid_ratio"] = rd(close_mid_ratio, 4)
+        out["sample_count"] = int(len(x))
+        return out
+
+    def pct_rank_series(sv: pd.Series) -> pd.Series:
+        sv = pd.to_numeric(sv, errors="coerce")
+        if sv.notna().sum() < 6:
+            return pd.Series(np.nan, index=sv.index)
+        return sv.rank(pct=True, method="average")
+
+    bw_rank = pct_rank_series(valid["boll_width"])
+    disp_rank = pct_rank_series(valid["bbi_dispersion"])
+    if bw_rank.notna().any() and disp_rank.notna().any():
+        tight_metric = bw_rank.fillna(1.0) * 0.65 + disp_rank.fillna(1.0) * 0.35
+    elif bw_rank.notna().any():
+        tight_metric = bw_rank.fillna(1.0)
+    elif disp_rank.notna().any():
+        tight_metric = disp_rank.fillna(1.0)
+    else:
+        out = dict(empty)
+        out["detail"] = f"{label}缩口指标不可用"
+        out["anchor_price"] = rd(cur_mid, 3)
+        out["current_mid"] = rd(cur_mid, 3)
+        out["current_close"] = rd(cur_close, 3)
+        out["close_mid_ratio"] = rd(close_mid_ratio, 4)
+        out["sample_count"] = int(len(x))
+        return out
+
+    tight_local_idx = int(tight_metric.idxmin())
+    tight = x.loc[tight_local_idx]
+    tight_date = ss(tight.get("date", ""))[:10]
+    post = x.iloc[tight_local_idx + 1:].copy().reset_index(drop=False).rename(columns={"index": "orig_idx"})
+
     score = 0.0
     reasons: List[str] = []
-    anchor = 0.0
-    if mid > 0:
-        if sf(cur.close) >= mid:
-            score += 5.0
-            reasons.append("月线站回中轨")
-            anchor = mid
-        elif sf(cur.high) >= mid and sf(cur.close) >= mid * 0.985:
-            score += 2.5
-            reasons.append("月线贴近中轨")
-            anchor = mid
-    recent = m.tail(60).copy()
-    if len(recent) >= 24 and pd.notna(cur.get("boll_width", np.nan)):
-        widths = recent["boll_width"].dropna()
-        if len(widths) >= 20:
-            pct = float((widths <= sf(cur.get("boll_width"))).sum() / len(widths))
-            if pct <= 0.15:
-                score += 3.0
-                reasons.append(f"月线缩口分位{pct:.0%}")
-            elif pct <= 0.30:
-                score += 1.5
-                reasons.append(f"月线轻缩口{pct:.0%}")
-    # 最大量阳K实体中位/实底防守，用最近100个月可落地近似。
-    scan = m.tail(100).iloc[:-1].copy()
-    if len(scan) >= 12:
-        bull = scan[(scan["close"] > scan["open"]) & (scan["body_ratio"] >= 0.35)]
-        if not bull.empty:
-            mx = bull.loc[bull["volume"].idxmax()]
-            body_top = max(sf(mx.open), sf(mx.close))
-            body_bottom = min(sf(mx.open), sf(mx.close))
-            body_mid = (body_top + body_bottom) / 2.0
-            if body_mid > 0 and last_close >= body_mid * 0.995:
-                score += 4.0
-                reasons.append(f"最大量阳K中位防守{body_mid:.2f}")
-                anchor = anchor or body_mid
-            if body_top > 0 and last_close >= body_top * 1.003:
-                score += 3.0
-                reasons.append(f"最大量阳K实体顶修复{body_top:.2f}")
-                anchor = body_top
-    score = clamp(score, 0, 18)
-    if score >= 12:
-        typ = "大周期价值重估"
+    stage = "TIGHT_ONLY"
+    tight_pct = sf(tight_metric.loc[tight_local_idx])
+    if tight_pct <= 0.15:
+        score += 2.0
+        reasons.append(f"{label}{lookback}期内最紧缩口{tight_date}，缩口分位{tight_pct:.0%}")
+    elif tight_pct <= 0.30:
+        score += 1.0
+        reasons.append(f"{label}{lookback}期内相对缩口{tight_date}，缩口分位{tight_pct:.0%}")
+    else:
+        reasons.append(f"{label}{lookback}期内缩口不极致{tight_date}，分位{tight_pct:.0%}")
+
+    first_above_date = ""
+    first_periods_after_tight = 0
+    support_periods = 0
+    breakdown_date = ""
+    repair_volume_ratio = 0.0
+
+    if post.empty or len(post) < 2:
+        typ = f"{label}缩口观察" if score > 0 else "无"
+        return {
+            **dict(empty), "score": rd(clamp(score, 0, params["score_cap"]), 2), "type": typ,
+            "detail": "；".join(reasons), "anchor_price": rd(cur_mid, 3), "tight_date": tight_date,
+            "tight_idx": tight_local_idx, "repair_stage": stage, "current_mid": rd(cur_mid, 3),
+            "current_close": rd(cur_close, 3), "close_mid_ratio": rd(close_mid_ratio, 4),
+            "sample_count": int(len(x)), "available": True,
+        }
+
+    post["hard_above_mid"] = post["close"] >= post["mid"] * float(params["close_above"])
+    post["soft_above_mid"] = post["close"] >= post["mid"] * float(params["soft_above"])
+    post["below_mid"] = post["close"] < post["mid"] * float(params["breakdown"])
+    post["touch_mid"] = post["low"] <= post["mid"] * float(params["touch"])
+    post["bull_break_mid"] = (
+        (post["close"] > post["open"])
+        & post["hard_above_mid"]
+        & (post["close_pos"].fillna(0) >= 0.55)
+    )
+
+    break_rows = post[post["bull_break_mid"]]
+    start_pos = -1
+    if not break_rows.empty:
+        br0 = break_rows.iloc[0]
+        start_pos = int(post.index[post["orig_idx"] == br0["orig_idx"]][0])
+        first_periods_after_tight = start_pos + 1
+        first_above_date = ss(br0.get("date", ""))[:10]
+        if first_periods_after_tight <= int(params["stand_max_periods"]):
+            score += 2.0
+            reasons.append(f"缩口后{first_periods_after_tight}{label[-1]}内有效站上中轨")
+        else:
+            score += 0.8
+            reasons.append(f"缩口后{first_periods_after_tight}{label[-1]}才站上中轨，时间偏慢")
+        close_strength = sf(br0.close) / max(sf(br0.mid), 1e-9) - 1.0
+        if close_strength >= 0.018:
+            score += 0.8
+            reasons.append(f"首次站上收盘强度{close_strength:.1%}")
+        elif close_strength >= 0.008:
+            score += 0.4
+            reasons.append(f"首次站上收盘强度{close_strength:.1%}")
+        vol_base = sf(post.iloc[:start_pos]["volume"].tail(6).mean()) if start_pos > 0 else sf(x.iloc[max(0, tight_local_idx-6):tight_local_idx]["volume"].mean())
+        first_vol_ratio = sf(br0.volume) / max(vol_base, 1e-9) if vol_base > 0 else 0.0
+        if 1.05 <= first_vol_ratio <= 2.80:
+            score += 0.6
+            reasons.append(f"首次站上量能健康{first_vol_ratio:.2f}倍")
+        elif first_vol_ratio > 3.50:
+            score -= 0.4
+            reasons.append(f"首次站上量能过猛{first_vol_ratio:.2f}倍")
+        stage = "BREAK_MID"
+    else:
+        if cur_close >= cur_mid * float(params["close_above"]):
+            score += 0.6
+            reasons.append(f"当前站上{label}中轨，但缺少缩口后首次站上记录")
+            stage = "CURRENT_ABOVE_ONLY"
+
+    support_score = 0.0
+    support_touched = 0
+    if start_pos >= 0 and len(post) - start_pos >= int(params["support_min"]):
+        for n in range(int(params["support_min"]), min(int(params["support_max"]), len(post) - start_pos) + 1):
+            seg = post.iloc[start_pos:start_pos + n]
+            close_hold = bool((seg["close"] >= seg["mid"] * float(params["hold_close"])).all())
+            touch_count = int((seg["low"] <= seg["mid"] * float(params["touch"])).sum())
+            if close_hold:
+                s = 2.0
+                if touch_count >= 1:
+                    s += 0.7
+                if n >= int(params["support_max"]):
+                    s += 0.4
+                if s > support_score:
+                    support_score = s
+                    support_periods = n
+                    support_touched = touch_count
+        if support_score > 0:
+            score += support_score
+            reasons.append(f"站上后{support_periods}{label[-1]}收盘不破中轨，影线回踩{support_touched}次")
+            stage = "MID_SUPPORT_CONFIRMED"
+
+    breakdown_pos = -1
+    if support_periods > 0:
+        after_support = post.iloc[start_pos + support_periods:].copy()
+        bd = after_support[after_support["below_mid"]]
+        if not bd.empty:
+            breakdown_pos = int(post.index[post["orig_idx"] == bd.iloc[0]["orig_idx"]][0])
+            breakdown_date = ss(bd.iloc[0].get("date", ""))[:10]
+            score += 2.0
+            reasons.append(f"站稳后曾有效跌破{label}中轨")
+            stage = "BREAKDOWN_AFTER_SUPPORT"
+
+    prev_close = sf(x.iloc[-2].close) if len(x) >= 2 else 0.0
+    prev_mid = sf(x.iloc[-2].mid) if len(x) >= 2 else 0.0
+    current_repair = bool(cur_close >= cur_mid * float(params["close_above"]))
+    current_soft_repair = bool(cur_close >= cur_mid * float(params["soft_above"]))
+    from_below = bool(prev_mid > 0 and prev_close < prev_mid * 0.995 and current_repair)
+
+    vol_ref = sf(x.iloc[-7:-1]["volume"].mean()) if len(x) >= 8 else sf(x.iloc[:-1]["volume"].mean())
+    repair_volume_ratio = sf(cur.volume) / max(vol_ref, 1e-9) if vol_ref > 0 else 0.0
+    if current_repair:
+        if breakdown_pos >= 0:
+            score += 3.0
+            stage = "FULL_MID_REPAIR"
+            if from_below:
+                score += 0.8
+                reasons.append(f"当前{label}从中轨下方重新站回，闭环修复确认")
+            else:
+                reasons.append(f"当前{label}重新站回中轨，闭环修复成立")
+        elif stage in {"MID_SUPPORT_CONFIRMED", "BREAK_MID"}:
+            score += 1.0
+            reasons.append(f"当前仍站在{label}中轨上方")
+        elif from_below:
+            score += 1.2
+            reasons.append(f"当前{label}从中轨下方修复回中轨")
+            stage = "SIMPLE_REPAIR"
+        if close_mid_ratio >= 1.025:
+            score += 0.8
+            reasons.append(f"当前收盘高于中轨{close_mid_ratio - 1.0:.1%}")
+        elif close_mid_ratio >= 1.010:
+            score += 0.4
+            reasons.append(f"当前收盘高于中轨{close_mid_ratio - 1.0:.1%}")
+        if 0.90 <= repair_volume_ratio <= 2.50:
+            score += 0.6
+            reasons.append(f"回站量能健康{repair_volume_ratio:.2f}倍")
+        elif repair_volume_ratio > 3.50:
+            score -= 0.4
+            reasons.append(f"回站量能过猛{repair_volume_ratio:.2f}倍")
+    elif current_soft_repair:
+        score += 0.5
+        reasons.append(f"当前贴近/略站{label}中轨但未达到强确认")
+    elif sf(cur.high) >= cur_mid and cur_close >= cur_mid * 0.985:
+        score += 0.4
+        reasons.append(f"当前触及{label}中轨但收盘未有效站稳")
+
+    if breakdown_pos >= 0 and not current_repair:
+        score = min(score, 6.0)
+        reasons.append("跌破后尚未强势回站，封顶为观察")
+
+    score = clamp(score, 0, float(params["score_cap"]))
+    if stage == "FULL_MID_REPAIR" and score >= 9:
+        typ = f"{label}中轨闭环修复"
     elif score >= 7:
-        typ = "大周期修复"
+        typ = f"{label}中轨修复"
+    elif score >= 4:
+        typ = f"{label}中轨观察"
     elif score > 0:
-        typ = "大周期弱修复"
+        typ = f"{label}弱修复"
     else:
         typ = "无"
-    return {"score": rd(score, 2), "type": typ, "detail": "；".join(reasons) or "无大周期定价证据", "anchor_price": rd(anchor, 3)}
 
+    return {
+        "score": rd(score, 2),
+        "type": typ,
+        "detail": "；".join(reasons) or f"无{label}中轨修复证据",
+        "anchor_price": rd(cur_mid, 3),
+        "tight_date": tight_date,
+        "tight_idx": tight_local_idx,
+        "repair_stage": stage,
+        "cycle": params["cycle"],
+        "first_above_date": first_above_date,
+        "first_above_periods_after_tight": int(first_periods_after_tight),
+        "support_periods": int(support_periods),
+        "breakdown_date": breakdown_date,
+        "current_mid": rd(cur_mid, 3),
+        "current_close": rd(cur_close, 3),
+        "close_mid_ratio": rd(close_mid_ratio, 4),
+        "repair_volume_ratio": rd(repair_volume_ratio, 3),
+        "sample_count": int(len(x)),
+        "available": True,
+    }
+
+
+def evaluate_monthly_mid_repair(m: pd.DataFrame) -> Dict[str, Any]:
+    return evaluate_cycle_mid_repair(m, "month")
+
+
+def evaluate_multi_cycle_mid_repair(d: pd.DataFrame) -> Dict[str, Any]:
+    month = evaluate_cycle_mid_repair(build_monthly_deep_df(d), "month")
+    quarter = evaluate_cycle_mid_repair(build_quarterly_deep_df(d), "quarter")
+    year = evaluate_cycle_mid_repair(build_yearly_deep_df(d), "year")
+    repairs = {"month": month, "quarter": quarter, "year": year}
+
+    base_weights = {"month": 0.55, "quarter": 0.32, "year": 0.18}
+    available_keys = [k for k, r in repairs.items() if bool(r.get("available")) and sf(r.get("anchor_price")) > 0]
+    if available_keys:
+        total_weight = sum(base_weights[k] for k in available_keys)
+        weighted = sum(sf(repairs[k].get("score")) * base_weights[k] for k in available_keys) / max(total_weight, 1e-9)
+    else:
+        weighted = 0.0
+
+    full_count = sum(1 for k in available_keys if ss(repairs[k].get("repair_stage")) == "FULL_MID_REPAIR")
+    repair_count = sum(1 for k in available_keys if sf(repairs[k].get("score")) >= 7)
+    if full_count >= 2:
+        weighted += 1.5
+    elif repair_count >= 2:
+        weighted += 0.8
+    score = clamp(weighted, 0, 18)
+
+    if available_keys:
+        best_key, best = max(((k, repairs[k]) for k in available_keys), key=lambda kv: sf(kv[1].get("score")))
+    else:
+        best_key, best = max(repairs.items(), key=lambda kv: sf(kv[1].get("sample_count")))
+
+    details = []
+    unavailable = []
+    for key, r in [("month", month), ("quarter", quarter), ("year", year)]:
+        if sf(r.get("score")) > 0 and ss(r.get("detail")):
+            details.append(f"{ss(r.get('type'))}:{ss(r.get('detail'))}")
+        elif not bool(r.get("available")):
+            unavailable.append(f"{ss(r.get('label') or key)}不可用:{ss(r.get('detail'))}")
+
+    available_count = len(available_keys)
+    if available_count >= 2 and full_count >= 2 and score >= 12:
+        typ = "多周期中轨闭环修复"
+    elif available_count >= 2 and score >= 9:
+        typ = "多周期高级别中轨修复"
+    elif score >= 10:
+        typ = f"{ss(best.get('type')) or '高级别中轨修复'}"
+    elif score >= 6:
+        typ = "高级别中轨观察"
+    elif score > 0:
+        typ = "高级别弱修复"
+    else:
+        typ = "无"
+    return {
+        "score": rd(score, 2),
+        "type": typ,
+        "detail": "；".join(details[:4]) or "无高级别中轨修复证据",
+        "unavailable_detail": "；".join(unavailable[:3]),
+        "available_cycles": ",".join(available_keys),
+        "available_cycle_count": int(available_count),
+        "anchor_price": best.get("anchor_price", 0),
+        "best_cycle": best_key,
+        "repair_stage": best.get("repair_stage", ""),
+        "tight_date": best.get("tight_date", ""),
+        "month": month,
+        "quarter": quarter,
+        "year": year,
+        "monthly_mid_repair_score": month.get("score", 0),
+        "monthly_mid_repair_type": month.get("type", ""),
+        "monthly_mid_repair_stage": month.get("repair_stage", ""),
+        "monthly_mid_tight_date": month.get("tight_date", ""),
+        "monthly_mid_sample_count": month.get("sample_count", 0),
+        "quarter_mid_repair_score": quarter.get("score", 0),
+        "quarter_mid_repair_type": quarter.get("type", ""),
+        "quarter_mid_repair_stage": quarter.get("repair_stage", ""),
+        "quarter_mid_tight_date": quarter.get("tight_date", ""),
+        "quarter_mid_sample_count": quarter.get("sample_count", 0),
+        "year_mid_repair_score": year.get("score", 0),
+        "year_mid_repair_type": year.get("type", ""),
+        "year_mid_repair_stage": year.get("repair_stage", ""),
+        "year_mid_tight_date": year.get("tight_date", ""),
+        "year_mid_sample_count": year.get("sample_count", 0),
+    }
+
+
+def evaluate_major_cycle_pricing(d: pd.DataFrame, last_close: float) -> Dict[str, Any]:
+    if d.empty or last_close <= 0:
+        return {"score": 0.0, "type": "无", "detail": "高级别样本不足", "anchor_price": 0.0}
+
+    mid_repair = evaluate_multi_cycle_mid_repair(d)
+    score = sf(mid_repair.get("score"))
+    reasons: List[str] = []
+    if ss(mid_repair.get("detail")) and ss(mid_repair.get("type")) != "无":
+        reasons.append(ss(mid_repair.get("detail")))
+    anchor = sf(mid_repair.get("anchor_price"))
+
+    m = build_monthly_deep_df(d)
+    if not m.empty:
+        scan = m.tail(100).iloc[:-1].copy()
+        if len(scan) >= 12:
+            bull = scan[(scan["close"] > scan["open"]) & (scan["body_ratio"] >= 0.35)]
+            if not bull.empty:
+                mx = bull.loc[bull["volume"].idxmax()]
+                body_top = max(sf(mx.open), sf(mx.close))
+                body_bottom = min(sf(mx.open), sf(mx.close))
+                body_mid = (body_top + body_bottom) / 2.0
+                if body_mid > 0 and last_close >= body_mid * 0.995:
+                    score += 2.5
+                    reasons.append(f"月线最大量阳K中位修复{body_mid:.2f}")
+                    anchor = anchor or body_mid
+                if body_top > 0 and last_close >= body_top * 1.003:
+                    score += 1.5
+                    reasons.append(f"月线最大量阳K实体顶修复{body_top:.2f}")
+                    anchor = body_top
+
+    score = clamp(score, 0, 18)
+    if score >= 14 and ss(mid_repair.get("type")) == "多周期中轨闭环修复":
+        typ = "多周期中轨闭环修复+历史量峰修复"
+    elif score >= 11:
+        typ = "高级别大周期修复"
+    elif score >= 7:
+        typ = "高级别修复观察"
+    elif score > 0:
+        typ = "高级别弱修复"
+    else:
+        typ = "无"
+    return {
+        "score": rd(score, 2),
+        "type": typ,
+        "detail": "；".join(reasons) or "无高级别修复证据",
+        "anchor_price": rd(anchor, 3),
+        "major_mid_best_cycle": mid_repair.get("best_cycle", ""),
+        "major_mid_repair_stage": mid_repair.get("repair_stage", ""),
+        "major_mid_tight_date": mid_repair.get("tight_date", ""),
+        "monthly_mid_repair_score": mid_repair.get("monthly_mid_repair_score", 0),
+        "monthly_mid_repair_type": mid_repair.get("monthly_mid_repair_type", ""),
+        "monthly_mid_repair_stage": mid_repair.get("monthly_mid_repair_stage", ""),
+        "monthly_mid_tight_date": mid_repair.get("monthly_mid_tight_date", ""),
+        "quarter_mid_repair_score": mid_repair.get("quarter_mid_repair_score", 0),
+        "quarter_mid_repair_type": mid_repair.get("quarter_mid_repair_type", ""),
+        "quarter_mid_repair_stage": mid_repair.get("quarter_mid_repair_stage", ""),
+        "quarter_mid_tight_date": mid_repair.get("quarter_mid_tight_date", ""),
+        "year_mid_repair_score": mid_repair.get("year_mid_repair_score", 0),
+        "year_mid_repair_type": mid_repair.get("year_mid_repair_type", ""),
+        "year_mid_repair_stage": mid_repair.get("year_mid_repair_stage", ""),
+        "year_mid_tight_date": mid_repair.get("year_mid_tight_date", ""),
+        "major_mid_available_cycles": mid_repair.get("available_cycles", ""),
+        "major_mid_available_cycle_count": mid_repair.get("available_cycle_count", 0),
+        "monthly_mid_sample_count": mid_repair.get("monthly_mid_sample_count", 0),
+        "quarter_mid_sample_count": mid_repair.get("quarter_mid_sample_count", 0),
+        "year_mid_sample_count": mid_repair.get("year_mid_sample_count", 0),
+        "major_mid_unavailable_detail": mid_repair.get("unavailable_detail", ""),
+    }
 
 def evaluate_supply_absorption(d: pd.DataFrame, bidx: int, line: float) -> Dict[str, Any]:
     if d.empty or line <= 0 or bidx < 40:
@@ -1246,43 +1833,253 @@ def evaluate_fund_behavior(d: pd.DataFrame, bidx: int) -> Dict[str, Any]:
     return {"score": rd(score, 2), "type": typ, "detail": "；".join(reasons), "volume_ratio": rd(vol_ratio, 2), "stall": bool(stall)}
 
 
-def evaluate_activity(d: pd.DataFrame, code: str) -> Dict[str, Any]:
+
+def evaluate_sticky_structure(d: pd.DataFrame, line: float = 0.0, bidx: int = -1, window: int = 30) -> Dict[str, Any]:
+    """核心线附近K线粘合度风险识别。
+
+    设计口径：
+    1）只看突破前窗口，优先 bidx 前 window 根日K；
+    2）只保留四个核心指标：实体重叠率、收盘聚集度、错位率、大实体比率；
+    3）只有粘合发生在核心线附近才扣分，远离核心线只输出观察，不扣分；
+    4）粘合度是负向风险因子，不作为爆发前夜加分项。
+    """
+    empty = {
+        "sticky_state": "NO_SAMPLE",
+        "sticky_raw_score": 0.0,
+        "sticky_penalty": 0.0,
+        "sticky_core_distance_pct": 0.0,
+        "sticky_core_context_factor": 0.0,
+        "sticky_body_overlap_ratio": 0.0,
+        "sticky_body_overlap_strength": 0.0,
+        "sticky_range_overlap_ratio": 0.0,
+        "sticky_close_mad_pct": 0.0,
+        "sticky_body_mid_mad_pct": 0.0,
+        "sticky_dislocation_ratio": 0.0,
+        "sticky_large_body_ratio": 0.0,
+        "sticky_detail": "粘合样本不足",
+    }
+
+    if d.empty or len(d) < 12:
+        return dict(empty)
+
+    core_line = sf(line)
+    if core_line <= 0:
+        out = dict(empty)
+        out["sticky_state"] = "NO_CORE_LINE"
+        out["sticky_detail"] = "核心线无效，不计算关键位粘合风险"
+        return out
+
+    if bidx is not None and int(bidx) > 0:
+        sticky_window = d.iloc[max(0, int(bidx) - window):int(bidx)].copy()
+    else:
+        sticky_window = d.tail(window).copy()
+
+    if sticky_window.empty or len(sticky_window) < 12:
+        return dict(empty)
+
+    sw = sticky_window.copy().reset_index(drop=True)
+    o = pd.to_numeric(sw["open"], errors="coerce").to_numpy(dtype=float)
+    h = pd.to_numeric(sw["high"], errors="coerce").to_numpy(dtype=float)
+    l = pd.to_numeric(sw["low"], errors="coerce").to_numpy(dtype=float)
+    c = pd.to_numeric(sw["close"], errors="coerce").to_numpy(dtype=float)
+
+    valid = np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c) & (o > 0) & (h > 0) & (l > 0) & (c > 0)
+    o, h, l, c = o[valid], h[valid], l[valid], c[valid]
+    if len(c) < 12:
+        return dict(empty)
+
+    center = float(np.nanmedian(c))
+    if center <= 0:
+        return dict(empty)
+
+    body_low = np.minimum(o, c)
+    body_high = np.maximum(o, c)
+    body_mid = (body_low + body_high) / 2.0
+    body = np.abs(c - o)
+    prev_close_arr = np.r_[c[0], c[:-1]]
+
+    body_hits: List[bool] = []
+    body_strengths: List[float] = []
+    dislocated_flags: List[bool] = []
+    for i in range(1, len(c)):
+        inter = max(0.0, min(body_high[i], body_high[i - 1]) - max(body_low[i], body_low[i - 1]))
+        base = max(min(body_high[i] - body_low[i], body_high[i - 1] - body_low[i - 1]), center * 0.003)
+        body_strength = inter / base
+        body_hits.append(inter > center * 0.001)
+        body_strengths.append(float(min(max(body_strength, 0.0), 2.0)))
+
+        mid_far = abs(body_mid[i] - body_mid[i - 1]) / max(center, 1e-9) > 0.050
+        dislocated_flags.append((inter <= center * 0.001) and mid_far)
+
+    body_overlap_ratio = float(np.mean(body_hits)) if body_hits else 0.0
+    body_overlap_strength = float(np.mean(body_strengths)) if body_strengths else 0.0
+    dislocation_ratio = float(np.mean(dislocated_flags)) if dislocated_flags else 0.0
+
+    close_median = float(np.nanmedian(c))
+    close_mad_pct = float(np.nanmedian(np.abs(c - close_median)) / max(close_median, 1e-9))
+    body_mid_median = float(np.nanmedian(body_mid))
+    body_mid_mad_pct = float(np.nanmedian(np.abs(body_mid - body_mid_median)) / max(body_mid_median, 1e-9))
+
+    body_pct_arr = body / np.maximum(prev_close_arr, center * 0.01)
+    large_body_ratio = float(np.mean(body_pct_arr >= 0.020))
+
+    median_body_mid = float(np.nanmedian(body_mid))
+    median_close = float(np.nanmedian(c))
+    core_distance = min(
+        abs(median_body_mid - core_line) / max(core_line, 1e-9),
+        abs(median_close - core_line) / max(core_line, 1e-9),
+    )
+
+    if core_distance <= 0.05:
+        context_factor = 1.00
+    elif core_distance <= 0.08:
+        context_factor = 0.60
+    else:
+        context_factor = 0.0
+
+    # 四因子粘合原始分：实体重叠 + 收盘聚集 - 错位 - 大实体推进。
+    sticky_raw = (
+        42.0 * body_overlap_ratio
+        + 28.0 * max(0.0, 1.0 - close_mad_pct / 0.050)
+        - 22.0 * dislocation_ratio
+        - 20.0 * large_body_ratio
+    )
+    sticky_raw = clamp(sticky_raw, 0.0, 100.0)
+
+    if sticky_raw >= 70 and body_overlap_ratio >= 0.68 and close_mad_pct <= 0.030 and dislocation_ratio <= 0.22 and large_body_ratio <= 0.24:
+        sticky_state = "OVER_STICKY"
+    elif sticky_raw >= 52 and body_overlap_ratio >= 0.55 and close_mad_pct <= 0.045 and dislocation_ratio <= 0.35:
+        sticky_state = "STICKY"
+    elif sticky_raw >= 35:
+        sticky_state = "MILD_STICKY"
+    else:
+        sticky_state = "NOT_STICKY"
+
+    if context_factor <= 0.0:
+        penalty = 0.0
+        detail = f"粘合距核心线{core_distance:.1%}，超出关键位范围，不扣分"
+    elif sticky_state == "OVER_STICKY":
+        penalty = 6.0 * context_factor
+        detail = f"核心线附近过度粘合：距线{core_distance:.1%}，实体重叠{body_overlap_ratio:.0%}，收盘离散{close_mad_pct:.1%}，扣{penalty:.1f}"
+    elif sticky_state == "STICKY":
+        penalty = 3.5 * context_factor
+        detail = f"核心线附近偏粘合：距线{core_distance:.1%}，实体重叠{body_overlap_ratio:.0%}，扣{penalty:.1f}"
+    elif sticky_state == "MILD_STICKY":
+        penalty = 1.5 * context_factor
+        detail = f"核心线附近轻微粘合：距线{core_distance:.1%}，扣{penalty:.1f}"
+    else:
+        penalty = 0.0
+        detail = f"核心线附近不粘合：距线{core_distance:.1%}，攻击弹性尚可"
+
+    return {
+        "sticky_state": sticky_state,
+        "sticky_raw_score": rd(sticky_raw, 2),
+        "sticky_penalty": rd(penalty, 2),
+        "sticky_core_distance_pct": rd(core_distance * 100.0, 2),
+        "sticky_core_context_factor": rd(context_factor, 2),
+        "sticky_body_overlap_ratio": rd(body_overlap_ratio, 3),
+        "sticky_body_overlap_strength": rd(body_overlap_strength, 3),
+        "sticky_range_overlap_ratio": 0.0,
+        "sticky_close_mad_pct": rd(close_mad_pct, 4),
+        "sticky_body_mid_mad_pct": rd(body_mid_mad_pct, 4),
+        "sticky_dislocation_ratio": rd(dislocation_ratio, 3),
+        "sticky_large_body_ratio": rd(large_body_ratio, 3),
+        "sticky_detail": detail,
+    }
+
+
+def evaluate_activity(d: pd.DataFrame, code: str, line: float = 0.0, bidx: int = -1) -> Dict[str, Any]:
     if d.empty or len(d) < 60:
-        return {"score": 0.0, "type": "无", "detail": "股性样本不足"}
+        return {
+            "score": 0.0,
+            "type": "无",
+            "detail": "股性样本不足",
+            "limitup_100d_count": 0,
+            "big_up_100d_count": 0,
+            "gap_100d_count": 0,
+            "atr60": 0.0,
+            "amount20": 0.0,
+            "volume_ratio_20_60": 0.0,
+            "amount_ratio_20_60": 0.0,
+            **evaluate_sticky_structure(pd.DataFrame(), line, bidx),
+        }
+
     w = d.tail(100).copy()
     limit_thr = get_limit_threshold(code)
     limit_count = int((w["pct_chg"] >= limit_thr).sum())
     big_up_count = int((w["pct_chg"] >= 5.0).sum())
     gap_count = int((w["open"] >= w["close"].shift(1) * 1.015).sum())
     atr = sf(w["range_pct"].replace([np.inf, -np.inf], np.nan).dropna().tail(60).mean())
-    body_med = sf(w["entity_abs_pct"].replace([np.inf, -np.inf], np.nan).dropna().tail(60).median())
     amount20 = sf(w["amount"].tail(20).mean()) if "amount" in w.columns else 0.0
+    volume20 = sf(w["volume"].tail(20).mean()) if "volume" in w.columns else 0.0
+    volume60 = sf(w["volume"].tail(60).mean()) if "volume" in w.columns else 0.0
+    volume_ratio_20_60 = volume20 / max(volume60, 1e-9) if volume60 > 0 else 0.0
+    amount_ratio_20_60 = (
+        sf(w["amount"].tail(20).mean()) / max(sf(w["amount"].tail(60).mean()), 1e-9)
+        if "amount" in w.columns and sf(w["amount"].tail(60).mean()) > 0 else 0.0
+    )
+
     score = 0.0
     reasons: List[str] = []
-    if limit_count >= 4:
-        score += 6.0; reasons.append(f"100日涨停{limit_count}次")
-    elif limit_count >= 2:
-        score += 3.5; reasons.append(f"100日涨停{limit_count}次")
-    elif limit_count == 0:
+
+    if limit_count >= 5:
+        score += 7.0; reasons.append(f"100日涨停{limit_count}次")
+    elif limit_count >= 3:
+        score += 5.0; reasons.append(f"100日涨停{limit_count}次")
+    elif limit_count >= 1:
+        score += 1.5; reasons.append(f"100日涨停{limit_count}次")
+    else:
         score -= 2.0; reasons.append("100日无涨停")
-    if big_up_count >= 6:
+
+    if big_up_count >= 8:
         score += 4.0; reasons.append(f"大阳{big_up_count}次")
-    elif big_up_count >= 3:
-        score += 2.0; reasons.append(f"大阳{big_up_count}次")
-    if gap_count >= 3:
-        score += 2.0; reasons.append(f"跳空{gap_count}次")
-    if atr >= 0.035:
-        score += 3.0; reasons.append(f"ATR弹性{atr:.1%}")
+    elif big_up_count >= 4:
+        score += 2.5; reasons.append(f"大阳{big_up_count}次")
+    elif big_up_count >= 2:
+        score += 1.0; reasons.append(f"大阳{big_up_count}次")
+
+    if gap_count >= 4:
+        score += 2.5; reasons.append(f"跳空{gap_count}次")
+    elif gap_count >= 2:
+        score += 1.2; reasons.append(f"跳空{gap_count}次")
+
+    if atr >= 0.055:
+        score += 4.0; reasons.append(f"ATR弹性{atr:.1%}")
+    elif atr >= 0.035:
+        score += 2.5; reasons.append(f"ATR弹性{atr:.1%}")
     elif atr < 0.018:
-        score -= 2.0; reasons.append(f"波动黏密{atr:.1%}")
-    if body_med < 0.008:
-        score -= 1.5; reasons.append("实体黏密")
+        score -= 2.0; reasons.append(f"波动过窄{atr:.1%}")
+
+    if volume_ratio_20_60 >= 1.20:
+        score += 1.5; reasons.append(f"量能中枢抬升{volume_ratio_20_60:.2f}")
+    elif 0 < volume_ratio_20_60 <= 0.65:
+        score -= 1.0; reasons.append(f"量能中枢收缩{volume_ratio_20_60:.2f}")
+
     if amount20 > 0 and amount20 < 5e7:
         score -= 3.0; reasons.append(f"成交额不足{amount20/1e8:.2f}亿")
-    score = clamp(score, -8, 14)
-    typ = "高活跃" if score >= 8 else "中活跃" if score >= 4 else "低活跃" if score < 0 else "普通"
-    return {"score": rd(score, 2), "type": typ, "detail": "；".join(reasons), "limitup_100d_count": limit_count, "big_up_100d_count": big_up_count, "gap_100d_count": gap_count, "atr60": rd(atr, 4), "amount20": rd(amount20, 2)}
 
+    sticky = evaluate_sticky_structure(d, line=line, bidx=bidx, window=30)
+    sticky_penalty = sf(sticky.get("sticky_penalty"))
+    if sticky_penalty > 0:
+        score -= sticky_penalty
+    reasons.append(ss(sticky.get("sticky_detail")))
+
+    score = clamp(score, -12, 16)
+    typ = "高活跃" if score >= 8 else "中活跃" if score >= 4 else "低活跃" if score < 0 else "普通"
+
+    return {
+        "score": rd(score, 2),
+        "type": typ,
+        "detail": "；".join([x for x in reasons if ss(x)]),
+        "limitup_100d_count": limit_count,
+        "big_up_100d_count": big_up_count,
+        "gap_100d_count": gap_count,
+        "atr60": rd(atr, 4),
+        "amount20": rd(amount20, 2),
+        "volume_ratio_20_60": rd(volume_ratio_20_60, 3),
+        "amount_ratio_20_60": rd(amount_ratio_20_60, 3),
+        **sticky,
+    }
 
 def evaluate_time_maturity(d: pd.DataFrame, bidx: int) -> Dict[str, Any]:
     if d.empty or bidx < 30:
@@ -1413,10 +2210,12 @@ def evaluate_risk_counterevidence(d: pd.DataFrame, bidx: int, line: float, fund:
     return {"penalty": rd(clamp(penalty, 0, 45), 2), "block": bool(block), "level": level, "detail": "；".join(reasons) or "无明显风险反证", "recent20_pct": rd(recent20_pct, 2), "post_drawdown_pct": rd(drawdown, 2), "below_line_count": below_count}
 
 
+
+
+
 def arbitrate_hypotheses(major: Dict[str, Any], supply: Dict[str, Any], eve: Dict[str, Any], pullback: Dict[str, Any], fund: Dict[str, Any], activity: Dict[str, Any], timing: Dict[str, Any], trade: Dict[str, Any], risk: Dict[str, Any]) -> Dict[str, Any]:
-    # 母机会分只取主假设，其他证据进入封顶共振，杜绝同源线性堆分。
     hypotheses = []
-    hypotheses.append(("大周期价值重估", sf(major.get("score")) * 2.6 + sf(pullback.get("score")) * 0.9 + sf(fund.get("score")) * 0.45))
+    hypotheses.append(("高级别中轨修复", sf(major.get("score")) * 2.6 + sf(pullback.get("score")) * 0.9 + sf(fund.get("score")) * 0.45))
     hypotheses.append(("供应吸收后突破", sf(supply.get("score")) * 3.1 + sf(fund.get("score")) * 0.75 + sf(timing.get("score")) * 0.65))
     hypotheses.append(("爆发前夜启动", sf(eve.get("score")) * 3.0 + sf(timing.get("score")) * 0.90 + sf(activity.get("score")) * 0.45))
     hypotheses.append(("回踩承接二买", sf(pullback.get("score")) * 3.2 + sf(fund.get("score")) * 0.65 + sf(trade.get("score")) * 0.45))
@@ -1427,7 +2226,6 @@ def arbitrate_hypotheses(major: Dict[str, Any], supply: Dict[str, Any], eve: Dic
     second_score = hypotheses_sorted[1][1] if len(hypotheses_sorted) > 1 else 0.0
     dominance = primary_score - second_score
     evidence_scores = [sf(major.get("score")), sf(supply.get("score")), sf(eve.get("score")), sf(pullback.get("score")), max(0.0, sf(fund.get("score"))), max(0.0, sf(activity.get("score"))), sf(timing.get("score"))]
-    # 去掉主假设中的主来源后仍只给封顶共振。
     resonance_score = clamp(sum(sorted(evidence_scores, reverse=True)[1:4]) * 0.55, 0, 20)
     trade_score = clamp(sf(trade.get("score")), 0, 20)
     raw = primary_score + resonance_score + trade_score - sf(risk.get("penalty"))
@@ -1465,7 +2263,7 @@ def arbitrate_hypotheses(major: Dict[str, Any], supply: Dict[str, Any], eve: Dic
     return {"primary_setup_type": primary_type, "primary_setup_score": rd(primary_score, 2), "second_setup_score": rd(second_score, 2), "primary_dominance": rd(dominance, 2), "resonance_score": rd(resonance_score, 2), "trade_score": rd(trade_score, 2), "final_score": rd(final_score, 2), "grade": grade, "action": action, "pool": pool, "hypothesis_scores": ";".join([f"{n}:{rd(v,1)}" for n, v in hypotheses_sorted])}
 
 
-def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, core: Dict[str, Any], br: Dict[str, Any]) -> Dict[str, Any]:
+def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, line_info: Dict[str, Any], br: Dict[str, Any]) -> Dict[str, Any]:
     d = add_deep_indicators(df)
     L = sf(line)
     empty = {
@@ -1492,12 +2290,11 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, c
     eve = evaluate_explosion_eve(d, bidx)
     pullback = evaluate_pullback_acceptance(d, bidx, L)
     fund = evaluate_fund_behavior(d, bidx)
-    activity = evaluate_activity(d, code)
+    activity = evaluate_activity(d, code, L, bidx)
     timing = evaluate_time_maturity(d, bidx)
     trade = evaluate_trade_pricing(d, bidx, L, sf(pullback.get("support_price")))
     risk = evaluate_risk_counterevidence(d, bidx, L, fund, trade)
     arb = arbitrate_hypotheses(major, supply, eve, pullback, fund, activity, timing, trade, risk)
-
     pos = []
     for item in [major, supply, eve, pullback, fund, activity, timing]:
         if sf(item.get("score")) > 0 and ss(item.get("detail")):
@@ -1509,7 +2306,6 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, c
         neg.append("风险反证：" + ss(risk.get("detail")))
     if bool(fund.get("stall")):
         neg.append("资金行为为放量滞涨")
-
     return {
         "deep_score": arb["final_score"],
         "deep_grade": arb["grade"],
@@ -1544,6 +2340,22 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, c
         "score_major_cycle": major.get("score", 0),
         "major_cycle_type": major.get("type", ""),
         "major_cycle_detail": major.get("detail", ""),
+        "major_cycle_anchor_price": major.get("anchor_price", 0),
+        "major_mid_best_cycle": major.get("major_mid_best_cycle", ""),
+        "major_mid_repair_stage": major.get("major_mid_repair_stage", ""),
+        "major_mid_tight_date": major.get("major_mid_tight_date", ""),
+        "monthly_mid_repair_score": major.get("monthly_mid_repair_score", 0),
+        "monthly_mid_repair_type": major.get("monthly_mid_repair_type", ""),
+        "monthly_mid_repair_stage": major.get("monthly_mid_repair_stage", ""),
+        "monthly_mid_tight_date": major.get("monthly_mid_tight_date", ""),
+        "quarter_mid_repair_score": major.get("quarter_mid_repair_score", 0),
+        "quarter_mid_repair_type": major.get("quarter_mid_repair_type", ""),
+        "quarter_mid_repair_stage": major.get("quarter_mid_repair_stage", ""),
+        "quarter_mid_tight_date": major.get("quarter_mid_tight_date", ""),
+        "year_mid_repair_score": major.get("year_mid_repair_score", 0),
+        "year_mid_repair_type": major.get("year_mid_repair_type", ""),
+        "year_mid_repair_stage": major.get("year_mid_repair_stage", ""),
+        "year_mid_tight_date": major.get("year_mid_tight_date", ""),
         "score_supply_absorption": supply.get("score", 0),
         "supply_absorption_type": supply.get("type", ""),
         "supply_absorption_detail": supply.get("detail", ""),
@@ -1566,6 +2378,19 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, c
         "limitup_100d_count": activity.get("limitup_100d_count", 0),
         "big_up_100d_count": activity.get("big_up_100d_count", 0),
         "gap_100d_count": activity.get("gap_100d_count", 0),
+        "sticky_state": activity.get("sticky_state", ""),
+        "sticky_raw_score": activity.get("sticky_raw_score", 0),
+        "sticky_penalty": activity.get("sticky_penalty", 0),
+        "sticky_core_distance_pct": activity.get("sticky_core_distance_pct", 0),
+        "sticky_core_context_factor": activity.get("sticky_core_context_factor", 0),
+        "sticky_body_overlap_ratio": activity.get("sticky_body_overlap_ratio", 0),
+        "sticky_body_overlap_strength": activity.get("sticky_body_overlap_strength", 0),
+        "sticky_range_overlap_ratio": activity.get("sticky_range_overlap_ratio", 0),
+        "sticky_close_mad_pct": activity.get("sticky_close_mad_pct", 0),
+        "sticky_body_mid_mad_pct": activity.get("sticky_body_mid_mad_pct", 0),
+        "sticky_dislocation_ratio": activity.get("sticky_dislocation_ratio", 0),
+        "sticky_large_body_ratio": activity.get("sticky_large_body_ratio", 0),
+        "sticky_detail": activity.get("sticky_detail", ""),
         "score_time_maturity": timing.get("score", 0),
         "time_maturity_type": timing.get("type", ""),
         "time_maturity_detail": timing.get("detail", ""),
@@ -1578,28 +2403,64 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, c
         "event_tags": events.get("tags", ""),
         "confirm_condition": trade.get("confirm_condition", ""),
         "giveup_condition": trade.get("giveup_condition", ""),
-        # 旧字段置零：核心线已经是海选门票，不再参与深度总分。
-        "score_core_line": 0.0,
-        "score_breakout_k": rd(sf(br.get("quality")), 2),
-        "score_post_state": pullback.get("score", 0),
-        "score_position_rr": trade.get("score", 0),
-        "score_volume_heat": fund.get("score", 0),
-        "score_risk_control": max(0.0, 10.0 - sf(risk.get("penalty")) / 3.0),
     }
 
 
 def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
-    core = choose_core_line(df)
-    line = sf(core.get("line")) if core.get("line") is not None else 0.0
-    br = daily_breakout_quality(df, line)
-    if not br.get("hit"):
+    historical_line = choose_historical_core_resonance_line(df)
+    thousand_line = choose_thousand_day_resonance_trigger_line(df)
+    historical_price = sf(historical_line.get("line")) if historical_line.get("line") is not None else 0.0
+    thousand_price = sf(thousand_line.get("line")) if thousand_line.get("line") is not None else 0.0
+    historical_breakout = daily_breakout_quality(df, historical_price)
+    thousand_breakout = daily_breakout_quality(df, thousand_price)
+    historical_hit = bool(historical_breakout.get("hit"))
+    thousand_hit = bool(thousand_breakout.get("hit"))
+    if not (historical_hit or thousand_hit):
         return {}
-    deep = deep_status_and_score(code, name, df, line, core, br)
+    options: List[Dict[str, Any]] = []
+    if historical_hit:
+        options.append({"line_type": "历史核心共振线", "line_info": historical_line, "breakout": historical_breakout})
+    if thousand_hit:
+        options.append({"line_type": "千日共振触发线", "line_info": thousand_line, "breakout": thousand_breakout})
+    primary = select_primary_assessment_line(df, options)
+    if not primary:
+        return {}
+    primary_type = ss(primary.get("line_type"))
+    primary_line_info = primary.get("line_info", {}) or {}
+    primary_breakout = primary.get("breakout", {}) or {}
+    primary_price = sf(primary.get("line"))
+    deep = deep_status_and_score(code, name, df, primary_price, primary_line_info, primary_breakout)
+    if historical_hit and thousand_hit:
+        source = "双线共振"
+    elif historical_hit:
+        source = "历史核心共振线"
+    else:
+        source = "千日共振触发线"
     row = {
         "股票代码": code,
         "股票中文名称": name or code,
-        "核心线价位": rd(line, 3),
-        "高质量突破日期": br.get("date", ""),
+        "海选命中来源": source,
+        "主评测线类型": primary_type,
+        "主评测线价位": rd(primary_price, 3),
+        "主评测线突破日期": primary_breakout.get("date", ""),
+        "主评测线突破质量": primary_breakout.get("quality", 0),
+        "主评测线共振次数": primary_line_info.get("effective_resonance_count", 0),
+        "主评测线带量共振次数": primary_line_info.get("volume_resonance_count", 0),
+        "主评测线净分": primary_line_info.get("net_score", 0),
+        "主评测线选择分": primary.get("assessment_score", 0),
+        "主评测线选择原因": primary.get("assessment_reason", ""),
+        "历史核心共振线价位": rd(historical_price, 3),
+        "历史核心共振线突破日期": historical_breakout.get("date", "") if historical_hit else "",
+        "历史核心共振线是否命中": historical_hit,
+        "历史核心共振线共振次数": historical_line.get("effective_resonance_count", 0),
+        "历史核心共振线带量共振次数": historical_line.get("volume_resonance_count", 0),
+        "历史核心共振线净分": historical_line.get("net_score", 0),
+        "千日共振触发线价位": rd(thousand_price, 3),
+        "千日共振触发线突破日期": thousand_breakout.get("date", "") if thousand_hit else "",
+        "千日共振触发线是否命中": thousand_hit,
+        "千日共振触发线共振次数": thousand_line.get("effective_resonance_count", 0),
+        "千日共振触发线带量共振次数": thousand_line.get("volume_resonance_count", 0),
+        "千日共振触发线净分": thousand_line.get("net_score", 0),
         "深度等级": deep.get("deep_grade", "D"),
         "深度得分": deep.get("deep_score", 0),
         "当前状态": deep.get("deep_state", ""),
@@ -1609,7 +2470,7 @@ def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
         "扣分原因": deep.get("deep_negative_reasons", ""),
         "风险标签": deep.get("risk_flags", ""),
         "当前收盘": deep.get("current_close", 0),
-        "距核心线%": deep.get("distance_line_pct", 0),
+        "距主评测线%": deep.get("distance_line_pct", 0),
         "交易防守位": deep.get("defense_price", 0),
         "防守距离%": deep.get("defense_distance_pct", 0),
         "目标/压力价": deep.get("target_price", 0),
@@ -1623,20 +2484,13 @@ def screen_one_stock(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
         "近5日涨幅%": deep.get("recent5_pct", 0),
         "近10日涨幅%": deep.get("recent10_pct", 0),
         "近20日涨幅%": deep.get("recent20_pct", 0),
-        # 以下字段进CSV/JSON审计。
-        "core_line_score": core.get("net_score", 0),
-        "core_line_resonance_count": core.get("effective_resonance_count", 0),
-        "core_line_volume_resonance_count": core.get("volume_resonance_count", 0),
-        "core_line_entity_cut_count": core.get("entity_cut_count", 0),
-        "core_line_entity_accept_count": core.get("entity_accept_count", 0),
-        "breakout_quality": br.get("quality", 0),
-        "breakout_close": br.get("close", 0),
+        "breakout_quality": primary_breakout.get("quality", 0),
+        "breakout_close": primary_breakout.get("close", 0),
     }
     for key, val in deep.items():
         if key not in row:
             row[key] = val
     return row
-
 
 def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -1656,7 +2510,7 @@ def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dic
             print(f"screen failed code={code} err={str(exc)[:120]}", flush=True)
         if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
             progress("deep", i, len(items), start, f"hit={len(rows)} current={code}")
-    rows = sorted(rows, key=lambda x: (sf(x.get("深度得分")), ss(x.get("高质量突破日期")), sf(x.get("breakout_quality")), sf(x.get("core_line_score"))), reverse=True)
+    rows = sorted(rows, key=lambda x: (sf(x.get("深度得分")), ss(x.get("主评测线突破日期")), sf(x.get("breakout_quality")), sf(x.get("主评测线净分"))), reverse=True)
     return rows
 
 
@@ -1743,7 +2597,7 @@ def selected_quality_note(selected: List[Dict[str, Any]]) -> str:
         return "今日精选质量：A级/S级满足数量，直接输出深度精选。"
     if formal_count > 0:
         return f"今日精选质量：A级/S级仅{formal_count}只，其余按深度得分补入相对最优观察，不伪装成A级。"
-    return "今日精选质量：无A级/S级，输出未硬剔除票中的相对最优Top3，只能按观察处理。"
+    return f"今日精选质量：无A级/S级，输出未硬剔除票中的相对最优Top{DEEP_FINAL_PICK_LIMIT}，只能按观察处理。"
 
 def short_reason(text: Any, max_len: int = 90) -> str:
     s = ss(text).replace("\n", "；")
@@ -1766,15 +2620,16 @@ def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
 
     if selected:
         lines.extend([
-            "| 排名 | 股票代码 | 股票简称 | 核心线 | 突破日 | 深度评级 | 得分 | 入选性质 | 状态 | 防守位 | RR | 操作 |",
-            "|---:|---|---|---:|---|---|---:|---|---|---:|---:|---|",
+            "| 排名 | 股票代码 | 股票简称 | 海选来源 | 主评测线类型 | 主评测线 | 突破日 | 深度评级 | 得分 | 入选性质 | 状态 | 防守位 | RR | 操作 |",
+            "|---:|---|---|---|---|---:|---|---|---:|---|---|---:|---:|---|",
         ])
         for idx, r in enumerate(selected, 1):
             lines.append(
-                f"| {idx} | {r.get('股票代码','')} | {r.get('股票中文名称','')} | {r.get('核心线价位',0)} | "
-                f"{r.get('高质量突破日期','')} | {r.get('深度等级','')} | {r.get('深度得分',0)} | "
-                f"{short_reason(r.get('最终入选性质',''), 22)} | {short_reason(r.get('当前状态',''), 18)} | "
-                f"{r.get('交易防守位',0)} | {r.get('估算赔率',0)} | {short_reason(r.get('操作建议',''), 24)} |"
+                f"| {idx} | {r.get('股票代码','')} | {r.get('股票中文名称','')} | {short_reason(r.get('海选命中来源',''), 12)} | "
+                f"{short_reason(r.get('主评测线类型',''), 12)} | {r.get('主评测线价位',0)} | {r.get('主评测线突破日期','')} | "
+                f"{r.get('深度等级','')} | {r.get('深度得分',0)} | {short_reason(r.get('最终入选性质',''), 22)} | "
+                f"{short_reason(r.get('当前状态',''), 18)} | {r.get('交易防守位',0)} | {r.get('估算赔率',0)} | "
+                f"{short_reason(r.get('操作建议',''), 24)} |"
             )
         lines.append("")
         for idx, r in enumerate(selected, 1):
@@ -1789,7 +2644,7 @@ def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
     else:
         lines.append("今日无三号员工最终精选：所有海选票均被硬风险、突破失败或数据异常剔除。")
 
-    # 未入前三的深度候选不进入 Telegram/Markdown 正文，避免把海选/观察池误当精选。
+    # 未入最终精选的深度候选不进入 Telegram/Markdown 正文，避免把海选/观察池误当精选。
     # 全量 rows 已写入 CSV/JSON，复盘时看审计文件。
 
 
@@ -1806,6 +2661,7 @@ def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], sel
         "config": {
             "agg_window": AGG_WINDOW,
             "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
+            "thousand_day_lookback": THOUSAND_DAY_LOOKBACK,
             "core_line_tol": CORE_LINE_TOL,
             "min_core_resonance": MIN_CORE_RESONANCE,
             "deep_min_formal_score": DEEP_MIN_FORMAL_SCORE,
@@ -1836,108 +2692,10 @@ def send_report(md: str) -> None:
         time.sleep(0.4)
 
 
-def synthetic_coreline_df() -> pd.DataFrame:
-    rows = []
-    start = datetime(2024, 1, 1)
-    price = 10.0
-    for i in range(140):
-        dt = start + timedelta(days=i)
-        if dt.weekday() >= 5:
-            continue
-        if len(rows) < 100:
-            open_ = 9.6 + (len(rows) % 7) * 0.03
-            close = 9.7 + (len(rows) % 5) * 0.04
-            high = 10.0 if len(rows) % 6 in {0, 1, 2} else max(open_, close) + 0.15
-            low = min(open_, close) - 0.2
-            vol = 1000 + (len(rows) % 9) * 50
-        else:
-            open_ = price
-            close = price * 1.005
-            high = max(open_, close) * 1.01
-            low = min(open_, close) * 0.99
-            vol = 1100
-        rows.append({"date": dt.strftime("%Y-%m-%d"), "code": "000001", "name": "测试股", "open": open_, "high": high, "low": low, "close": close, "volume": vol, "amount": vol * close})
-        price = close
-    d = normalize_hist(pd.DataFrame(rows))
-    # 末端制造有效突破：前一日在线下，当日收盘在线上。
-    if len(d) >= 2:
-        d.loc[d.index[-2], ["open", "high", "low", "close", "volume"]] = [9.72, 9.85, 9.62, 9.78, 1400]
-        d.loc[d.index[-1], ["open", "high", "low", "close", "volume"]] = [9.85, 10.35, 9.80, 10.25, 2200]
-        prev = d.close.shift(1)
-        d["pct_chg"] = (d.close / prev - 1.0) * 100.0
-        d.loc[prev <= 0, "pct_chg"] = 0.0
-    return d
 
-
-def run_self_check() -> Dict[str, Any]:
-    checks: List[Dict[str, Any]] = []
-    ok_all = True
-
-    # 第1遍：核心线实体接受不淘汰、能输出线。
-    try:
-        df = synthetic_coreline_df()
-        core = choose_core_line(df)
-        ok = core.get("line") is not None and sf(core.get("effective_resonance_count")) >= MIN_CORE_RESONANCE
-        checks.append({"round": 1, "name": "核心线识别与实体接受不淘汰", "ok": bool(ok), "detail": core})
-        ok_all = ok_all and bool(ok)
-    except Exception as exc:
-        checks.append({"round": 1, "name": "核心线识别与实体接受不淘汰", "ok": False, "error": str(exc)})
-        ok_all = False
-
-    # 第2遍：最近20日高质量突破必须来自下往上，且以收盘确认。
-    try:
-        df = synthetic_coreline_df()
-        core = choose_core_line(df)
-        br = daily_breakout_quality(df, sf(core.get("line")))
-        ok = bool(br.get("hit")) and ss(br.get("date")) == ss(df.iloc[-1].date)
-        checks.append({"round": 2, "name": "20日内日K高质量突破确认", "ok": bool(ok), "detail": br})
-        ok_all = ok_all and bool(ok)
-    except Exception as exc:
-        checks.append({"round": 2, "name": "20日内日K高质量突破确认", "ok": False, "error": str(exc)})
-        ok_all = False
-
-    # 第3遍：海选层不评级，所有命中票深度评分后，最终只输出Top3；A级不足时用最高分补足。
-    try:
-        base = {
-            "股票中文名称": "测试股", "核心线价位": 10.0, "高质量突破日期": "2024-05-01",
-            "当前状态": "供应吸收后突破", "交易防守位": 9.8, "估算赔率": 2.0,
-            "操作建议": "正式买入池｜轻仓/确认候选", "候选池": "正式候选",
-            "加分原因": "测试加分", "扣分原因": "暂无明显扣分项",
-            "confirm_condition": "站稳核心线", "giveup_condition": "跌破防守位",
-            "trade_pricing_ok": True, "primary_setup_score": 42, "risk_penalty": 0,
-        }
-        fake_rows = []
-        for i, (code, grade, score) in enumerate([
-            ("000001", "A", 81), ("000002", "S", 90), ("000003", "B", 72),
-            ("000004", "C", 62), ("000005", "D", 40),
-        ], 1):
-            r = dict(base)
-            r.update({"股票代码": code, "股票中文名称": f"测试股{i}", "深度等级": grade, "深度得分": score})
-            fake_rows.append(r)
-        md = build_report(fake_rows, {"cache_hit": 5, "cache_files": 5})
-        ok = (
-            "三号员工最终深度精选" in md
-            and "海选召回：5只" in md
-            and "完成深度评分：5只" in md
-            and "| 1 | 000002" in md
-            and "| 2 | 000001" in md
-            and "| 3 | 000003" in md
-            and "000004" not in md
-            and "000005" not in md
-            and "Telegram 只推最终精选" in md
-        )
-        checks.append({"round": 3, "name": "海选不评级，全量深评后只推Top3", "ok": bool(ok), "detail": {"md_preview": md[:900]}})
-        ok_all = ok_all and bool(ok)
-    except Exception as exc:
-        checks.append({"round": 3, "name": "海选不评级，全量深评后只推Top3", "ok": False, "error": str(exc)})
-        ok_all = False
-
-    return {
-        "overall_ok": bool(ok_all),
-        "checked_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
-        "checks": checks,
-    }
-
+# 自检与模拟样本已从生产主文件拆出到 employee3_coreline_selfcheck.py。
+# 生产运行只负责：读取缓存 -> 海选/深评 -> 写入报告 -> Telegram 推送。
+# 如需开发验证，请单独运行：python employee3_coreline_selfcheck.py
 
 def main() -> None:
     print(BOOT, flush=True)
@@ -1945,8 +2703,15 @@ def main() -> None:
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
     print(f"progress_color_enabled={progress_color_enabled()} 条形进度=True", flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
-    self_check = run_self_check()
-    print(f"self_check_overall_ok={self_check.get('overall_ok')}", flush=True)
+
+    # 生产主流程不再混入模拟自检。
+    # 自检结果字段保留在 JSON 中，只作为审计占位，避免破坏既有输出契约。
+    self_check = {
+        "enabled": False,
+        "status": "moved_to_employee3_coreline_selfcheck.py",
+        "note": "生产主流程不执行模拟自检；开发验证请单独运行 selfcheck 文件。",
+    }
+
     hist, names, stat = load_cache()
     if hist and ALLOW_BAOSTOCK_FALLBACK:
         stat["recent_refresh"] = refresh_recent_cache(hist)
