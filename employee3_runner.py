@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -37,7 +37,7 @@ except Exception:
 
     bs = None
 
-BOOT = "EMPLOYEE3_DUAL_LINE_BREAKOUT_DEEP_SCREEN_V3_20260606"
+BOOT = "EMPLOYEE3_DUAL_LINE_BREAKOUT_DEEP_SCREEN_V5_RECENT_IPO_BRANCH_20260607"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -83,7 +83,7 @@ TARGET_RAW_KEYS = [
 
 ]
 
-AGG_WINDOW = int(os.getenv("EMPLOYEE3_AGG_WINDOW", "20"))
+CORE_LINE_TIMEFRAME = "自然月K"
 
 BREAKOUT_LOOKBACK_DAYS = int(os.getenv("EMPLOYEE3_BREAKOUT_LOOKBACK_DAYS", "20"))
 
@@ -106,6 +106,26 @@ ASSESSMENT_LINE_MAX_BELOW_PCT = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MAX_B
 ASSESSMENT_LINE_MIN_SPACE_PCT = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MIN_SPACE_PCT", "6.0"))
 
 ASSESSMENT_LINE_MIN_RR = float(os.getenv("EMPLOYEE3_ASSESSMENT_LINE_MIN_RR", "1.05"))
+
+# 全历史压力定价：不能只看520日。先分近端/中期/长期/全历史，再决定是历史压力RR还是价格发现。
+OVERHEAD_PRESSURE_MIN_ABOVE_PCT = float(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_MIN_ABOVE_PCT", "0.025"))
+OVERHEAD_PRESSURE_BAND_TOL = float(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_BAND_TOL", "0.018"))
+OVERHEAD_PRESSURE_NEAR_DAYS = int(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_NEAR_DAYS", "520"))
+OVERHEAD_PRESSURE_MID_DAYS = int(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_MID_DAYS", "1200"))
+OVERHEAD_PRESSURE_LONG_DAYS = int(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_LONG_DAYS", "2400"))
+OVERHEAD_PRESSURE_MIN_RELIABLE_HITS = int(os.getenv("EMPLOYEE3_OVERHEAD_PRESSURE_MIN_RELIABLE_HITS", "2"))
+PRICE_DISCOVERY_MAX_RISK_PCT = float(os.getenv("EMPLOYEE3_PRICE_DISCOVERY_MAX_RISK_PCT", "8.5"))
+PRICE_DISCOVERY_MAX_DISTANCE_PCT = float(os.getenv("EMPLOYEE3_PRICE_DISCOVERY_MAX_DISTANCE_PCT", "12.0"))
+
+RECENT_IPO_SPECIAL_MAX_DAYS = int(os.getenv("EMPLOYEE3_RECENT_IPO_SPECIAL_MAX_DAYS", "250"))
+RECENT_IPO_MIN_FORMAL_DAYS = int(os.getenv("EMPLOYEE3_RECENT_IPO_MIN_FORMAL_DAYS", "60"))
+RECENT_IPO_MIN_PLATFORM_DAYS = int(os.getenv("EMPLOYEE3_RECENT_IPO_MIN_PLATFORM_DAYS", "30"))
+RECENT_IPO_PLATFORM_MIN_WINDOW = int(os.getenv("EMPLOYEE3_RECENT_IPO_PLATFORM_MIN_WINDOW", "15"))
+RECENT_IPO_PLATFORM_MAX_WINDOW = int(os.getenv("EMPLOYEE3_RECENT_IPO_PLATFORM_MAX_WINDOW", "45"))
+RECENT_IPO_PLATFORM_BASE_AMP = float(os.getenv("EMPLOYEE3_RECENT_IPO_PLATFORM_BASE_AMP", "0.22"))
+RECENT_IPO_PLATFORM_ATR_MULT = float(os.getenv("EMPLOYEE3_RECENT_IPO_PLATFORM_ATR_MULT", "4.0"))
+RECENT_IPO_PRICE_DISCOVERY_MAX_RISK_PCT = float(os.getenv("EMPLOYEE3_RECENT_IPO_PRICE_DISCOVERY_MAX_RISK_PCT", "7.5"))
+RECENT_IPO_PRICE_DISCOVERY_MAX_DISTANCE_PCT = float(os.getenv("EMPLOYEE3_RECENT_IPO_PRICE_DISCOVERY_MAX_DISTANCE_PCT", "10.0"))
 
 CACHE_SCAN_PROGRESS_EVERY = int(os.getenv("EMPLOYEE3_CACHE_SCAN_PROGRESS_EVERY", "500"))
 
@@ -154,6 +174,11 @@ DEEP_FINAL_PICK_LIMIT = int(os.getenv("EMPLOYEE3_DEEP_FINAL_PICK_LIMIT", os.gete
 DEEP_MIN_FORMAL_SCORE = float(os.getenv("EMPLOYEE3_DEEP_MIN_FORMAL_SCORE", "78"))
 
 DEEP_FORMAL_GRADES = tuple(x.strip() for x in os.getenv("EMPLOYEE3_DEEP_FORMAL_GRADES", "S,A").split(",") if x.strip())
+DEEP_BACKUP_MIN_SCORE = float(os.getenv("EMPLOYEE3_DEEP_BACKUP_MIN_SCORE", "58"))
+DEEP_BACKUP_ALLOWED_GRADES = tuple(x.strip().upper() for x in os.getenv("EMPLOYEE3_DEEP_BACKUP_ALLOWED_GRADES", "B,C").split(",") if x.strip())
+DEEP_BACKUP_MAX_RISK_PENALTY = float(os.getenv("EMPLOYEE3_DEEP_BACKUP_MAX_RISK_PENALTY", "18"))
+DEEP_BACKUP_MAX_DISTANCE_LINE_PCT = float(os.getenv("EMPLOYEE3_DEEP_BACKUP_MAX_DISTANCE_LINE_PCT", "18"))
+DEEP_BACKUP_MAX_DEFENSE_DISTANCE_PCT = float(os.getenv("EMPLOYEE3_DEEP_BACKUP_MAX_DEFENSE_DISTANCE_PCT", "12"))
 
 def now_bj() -> datetime:
 
@@ -721,7 +746,7 @@ def load_name_map() -> Dict[str, str]:
 
             scan_name_json(name_map, pth)
 
-    if os.getenv("EMPLOYEE3_NAME_BAOSTOCK_FALLBACK", "1") == "1" and bs is not None:
+    if os.getenv("EMPLOYEE3_NAME_BAOSTOCK_FALLBACK", "0") == "1" and bs is not None:
 
         try:
 
@@ -945,29 +970,43 @@ def refresh_recent_cache(hist: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
 
     return stat
 
-def aggregate_bars(df: pd.DataFrame, window: int = AGG_WINDOW) -> pd.DataFrame:
+def aggregate_monthly_bars(df: pd.DataFrame) -> pd.DataFrame:
 
     d = normalize_hist(df)
 
-    if d.empty or len(d) < max(22, window * 3):
+    if d.empty or len(d) < 60:
 
         return pd.DataFrame()
 
-    d = d.reset_index(drop=True)
+    d = d.reset_index(drop=True).copy()
 
-    d["grp"] = [(len(d) - 1 - i) // window for i in range(len(d))]
+    dt = pd.to_datetime(d["date"], errors="coerce")
+
+    d = d[dt.notna()].copy()
+
+    if d.empty:
+
+        return pd.DataFrame()
+
+    d["_month"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
 
     bars: List[Dict[str, Any]] = []
 
-    for _, g in d.groupby("grp"):
+    for month, g in d.groupby("_month", sort=True):
 
-        g = g.sort_index()
+        g = g.sort_values("date").reset_index(drop=True)
+
+        if g.empty:
+
+            continue
 
         bars.append({
 
-            "start": g.iloc[0].date,
+            "month": ss(month),
 
-            "end": g.iloc[-1].date,
+            "start": ss(g.iloc[0].date),
+
+            "end": ss(g.iloc[-1].date),
 
             "open": sf(g.iloc[0].open),
 
@@ -977,7 +1016,9 @@ def aggregate_bars(df: pd.DataFrame, window: int = AGG_WINDOW) -> pd.DataFrame:
 
             "close": sf(g.iloc[-1].close),
 
-            "volume": sf(g.volume.sum()),
+            "volume": sf(g.volume.sum()) if "volume" in g.columns else 0.0,
+
+            "amount": sf(g.amount.sum()) if "amount" in g.columns else 0.0,
 
         })
 
@@ -999,6 +1040,7 @@ def aggregate_bars(df: pd.DataFrame, window: int = AGG_WINDOW) -> pd.DataFrame:
 
     return k
 
+
 def line_candidate_sources(k: pd.DataFrame) -> Dict[float, str]:
 
     sources: Dict[float, set] = {}
@@ -1016,6 +1058,8 @@ def line_candidate_sources(k: pd.DataFrame) -> Dict[float, str]:
         add(r.get("high", 0.0), "最高价")
 
         add(r.get("body_top", 0.0), "实体顶")
+
+        add(r.get("close", 0.0), "收盘价")
 
     prev_volume = k.volume.shift(1) if "volume" in k.columns else pd.Series([0.0] * len(k))
 
@@ -1161,7 +1205,7 @@ def batch_score_lines(k: pd.DataFrame, sources: Dict[float, str], chunk_size: in
 
                 "line_type": "core_line" if level == "核心线候选" else "non_core",
 
-                "timeframe": f"{AGG_WINDOW}日聚合K",
+                "timeframe": CORE_LINE_TIMEFRAME,
 
                 "current_state": "存在实体接受记录" if int(entity_accept_arr[j]) else "暂无实体接受记录",
 
@@ -1221,17 +1265,17 @@ def choose_resonance_line(df: pd.DataFrame, line_label: str, lookback_days: int 
 
         d = d.tail(lookback_days).reset_index(drop=True)
 
-    raw_k = aggregate_bars(d, AGG_WINDOW)
+    raw_k = aggregate_monthly_bars(d)
 
     if raw_k.empty or len(raw_k) < 3:
 
-        return {"line": None, "level": "数据不足", "reason": f"{line_label}历史K线不足", "line_label": line_label}
+        return {"line": None, "level": "数据不足", "reason": f"{line_label}自然月K线不足", "line_label": line_label}
 
     completed = raw_k.iloc[:-1].reset_index(drop=True)
 
     if completed.empty:
 
-        return {"line": None, "level": "数据不足", "reason": f"{line_label}无已完成聚合K", "line_label": line_label}
+        return {"line": None, "level": "数据不足", "reason": f"{line_label}无已完成自然月K", "line_label": line_label}
 
     sources = line_candidate_sources(completed)
 
@@ -1295,23 +1339,900 @@ def choose_five_hundred_day_resonance_trigger_line(df: pd.DataFrame) -> Dict[str
 
     return choose_resonance_line(df, "五百日共振触发线", lookback_days=FIVE_HUNDRED_DAY_LOOKBACK, rank_mode="five_hundred_day")
 
+
+def recent_ipo_empty_context(d: pd.DataFrame = None, detail: str = "") -> Dict[str, Any]:
+    x = normalize_hist(d) if d is not None else pd.DataFrame()
+    first_date = ss(x.iloc[0].get("date", "")) if not x.empty else ""
+    return {
+        "is_recent_ipo": False,
+        "recent_ipo_flag": False,
+        "listing_age_days": int(len(x)) if x is not None else 0,
+        "first_trade_date": first_date,
+        "recent_ipo_stage": "普通股/非次新",
+        "recent_ipo_maturity_score": 0.0,
+        "recent_ipo_platform_valid": False,
+        "recent_ipo_platform_score": 0.0,
+        "recent_ipo_platform_upper": 0.0,
+        "recent_ipo_platform_lower": 0.0,
+        "recent_ipo_platform_window": 0,
+        "recent_ipo_platform_amp_pct": 0.0,
+        "recent_ipo_max_amount_high": 0.0,
+        "recent_ipo_max_amount_body_top": 0.0,
+        "recent_ipo_max_amount_body_bottom": 0.0,
+        "recent_ipo_ipo_day_high": 0.0,
+        "recent_ipo_ipo_day_close": 0.0,
+        "recent_ipo_post_high": 0.0,
+        "recent_ipo_post_high_date": "",
+        "recent_ipo_action": "NORMAL",
+        "recent_ipo_detail": detail or "非次新股，不启用次新专属分支",
+    }
+
+
+def evaluate_recent_ipo_platform(d: pd.DataFrame) -> Dict[str, Any]:
+    x = add_deep_indicators(d)
+    if x.empty or len(x) < RECENT_IPO_MIN_PLATFORM_DAYS:
+        return {
+            "valid": False, "score": 0.0, "detail": "上市后平台样本不足",
+            "upper": 0.0, "lower": 0.0, "window": 0, "amp_pct": 0.0,
+            "vol_cv": 0.0, "touch_upper": 0, "touch_lower": 0, "long_bear_count": 0,
+        }
+    completed = x.iloc[:-1].copy().reset_index(drop=True) if len(x) > 1 else x.copy().reset_index(drop=True)
+    if len(completed) < RECENT_IPO_MIN_PLATFORM_DAYS:
+        return {
+            "valid": False, "score": 0.0, "detail": "上市后平台未完成，需更多交易日",
+            "upper": 0.0, "lower": 0.0, "window": 0, "amp_pct": 0.0,
+            "vol_cv": 0.0, "touch_upper": 0, "touch_lower": 0, "long_bear_count": 0,
+        }
+    max_window = min(RECENT_IPO_PLATFORM_MAX_WINDOW, len(completed))
+    min_window = min(max(RECENT_IPO_PLATFORM_MIN_WINDOW, 12), max_window)
+    best: Dict[str, Any] = {}
+    for win in range(min_window, max_window + 1):
+        seg = completed.tail(win).copy().reset_index(drop=True)
+        close_mid = sf(seg["close"].median())
+        if close_mid <= 0:
+            continue
+        high_max = sf(seg["high"].max())
+        low_min = sf(seg["low"].min())
+        amp = (high_max - low_min) / max(close_mid, 1e-9)
+        atr = sf(seg["range_pct"].replace([np.inf, -np.inf], np.nan).dropna().median()) if "range_pct" in seg.columns else 0.0
+        allowed_amp = max(RECENT_IPO_PLATFORM_BASE_AMP, atr * RECENT_IPO_PLATFORM_ATR_MULT)
+        allowed_amp = min(max(allowed_amp, 0.18), 0.36)
+        volume_mean = sf(seg["volume"].mean())
+        vol_cv = sf(seg["volume"].std()) / max(volume_mean, 1e-9) if volume_mean > 0 else 9.99
+        upper = max(sf(seg["body_top"].quantile(0.88)) if "body_top" in seg.columns else 0.0, sf(seg["close"].quantile(0.90)))
+        upper = max(upper, sf(seg["high"].quantile(0.78)))
+        lower = min(sf(seg["body_bottom"].quantile(0.12)) if "body_bottom" in seg.columns else low_min, sf(seg["close"].quantile(0.10)))
+        lower = min(lower, sf(seg["low"].quantile(0.22)))
+        if upper <= 0 or lower <= 0 or upper <= lower:
+            continue
+        touch_upper = int(((seg["high"] >= upper * 0.985) | (seg["close"] >= upper * 0.990)).sum())
+        touch_lower = int(((seg["low"] <= lower * 1.015) | (seg["close"] <= lower * 1.010)).sum())
+        long_bear = (seg["close"] < seg["open"]) & (((seg["open"] - seg["close"]) / seg["close"].shift(1).replace(0, np.nan)) >= 0.035) & (seg["volume"] >= seg["vol_ma20"].fillna(seg["volume"].median()) * 1.35)
+        long_bear_count = int(long_bear.sum())
+        close_mad = sf((seg["close"] - close_mid).abs().median()) / max(close_mid, 1e-9)
+        score = 0.0
+        reasons: List[str] = []
+        if amp <= allowed_amp:
+            score += 4.0; reasons.append(f"振幅{amp:.1%}<=阈值{allowed_amp:.1%}")
+        elif amp <= allowed_amp * 1.20:
+            score += 1.5; reasons.append(f"振幅略宽{amp:.1%}")
+        else:
+            reasons.append(f"振幅过宽{amp:.1%}")
+        if vol_cv <= 0.85:
+            score += 2.5; reasons.append(f"量能趋稳CV{vol_cv:.2f}")
+        elif vol_cv <= 1.20:
+            score += 1.0; reasons.append(f"量能波动可接受CV{vol_cv:.2f}")
+        if touch_upper >= 2:
+            score += 1.8; reasons.append(f"上沿触碰{touch_upper}次")
+        if touch_lower >= 2:
+            score += 1.6; reasons.append(f"下沿承接{touch_lower}次")
+        if close_mad <= 0.075:
+            score += 1.4; reasons.append(f"收盘集中{close_mad:.1%}")
+        if long_bear_count == 0:
+            score += 1.5; reasons.append("无放量长阴破坏")
+        elif long_bear_count == 1:
+            score -= 1.0; reasons.append("有1次放量长阴")
+        else:
+            score -= 4.0; reasons.append(f"放量长阴{long_bear_count}次")
+        valid = bool(score >= 7.0 and amp <= allowed_amp * 1.20 and touch_upper >= 2 and touch_lower >= 1 and long_bear_count <= 1)
+        item = {
+            "valid": valid, "score": rd(score, 2), "detail": "；".join(reasons),
+            "upper": rd(upper, 3), "lower": rd(lower, 3), "window": int(win),
+            "amp_pct": rd(amp * 100.0, 2), "vol_cv": rd(vol_cv, 3),
+            "touch_upper": int(touch_upper), "touch_lower": int(touch_lower),
+            "long_bear_count": int(long_bear_count),
+        }
+        if not best or (item["valid"], item["score"], -item["amp_pct"]) > (best.get("valid", False), sf(best.get("score")), -sf(best.get("amp_pct"))):
+            best = item
+    if not best:
+        return {
+            "valid": False, "score": 0.0, "detail": "未识别到可用上市后平台",
+            "upper": 0.0, "lower": 0.0, "window": 0, "amp_pct": 0.0,
+            "vol_cv": 0.0, "touch_upper": 0, "touch_lower": 0, "long_bear_count": 0,
+        }
+    return best
+
+
+def evaluate_recent_ipo_context(d: pd.DataFrame) -> Dict[str, Any]:
+    x = add_deep_indicators(d)
+    if x.empty:
+        return recent_ipo_empty_context(x, "数据为空")
+    listing_age = int(len(x))
+    first = x.iloc[0]
+    first_date = ss(first.get("date", ""))
+    if listing_age > RECENT_IPO_SPECIAL_MAX_DAYS:
+        return recent_ipo_empty_context(x, "上市时间已超过次新专属窗口，使用普通股逻辑")
+    completed = x.iloc[:-1].copy().reset_index(drop=True) if len(x) > 1 else x.copy().reset_index(drop=True)
+    platform = evaluate_recent_ipo_platform(x)
+    amount_series = pd.to_numeric(completed.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0) if not completed.empty else pd.Series(dtype=float)
+    if not completed.empty and len(amount_series) == len(completed) and float(amount_series.max() if len(amount_series) else 0.0) > 0:
+        max_amount_idx = int(amount_series.idxmax())
+        max_amount_row = completed.iloc[max_amount_idx]
+    elif not completed.empty:
+        volume_series = pd.to_numeric(completed.get("volume", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        max_amount_idx = int(volume_series.idxmax()) if len(volume_series) else 0
+        max_amount_row = completed.iloc[max_amount_idx]
+    else:
+        max_amount_row = first
+    post_high = sf(completed["high"].max()) if not completed.empty else sf(first.high)
+    post_high_date = ""
+    try:
+        hi_idx = pd.to_numeric(completed["high"], errors="coerce").idxmax() if not completed.empty else 0
+        post_high_date = ss(completed.loc[hi_idx].get("date", "")) if not completed.empty else first_date
+    except Exception:
+        post_high_date = ""
+    maturity = 0.0
+    reasons: List[str] = [f"上市{listing_age}个交易日"]
+    if listing_age >= RECENT_IPO_MIN_FORMAL_DAYS:
+        maturity += 4.0; reasons.append("样本达到正式评估下限")
+    elif listing_age >= RECENT_IPO_MIN_PLATFORM_DAYS:
+        maturity += 2.0; reasons.append("样本仅够观察")
+    else:
+        reasons.append("样本不足，筹码结构未沉淀")
+    if bool(platform.get("valid")):
+        maturity += min(4.0, sf(platform.get("score")) * 0.45); reasons.append(f"上市后平台有效：{platform.get('detail')}")
+    else:
+        reasons.append(f"上市后平台未确认：{platform.get('detail')}")
+    max_amount_high = sf(max_amount_row.get("high", 0.0))
+    max_amount_body_top = max(sf(max_amount_row.get("open", 0.0)), sf(max_amount_row.get("close", 0.0)))
+    max_amount_body_bottom = min(sf(max_amount_row.get("open", 0.0)), sf(max_amount_row.get("close", 0.0)))
+    maturity = clamp(maturity, 0, 10)
+    if listing_age < RECENT_IPO_MIN_PLATFORM_DAYS:
+        action = "HARD_REJECT"
+        stage = "次新样本不足"
+    elif listing_age < RECENT_IPO_MIN_FORMAL_DAYS:
+        action = "OBSERVE_ONLY"
+        stage = "次新观察期"
+    elif not bool(platform.get("valid")):
+        action = "OBSERVE_ONLY"
+        stage = "次新平台未确认"
+    else:
+        action = "ALLOW_FORMAL_IF_CONFIRMED"
+        stage = "次新平台成熟"
+    return {
+        "is_recent_ipo": True,
+        "recent_ipo_flag": True,
+        "listing_age_days": listing_age,
+        "first_trade_date": first_date,
+        "recent_ipo_stage": stage,
+        "recent_ipo_maturity_score": rd(maturity, 2),
+        "recent_ipo_platform_valid": bool(platform.get("valid")),
+        "recent_ipo_platform_score": platform.get("score", 0),
+        "recent_ipo_platform_upper": platform.get("upper", 0),
+        "recent_ipo_platform_lower": platform.get("lower", 0),
+        "recent_ipo_platform_window": platform.get("window", 0),
+        "recent_ipo_platform_amp_pct": platform.get("amp_pct", 0),
+        "recent_ipo_max_amount_high": rd(max_amount_high, 3),
+        "recent_ipo_max_amount_body_top": rd(max_amount_body_top, 3),
+        "recent_ipo_max_amount_body_bottom": rd(max_amount_body_bottom, 3),
+        "recent_ipo_ipo_day_high": rd(sf(first.get("high", 0.0)), 3),
+        "recent_ipo_ipo_day_close": rd(sf(first.get("close", 0.0)), 3),
+        "recent_ipo_post_high": rd(post_high, 3),
+        "recent_ipo_post_high_date": post_high_date,
+        "recent_ipo_action": action,
+        "recent_ipo_detail": "；".join(reasons),
+    }
+
+
+def _score_recent_ipo_line(d: pd.DataFrame, line: float, source: str) -> Dict[str, Any]:
+    x = normalize_hist(d)
+    L = sf(line)
+    if x.empty or L <= 0:
+        return {"line": None, "level": "未识别", "reason": "次新筹码线无效", "line_label": "次新上市后筹码线"}
+    completed = x.iloc[:-1].copy().reset_index(drop=True) if len(x) > 1 else x.copy().reset_index(drop=True)
+    if completed.empty:
+        return {"line": None, "level": "未识别", "reason": "次新筹码线样本不足", "line_label": "次新上市后筹码线"}
+    body_top = completed[["open", "close"]].max(axis=1)
+    body_bottom = completed[["open", "close"]].min(axis=1)
+    vol = pd.to_numeric(completed.get("volume", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    vol_med = sf(vol.median())
+    tol = max(CORE_LINE_TOL, 0.012)
+    high_touch = (abs(completed["high"] - L) / max(L, 1e-9) <= tol)
+    body_touch = (abs(body_top - L) / max(L, 1e-9) <= tol)
+    close_touch = (abs(completed["close"] - L) / max(L, 1e-9) <= tol)
+    upper_shadow = (body_top <= L) & (L <= completed["high"])
+    touch = high_touch | body_touch | close_touch | upper_shadow
+    volume_touch = touch & (vol >= vol_med * 1.25) if vol_med > 0 else touch & False
+    entity_cut = (body_bottom < L) & (L < body_top)
+    hit = int(touch.sum())
+    vol_hit = int(volume_touch.sum())
+    cut = int(entity_cut.sum())
+    net = hit + vol_hit * 0.8 - cut * 0.35
+    level = "核心线候选" if hit >= 2 and net > 0 else "未成线"
+    return {
+        "line": rd(L, 3),
+        "score": rd(hit, 3),
+        "net_score": rd(net, 3),
+        "effective_resonance_count": hit,
+        "volume_resonance_count": vol_hit,
+        "entity_cut_count": cut,
+        "level": level,
+        "line_type": "recent_ipo_core_line" if level == "核心线候选" else "non_core",
+        "timeframe": "上市后日K",
+        "current_state": "次新上市后筹码交换线",
+        "source": source,
+        "line_label": "次新上市后筹码线",
+        "lookback_days": int(len(completed)),
+        "rank_mode": "recent_ipo",
+    }
+
+
+def choose_recent_ipo_core_line(df: pd.DataFrame) -> Dict[str, Any]:
+    x = normalize_hist(df)
+    ctx = evaluate_recent_ipo_context(x)
+    if not bool(ctx.get("is_recent_ipo")):
+        return {"line": None, "level": "非次新", "reason": "非次新股，不启用次新筹码线", "line_label": "次新上市后筹码线", "recent_ipo_context": ctx}
+    if int(sf(ctx.get("listing_age_days"))) < RECENT_IPO_MIN_PLATFORM_DAYS:
+        return {"line": None, "level": "样本不足", "reason": "次新上市后交易日不足，不生成正式筹码线", "line_label": "次新上市后筹码线", "recent_ipo_context": ctx}
+    raw_candidates: List[Tuple[float, str, float]] = []
+    def add(price: Any, source: str, weight: float) -> None:
+        v = sf(price)
+        if v > 0:
+            raw_candidates.append((v, source, weight))
+    add(ctx.get("recent_ipo_ipo_day_high"), "上市首日高点", 3.0)
+    add(ctx.get("recent_ipo_ipo_day_close"), "上市首日收盘", 0.5)
+    add(ctx.get("recent_ipo_max_amount_high"), "上市后最大成交额K高点", 4.0)
+    add(ctx.get("recent_ipo_max_amount_body_top"), "上市后最大成交额K实体顶", 3.5)
+    add(ctx.get("recent_ipo_post_high"), "上市以来高点", 3.0)
+    if bool(ctx.get("recent_ipo_platform_valid")):
+        add(ctx.get("recent_ipo_platform_upper"), "上市后平台上沿", 10.0)
+    if not raw_candidates:
+        return {"line": None, "level": "未识别", "reason": "次新未识别上市后筹码候选线", "line_label": "次新上市后筹码线", "recent_ipo_context": ctx}
+    scored: List[Dict[str, Any]] = []
+    for price, source, weight in raw_candidates:
+        item = _score_recent_ipo_line(x, price, source)
+        item["recent_ipo_source_weight"] = rd(weight, 2)
+        item["recent_ipo_context"] = ctx
+        last_close_for_rank = sf(x.iloc[-1].get("close", 0.0)) if not x.empty else 0.0
+        line_distance_pct = pct_change(last_close_for_rank, sf(item.get("line"))) if last_close_for_rank > 0 and sf(item.get("line")) > 0 else 0.0
+        distance_bonus = 0.0
+        if 0.0 <= line_distance_pct <= 10.0:
+            distance_bonus = 3.0
+        elif 10.0 < line_distance_pct <= 15.0:
+            distance_bonus = 1.0
+        elif line_distance_pct > 15.0:
+            distance_bonus = -min(8.0, (line_distance_pct - 15.0) * 0.65)
+        platform_bonus = 5.0 if bool(ctx.get("recent_ipo_platform_valid")) and "平台上沿" in source else 0.0
+        item["recent_ipo_line_distance_pct"] = rd(line_distance_pct, 2)
+        item["recent_ipo_line_rank_score"] = rd(sf(item.get("net_score")) * 0.55 + weight + platform_bonus + distance_bonus + sf(item.get("volume_resonance_count")) * 0.6, 3)
+        if line_distance_pct > 18.0:
+            item["level"] = "过远低线"
+            item["line_type"] = "non_core"
+        if ss(item.get("line_type")) == "recent_ipo_core_line":
+            scored.append(item)
+    if not scored:
+        fallback = max((_score_recent_ipo_line(x, price, source) for price, source, _ in raw_candidates), key=lambda z: sf(z.get("net_score")))
+        fallback["recent_ipo_context"] = ctx
+        fallback["reason"] = "次新候选线共振不足，仅作观察"
+        return fallback
+    best = max(scored, key=lambda z: (sf(z.get("recent_ipo_line_rank_score")), sf(z.get("volume_resonance_count")), sf(z.get("effective_resonance_count"))))
+    best["top_candidates"] = sorted(scored, key=lambda z: sf(z.get("recent_ipo_line_rank_score")), reverse=True)[:6]
+    return best
+
+
+def build_recent_ipo_pressure_profile(d: pd.DataFrame, bidx: int, last_close: float, end_idx: Any = None) -> Dict[str, Any]:
+    x = normalize_hist(d)
+    ctx = evaluate_recent_ipo_context(x)
+    listing_age = int(sf(ctx.get("listing_age_days")))
+    if x.empty or last_close <= 0:
+        return {"pressure_found": False, "target_reliable": False, "target_price": 0.0, "space_pct": 0.0, "pricing_mode": "次新数据不足", "pressure_horizon": "次新", "target_type": "次新压力样本不足", "pressure_audit_detail": "次新压力样本不足", **ctx}
+    if end_idx is None:
+        end_idx = len(x) - 1
+    end_idx = max(1, min(int(end_idx), len(x)))
+    completed = x.iloc[:end_idx].copy().reset_index(drop=True)
+    levels: List[Tuple[float, str, bool, float]] = []
+    def add_level(price: Any, label: str, reliable: bool, weight: float) -> None:
+        v = sf(price)
+        if v > 0 and v >= last_close * (1.0 + OVERHEAD_PRESSURE_MIN_ABOVE_PCT):
+            levels.append((v, label, reliable, weight))
+    add_level(ctx.get("recent_ipo_post_high"), "上市以来高点", True, 5.0)
+    add_level(ctx.get("recent_ipo_ipo_day_high"), "上市首日高点", True, 4.0)
+    add_level(ctx.get("recent_ipo_max_amount_high"), "最大成交额K高点", True, 4.5)
+    add_level(ctx.get("recent_ipo_max_amount_body_top"), "最大成交额K实体顶", True, 3.5)
+    if bool(ctx.get("recent_ipo_platform_valid")):
+        add_level(ctx.get("recent_ipo_platform_upper"), "上市后平台上沿", True, 5.0)
+    if levels:
+        price, label, reliable, weight = sorted(levels, key=lambda z: (z[0], -z[3]))[0]
+        space = pct_change(price, last_close)
+        audit = f"次新上市后压力:{label}{price:.2f}；上市{listing_age}日；平台有效={bool(ctx.get('recent_ipo_platform_valid'))}；最大成交额K高点{ctx.get('recent_ipo_max_amount_high')}；上市以来高点{ctx.get('recent_ipo_post_high')}"
+        return {
+            "pressure_found": True,
+            "target_reliable": bool(reliable),
+            "target_price": rd(price, 3),
+            "space_pct": rd(space, 2),
+            "target_quality": "valid" if reliable else "weak",
+            "pricing_mode": "次新上市后筹码压力定价",
+            "pressure_horizon": "次新上市后",
+            "target_type": f"次新{label}",
+            "near_pressure_price": 0.0,
+            "mid_pressure_price": 0.0,
+            "long_pressure_price": 0.0,
+            "full_pressure_price": rd(price, 3),
+            "near_pressure_quality": "recent_ipo",
+            "mid_pressure_quality": "recent_ipo",
+            "long_pressure_quality": "recent_ipo",
+            "full_pressure_quality": "valid" if reliable else "weak",
+            "full_history_high": ctx.get("recent_ipo_post_high", 0),
+            "full_history_high_date": ctx.get("recent_ipo_post_high_date", ""),
+            "pressure_audit_detail": audit,
+            "pressure_scan_sample_days": int(len(completed)),
+            "recent_ipo_price_discovery_ok": False,
+            **ctx,
+        }
+    platform_ok = bool(ctx.get("recent_ipo_platform_valid"))
+    price_discovery_ok = bool(listing_age >= RECENT_IPO_MIN_FORMAL_DAYS and platform_ok)
+    pricing_mode = "次新上市后价格发现" if price_discovery_ok else "次新历史压力不足"
+    target_type = "次新突破上市后筹码区进入价格发现" if price_discovery_ok else "次新样本短/平台不足，不按价格发现加分"
+    return {
+        "pressure_found": False,
+        "target_reliable": False,
+        "target_price": 0.0,
+        "space_pct": 0.0,
+        "target_quality": "none",
+        "pricing_mode": pricing_mode,
+        "pressure_horizon": "次新上市后",
+        "target_type": target_type,
+        "near_pressure_price": 0.0,
+        "mid_pressure_price": 0.0,
+        "long_pressure_price": 0.0,
+        "full_pressure_price": 0.0,
+        "near_pressure_quality": "recent_ipo",
+        "mid_pressure_quality": "recent_ipo",
+        "long_pressure_quality": "recent_ipo",
+        "full_pressure_quality": "none",
+        "full_history_high": ctx.get("recent_ipo_post_high", 0),
+        "full_history_high_date": ctx.get("recent_ipo_post_high_date", ""),
+        "pressure_audit_detail": f"次新无上方筹码压力；上市{listing_age}日；平台有效={platform_ok}；上市以来高点{ctx.get('recent_ipo_post_high')}；不套用老股全历史价格发现",
+        "pressure_scan_sample_days": int(len(completed)),
+        "recent_ipo_price_discovery_ok": price_discovery_ok,
+        **ctx,
+    }
+
+def _pressure_empty_scan(horizon_key: str, horizon_label: str, lookback_days: int, sample_days: int, reason: str) -> Dict[str, Any]:
+
+    return {
+
+        "horizon_key": horizon_key,
+
+        "horizon_label": horizon_label,
+
+        "lookback_days": int(lookback_days),
+
+        "sample_days": int(sample_days),
+
+        "pressure_found": False,
+
+        "target_reliable": False,
+
+        "target_price": 0.0,
+
+        "space_pct": 0.0,
+
+        "target_quality": "none",
+
+        "hit_count": 0,
+
+        "volume_hit_count": 0,
+
+        "band_low": 0.0,
+
+        "band_high": 0.0,
+
+        "full_high": 0.0,
+
+        "full_high_date": "",
+
+        "detail": reason,
+
+    }
+
+
+def _price_event_rows(window: pd.DataFrame, last_close: float) -> List[Dict[str, Any]]:
+
+    if window.empty or last_close <= 0:
+
+        return []
+
+    threshold = last_close * (1.0 + OVERHEAD_PRESSURE_MIN_ABOVE_PCT)
+
+    events: List[Dict[str, Any]] = []
+
+    for pos, (_, r) in enumerate(window.iterrows()):
+
+        open_ = sf(r.get("open", 0.0))
+
+        high = sf(r.get("high", 0.0))
+
+        close = sf(r.get("close", 0.0))
+
+        volume = sf(r.get("volume", 0.0))
+
+        if high <= 0 or close <= 0 or open_ <= 0:
+
+            continue
+
+        body_top = max(open_, close)
+
+        for price, source in [(high, "最高价"), (body_top, "实体顶"), (close, "收盘价")]:
+
+            if price >= threshold:
+
+                events.append({
+
+                    "price": float(price),
+
+                    "row_pos": int(pos),
+
+                    "date": ss(r.get("date", "")),
+
+                    "volume": float(volume),
+
+                    "source": source,
+
+                })
+
+    return sorted(events, key=lambda x: sf(x.get("price")))
+
+
+def _score_pressure_group(group: List[Dict[str, Any]], vol_med: float, last_close: float) -> Dict[str, Any]:
+
+    prices = [sf(x.get("price")) for x in group if sf(x.get("price")) > 0]
+
+    if not prices:
+
+        return {}
+
+    row_ids = set(int(sf(x.get("row_pos"))) for x in group)
+
+    unique_hits = len(row_ids)
+
+    volume_rows = set(
+
+        int(sf(x.get("row_pos")))
+
+        for x in group
+
+        if vol_med > 0 and sf(x.get("volume")) >= vol_med * 1.30
+
+    )
+
+    volume_hits = len(volume_rows)
+
+    body_or_close_events = sum(1 for x in group if ss(x.get("source")) in {"实体顶", "收盘价"})
+
+    pressure_score = unique_hits + volume_hits * 0.70 + body_or_close_events * 0.15
+
+    if unique_hits >= max(4, OVERHEAD_PRESSURE_MIN_RELIABLE_HITS + 2) or volume_hits >= 2 or pressure_score >= 5.0:
+
+        quality = "strong"
+
+    elif unique_hits >= OVERHEAD_PRESSURE_MIN_RELIABLE_HITS or volume_hits >= 1:
+
+        quality = "valid"
+
+    else:
+
+        quality = "weak"
+
+    band_low = min(prices)
+
+    band_high = max(prices)
+
+    pressure_price = max(last_close * (1.0 + OVERHEAD_PRESSURE_MIN_ABOVE_PCT), band_low)
+
+    return {
+
+        "pressure_found": True,
+
+        "target_reliable": quality in {"strong", "valid"},
+
+        "target_price": rd(pressure_price, 3),
+
+        "target_quality": quality,
+
+        "hit_count": int(unique_hits),
+
+        "volume_hit_count": int(volume_hits),
+
+        "band_low": rd(band_low, 3),
+
+        "band_high": rd(band_high, 3),
+
+        "space_pct": rd(pct_change(pressure_price, last_close), 2),
+
+        "pressure_score": rd(pressure_score, 2),
+
+        "sample_dates": ",".join([ss(x.get("date")) for x in group[:3] if ss(x.get("date"))]),
+
+    }
+
+
+def scan_overhead_pressure_window(window: pd.DataFrame, last_close: float, horizon_key: str, horizon_label: str, lookback_days: int) -> Dict[str, Any]:
+
+    w = normalize_hist(window)
+
+    sample_days = int(len(w))
+
+    if w.empty or last_close <= 0:
+
+        return _pressure_empty_scan(horizon_key, horizon_label, lookback_days, sample_days, f"{horizon_label}样本不足")
+
+    high_series = pd.to_numeric(w.get("high", pd.Series(dtype=float)), errors="coerce").dropna()
+
+    if high_series.empty:
+
+        return _pressure_empty_scan(horizon_key, horizon_label, lookback_days, sample_days, f"{horizon_label}高点数据无效")
+
+    full_high = sf(high_series.max())
+
+    full_high_date = ""
+
+    try:
+
+        full_high_idx = pd.to_numeric(w["high"], errors="coerce").idxmax()
+
+        full_high_date = ss(w.loc[full_high_idx].get("date", ""))
+
+    except Exception:
+
+        full_high_date = ""
+
+    threshold = last_close * (1.0 + OVERHEAD_PRESSURE_MIN_ABOVE_PCT)
+
+    if full_high < threshold:
+
+        out = _pressure_empty_scan(horizon_key, horizon_label, lookback_days, sample_days, f"{horizon_label}无高于当前{OVERHEAD_PRESSURE_MIN_ABOVE_PCT:.1%}的历史压力")
+
+        out.update({"full_high": rd(full_high, 3), "full_high_date": full_high_date})
+
+        return out
+
+    events = _price_event_rows(w, last_close)
+
+    if not events:
+
+        out = _pressure_empty_scan(horizon_key, horizon_label, lookback_days, sample_days, f"{horizon_label}无有效压力事件")
+
+        out.update({"full_high": rd(full_high, 3), "full_high_date": full_high_date})
+
+        return out
+
+    vol_med = sf(pd.to_numeric(w.get("volume", pd.Series(dtype=float)), errors="coerce").dropna().median())
+
+    groups: List[List[Dict[str, Any]]] = []
+
+    cur: List[Dict[str, Any]] = []
+
+    base = 0.0
+
+    for ev in events:
+
+        price = sf(ev.get("price"))
+
+        if price <= 0:
+
+            continue
+
+        if not cur:
+
+            cur = [ev]
+
+            base = price
+
+        elif base > 0 and abs(price - base) / base <= OVERHEAD_PRESSURE_BAND_TOL:
+
+            cur.append(ev)
+
+        else:
+
+            groups.append(cur)
+
+            cur = [ev]
+
+            base = price
+
+    if cur:
+
+        groups.append(cur)
+
+    scored = []
+
+    for group in groups:
+
+        item = _score_pressure_group(group, vol_med, last_close)
+
+        if item:
+
+            scored.append(item)
+
+    if not scored:
+
+        out = _pressure_empty_scan(horizon_key, horizon_label, lookback_days, sample_days, f"{horizon_label}压力分组无效")
+
+        out.update({"full_high": rd(full_high, 3), "full_high_date": full_high_date})
+
+        return out
+
+    reliable = [x for x in scored if bool(x.get("target_reliable"))]
+
+    picked = min(reliable, key=lambda x: sf(x.get("target_price"))) if reliable else min(scored, key=lambda x: sf(x.get("target_price")))
+
+    picked.update({
+
+        "horizon_key": horizon_key,
+
+        "horizon_label": horizon_label,
+
+        "lookback_days": int(lookback_days),
+
+        "sample_days": sample_days,
+
+        "full_high": rd(full_high, 3),
+
+        "full_high_date": full_high_date,
+
+        "detail": f"{horizon_label}压力{picked.get('target_price')}，质量{picked.get('target_quality')}，共振{picked.get('hit_count')}次/带量{picked.get('volume_hit_count')}次，区间{picked.get('band_low')}-{picked.get('band_high')}",
+
+    })
+
+    return picked
+
+
+def build_overhead_pressure_profile(d: pd.DataFrame, bidx: int, last_close: float, end_idx: Any = None) -> Dict[str, Any]:
+
+    x = normalize_hist(d)
+
+    if x.empty or last_close <= 0:
+
+        return {
+
+            "pressure_found": False,
+
+            "target_reliable": False,
+
+            "target_price": 0.0,
+
+            "space_pct": 0.0,
+
+            "pricing_mode": "数据不足",
+
+            "pressure_horizon": "无",
+
+            "target_type": "压力样本不足",
+
+            "pressure_audit_detail": "压力样本不足",
+
+        }
+
+    if end_idx is None:
+
+        end_idx = int(bidx)
+
+    end_idx = max(1, min(int(end_idx), len(x)))
+
+    pre_all = x.iloc[:end_idx].copy().reset_index(drop=True)
+
+    if pre_all.empty:
+
+        return {
+
+            "pressure_found": False,
+
+            "target_reliable": False,
+
+            "target_price": 0.0,
+
+            "space_pct": 0.0,
+
+            "pricing_mode": "数据不足",
+
+            "pressure_horizon": "无",
+
+            "target_type": "压力样本不足",
+
+            "pressure_audit_detail": "压力样本不足",
+
+        }
+
+    horizons = [
+
+        ("near", "近520日", OVERHEAD_PRESSURE_NEAR_DAYS),
+
+        ("mid", "近1200日", OVERHEAD_PRESSURE_MID_DAYS),
+
+        ("long", "近2400日", OVERHEAD_PRESSURE_LONG_DAYS),
+
+        ("full", "全历史", 0),
+
+    ]
+
+    scans: Dict[str, Dict[str, Any]] = {}
+
+    for key, label, days in horizons:
+
+        win = pre_all if days <= 0 or len(pre_all) <= days else pre_all.tail(days)
+
+        scans[key] = scan_overhead_pressure_window(win, last_close, key, label, days)
+
+    chosen: Dict[str, Any] = {}
+
+    for key in ["near", "mid", "long", "full"]:
+
+        item = scans.get(key, {})
+
+        if bool(item.get("pressure_found")) and bool(item.get("target_reliable")):
+
+            chosen = dict(item)
+
+            break
+
+    if not chosen:
+
+        weak_items = [scans[k] for k in ["near", "mid", "long", "full"] if bool(scans.get(k, {}).get("pressure_found"))]
+
+        if weak_items:
+
+            chosen = min(weak_items, key=lambda x: sf(x.get("target_price")))
+
+    full_scan = scans.get("full", {})
+
+    if chosen:
+
+        hkey = ss(chosen.get("horizon_key"))
+
+        reliable = bool(chosen.get("target_reliable"))
+
+        if not reliable:
+
+            pricing_mode = "弱压力参考"
+
+            target_type = f"{chosen.get('horizon_label', '')}弱压力参考"
+
+        elif hkey == "near":
+
+            pricing_mode = "近端历史压力定价"
+
+            target_type = "近端历史压力"
+
+        elif hkey in {"mid", "long"}:
+
+            pricing_mode = "近端真空｜中远期压力定价"
+
+            target_type = f"{chosen.get('horizon_label', '')}历史压力"
+
+        else:
+
+            pricing_mode = "近端真空｜全历史压力定价"
+
+            target_type = "全历史远端压力"
+
+        target_price = sf(chosen.get("target_price"))
+
+        space_pct = pct_change(target_price, last_close) if target_price > 0 else 0.0
+
+        out = dict(chosen)
+
+        out.update({
+
+            "pressure_found": bool(target_price > 0),
+
+            "target_reliable": reliable,
+
+            "target_price": rd(target_price, 3),
+
+            "space_pct": rd(space_pct, 2),
+
+            "pricing_mode": pricing_mode,
+
+            "pressure_horizon": chosen.get("horizon_label", ""),
+
+            "target_type": target_type,
+
+        })
+
+    else:
+
+        pricing_mode = "全历史价格发现" if sf(full_scan.get("full_high")) < last_close * (1.0 + OVERHEAD_PRESSURE_MIN_ABOVE_PCT) else "压力未成线"
+
+        target_type = "全历史上方无有效历史压力" if pricing_mode == "全历史价格发现" else "存在上影/毛刺但未成可靠压力"
+
+        out = {
+
+            "pressure_found": False,
+
+            "target_reliable": False,
+
+            "target_price": 0.0,
+
+            "space_pct": 0.0,
+
+            "target_quality": "none",
+
+            "pricing_mode": pricing_mode,
+
+            "pressure_horizon": "全历史",
+
+            "target_type": target_type,
+
+            "full_high": full_scan.get("full_high", 0.0),
+
+            "full_high_date": full_scan.get("full_high_date", ""),
+
+        }
+
+    def p(key: str, field: str = "target_price") -> float:
+
+        return rd(scans.get(key, {}).get(field, 0.0), 3)
+
+    audit_parts = []
+
+    for key in ["near", "mid", "long", "full"]:
+
+        item = scans.get(key, {})
+
+        if bool(item.get("pressure_found")):
+
+            audit_parts.append(f"{item.get('horizon_label')}:{item.get('target_price')}({item.get('target_quality')},共振{item.get('hit_count')})")
+
+        else:
+
+            audit_parts.append(f"{item.get('horizon_label')}:{item.get('detail')}")
+
+    out.update({
+
+        "near_pressure_price": p("near"),
+
+        "mid_pressure_price": p("mid"),
+
+        "long_pressure_price": p("long"),
+
+        "full_pressure_price": p("full"),
+
+        "near_pressure_quality": scans.get("near", {}).get("target_quality", "none"),
+
+        "mid_pressure_quality": scans.get("mid", {}).get("target_quality", "none"),
+
+        "long_pressure_quality": scans.get("long", {}).get("target_quality", "none"),
+
+        "full_pressure_quality": scans.get("full", {}).get("target_quality", "none"),
+
+        "full_history_high": scans.get("full", {}).get("full_high", 0.0),
+
+        "full_history_high_date": scans.get("full", {}).get("full_high_date", ""),
+
+        "pressure_audit_detail": "；".join(audit_parts),
+
+        "pressure_scan_sample_days": int(len(pre_all)),
+
+    })
+
+    return out
+
+
 def first_real_pressure_before_breakout(d: pd.DataFrame, bidx: int, last_close: float) -> Dict[str, Any]:
 
-    if d.empty or bidx <= 0 or last_close <= 0:
+    return build_overhead_pressure_profile(d, bidx, last_close, end_idx=bidx)
 
-        return {"target_price": 0.0, "space_pct": 0.0, "pressure_found": False}
-
-    pre = d.iloc[max(0, bidx - 520):bidx].copy()
-
-    highs = pd.to_numeric(pre.get("high", pd.Series(dtype=float)), errors="coerce").dropna()
-
-    pressures = sorted([float(x) for x in highs.tolist() if float(x) >= last_close * 1.025])
-
-    target = pressures[0] if pressures else 0.0
-
-    space = pct_change(target, last_close) if target > 0 else 0.0
-
-    return {"target_price": rd(target, 3), "space_pct": rd(space, 2), "pressure_found": bool(target > 0)}
 
 def score_assessment_line_option(df: pd.DataFrame, line_info: Dict[str, Any], breakout: Dict[str, Any], line_type: str) -> Dict[str, Any]:
 
@@ -1469,7 +2390,7 @@ def score_assessment_line_option(df: pd.DataFrame, line_info: Dict[str, Any], br
 
         reasons.append(f"防守距离{risk_pct:.1f}%偏远")
 
-    if bool(pressure.get("pressure_found")):
+    if bool(pressure.get("pressure_found")) and bool(pressure.get("target_reliable", True)):
 
         if space_pct >= 18.0:
 
@@ -1509,7 +2430,7 @@ def score_assessment_line_option(df: pd.DataFrame, line_info: Dict[str, Any], br
 
     else:
 
-        reasons.append("无真实上方压力，不虚构空间")
+        reasons.append(ss(pressure.get("target_type")) or "无可靠历史上方压力，赔率不虚构")
 
     if below_after > 0:
 
@@ -1744,6 +2665,344 @@ def deep_grade(score: float) -> str:
     if s >= 58:
 
         return "C"
+
+    return "D"
+
+def _score_by_thresholds(value: float, steps: List[Tuple[float, float]], default: float = 0.0) -> float:
+    v = sf(value)
+    score = default
+    for threshold, step_score in steps:
+        if v >= threshold:
+            score = step_score
+    return score
+
+def _line_resonance_bonus(line_info: Dict[str, Any], max_bonus: float) -> float:
+    hit = int(sf(line_info.get("effective_resonance_count")))
+    vol_hit = int(sf(line_info.get("volume_resonance_count")))
+    net = sf(line_info.get("net_score"))
+    raw = max(0.0, (hit - 3) * 0.35 + vol_hit * 0.65 + max(0.0, net) * 0.025)
+    return rd(min(max_bonus, raw), 2)
+
+def _line_pair_distance_pct(a: float, b: float) -> float:
+    a = sf(a); b = sf(b)
+    if a <= 0 or b <= 0:
+        return 999.0
+    return abs(a - b) / max(a, b) * 100.0
+
+def score_core_line_level(line_type: str, line_info: Dict[str, Any], hit_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ctx = hit_context or {}
+    typ = ss(line_type)
+    historical_hit = bool(ctx.get("historical_hit"))
+    five_hit = bool(ctx.get("five_hundred_hit"))
+    recent_ipo_hit = bool(ctx.get("recent_ipo_hit"))
+    historical_price = sf(ctx.get("historical_price"))
+    five_price = sf(ctx.get("five_hundred_price"))
+    historical_date = ss(ctx.get("historical_breakout_date"))
+    five_date = ss(ctx.get("five_hundred_breakout_date"))
+    pair_dist = _line_pair_distance_pct(historical_price, five_price)
+    reasons: List[str] = []
+
+    if historical_hit and five_hit and pair_dist <= 5.0:
+        base = 22.0
+        if pair_dist <= 3.0:
+            base += 1.0
+        if pair_dist <= 1.5:
+            base += 1.0
+        if historical_date and historical_date == five_date:
+            base += 0.7
+        bonus = min(1.3, _line_resonance_bonus(ctx.get("historical_line", {}) or {}, 0.7) + _line_resonance_bonus(ctx.get("five_hundred_line", {}) or {}, 0.7))
+        score = clamp(base + bonus, 22.0, 25.0)
+        reasons.append(f"历史线+500日线双线共振，距离{pair_dist:.1f}%")
+        return {"score": rd(score, 2), "detail": "；".join(reasons), "line_level_type": "双线共振突破", "dual_line_distance_pct": rd(pair_dist, 2)}
+
+    if "历史" in typ:
+        score = 18.0 + _line_resonance_bonus(line_info, 2.0)
+        score = clamp(score, 18.0, 20.0)
+        reasons.append(f"历史自然月核心线，共振{int(sf(line_info.get('effective_resonance_count')))}次/带量{int(sf(line_info.get('volume_resonance_count')))}次")
+        return {"score": rd(score, 2), "detail": "；".join(reasons), "line_level_type": "历史核心线突破", "dual_line_distance_pct": rd(pair_dist, 2)}
+
+    if "五百" in typ or "500" in typ:
+        score = 15.0 + _line_resonance_bonus(line_info, 3.0)
+        score = clamp(score, 15.0, 18.0)
+        reasons.append(f"近500日辅助核心线，共振{int(sf(line_info.get('effective_resonance_count')))}次/带量{int(sf(line_info.get('volume_resonance_count')))}次")
+        return {"score": rd(score, 2), "detail": "；".join(reasons), "line_level_type": "500日辅助线突破", "dual_line_distance_pct": rd(pair_dist, 2)}
+
+    if "次新" in typ or recent_ipo_hit:
+        score = 15.0 + _line_resonance_bonus(line_info, 3.0)
+        score = clamp(score, 15.0, 18.0)
+        reasons.append("次新上市后筹码线，按辅助核心线处理")
+        return {"score": rd(score, 2), "detail": "；".join(reasons), "line_level_type": "次新筹码线突破", "dual_line_distance_pct": rd(pair_dist, 2)}
+
+    score = clamp(12.0 + _line_resonance_bonus(line_info, 3.0), 0.0, 18.0)
+    reasons.append("未知线型，保守给分")
+    return {"score": rd(score, 2), "detail": "；".join(reasons), "line_level_type": typ or "未知线型", "dual_line_distance_pct": rd(pair_dist, 2)}
+
+def score_breakout_k_quality(d: pd.DataFrame, bidx: int, line: float, fund: Dict[str, Any], events: Dict[str, Any]) -> Dict[str, Any]:
+    if d.empty or bidx <= 0 or bidx >= len(d) or line <= 0:
+        return {"score": 0.0, "detail": "突破K样本不足", "entity_score": 0, "direction_score": 0, "body_score": 0, "close_control_score": 0, "volume_score": 0, "pattern_score": 0}
+    b = d.iloc[bidx]
+    prev = d.iloc[bidx - 1]
+    prev_close = sf(prev.close)
+    open_ = sf(b.open); high = sf(b.high); low = sf(b.low); close = sf(b.close)
+    feat = kline_features(b, prev_close=prev_close, line=line)
+    entity_ratio = sf(feat.get("entity_above_line_ratio"))
+    body_ratio = sf(feat.get("body_ratio"))
+    close_pos = sf(feat.get("close_pos"))
+    vol_ratio = sf(fund.get("volume_ratio"))
+    is_true_yang = close > open_
+    is_fake_yin_true_yang = close < open_ and close > prev_close
+
+    entity_score = 0.0
+    if entity_ratio >= 0.80:
+        entity_score = 10.0
+    elif entity_ratio >= 0.60:
+        entity_score = 8.0
+    elif entity_ratio >= 0.40:
+        entity_score = 6.0
+    elif entity_ratio >= 0.20:
+        entity_score = 4.0
+    elif close >= line:
+        entity_score = 2.0
+
+    if is_true_yang:
+        direction_score = 5.0 if close > prev_close else 3.0
+    elif is_fake_yin_true_yang:
+        direction_score = 3.0
+    elif close > prev_close:
+        direction_score = 1.0
+    else:
+        direction_score = 0.0
+
+    if body_ratio >= 0.80:
+        body_score = 5.0
+    elif body_ratio >= 0.65:
+        body_score = 4.0
+    elif body_ratio >= 0.45:
+        body_score = 3.0
+    elif body_ratio >= 0.25:
+        body_score = 2.0
+    else:
+        body_score = 1.0 if body_ratio > 0 else 0.0
+
+    if close_pos >= 0.95:
+        close_control_score = 5.0
+    elif close_pos >= 0.85:
+        close_control_score = 4.0
+    elif close_pos >= 0.70:
+        close_control_score = 3.0
+    elif close_pos >= 0.50:
+        close_control_score = 1.0
+    else:
+        close_control_score = 0.0
+
+    if bool(fund.get("stall")):
+        volume_score = 0.0
+    elif bool(events.get("limit_up")) and close_pos >= 0.88:
+        # 涨停板日成交量可能因早封板失真，不能简单因不足标准倍量重扣。
+        if vol_ratio >= 1.2:
+            volume_score = 9.0
+        elif vol_ratio >= 0.8:
+            volume_score = 7.0
+        else:
+            volume_score = 5.0
+    elif 1.8 <= vol_ratio <= 2.5 and is_true_yang:
+        volume_score = 10.0
+    elif 1.5 <= vol_ratio < 1.8 and is_true_yang:
+        volume_score = 8.0
+    elif 1.2 <= vol_ratio <= 3.2 and is_true_yang:
+        volume_score = 6.0
+    elif 0.85 <= vol_ratio < 1.2 and close_pos >= 0.72:
+        volume_score = 3.0
+    elif vol_ratio > 3.2 and is_true_yang and close_pos >= 0.75:
+        volume_score = 4.0
+    else:
+        volume_score = 1.0 if vol_ratio > 0 else 0.0
+
+    pattern_raw = 0.0
+    pattern_reasons: List[str] = []
+    if bool(events.get("bullish_engulf")):
+        pattern_raw += 2.0; pattern_reasons.append("阳包阴")
+    if bool(events.get("separation_line")):
+        pattern_raw += 2.0; pattern_reasons.append("分手线")
+    if bool(events.get("gap_up")):
+        pattern_raw += 2.0; pattern_reasons.append("跳空")
+    if bool(events.get("limit_up")):
+        pattern_raw += 4.0; pattern_reasons.append("涨停近似")
+    if bool(events.get("full_body")):
+        pattern_raw += 1.0; pattern_reasons.append("强实体阳线")
+    if bool(events.get("gap_up")) and bool(events.get("bullish_engulf")):
+        pattern_raw += 1.0
+    if bool(events.get("bullish_engulf")) and 1.8 <= vol_ratio <= 2.5:
+        pattern_raw += 1.0
+    pattern_score = min(5.0, pattern_raw)
+
+    # 高质量突破是三号员工的主事件：核心线被漂亮打穿时，应有足够权重，
+    # 否则会被后续多个同源风险扣分项过度压制。这里不盲目给所有突破加分，
+    # 只奖励“实体站线 + 收盘控制 + 健康量能 + 非滞涨”的高质量突破。
+    high_quality_bonus = 0.0
+    high_quality_reasons: List[str] = []
+    volume_healthy_for_breakout = (
+        (1.5 <= vol_ratio <= 3.2 and is_true_yang)
+        or (bool(events.get("limit_up")) and vol_ratio >= 0.8 and close_pos >= 0.88)
+    )
+    if (not bool(fund.get("stall"))) and entity_ratio >= 0.60 and close_pos >= 0.85 and volume_healthy_for_breakout:
+        high_quality_bonus += 4.0
+        high_quality_reasons.append("高质量实体突破")
+        if entity_ratio >= 0.80:
+            high_quality_bonus += 1.5
+            high_quality_reasons.append("实体大部在线上")
+        if body_ratio >= 0.65:
+            high_quality_bonus += 1.0
+            high_quality_reasons.append("实体饱满")
+        if close_pos >= 0.95:
+            high_quality_bonus += 1.0
+            high_quality_reasons.append("收盘强控盘")
+        if 1.8 <= vol_ratio <= 2.5 and is_true_yang:
+            high_quality_bonus += 0.5
+            high_quality_reasons.append("标准倍量")
+    high_quality_bonus = clamp(high_quality_bonus, 0.0, 8.0)
+
+    total = clamp(entity_score + direction_score + body_score + close_control_score + volume_score + pattern_score + high_quality_bonus, 0.0, 48.0)
+    detail = (
+        f"实体上线{entity_ratio:.0%}/{entity_score:.1f}分；"
+        f"方向{'真阳' if is_true_yang else '假阴真阳' if is_fake_yin_true_yang else '非阳'}{direction_score:.1f}分；"
+        f"实体效率{body_ratio:.0%}/{body_score:.1f}分；"
+        f"收盘位置{close_pos:.0%}/{close_control_score:.1f}分；"
+        f"量比{vol_ratio:.2f}/{volume_score:.1f}分；"
+        f"形态{'+'.join(pattern_reasons) if pattern_reasons else '无'}/{pattern_score:.1f}分；"
+        f"高质量突破加成{'+'.join(high_quality_reasons) if high_quality_reasons else '无'}/{high_quality_bonus:.1f}分"
+    )
+    return {
+        "score": rd(total, 2),
+        "detail": detail,
+        "entity_score": rd(entity_score, 2),
+        "direction_score": rd(direction_score, 2),
+        "body_score": rd(body_score, 2),
+        "close_control_score": rd(close_control_score, 2),
+        "volume_score": rd(volume_score, 2),
+        "pattern_score": rd(pattern_score, 2),
+        "high_quality_breakout_bonus": rd(high_quality_bonus, 2),
+        "is_true_yang": bool(is_true_yang),
+        "is_fake_yin_true_yang": bool(is_fake_yin_true_yang),
+        "entity_above_line_ratio": rd(entity_ratio, 3),
+        "body_ratio": rd(body_ratio, 3),
+        "close_pos": rd(close_pos, 3),
+        "volume_ratio": rd(vol_ratio, 2),
+    }
+
+def score_acceptance_15(pullback: Dict[str, Any], d: pd.DataFrame, bidx: int, line: float) -> Dict[str, Any]:
+    if d.empty or bidx <= 0 or bidx >= len(d) or line <= 0:
+        return {"score": 0.0, "detail": "承接样本不足"}
+    post = d.iloc[bidx:].copy().reset_index(drop=True)
+    if len(post) <= 1:
+        return {"score": 8.0, "detail": "突破当天为最新日，承接暂按中性8分"}
+    below_count = int((post["close"] < line * 0.992).sum())
+    last3_below = int((post.tail(3)["close"] < line * 0.992).sum())
+    raw = sf(pullback.get("score"))
+    if last3_below >= 2 or sf(post.iloc[-1].close) < line * 0.988:
+        score = 2.0
+        detail = "突破后快速跌回线下"
+    elif below_count > 0:
+        score = max(4.0, min(7.0, 8.0 - below_count * 1.2))
+        detail = f"突破后曾跌回线下{below_count}次"
+    else:
+        if raw >= 12.0:
+            score = 15.0
+        elif raw >= 7.0:
+            score = 11.0
+        else:
+            score = 8.0
+        detail = ss(pullback.get("detail")) or "突破后收盘未有效跌回线下"
+    return {"score": rd(clamp(score, 0.0, 15.0), 2), "detail": detail}
+
+def score_space_odds_12(trade: Dict[str, Any]) -> Dict[str, Any]:
+    space = sf(trade.get("space_pct"))
+    rr = sf(trade.get("rr"))
+    target_price = sf(trade.get("target_price"))
+    target_reliable = bool(trade.get("target_reliable"))
+    pricing_mode = ss(trade.get("pricing_mode"))
+    risk_pct = sf(trade.get("defense_distance_pct"))
+    reasons: List[str] = []
+
+    if target_price > 0 and target_reliable:
+        if space >= 18.0:
+            score = 12.0
+        elif space >= 10.0:
+            score = 10.0
+        elif space >= 6.0:
+            score = 8.0
+        elif space >= 3.0:
+            score = 5.0
+        else:
+            score = 2.0
+        if rr >= 2.0:
+            score += 1.0
+        elif rr < 1.05 and score > 3.0:
+            score -= 2.0
+        reasons.append(f"上方空间{space:.1f}%，RR={rr:.2f}")
+    elif pricing_mode in {"全历史价格发现", "次新上市后价格发现"}:
+        score = 9.0 if risk_pct <= 8.5 else 7.0
+        reasons.append(f"{pricing_mode}，无可靠固定压力，不虚构满分")
+    else:
+        score = 6.0
+        reasons.append("压力不可靠，按中性偏低处理")
+    return {"score": rd(clamp(score, 0.0, 12.0), 2), "detail": "；".join(reasons)}
+
+def score_technical_risk_8(risk: Dict[str, Any], fund: Dict[str, Any], trade: Dict[str, Any], data_fresh: bool, recent_ipo: Dict[str, Any]) -> Dict[str, Any]:
+    penalty = sf(risk.get("penalty"))
+    score = 8.0
+    reasons: List[str] = []
+    if penalty >= 35.0 or bool(risk.get("block")):
+        score = 0.0
+        reasons.append(ss(risk.get("detail")) or "硬风险")
+    elif penalty >= 25.0:
+        score = 1.5; reasons.append(ss(risk.get("detail")))
+    elif penalty >= 10.0:
+        score = 4.0; reasons.append(ss(risk.get("detail")))
+    elif penalty > 0:
+        score = 6.0; reasons.append(ss(risk.get("detail")))
+    if bool(fund.get("stall")):
+        score = min(score, 2.0); reasons.append("放量滞涨")
+    if sf(trade.get("defense_distance_pct")) > 12.0:
+        score = min(score, 4.0); reasons.append("防守距离过远")
+    if not data_fresh:
+        score = 0.0; reasons.append("数据日期未对齐")
+    if bool(recent_ipo.get("is_recent_ipo")) and ss(recent_ipo.get("recent_ipo_action")) == "HARD_REJECT":
+        score = 0.0; reasons.append("次新样本不足")
+    return {"score": rd(clamp(score, 0.0, 8.0), 2), "detail": "；".join([x for x in reasons if ss(x)]) or "无明显可落地技术风险"}
+
+
+def _weighted_component_score(value: Any, raw_max: float, target_weight: float) -> float:
+    """把已有底层评分压缩到正式100分权重里，避免各模块原始满分相加超过100。"""
+    if raw_max <= 0 or target_weight <= 0:
+        return 0.0
+    return rd(clamp(sf(value), 0.0, raw_max) / raw_max * target_weight, 2)
+
+def score_context_13(major: Dict[str, Any], supply: Dict[str, Any], eve: Dict[str, Any], activity: Dict[str, Any], timing: Dict[str, Any]) -> Dict[str, Any]:
+    """13分独立上下文分：回答“这个突破发生的土壤好不好”，而不是重复奖励突破K本身。"""
+    major_part = _weighted_component_score(major.get("score"), 16.0, 3.0)
+    supply_part = _weighted_component_score(supply.get("score"), 14.0, 3.0)
+    eve_part = _weighted_component_score(eve.get("score"), 18.0, 3.0)
+    activity_part = _weighted_component_score(max(0.0, sf(activity.get("score"))), 16.0, 2.0)
+    timing_part = _weighted_component_score(timing.get("score"), 10.0, 2.0)
+    total = rd(clamp(major_part + supply_part + eve_part + activity_part + timing_part, 0.0, 13.0), 2)
+
+    parts = [
+        f"大周期{major_part:.2f}/3：{ss(major.get('type')) or '无'}",
+        f"供应吸收{supply_part:.2f}/3：{ss(supply.get('type')) or '无'}",
+        f"爆发前夜{eve_part:.2f}/3：{ss(eve.get('type')) or '无'}",
+        f"股性活跃{activity_part:.2f}/2：{ss(activity.get('type')) or '无'}",
+        f"时间成熟{timing_part:.2f}/2：{ss(timing.get('type')) or '无'}",
+    ]
+    return {
+        "score": total,
+        "detail": "；".join(parts),
+        "major_component": major_part,
+        "supply_component": supply_part,
+        "explosion_eve_component": eve_part,
+        "activity_component": activity_part,
+        "timing_component": timing_part,
+    }
 
     return "D"
 
@@ -1997,19 +3256,21 @@ def cycle_mid_repair_params(cycle: str) -> Dict[str, Any]:
 
     if c == "quarter":
 
-        return {"cycle": "quarter", "label": "季线", "lookback": 20, "min_len": 8, "min_valid": 7, "support_min": 2, "support_max": 4, "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.992, "breakdown": 0.985, "touch": 1.018, "score_cap": 10.0}
+        return {"cycle": "quarter", "label": "季线", "unit": "个季度", "lookback": 20, "min_len": 8, "min_valid": 7, "support_min": 2, "support_max": 4, "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.992, "breakdown": 0.985, "touch": 1.018, "score_cap": 10.0, "max_actionable_above": 1.20}
 
     if c == "year":
 
-        return {"cycle": "year", "label": "年线", "lookback": 8, "min_len": 6, "min_valid": 5, "support_min": 1, "support_max": 2, "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.990, "breakdown": 0.982, "touch": 1.020, "score_cap": 10.0}
+        return {"cycle": "year", "label": "年线", "unit": "年", "lookback": 8, "min_len": 6, "min_valid": 5, "support_min": 1, "support_max": 2, "close_above": 1.005, "soft_above": 1.001, "hold_close": 0.990, "breakdown": 0.982, "touch": 1.020, "score_cap": 10.0, "max_actionable_above": 1.35}
 
-    return {"cycle": "month", "label": "月线", "lookback": 36, "min_len": 24, "min_valid": 18, "support_min": 3, "support_max": 5, "close_above": 1.005, "soft_above": 1.002, "hold_close": 0.992, "breakdown": 0.985, "touch": 1.018, "score_cap": 10.0}
+    return {"cycle": "month", "label": "月线", "unit": "个月", "lookback": 36, "min_len": 24, "min_valid": 18, "support_min": 3, "support_max": 5, "close_above": 1.005, "soft_above": 1.002, "hold_close": 0.992, "breakdown": 0.985, "touch": 1.018, "score_cap": 10.0, "max_actionable_above": 1.12}
 
 def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str, Any]:
 
     params = cycle_mid_repair_params(cycle)
 
     label = params["label"]
+
+    unit = ss(params.get("unit")) or "根"
 
     empty = {
 
@@ -2020,6 +3281,8 @@ def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str
         "available": False, "support_periods": 0, "breakdown_date": "", "current_mid": 0.0,
 
         "current_close": 0.0, "close_mid_ratio": 0.0, "repair_volume_ratio": 0.0,
+
+        "overextended": False, "overextension_detail": "",
 
     }
 
@@ -2081,6 +3344,28 @@ def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str
 
         return out
 
+    max_actionable_above = float(params.get("max_actionable_above", 1.25))
+
+    if close_mid_ratio > max_actionable_above:
+
+        detail = f"当前收盘高于{label}中轨{close_mid_ratio - 1.0:.1%}，已明显远离中轨；不按{label}中轨修复买点加分"
+
+        return {
+
+            "score": 0.0, "type": f"{label}中轨远离无效", "detail": detail,
+
+            "anchor_price": rd(cur_mid, 3), "repair_stage": "MID_OVEREXTENDED", "cycle": params["cycle"],
+
+            "support_periods": 0, "breakdown_date": "", "current_mid": rd(cur_mid, 3),
+
+            "current_close": rd(cur_close, 3), "close_mid_ratio": rd(close_mid_ratio, 4),
+
+            "repair_volume_ratio": 0.0, "sample_count": int(len(x)), "available": True,
+
+            "overextended": True, "overextension_detail": detail,
+
+        }
+
     score = 0.0
 
     reasons: List[str] = []
@@ -2141,7 +3426,7 @@ def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str
 
         stage = "MID_SUPPORT_CONFIRMED" if score >= 3.0 else stage
 
-        reasons.append(f"最近{support_periods}{label[-1]}收盘守住中轨")
+        reasons.append(f"最近{support_periods}{unit}收盘守住中轨")
 
     prior = valid.iloc[:-1].copy()
 
@@ -2239,6 +3524,8 @@ def evaluate_cycle_mid_repair(k: pd.DataFrame, cycle: str = "month") -> Dict[str
 
         "repair_volume_ratio": rd(repair_volume_ratio, 3), "sample_count": int(len(x)), "available": True,
 
+        "overextended": False, "overextension_detail": "",
+
     }
 
 def evaluate_multi_cycle_mid_repair(d: pd.DataFrame) -> Dict[str, Any]:
@@ -2285,7 +3572,13 @@ def evaluate_multi_cycle_mid_repair(d: pd.DataFrame) -> Dict[str, Any]:
 
     unavailable = []
 
+    distance_warnings = []
+
     for key, r in [("month", month), ("quarter", quarter), ("year", year)]:
+
+        if bool(r.get("overextended")) and ss(r.get("overextension_detail")):
+
+            distance_warnings.append(ss(r.get("overextension_detail")))
 
         if sf(r.get("score")) > 0 and ss(r.get("detail")):
 
@@ -2321,6 +3614,8 @@ def evaluate_multi_cycle_mid_repair(d: pd.DataFrame) -> Dict[str, Any]:
 
         "unavailable_detail": "；".join(unavailable[:3]), "available_cycles": ",".join(available_keys),
 
+        "distance_warning_detail": "；".join(distance_warnings[:3]),
+
         "available_cycle_count": int(len(available_keys)), "anchor_price": best.get("anchor_price", 0),
 
         "best_cycle": best_key, "repair_stage": best.get("repair_stage", ""),
@@ -2347,9 +3642,15 @@ def evaluate_major_cycle_pricing(d: pd.DataFrame, last_close: float) -> Dict[str
 
     reasons: List[str] = []
 
+    warnings: List[str] = []
+
     if ss(mid_repair.get("detail")) and ss(mid_repair.get("type")) != "无":
 
         reasons.append(ss(mid_repair.get("detail")))
+
+    if ss(mid_repair.get("distance_warning_detail")):
+
+        warnings.append(ss(mid_repair.get("distance_warning_detail")))
 
     anchor = sf(mid_repair.get("anchor_price"))
 
@@ -2375,19 +3676,35 @@ def evaluate_major_cycle_pricing(d: pd.DataFrame, last_close: float) -> Dict[str
 
                 if body_mid > 0 and last_close >= body_mid * 0.995:
 
-                    score += 2.5
+                    mid_dist = pct_change(last_close, body_mid)
 
-                    reasons.append(f"月线最大量阳K中位修复{body_mid:.2f}")
+                    if mid_dist <= 15.0:
 
-                    anchor = anchor or body_mid
+                        score += 2.5
+
+                        reasons.append(f"月线最大量阳K中位修复{body_mid:.2f}")
+
+                        anchor = anchor or body_mid
+
+                    else:
+
+                        warnings.append(f"当前价高于月线最大量阳K中位{mid_dist:.1f}%，已远离该修复位，不按买点加分")
 
                 if body_top > 0 and last_close >= body_top * 1.003:
 
-                    score += 1.5
+                    top_dist = pct_change(last_close, body_top)
 
-                    reasons.append(f"月线最大量阳K实体顶修复{body_top:.2f}")
+                    if top_dist <= 12.0:
 
-                    anchor = body_top
+                        score += 1.5
+
+                        reasons.append(f"月线最大量阳K实体顶修复{body_top:.2f}")
+
+                        anchor = body_top
+
+                    else:
+
+                        warnings.append(f"当前价高于月线最大量阳K实体顶{top_dist:.1f}%，已远离该修复位，不按买点加分")
 
     score = clamp(score, 0, 16)
 
@@ -2426,6 +3743,8 @@ def evaluate_major_cycle_pricing(d: pd.DataFrame, last_close: float) -> Dict[str
         "monthly_mid_sample_count": mid_repair.get("monthly_mid_sample_count", 0), "quarter_mid_sample_count": mid_repair.get("quarter_mid_sample_count", 0), "year_mid_sample_count": mid_repair.get("year_mid_sample_count", 0),
 
         "major_mid_unavailable_detail": mid_repair.get("unavailable_detail", ""),
+
+        "major_cycle_distance_warning": "；".join(warnings[:4]),
 
     }
 
@@ -3297,7 +4616,7 @@ def evaluate_trade_pricing(d: pd.DataFrame, bidx: int, line: float, support_pric
 
     if d.empty or bidx <= 0 or bidx >= len(d) or line <= 0:
 
-        return {"score": 0.0, "ok": False, "detail": "交易定价样本不足", "defense_price": 0.0, "target_price": 0.0, "rr": 0.0}
+        return {"score": 0.0, "ok": False, "detail": "交易定价样本不足", "defense_price": 0.0, "target_price": 0.0, "rr": 0.0, "pricing_mode": "数据不足", "pressure_audit_detail": "交易定价样本不足"}
 
     last = d.iloc[-1]
 
@@ -3341,19 +4660,28 @@ def evaluate_trade_pricing(d: pd.DataFrame, bidx: int, line: float, support_pric
 
     risk_pct = pct_change(last_close, defense_price) if defense_price > 0 else 0.0
 
-    pre = d.iloc[max(0, bidx - 520):bidx].copy()
+    # 当前交易定价必须使用“截至当前日前”的全部已知历史；次新股单独走上市后筹码分支，不能套老股全历史压力。
+    recent_ipo_pricing_context = evaluate_recent_ipo_context(d)
+    if bool(recent_ipo_pricing_context.get("is_recent_ipo")):
+        pressure = build_recent_ipo_pressure_profile(d, bidx, last_close, end_idx=max(1, len(d) - 1))
+    else:
+        pressure = build_overhead_pressure_profile(d, bidx, last_close, end_idx=max(1, len(d) - 1))
 
-    highs = pd.to_numeric(pre["high"], errors="coerce").dropna()
+    target_price = sf(pressure.get("target_price"))
 
-    pressures = sorted([float(x) for x in highs.tolist() if float(x) >= last_close * 1.025])
+    target_reliable = bool(pressure.get("target_reliable"))
 
-    target_price = pressures[0] if pressures else 0.0
+    pricing_mode = ss(pressure.get("pricing_mode")) or "压力未识别"
 
-    target_type = "历史真实压力" if target_price > 0 else "无真实上方压力"
+    target_type = ss(pressure.get("target_type")) or pricing_mode
+
+    pressure_horizon = ss(pressure.get("pressure_horizon"))
 
     space_pct = pct_change(target_price, last_close) if target_price > 0 else 0.0
 
-    rr = space_pct / risk_pct if risk_pct > 0 and target_price > 0 else 0.0
+    rr = space_pct / risk_pct if risk_pct > 0 and target_price > 0 and target_reliable else 0.0
+
+    distance_line_pct = pct_change(last_close, line)
 
     score = 0.0
 
@@ -3371,15 +4699,15 @@ def evaluate_trade_pricing(d: pd.DataFrame, bidx: int, line: float, support_pric
 
         reasons.append(f"防守距离{risk_pct:.1f}%偏远")
 
-    if target_price > 0:
+    if target_price > 0 and target_reliable:
 
         if space_pct >= 18.0:
 
-            score += 5.0; reasons.append(f"真实空间{space_pct:.1f}%")
+            score += 5.0; reasons.append(f"{target_type}空间{space_pct:.1f}%")
 
         elif space_pct >= 10.0:
 
-            score += 3.0; reasons.append(f"真实空间{space_pct:.1f}%")
+            score += 3.0; reasons.append(f"{target_type}空间{space_pct:.1f}%")
 
         else:
 
@@ -3387,39 +4715,219 @@ def evaluate_trade_pricing(d: pd.DataFrame, bidx: int, line: float, support_pric
 
         if rr >= 2.0:
 
-            score += 6.0; reasons.append(f"RR={rr:.2f}")
+            score += 6.0; reasons.append(f"历史压力RR={rr:.2f}")
 
         elif rr >= 1.35:
 
-            score += 3.5; reasons.append(f"RR={rr:.2f}")
+            score += 3.5; reasons.append(f"历史压力RR={rr:.2f}")
 
         else:
 
-            reasons.append(f"RR={rr:.2f}不足")
+            reasons.append(f"历史压力RR={rr:.2f}不足")
+
+    elif target_price > 0 and not target_reliable:
+
+        score -= 1.0
+
+        reasons.append(f"上方仅弱压力参考{target_price:.2f}，不按固定RR重仓")
+
+    elif pricing_mode in {"全历史价格发现", "次新上市后价格发现"}:
+
+        if pricing_mode == "次新上市后价格发现":
+
+            if bool(pressure.get("recent_ipo_price_discovery_ok")) and risk_pct <= RECENT_IPO_PRICE_DISCOVERY_MAX_RISK_PCT and distance_line_pct <= RECENT_IPO_PRICE_DISCOVERY_MAX_DISTANCE_PCT:
+
+                score += 4.5
+
+                reasons.append("次新突破上市后筹码区进入价格发现；不设固定目标，用防守位和移动止盈管理")
+
+            else:
+
+                reasons.append("次新价格发现条件不足，需平台成熟、距线合适且防守位清楚")
+
+        elif risk_pct <= PRICE_DISCOVERY_MAX_RISK_PCT and distance_line_pct <= PRICE_DISCOVERY_MAX_DISTANCE_PCT:
+
+            score += 5.0
+
+            reasons.append("全历史上方无有效压力，价格发现模式；不设固定目标，用防守位和移动止盈管理")
+
+        else:
+
+            reasons.append("全历史价格发现但当前距线/防守偏远，只能等待回踩")
 
     else:
 
-        reasons.append("无真实压力不虚构15%目标")
-
-    distance_line_pct = pct_change(last_close, line)
+        reasons.append(f"{target_type}，赔率不按固定目标虚构")
 
     if 0.0 <= distance_line_pct <= 8.0:
 
         score += 2.0; reasons.append(f"距核心线{distance_line_pct:.1f}%")
 
+    elif 8.0 < distance_line_pct <= 12.0:
+
+        score += 0.5; reasons.append(f"距核心线{distance_line_pct:.1f}%略远")
+
     elif distance_line_pct > 18.0:
 
         score -= 4.0; reasons.append(f"距核心线{distance_line_pct:.1f}%过远")
 
-    ok = bool(risk_pct <= 10.5 and target_price > 0 and rr >= 1.35 and space_pct >= 8.0 and distance_line_pct <= 18.0)
+    historical_ok = bool(target_price > 0 and target_reliable and risk_pct <= 10.5 and rr >= 1.35 and space_pct >= 8.0 and distance_line_pct <= 18.0)
+
+    old_stock_price_discovery_ok = bool(target_price <= 0 and pricing_mode == "全历史价格发现" and risk_pct <= PRICE_DISCOVERY_MAX_RISK_PCT and distance_line_pct <= PRICE_DISCOVERY_MAX_DISTANCE_PCT)
+
+    recent_ipo_price_discovery_ok = bool(target_price <= 0 and pricing_mode == "次新上市后价格发现" and bool(pressure.get("recent_ipo_price_discovery_ok")) and risk_pct <= RECENT_IPO_PRICE_DISCOVERY_MAX_RISK_PCT and distance_line_pct <= RECENT_IPO_PRICE_DISCOVERY_MAX_DISTANCE_PCT)
+
+    price_discovery_ok = old_stock_price_discovery_ok or recent_ipo_price_discovery_ok
+
+    ok = historical_ok or price_discovery_ok
 
     score = clamp(score, -8, 20)
 
-    confirm = f"放量收盘站稳{max(line, support_price):.2f}且不跌破{defense_price:.2f}"
+    trigger_price = max([x for x in [line, support_price] if sf(x) > 0] or [line])
 
-    giveup = f"收盘跌破{defense_price:.2f}或放量长阴跌回核心线{line:.2f}下方"
+    recent_tail = d.tail(min(20, len(d))).copy()
 
-    return {"score": rd(score, 2), "ok": ok, "detail": "；".join(reasons), "defense_price": rd(defense_price, 3), "defense_type": defense_type, "structure_key_price": rd(structure_key, 3), "defense_distance_pct": rd(risk_pct, 2), "target_price": rd(target_price, 3), "target_type": target_type, "space_pct": rd(space_pct, 2), "rr": rd(rr, 2), "distance_line_pct": rd(distance_line_pct, 2), "confirm_condition": confirm, "giveup_condition": giveup}
+    recent_high = sf(recent_tail["high"].max()) if not recent_tail.empty and "high" in recent_tail.columns else sf(last.get("high", last_close))
+
+    if last_close >= max(trigger_price, defense_price) * 1.003:
+
+        if target_price > 0 and target_reliable:
+
+            if distance_line_pct > 12.0:
+
+                confirm = f"已站上主评测线{line:.2f}且距线{distance_line_pct:.1f}%；不追涨，后续只看能否守住交易防守位{defense_price:.2f}并向{pressure_horizon}压力{target_price:.2f}推进"
+
+            else:
+
+                confirm = f"已站上主评测线{line:.2f}；后续看能否守住交易防守位{defense_price:.2f}，并向{pressure_horizon}压力{target_price:.2f}推进"
+
+        elif target_price > 0 and not target_reliable:
+
+            confirm = f"已站上主评测线{line:.2f}；上方仅弱压力参考{target_price:.2f}，不按固定RR重仓，只看回踩守住{defense_price:.2f}后能否继续放量拓展"
+
+        elif pricing_mode in {"全历史价格发现", "次新上市后价格发现"}:
+
+            if pricing_mode == "次新上市后价格发现":
+
+                if distance_line_pct > RECENT_IPO_PRICE_DISCOVERY_MAX_DISTANCE_PCT:
+
+                    confirm = f"次新价格发现但距主评测线{distance_line_pct:.1f}%偏远；不追涨，只等待缩量/正常回踩不破交易防守位{defense_price:.2f}"
+
+                else:
+
+                    confirm = f"次新上市后筹码区价格发现；不设固定目标，后续核心是守住交易防守位{defense_price:.2f}，沿MA10/BBI或移动止盈管理"
+
+            elif distance_line_pct > PRICE_DISCOVERY_MAX_DISTANCE_PCT:
+
+                confirm = f"全历史价格发现但距主评测线{distance_line_pct:.1f}%偏远；不追涨，只等待缩量/正常回踩不破交易防守位{defense_price:.2f}"
+
+            else:
+
+                confirm = f"全历史价格发现；不设固定目标，后续核心是守住交易防守位{defense_price:.2f}，沿MA10/BBI或移动止盈管理"
+
+        elif recent_high > last_close * 1.003:
+
+            confirm = f"已站上主评测线{line:.2f}；历史压力未成可靠线，后续看守住{defense_price:.2f}并放量收盘突破近20日高点{recent_high:.2f}"
+
+        else:
+
+            confirm = f"已站上主评测线{line:.2f}；后续核心是缩量/正常回踩不破交易防守位{defense_price:.2f}，不再要求重复确认{trigger_price:.2f}"
+
+    else:
+
+        confirm = f"放量收盘站稳{max(trigger_price, defense_price):.2f}，且回踩不有效跌破交易防守位{defense_price:.2f}"
+
+    giveup = f"收盘跌破交易防守位{defense_price:.2f}，或放量长阴跌回主评测线{line:.2f}下方"
+
+    return {
+
+        "score": rd(score, 2),
+
+        "ok": ok,
+
+        "detail": "；".join(reasons),
+
+        "defense_price": rd(defense_price, 3),
+
+        "defense_type": defense_type,
+
+        "structure_key_price": rd(structure_key, 3),
+
+        "defense_distance_pct": rd(risk_pct, 2),
+
+        "target_price": rd(target_price, 3),
+
+        "target_type": target_type,
+
+        "space_pct": rd(space_pct, 2),
+
+        "rr": rd(rr, 2),
+
+        "distance_line_pct": rd(distance_line_pct, 2),
+
+        "confirm_condition": confirm,
+
+        "giveup_condition": giveup,
+
+        "trigger_price": rd(trigger_price, 3),
+
+        "recent_high_20d": rd(recent_high, 3),
+
+        "pricing_mode": pricing_mode,
+
+        "pressure_horizon": pressure_horizon,
+
+        "target_reliable": bool(target_reliable),
+
+        "pressure_quality": pressure.get("target_quality", "none"),
+
+        "near_pressure_price": pressure.get("near_pressure_price", 0),
+
+        "mid_pressure_price": pressure.get("mid_pressure_price", 0),
+
+        "long_pressure_price": pressure.get("long_pressure_price", 0),
+
+        "full_pressure_price": pressure.get("full_pressure_price", 0),
+
+        "near_pressure_quality": pressure.get("near_pressure_quality", "none"),
+
+        "mid_pressure_quality": pressure.get("mid_pressure_quality", "none"),
+
+        "long_pressure_quality": pressure.get("long_pressure_quality", "none"),
+
+        "full_pressure_quality": pressure.get("full_pressure_quality", "none"),
+
+        "full_history_high": pressure.get("full_history_high", 0),
+
+        "full_history_high_date": pressure.get("full_history_high_date", ""),
+
+        "pressure_audit_detail": pressure.get("pressure_audit_detail", ""),
+
+        "pressure_scan_sample_days": pressure.get("pressure_scan_sample_days", 0),
+        "recent_ipo_flag": bool(pressure.get("recent_ipo_flag", False)),
+        "listing_age_days": pressure.get("listing_age_days", 0),
+        "first_trade_date": pressure.get("first_trade_date", ""),
+        "recent_ipo_stage": pressure.get("recent_ipo_stage", ""),
+        "recent_ipo_action": pressure.get("recent_ipo_action", ""),
+        "recent_ipo_maturity_score": pressure.get("recent_ipo_maturity_score", 0),
+        "recent_ipo_platform_valid": bool(pressure.get("recent_ipo_platform_valid", False)),
+        "recent_ipo_platform_score": pressure.get("recent_ipo_platform_score", 0),
+        "recent_ipo_platform_upper": pressure.get("recent_ipo_platform_upper", 0),
+        "recent_ipo_platform_lower": pressure.get("recent_ipo_platform_lower", 0),
+        "recent_ipo_platform_window": pressure.get("recent_ipo_platform_window", 0),
+        "recent_ipo_platform_amp_pct": pressure.get("recent_ipo_platform_amp_pct", 0),
+        "recent_ipo_max_amount_high": pressure.get("recent_ipo_max_amount_high", 0),
+        "recent_ipo_max_amount_body_top": pressure.get("recent_ipo_max_amount_body_top", 0),
+        "recent_ipo_max_amount_body_bottom": pressure.get("recent_ipo_max_amount_body_bottom", 0),
+        "recent_ipo_ipo_day_high": pressure.get("recent_ipo_ipo_day_high", 0),
+        "recent_ipo_ipo_day_close": pressure.get("recent_ipo_ipo_day_close", 0),
+        "recent_ipo_post_high": pressure.get("recent_ipo_post_high", 0),
+        "recent_ipo_post_high_date": pressure.get("recent_ipo_post_high_date", ""),
+        "recent_ipo_detail": pressure.get("recent_ipo_detail", ""),
+        "recent_ipo_price_discovery_ok": bool(pressure.get("recent_ipo_price_discovery_ok", False)),
+
+    }
+
 
 def evaluate_risk_counterevidence(d: pd.DataFrame, bidx: int, line: float, fund: Dict[str, Any], trade: Dict[str, Any]) -> Dict[str, Any]:
 
@@ -3489,101 +4997,7 @@ def evaluate_risk_counterevidence(d: pd.DataFrame, bidx: int, line: float, fund:
 
     return {"penalty": rd(clamp(penalty, 0, 45), 2), "block": bool(block), "level": level, "detail": "；".join(reasons) or "无明显风险反证", "recent20_pct": rd(recent20_pct, 2), "post_drawdown_pct": rd(drawdown, 2), "below_line_count": below_count}
 
-def arbitrate_hypotheses(major: Dict[str, Any], supply: Dict[str, Any], eve: Dict[str, Any], pullback: Dict[str, Any], fund: Dict[str, Any], activity: Dict[str, Any], timing: Dict[str, Any], trade: Dict[str, Any], risk: Dict[str, Any]) -> Dict[str, Any]:
-
-    hypotheses = []
-
-    hypotheses.append(("供应吸收后突破", sf(supply.get("score")) * 3.1 + sf(fund.get("score")) * 0.75 + sf(timing.get("score")) * 0.65 + sf(major.get("score")) * 0.35))
-
-    hypotheses.append(("爆发前夜启动", sf(eve.get("score")) * 3.0 + sf(timing.get("score")) * 0.90 + sf(activity.get("score")) * 0.45))
-
-    hypotheses.append(("回踩承接二买", sf(pullback.get("score")) * 3.2 + sf(fund.get("score")) * 0.65 + sf(trade.get("score")) * 0.45))
-
-    hypotheses.append(("资金二次确认", max(0.0, sf(fund.get("score"))) * 3.0 + sf(pullback.get("score")) * 0.75 + sf(supply.get("score")) * 0.45))
-
-    hypotheses = [(name, clamp(score, 0, 60)) for name, score in hypotheses]
-
-    hypotheses_sorted = sorted(hypotheses, key=lambda x: x[1], reverse=True)
-
-    primary_type, primary_score = hypotheses_sorted[0]
-
-    second_score = hypotheses_sorted[1][1] if len(hypotheses_sorted) > 1 else 0.0
-
-    dominance = primary_score - second_score
-
-    evidence_scores = [sf(major.get("score")), sf(supply.get("score")), sf(eve.get("score")), sf(pullback.get("score")), max(0.0, sf(fund.get("score"))), max(0.0, sf(activity.get("score"))), sf(timing.get("score"))]
-
-    resonance_score = clamp(sum(sorted(evidence_scores, reverse=True)[1:4]) * 0.55, 0, 20)
-
-    trade_score = clamp(sf(trade.get("score")), 0, 20)
-
-    raw = primary_score + resonance_score + trade_score - sf(risk.get("penalty"))
-
-    if primary_score < 30:
-
-        raw = min(raw, 64.0)
-
-    if dominance < 4.0:
-
-        raw = min(raw, 76.0)
-
-    if not bool(trade.get("ok")):
-
-        raw = min(raw, 74.0)
-
-    if bool(risk.get("block")):
-
-        raw = min(raw, 49.0)
-
-    final_score = clamp(raw, 0, 100)
-
-    grade = deep_grade(final_score)
-
-    if bool(risk.get("block")):
-
-        action = "剔除｜突破失败或硬风险反证"
-
-        pool = "剔除"
-
-    elif final_score >= 88 and bool(trade.get("ok")) and primary_score >= 42:
-
-        action = "正式买入池｜标准仓位候选"
-
-        pool = "正式候选"
-
-    elif final_score >= 78 and bool(trade.get("ok")) and primary_score >= 38:
-
-        action = "正式买入池｜轻仓/确认候选"
-
-        pool = "正式候选"
-
-    elif "回踩" in str(pullback.get("type")) and not bool(trade.get("ok")):
-
-        action = "观察等待｜交易定价未过闸"
-
-        pool = "观察候选"
-
-    elif final_score >= 68:
-
-        action = "观察等待｜需要二次确认"
-
-        pool = "观察候选"
-
-    elif sf(trade.get("distance_line_pct")) > 18:
-
-        action = "降级｜突破过远不追"
-
-        pool = "低优先级"
-
-    else:
-
-        action = "低优先级观察"
-
-        pool = "低优先级"
-
-    return {"primary_setup_type": primary_type, "primary_setup_score": rd(primary_score, 2), "second_setup_score": rd(second_score, 2), "primary_dominance": rd(dominance, 2), "resonance_score": rd(resonance_score, 2), "trade_score": rd(trade_score, 2), "final_score": rd(final_score, 2), "grade": grade, "action": action, "pool": pool, "hypothesis_scores": ";".join([f"{n}:{rd(v,1)}" for n, v in hypotheses_sorted])}
-
-def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, line_info: Dict[str, Any], br: Dict[str, Any]) -> Dict[str, Any]:
+def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, line_info: Dict[str, Any], br: Dict[str, Any], line_type: str = "", hit_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
     d = add_deep_indicators(df)
 
@@ -3627,67 +5041,192 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, l
 
     events = detect_event_tags(d, bidx)
 
+    # 底层评估分两类：主事件直接进分；大周期/供应/爆发前夜/股性/时间汇总为独立13分上下文。
     major = evaluate_major_cycle_pricing(d, last_close)
-
     supply = evaluate_supply_absorption(d, bidx, L)
-
     eve = evaluate_explosion_eve(d, bidx)
-
     pullback = evaluate_pullback_acceptance(d, bidx, L)
-
     fund = evaluate_fund_behavior(d, bidx)
-
     activity = evaluate_activity(d, code, L, bidx)
-
     timing = evaluate_time_maturity(d, bidx)
-
     trade = evaluate_trade_pricing(d, bidx, L, sf(pullback.get("support_price")))
-
+    recent_ipo = evaluate_recent_ipo_context(d)
     risk = evaluate_risk_counterevidence(d, bidx, L, fund, trade)
 
-    arb = arbitrate_hypotheses(major, supply, eve, pullback, fund, activity, timing, trade, risk)
+    data_last_date = ss(last.get("date", ""))
 
-    pos = []
+    data_fresh = bool((not TARGET_DASH) or data_last_date == TARGET_DASH)
 
-    for item in [major, supply, eve, pullback, fund, activity, timing]:
+    line_score = score_core_line_level(line_type, line_info, hit_context)
+    k_score = score_breakout_k_quality(d, bidx, L, fund, events)
+    accept_score = score_acceptance_15(pullback, d, bidx, L)
+    space_score = score_space_odds_12(trade)
+    risk_score = score_technical_risk_8(risk, fund, trade, data_fresh, recent_ipo)
+    context_score = score_context_13(major, supply, eve, activity, timing)
 
-        if sf(item.get("score")) > 0 and ss(item.get("detail")):
+    # 正式100分结构：核心线25 + 突破K27 + 承接15 + 空间12 + 风险8 + 上下文13 = 100。
+    # k_score内部仍保留48分原始细分，进入总分前压缩为27分，避免原始细分把总分顶穿。
+    line_component = rd(clamp(sf(line_score.get("score")), 0.0, 25.0), 2)
+    breakout_component = _weighted_component_score(k_score.get("score"), 48.0, 27.0)
+    accept_component = rd(clamp(sf(accept_score.get("score")), 0.0, 15.0), 2)
+    space_component = rd(clamp(sf(space_score.get("score")), 0.0, 12.0), 2)
+    risk_component = rd(clamp(sf(risk_score.get("score")), 0.0, 8.0), 2)
+    context_component = rd(clamp(sf(context_score.get("score")), 0.0, 13.0), 2)
 
-            pos.append(ss(item.get("detail")))
+    raw_total = (
+        line_component
+        + breakout_component
+        + accept_component
+        + space_component
+        + risk_component
+        + context_component
+    )
 
-    neg = []
+    hard_reject = False
+    reject_reasons: List[str] = []
+
+    if not data_fresh:
+        hard_reject = True
+        reject_reasons.append(f"数据日期未对齐：目标{TARGET_DASH}，实际{data_last_date or '未知'}")
+
+    if bool(risk.get("block")):
+        hard_reject = True
+        reject_reasons.append(ss(risk.get("detail")) or "硬风险")
+
+    if bool(recent_ipo.get("is_recent_ipo")) and ss(recent_ipo.get("recent_ipo_action")) == "HARD_REJECT":
+        hard_reject = True
+        reject_reasons.append("次新样本不足")
+
+    deep_score_value = rd(clamp(raw_total, 0.0, 100.0), 2)
+
+    if hard_reject:
+        deep_score_value = min(deep_score_value, 49.0)
+        deep_grade_value = "D"
+        deep_state_value = "剔除｜" + "；".join([x for x in reject_reasons if ss(x)])
+        trade_action_value = deep_state_value
+        deep_pool_value = "剔除"
+    else:
+        deep_grade_value = deep_grade(deep_score_value)
+        if deep_score_value >= 85:
+            deep_state_value = "强推｜核心线突破质量高"
+            trade_action_value = "强推候选｜等待分时/次日承接确认"
+            deep_pool_value = "正式候选"
+        elif deep_score_value >= 78:
+            deep_state_value = "正式候选｜核心线突破有效"
+            trade_action_value = "正式候选｜按防守位管理"
+            deep_pool_value = "正式候选"
+        elif deep_score_value >= 70:
+            deep_state_value = "观察｜突破成立但质量未满"
+            trade_action_value = "观察等待｜看回踩承接或二次放量"
+            deep_pool_value = "观察候选"
+        else:
+            deep_state_value = "不推｜突破质量不足"
+            trade_action_value = "不推｜等待更高质量确认"
+            deep_pool_value = "不推"
+
+    pos = [
+        "核心线级别：" + ss(line_score.get("detail")),
+        "突破K质量：" + ss(k_score.get("detail")),
+        "突破后接受：" + ss(accept_score.get("detail")),
+        "空间赔率：" + ss(space_score.get("detail")),
+        "可落地风险：" + ss(risk_score.get("detail")),
+        "独立上下文13分：" + ss(context_score.get("detail")),
+    ]
+
+    if bool(recent_ipo.get("is_recent_ipo")) and ss(recent_ipo.get("recent_ipo_detail")):
+        pos.append("次新股专项：" + ss(recent_ipo.get("recent_ipo_detail")))
+
+    neg: List[str] = []
 
     if not bool(trade.get("ok")):
-
         neg.append("交易定价未过闸：" + ss(trade.get("detail")))
 
     if sf(risk.get("penalty")) > 0:
-
         neg.append("风险反证：" + ss(risk.get("detail")))
 
     if bool(fund.get("stall")):
-
         neg.append("资金行为为放量滞涨")
+
+    if not data_fresh:
+        neg.append(f"数据日期未对齐：目标{TARGET_DASH}，实际{data_last_date or '未知'}")
+
+    if bool(recent_ipo.get("is_recent_ipo")) and ss(recent_ipo.get("recent_ipo_action")) in {"HARD_REJECT", "OBSERVE_ONLY"}:
+        neg.append("次新股专项约束：" + ss(recent_ipo.get("recent_ipo_stage")) + "；" + ss(recent_ipo.get("recent_ipo_detail")))
+
+    risk_flag_parts: List[str] = []
+
+    if sf(risk.get("penalty")) > 0:
+        risk_flag_parts.append(ss(risk.get("detail")))
+
+    if not data_fresh:
+        risk_flag_parts.append("数据日期未对齐")
+
+    if bool(recent_ipo.get("is_recent_ipo")) and ss(recent_ipo.get("recent_ipo_action")) in {"HARD_REJECT", "OBSERVE_ONLY"}:
+        risk_flag_parts.append("次新专项约束")
+
+    risk_flag_text = "；".join([x for x in risk_flag_parts if ss(x)]) or "无"
 
     return {
 
-        "deep_score": arb["final_score"],
+        "deep_score": deep_score_value,
 
-        "deep_grade": arb["grade"],
+        "deep_grade": deep_grade_value,
 
-        "deep_state": arb["primary_setup_type"],
+        "deep_state": deep_state_value,
 
-        "trade_action": arb["action"],
+        "trade_action": trade_action_value,
 
-        "deep_pool": arb["pool"],
+        "deep_pool": deep_pool_value,
 
-        "deep_positive_reasons": "；".join(pos[:8]) or "无有效母机会证据",
+        "deep_positive_reasons": "；".join([x for x in pos if ss(x)]),
 
-        "deep_negative_reasons": "；".join(neg[:6]) or "暂无明显扣分项",
+        "deep_negative_reasons": "；".join(neg[:8]) or "暂无明显扣分项",
 
-        "risk_flags": ss(risk.get("detail")) if sf(risk.get("penalty")) > 0 else "无",
+        "risk_flags": risk_flag_text,
 
         "current_close": rd(last_close, 3),
+
+        "data_last_date": ss(last.get("date", "")),
+
+        "target_trade_date": TARGET_DASH,
+
+        "data_is_target_fresh": bool((not TARGET_DASH) or ss(last.get("date", "")) == TARGET_DASH),
+
+        "data_freshness_detail": f"数据截至{ss(last.get('date', '')) or '未知'}，目标交易日{TARGET_DASH or '未指定'}",
+
+        "score_core_line_level": line_component,
+        "score_core_line_level_raw": line_score.get("score", 0),
+        "core_line_level_type": line_score.get("line_level_type", ""),
+        "core_line_level_detail": line_score.get("detail", ""),
+        "dual_line_distance_pct": line_score.get("dual_line_distance_pct", 0),
+        "score_breakout_k_quality": breakout_component,
+        "score_breakout_k_quality_raw_48": k_score.get("score", 0),
+        "breakout_k_quality_detail": k_score.get("detail", ""),
+        "breakout_entity_score": k_score.get("entity_score", 0),
+        "breakout_direction_score": k_score.get("direction_score", 0),
+        "breakout_body_score": k_score.get("body_score", 0),
+        "breakout_close_control_score": k_score.get("close_control_score", 0),
+        "breakout_volume_score": k_score.get("volume_score", 0),
+        "breakout_pattern_score": k_score.get("pattern_score", 0),
+        "breakout_high_quality_bonus": k_score.get("high_quality_breakout_bonus", 0),
+        "breakout_is_true_yang": bool(k_score.get("is_true_yang")),
+        "breakout_is_fake_yin_true_yang": bool(k_score.get("is_fake_yin_true_yang")),
+        "score_acceptance_15": accept_component,
+        "score_acceptance_15_raw": accept_score.get("score", 0),
+        "acceptance_detail": accept_score.get("detail", ""),
+        "score_space_odds_12": space_component,
+        "score_space_odds_12_raw": space_score.get("score", 0),
+        "space_odds_detail": space_score.get("detail", ""),
+        "score_technical_risk_8": risk_component,
+        "score_technical_risk_8_raw": risk_score.get("score", 0),
+        "technical_risk_detail": risk_score.get("detail", ""),
+        "score_context_13": context_component,
+        "context_13_detail": context_score.get("detail", ""),
+        "context_major_component": context_score.get("major_component", 0),
+        "context_supply_component": context_score.get("supply_component", 0),
+        "context_explosion_eve_component": context_score.get("explosion_eve_component", 0),
+        "context_activity_component": context_score.get("activity_component", 0),
+        "context_timing_component": context_score.get("timing_component", 0),
 
         "distance_line_pct": trade.get("distance_line_pct", 0),
 
@@ -3700,6 +5239,58 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, l
         "target_price": trade.get("target_price", 0),
 
         "target_type": trade.get("target_type", ""),
+
+        "pricing_mode": trade.get("pricing_mode", ""),
+
+        "pressure_horizon": trade.get("pressure_horizon", ""),
+
+        "target_reliable": bool(trade.get("target_reliable")),
+
+        "pressure_quality": trade.get("pressure_quality", ""),
+
+        "near_pressure_price": trade.get("near_pressure_price", 0),
+
+        "mid_pressure_price": trade.get("mid_pressure_price", 0),
+
+        "long_pressure_price": trade.get("long_pressure_price", 0),
+
+        "full_pressure_price": trade.get("full_pressure_price", 0),
+
+        "near_pressure_quality": trade.get("near_pressure_quality", ""),
+
+        "mid_pressure_quality": trade.get("mid_pressure_quality", ""),
+
+        "long_pressure_quality": trade.get("long_pressure_quality", ""),
+
+        "full_pressure_quality": trade.get("full_pressure_quality", ""),
+
+        "full_history_high": trade.get("full_history_high", 0),
+
+        "full_history_high_date": trade.get("full_history_high_date", ""),
+
+        "pressure_audit_detail": trade.get("pressure_audit_detail", ""),
+
+        "pressure_scan_sample_days": trade.get("pressure_scan_sample_days", 0),
+        "recent_ipo_flag": bool(recent_ipo.get("recent_ipo_flag", False)),
+        "listing_age_days": recent_ipo.get("listing_age_days", 0),
+        "first_trade_date": recent_ipo.get("first_trade_date", ""),
+        "recent_ipo_stage": recent_ipo.get("recent_ipo_stage", ""),
+        "recent_ipo_action": recent_ipo.get("recent_ipo_action", ""),
+        "recent_ipo_maturity_score": recent_ipo.get("recent_ipo_maturity_score", 0),
+        "recent_ipo_platform_valid": bool(recent_ipo.get("recent_ipo_platform_valid", False)),
+        "recent_ipo_platform_score": recent_ipo.get("recent_ipo_platform_score", 0),
+        "recent_ipo_platform_upper": recent_ipo.get("recent_ipo_platform_upper", 0),
+        "recent_ipo_platform_lower": recent_ipo.get("recent_ipo_platform_lower", 0),
+        "recent_ipo_platform_window": recent_ipo.get("recent_ipo_platform_window", 0),
+        "recent_ipo_platform_amp_pct": recent_ipo.get("recent_ipo_platform_amp_pct", 0),
+        "recent_ipo_max_amount_high": recent_ipo.get("recent_ipo_max_amount_high", 0),
+        "recent_ipo_max_amount_body_top": recent_ipo.get("recent_ipo_max_amount_body_top", 0),
+        "recent_ipo_max_amount_body_bottom": recent_ipo.get("recent_ipo_max_amount_body_bottom", 0),
+        "recent_ipo_ipo_day_high": recent_ipo.get("recent_ipo_ipo_day_high", 0),
+        "recent_ipo_ipo_day_close": recent_ipo.get("recent_ipo_ipo_day_close", 0),
+        "recent_ipo_post_high": recent_ipo.get("recent_ipo_post_high", 0),
+        "recent_ipo_post_high_date": recent_ipo.get("recent_ipo_post_high_date", ""),
+        "recent_ipo_detail": recent_ipo.get("recent_ipo_detail", ""),
 
         "space_pct": trade.get("space_pct", 0),
 
@@ -3723,14 +5314,6 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, l
 
         "post_drawdown_pct": risk.get("post_drawdown_pct", 0),
 
-        "primary_setup_type": arb["primary_setup_type"],
-
-        "primary_setup_score": arb["primary_setup_score"],
-
-        "primary_dominance": arb["primary_dominance"],
-
-        "hypothesis_scores": arb["hypothesis_scores"],
-
         "score_major_cycle": major.get("score", 0),
 
         "major_cycle_type": major.get("type", ""),
@@ -3738,6 +5321,8 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, l
         "major_cycle_detail": major.get("detail", ""),
 
         "major_cycle_anchor_price": major.get("anchor_price", 0),
+
+        "major_cycle_distance_warning": major.get("major_cycle_distance_warning", ""),
 
         "major_mid_best_cycle": major.get("major_mid_best_cycle", ""),
 
@@ -3857,37 +5442,61 @@ def deep_status_and_score(code: str, name: str, df: pd.DataFrame, line: float, l
 
     }
 
+
 def build_dual_line_hit_candidate(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
 
     historical_line = choose_historical_core_resonance_line(df)
 
     five_hundred_line = choose_five_hundred_day_resonance_trigger_line(df)
 
+    recent_ipo_line = choose_recent_ipo_core_line(df)
+
     historical_price = sf(historical_line.get("line")) if historical_line.get("line") is not None else 0.0
 
     five_hundred_price = sf(five_hundred_line.get("line")) if five_hundred_line.get("line") is not None else 0.0
+
+    recent_ipo_price = sf(recent_ipo_line.get("line")) if recent_ipo_line.get("line") is not None else 0.0
 
     historical_breakout = daily_breakout_quality(df, historical_price)
 
     five_hundred_breakout = daily_breakout_quality(df, five_hundred_price)
 
+    recent_ipo_breakout = daily_breakout_quality(df, recent_ipo_price)
+
     historical_hit = bool(historical_breakout.get("hit"))
 
     five_hundred_hit = bool(five_hundred_breakout.get("hit"))
 
-    if not (historical_hit or five_hundred_hit):
+    recent_ipo_hit = bool(recent_ipo_breakout.get("hit")) and ss(recent_ipo_line.get("line_type")) == "recent_ipo_core_line"
+
+    recent_ipo_context = evaluate_recent_ipo_context(df)
+
+    is_recent_ipo = bool(recent_ipo_context.get("is_recent_ipo"))
+
+    # 次新股不允许套用普通历史/五百日共振线作为主评测线；只能由上市后筹码线触发。
+    option_historical_hit = bool(historical_hit and not is_recent_ipo)
+
+    option_five_hundred_hit = bool(five_hundred_hit and not is_recent_ipo)
+
+    option_recent_ipo_hit = bool(recent_ipo_hit and is_recent_ipo)
+
+    if not (option_historical_hit or option_five_hundred_hit or option_recent_ipo_hit):
 
         return {}
 
     options: List[Dict[str, Any]] = []
 
-    if historical_hit:
+    if option_historical_hit:
 
         options.append({"line_type": "历史核心共振线", "line_info": historical_line, "breakout": historical_breakout})
 
-    if five_hundred_hit:
+    if option_five_hundred_hit:
 
         options.append({"line_type": "五百日共振触发线", "line_info": five_hundred_line, "breakout": five_hundred_breakout})
+
+    if option_recent_ipo_hit:
+
+        options.append({"line_type": "次新上市后筹码线", "line_info": recent_ipo_line, "breakout": recent_ipo_breakout})
 
     primary = select_primary_assessment_line(df, options)
 
@@ -3895,17 +5504,21 @@ def build_dual_line_hit_candidate(code: str, name: str, df: pd.DataFrame) -> Dic
 
         return {}
 
-    if historical_hit and five_hundred_hit:
+    hit_sources: List[str] = []
 
-        source = "双线共振"
+    if option_historical_hit:
 
-    elif historical_hit:
+        hit_sources.append("历史核心共振线")
 
-        source = "历史核心共振线"
+    if option_five_hundred_hit:
 
-    else:
+        hit_sources.append("五百日共振触发线")
 
-        source = "五百日共振触发线"
+    if option_recent_ipo_hit:
+
+        hit_sources.append("次新上市后筹码线")
+
+    source = " + ".join(hit_sources) if hit_sources else "未识别"
 
     return {
 
@@ -3919,19 +5532,95 @@ def build_dual_line_hit_candidate(code: str, name: str, df: pd.DataFrame) -> Dic
 
         "five_hundred_line": five_hundred_line,
 
+        "recent_ipo_line": recent_ipo_line,
+
         "historical_breakout": historical_breakout,
 
         "five_hundred_breakout": five_hundred_breakout,
 
+        "recent_ipo_breakout": recent_ipo_breakout,
+
         "historical_hit": historical_hit,
 
         "five_hundred_hit": five_hundred_hit,
+
+        "recent_ipo_hit": recent_ipo_hit,
 
         "primary": primary,
 
         "df": df,
 
     }
+
+DEEP_CN_ALIAS_FIELDS: Tuple[Tuple[str, str, Any], ...] = (
+    ("深度等级", "deep_grade", "D"),
+    ("深度得分", "deep_score", 0),
+    ("当前状态", "deep_state", ""),
+    ("操作建议", "trade_action", ""),
+    ("候选池", "deep_pool", ""),
+    ("加分原因", "deep_positive_reasons", ""),
+    ("扣分原因", "deep_negative_reasons", ""),
+    ("风险标签", "risk_flags", ""),
+    ("核心线级别分", "score_core_line_level", 0),
+    ("突破K质量分", "score_breakout_k_quality", 0),
+    ("突破后接受分", "score_acceptance_15", 0),
+    ("空间赔率分", "score_space_odds_12", 0),
+    ("可落地风险分", "score_technical_risk_8", 0),
+    ("独立上下文13分", "score_context_13", 0),
+    ("上下文13分说明", "context_13_detail", ""),
+    ("核心线级别说明", "core_line_level_detail", ""),
+    ("突破K质量说明", "breakout_k_quality_detail", ""),
+    ("突破后接受说明", "acceptance_detail", ""),
+    ("空间赔率说明", "space_odds_detail", ""),
+    ("可落地风险说明", "technical_risk_detail", ""),
+    ("当前收盘", "current_close", 0),
+    ("是否次新股", "recent_ipo_flag", False),
+    ("上市交易日", "listing_age_days", 0),
+    ("首日日期", "first_trade_date", ""),
+    ("次新阶段", "recent_ipo_stage", ""),
+    ("次新动作", "recent_ipo_action", ""),
+    ("次新平台有效", "recent_ipo_platform_valid", False),
+    ("次新平台上沿", "recent_ipo_platform_upper", 0),
+    ("次新平台下沿", "recent_ipo_platform_lower", 0),
+    ("次新平台窗口", "recent_ipo_platform_window", 0),
+    ("次新最大成交额K高点", "recent_ipo_max_amount_high", 0),
+    ("次新上市以来高点", "recent_ipo_post_high", 0),
+    ("次新审计", "recent_ipo_detail", ""),
+    ("大周期远离警告", "major_cycle_distance_warning", ""),
+    ("数据截至", "data_last_date", ""),
+    ("目标交易日", "target_trade_date", ""),
+    ("距主评测线%", "distance_line_pct", 0),
+    ("交易防守位", "defense_price", 0),
+    ("防守距离%", "defense_distance_pct", 0),
+    ("目标/压力价", "target_price", 0),
+    ("定价模式", "pricing_mode", ""),
+    ("压力层级", "pressure_horizon", ""),
+    ("近端压力价", "near_pressure_price", 0),
+    ("中期压力价", "mid_pressure_price", 0),
+    ("长期压力价", "long_pressure_price", 0),
+    ("全历史压力价", "full_pressure_price", 0),
+    ("全历史最高价", "full_history_high", 0),
+    ("压力审计", "pressure_audit_detail", ""),
+    ("上方空间%", "space_pct", 0),
+    ("估算赔率", "rr_estimate", 0),
+    ("突破量比", "breakout_volume_ratio", 0),
+    ("突破实体在线上比例", "breakout_entity_above_line_ratio", 0),
+    ("突破收盘位置", "breakout_close_pos", 0),
+    ("突破上影比例", "breakout_upper_shadow_ratio", 0),
+    ("突破后天数", "days_since_breakout", 0),
+    ("近5日涨幅%", "recent5_pct", 0),
+    ("近10日涨幅%", "recent10_pct", 0),
+    ("近20日涨幅%", "recent20_pct", 0),
+)
+
+def apply_deep_cn_alias_fields(row: Dict[str, Any], deep: Dict[str, Any]) -> None:
+    for cn_key, deep_key, default in DEEP_CN_ALIAS_FIELDS:
+        row[cn_key] = deep.get(deep_key, default)
+
+def append_deep_audit_fields(row: Dict[str, Any], deep: Dict[str, Any]) -> None:
+    for key, val in deep.items():
+        if key not in row:
+            row[key] = val
 
 def deep_screen_dual_line_hit(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
@@ -3963,11 +5652,24 @@ def deep_screen_dual_line_hit(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
     primary_price = sf(primary.get("line"))
 
-    deep = deep_status_and_score(code, name, df, primary_price, primary_line_info, primary_breakout)
-
     historical_price = sf(historical_line.get("line")) if historical_line.get("line") is not None else 0.0
 
     five_hundred_price = sf(five_hundred_line.get("line")) if five_hundred_line.get("line") is not None else 0.0
+
+    hit_context = {
+        "historical_hit": historical_hit,
+        "five_hundred_hit": five_hundred_hit,
+        "recent_ipo_hit": bool(candidate.get("recent_ipo_hit")),
+        "historical_price": historical_price,
+        "five_hundred_price": five_hundred_price,
+        "historical_breakout_date": historical_breakout.get("date", ""),
+        "five_hundred_breakout_date": five_hundred_breakout.get("date", ""),
+        "historical_line": historical_line,
+        "five_hundred_line": five_hundred_line,
+    }
+
+    deep = deep_status_and_score(code, name, df, primary_price, primary_line_info, primary_breakout, primary_type, hit_context)
+
 
     row = {
 
@@ -4018,64 +5720,22 @@ def deep_screen_dual_line_hit(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "五百日共振触发线带量共振次数": five_hundred_line.get("volume_resonance_count", 0),
 
         "五百日共振触发线净分": five_hundred_line.get("net_score", 0),
-
-        "深度等级": deep.get("deep_grade", "D"),
-
-        "深度得分": deep.get("deep_score", 0),
-
-        "当前状态": deep.get("deep_state", ""),
-
-        "操作建议": deep.get("trade_action", ""),
-
-        "候选池": deep.get("deep_pool", ""),
-
-        "加分原因": deep.get("deep_positive_reasons", ""),
-
-        "扣分原因": deep.get("deep_negative_reasons", ""),
-
-        "风险标签": deep.get("risk_flags", ""),
-
-        "当前收盘": deep.get("current_close", 0),
-
-        "距主评测线%": deep.get("distance_line_pct", 0),
-
-        "交易防守位": deep.get("defense_price", 0),
-
-        "防守距离%": deep.get("defense_distance_pct", 0),
-
-        "目标/压力价": deep.get("target_price", 0),
-
-        "上方空间%": deep.get("space_pct", 0),
-
-        "估算赔率": deep.get("rr_estimate", 0),
-
-        "突破量比": deep.get("breakout_volume_ratio", 0),
-
-        "突破实体在线上比例": deep.get("breakout_entity_above_line_ratio", 0),
-
-        "突破收盘位置": deep.get("breakout_close_pos", 0),
-
-        "突破上影比例": deep.get("breakout_upper_shadow_ratio", 0),
-
-        "突破后天数": deep.get("days_since_breakout", 0),
-
-        "近5日涨幅%": deep.get("recent5_pct", 0),
-
-        "近10日涨幅%": deep.get("recent10_pct", 0),
-
-        "近20日涨幅%": deep.get("recent20_pct", 0),
-
-        "breakout_quality": primary_breakout.get("quality", 0),
-
-        "breakout_close": primary_breakout.get("close", 0),
+        "次新上市后筹码线价位": rd(sf((candidate.get("recent_ipo_line", {}) or {}).get("line")) if (candidate.get("recent_ipo_line", {}) or {}).get("line") is not None else 0.0, 3),
+        "次新上市后筹码线突破日期": (candidate.get("recent_ipo_breakout", {}) or {}).get("date", "") if bool(candidate.get("recent_ipo_hit")) else "",
+        "次新上市后筹码线是否命中": bool(candidate.get("recent_ipo_hit")),
+        "次新上市后筹码线共振次数": (candidate.get("recent_ipo_line", {}) or {}).get("effective_resonance_count", 0),
+        "次新上市后筹码线带量共振次数": (candidate.get("recent_ipo_line", {}) or {}).get("volume_resonance_count", 0),
+        "次新上市后筹码线净分": (candidate.get("recent_ipo_line", {}) or {}).get("net_score", 0),
 
     }
 
-    for key, val in deep.items():
+    apply_deep_cn_alias_fields(row, deep)
 
-        if key not in row:
+    row["breakout_quality"] = primary_breakout.get("quality", 0)
 
-            row[key] = val
+    row["breakout_close"] = primary_breakout.get("close", 0)
+
+    append_deep_audit_fields(row, deep)
 
     return row
 
@@ -4165,13 +5825,73 @@ def is_hard_rejected_row(r: Dict[str, Any]) -> bool:
 
         return True
 
+    if r.get("data_is_target_fresh") is False:
+
+        return True
+
+    if "数据日期未对齐" in action:
+
+        return True
+
     if "突破失败" in action or "硬风险" in action:
 
         return True
 
     return False
 
-def featured_sort_key(r: Dict[str, Any]) -> Tuple[int, float, int, float, float, float]:
+def is_backup_observation_row(r: Dict[str, Any]) -> bool:
+
+    if is_hard_rejected_row(r):
+
+        return False
+
+    grade = ss(r.get("深度等级") or r.get("deep_grade")).upper()
+
+    score = sf(r.get("深度得分") or r.get("deep_score"))
+
+    risk_penalty = sf(r.get("risk_penalty"))
+
+    distance_line = sf(r.get("距主评测线%") or r.get("distance_line_pct"))
+
+    defense_distance = sf(r.get("防守距离%") or r.get("defense_distance_pct"))
+
+    if grade not in DEEP_BACKUP_ALLOWED_GRADES:
+
+        return False
+
+    if score < DEEP_BACKUP_MIN_SCORE:
+
+        return False
+
+    if risk_penalty > DEEP_BACKUP_MAX_RISK_PENALTY:
+
+        return False
+
+    if distance_line > DEEP_BACKUP_MAX_DISTANCE_LINE_PCT:
+
+        return False
+
+    if defense_distance > DEEP_BACKUP_MAX_DEFENSE_DISTANCE_PCT:
+
+        return False
+
+    if bool(r.get("是否次新股") or r.get("recent_ipo_flag")):
+
+        ipo_action = ss(r.get("次新动作") or r.get("recent_ipo_action"))
+
+        platform_valid = bool(r.get("次新平台有效") or r.get("recent_ipo_platform_valid"))
+
+        if ipo_action == "HARD_REJECT":
+
+            return False
+
+        if ipo_action == "OBSERVE_ONLY" and not platform_valid:
+
+            return False
+
+    return True
+
+def featured_sort_key(r: Dict[str, Any]) -> Tuple[int, float, int, float, float]:
 
     grade = ss(r.get("深度等级") or r.get("deep_grade")).upper()
 
@@ -4179,13 +5899,11 @@ def featured_sort_key(r: Dict[str, Any]) -> Tuple[int, float, int, float, float,
 
     trade_ok = 1 if bool(r.get("trade_pricing_ok")) else 0
 
-    primary = sf(r.get("primary_setup_score"))
-
     rr = sf(r.get("估算赔率") or r.get("rr_estimate"))
 
     risk_penalty = sf(r.get("risk_penalty"))
 
-    return (grade_rank(grade), score, trade_ok, primary, rr, -risk_penalty)
+    return (grade_rank(grade), score, trade_ok, rr, -risk_penalty)
 
 def select_featured_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
@@ -4223,13 +5941,15 @@ def select_featured_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
             return selected
 
-    for r in usable:
+    backup = [r for r in usable if is_backup_observation_row(r)]
+
+    for r in backup:
 
         code = ss(r.get("股票代码"))
 
         if code and code not in seen:
 
-            r["最终入选性质"] = "A级不足补位｜相对最优观察"
+            r["最终入选性质"] = "非正式观察｜A级不足补位"
 
             selected.append(r)
 
@@ -4245,7 +5965,7 @@ def selected_quality_note(selected: List[Dict[str, Any]]) -> str:
 
     if not selected:
 
-        return "今日无可用精选：海选命中票全部被硬风险或突破失败剔除。"
+        return "今日无合格输出：海选命中票未达到正式A级/S级或非正式观察底线，宁可空仓/不推送。"
 
     formal_count = sum(
 
@@ -4261,9 +5981,9 @@ def selected_quality_note(selected: List[Dict[str, Any]]) -> str:
 
     if formal_count > 0:
 
-        return f"今日精选质量：A级/S级仅{formal_count}只，其余按深度得分补入相对最优观察，不伪装成A级。"
+        return f"今日精选质量：A级/S级仅{formal_count}只，其余仅为非正式观察补位，不构成买入池。"
 
-    return f"今日精选质量：无A级/S级，输出未硬剔除票中的相对最优Top{DEEP_FINAL_PICK_LIMIT}，只能按观察处理。"
+    return f"今日精选质量：无A级/S级，仅输出达到观察底线的非正式跟踪票；不构成买入池。"
 
 def short_reason(text: Any, max_len: int = 90) -> str:
 
@@ -4275,21 +5995,25 @@ def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
 
     if not rows:
 
-        return "三号员工：今日无双线突破海选命中。"
+        return f"三号员工Top5｜{TARGET_DASH or TARGET}\n今日无双线突破海选命中。"
 
-    selected = select_featured_rows(rows)
+    selected = select_featured_rows(rows)[:5]
 
     hard_rejected = len([r for r in rows if is_hard_rejected_row(r)])
 
+    formal_selected_count = sum(1 for r in selected if ss(r.get("最终入选性质")) == "A级/S级深度精选")
+
+    report_title = "三号员工Top5深度精选" if formal_selected_count > 0 else "三号员工Top5观察池｜无A级/S级"
+
     lines = [
 
-        f"三号员工最终深度精选｜{TARGET_DASH or TARGET}",
+        f"{report_title}｜{TARGET_DASH or TARGET}",
 
-        f"海选召回：{len(rows)}只；完成深度评分：{len(rows)}只；硬剔除：{hard_rejected}只；最终输出：{len(selected)}只。",
+        f"海选{len(rows)}只｜硬剔除{hard_rejected}只｜输出{len(selected)}只｜正式A/S {formal_selected_count}只",
 
         selected_quality_note(selected),
 
-        "全量海选/深度评分明细已写入 CSV/JSON 审计，Telegram 只推最终精选，不再推海选大表。",
+        "Telegram仅保留一页Top5；全量明细见CSV/JSON。",
 
         "",
 
@@ -4297,55 +6021,67 @@ def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
 
     if selected:
 
-        lines.extend([
-
-            "| 排名 | 股票代码 | 股票简称 | 海选来源 | 主评测线类型 | 主评测线 | 突破日 | 深度评级 | 得分 | 入选性质 | 状态 | 防守位 | RR | 操作 |",
-
-            "|---:|---|---|---|---|---:|---|---|---:|---|---|---:|---:|---|",
-
-        ])
-
         for idx, r in enumerate(selected, 1):
 
-            lines.append(
+            code = r.get('股票代码', '')
 
-                f"| {idx} | {r.get('股票代码','')} | {r.get('股票中文名称','')} | {short_reason(r.get('海选命中来源',''), 12)} | "
+            name = r.get('股票中文名称', '')
 
-                f"{short_reason(r.get('主评测线类型',''), 12)} | {r.get('主评测线价位',0)} | {r.get('主评测线突破日期','')} | "
+            grade = r.get('深度等级', '')
 
-                f"{r.get('深度等级','')} | {r.get('深度得分',0)} | {short_reason(r.get('最终入选性质',''), 22)} | "
+            score = r.get('深度得分', 0)
 
-                f"{short_reason(r.get('当前状态',''), 18)} | {r.get('交易防守位',0)} | {r.get('估算赔率',0)} | "
+            nature = ss(r.get('最终入选性质')) or '深度精选'
 
-                f"{short_reason(r.get('操作建议',''), 24)} |"
+            line_price = r.get('主评测线价位', 0)
 
-            )
+            breakout_date = r.get('主评测线突破日期', '')
 
-        lines.append("")
+            close_price = r.get('当前收盘', r.get('current_close', 0))
 
-        for idx, r in enumerate(selected, 1):
+            distance_line = r.get('距主评测线%', r.get('distance_line_pct', 0))
+
+            defense = r.get('交易防守位', r.get('defense_price', 0))
+
+            rr = r.get('估算赔率', r.get('rr_estimate', 0))
+
+            action = short_reason(r.get('操作建议', ''), 38)
+
+            reason = short_reason(r.get('加分原因', ''), 82)
+
+            risk = short_reason(r.get('扣分原因', ''), 72)
+
+            confirm = short_reason(r.get('confirm_condition', ''), 60)
+
+            giveup = short_reason(r.get('giveup_condition', ''), 60)
 
             lines.extend([
 
-                f"{idx}）{r.get('股票代码','')} {r.get('股票中文名称','')}",
+                f"{idx}. {code} {name}｜{grade} {score}分｜{nature}",
 
-                f"- 入选性质：{ss(r.get('最终入选性质')) or '深度精选'}",
+                f"   线:{line_price}｜破:{breakout_date}｜收:{close_price}｜距线:{distance_line}%｜防:{defense}｜RR:{rr}",
 
-                f"- 选中原因：{short_reason(r.get('加分原因',''), 180)}",
+                f"   操作:{action}",
 
-                f"- 扣分/风险：{short_reason(r.get('扣分原因',''), 160)}",
+                f"   亮点:{reason}",
 
-                f"- 确认条件：{short_reason(r.get('confirm_condition',''), 120)}",
+                f"   风险:{risk}",
 
-                f"- 放弃条件：{short_reason(r.get('giveup_condition',''), 120)}",
+                f"   确认:{confirm}｜放弃:{giveup}",
 
             ])
 
     else:
 
-        lines.append("今日无三号员工最终精选：所有海选票均被硬风险、突破失败或数据异常剔除。")
+        lines.append("今日无三号员工合格输出：海选票未达到正式买入池或非正式观察底线。")
 
-    return "\n".join(lines)
+    report = "\n".join(lines)
+
+    if len(report) > 3900:
+
+        report = report[:3850].rstrip() + "\n……\n报告过长，Telegram已压缩为一页；完整明细见CSV/JSON。"
+
+    return report
 
 def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], self_check: Dict[str, Any]) -> None:
 
@@ -4365,7 +6101,7 @@ def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], sel
 
         "config": {
 
-            "agg_window": AGG_WINDOW,
+            "core_line_timeframe": CORE_LINE_TIMEFRAME,
 
             "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
 
@@ -4378,6 +6114,10 @@ def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], sel
             "deep_min_formal_score": DEEP_MIN_FORMAL_SCORE,
 
             "deep_defense_buffer_pct": DEEP_DEFENSE_BUFFER_PCT,
+
+            "deep_backup_min_score": DEEP_BACKUP_MIN_SCORE,
+
+            "deep_backup_allowed_grades": ",".join(DEEP_BACKUP_ALLOWED_GRADES),
 
         },
 
@@ -4392,6 +6132,238 @@ def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], sel
     OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     SELF_CHECK_JSON.write_text(json.dumps(self_check, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class SelfCheckError(RuntimeError):
+
+    pass
+
+def _selfcheck_item(name: str, ok: bool, level: str, detail: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+    item: Dict[str, Any] = {
+        "name": name,
+        "ok": bool(ok),
+        "level": level,
+        "detail": detail,
+    }
+
+    if extra:
+        item.update(extra)
+
+    return item
+
+def _validate_target_date() -> Tuple[bool, str]:
+
+    if not re.fullmatch(r"\d{8}", TARGET or ""):
+        return False, f"TARGET无效: {TARGET!r}"
+
+    try:
+        datetime.strptime(TARGET, "%Y%m%d")
+    except Exception as exc:
+        return False, f"TARGET日期不可解析: {TARGET!r}, err={exc}"
+
+    return True, f"TARGET={TARGET} TARGET_DASH={TARGET_DASH}"
+
+def _validate_numeric_config() -> List[Dict[str, Any]]:
+
+    checks: List[Tuple[str, Any, float, float]] = [
+        ("BREAKOUT_LOOKBACK_DAYS", BREAKOUT_LOOKBACK_DAYS, 1, 250),
+        ("CORE_LINE_TOL", CORE_LINE_TOL, 0.001, 0.08),
+        ("CORE_LINE_BAND_TOL", CORE_LINE_BAND_TOL, 0.001, 0.10),
+        ("MIN_CACHE_ROWS", MIN_CACHE_ROWS, 30, 5000),
+        ("MIN_CORE_RESONANCE", MIN_CORE_RESONANCE, 1, 20),
+        ("FIVE_HUNDRED_DAY_LOOKBACK", FIVE_HUNDRED_DAY_LOOKBACK, 80, 3000),
+        ("LINE_TOP_CANDIDATE_LIMIT", LINE_TOP_CANDIDATE_LIMIT, 3, 80),
+        ("DEEP_FINAL_PICK_LIMIT", DEEP_FINAL_PICK_LIMIT, 1, 20),
+        ("DEEP_MIN_FORMAL_SCORE", DEEP_MIN_FORMAL_SCORE, 0, 100),
+        ("DEEP_BACKUP_MIN_SCORE", DEEP_BACKUP_MIN_SCORE, 0, 100),
+        ("DEEP_DEFENSE_BUFFER_PCT", DEEP_DEFENSE_BUFFER_PCT, 0.0, 0.20),
+    ]
+
+    out: List[Dict[str, Any]] = []
+
+    for name, value, low, high in checks:
+        v = sf(value, float("nan"))
+        ok = not math.isnan(v) and low <= v <= high
+        out.append(_selfcheck_item(
+            f"config::{name}",
+            ok,
+            "hard",
+            f"{name}={value}，允许范围[{low}, {high}]" if ok else f"{name}={value} 超出允许范围[{low}, {high}]",
+            {"value": value, "min": low, "max": high},
+        ))
+
+    grade_ok = bool(DEEP_FORMAL_GRADES) and all(ss(x).upper() in {"S", "A", "B", "C", "D"} for x in DEEP_FORMAL_GRADES)
+    out.append(_selfcheck_item(
+        "config::DEEP_FORMAL_GRADES",
+        grade_ok,
+        "hard",
+        f"DEEP_FORMAL_GRADES={DEEP_FORMAL_GRADES}" if grade_ok else f"DEEP_FORMAL_GRADES非法: {DEEP_FORMAL_GRADES}",
+    ))
+
+    backup_ok = all(ss(x).upper() in {"S", "A", "B", "C", "D"} for x in DEEP_BACKUP_ALLOWED_GRADES)
+    out.append(_selfcheck_item(
+        "config::DEEP_BACKUP_ALLOWED_GRADES",
+        backup_ok,
+        "hard",
+        f"DEEP_BACKUP_ALLOWED_GRADES={DEEP_BACKUP_ALLOWED_GRADES}" if backup_ok else f"DEEP_BACKUP_ALLOWED_GRADES非法: {DEEP_BACKUP_ALLOWED_GRADES}",
+    ))
+
+    return out
+
+def _check_output_writable() -> Dict[str, Any]:
+
+    try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        test_path = REPORT_DIR / ".employee3_write_test.tmp"
+        test_path.write_text("ok", encoding="utf-8")
+        if test_path.read_text(encoding="utf-8") != "ok":
+            return _selfcheck_item("output::writable", False, "hard", f"报告目录写入后读取异常: {REPORT_DIR}")
+        test_path.unlink(missing_ok=True)
+        return _selfcheck_item("output::writable", True, "hard", f"报告目录可写: {REPORT_DIR}")
+    except Exception as exc:
+        return _selfcheck_item("output::writable", False, "hard", f"报告目录不可写: {REPORT_DIR}, err={exc}")
+
+def _check_cache_files() -> List[Dict[str, Any]]:
+
+    items: List[Dict[str, Any]] = []
+    existing_dirs = [str(x) for x in CACHE_DIRS if x.exists()]
+    require_cache = os.getenv("EMPLOYEE3_SELF_CHECK_REQUIRE_CACHE", "1") == "1"
+    dir_ok = bool(existing_dirs) or not require_cache
+    if existing_dirs:
+        dir_detail = "存在缓存目录: " + " | ".join(existing_dirs)
+    elif require_cache:
+        dir_detail = "没有任何缓存目录存在"
+    else:
+        dir_detail = "没有任何缓存目录存在；当前已用 EMPLOYEE3_SELF_CHECK_REQUIRE_CACHE=0 临时降级"
+    items.append(_selfcheck_item(
+        "cache::dirs_exist",
+        dir_ok,
+        "hard" if require_cache else "warn",
+        dir_detail,
+        {"existing_dirs": existing_dirs, "configured_dirs": [str(x) for x in CACHE_DIRS], "require_cache": require_cache},
+    ))
+
+    files = iter_cache_files()
+    level = "hard" if require_cache else "warn"
+    ok = bool(files) or not require_cache
+    items.append(_selfcheck_item(
+        "cache::files_found",
+        ok,
+        level,
+        f"发现有效代码缓存文件 {len(files)} 个" if files else "未发现有效代码缓存文件；默认视为硬错误，可用 EMPLOYEE3_SELF_CHECK_REQUIRE_CACHE=0 临时降级",
+        {"cache_files": len(files), "require_cache": require_cache},
+    ))
+
+    sample_files = files[: min(8, len(files))]
+    required_cols = {"date", "open", "high", "low", "close"}
+    bad_samples: List[str] = []
+    short_samples: List[str] = []
+
+    for path in sample_files:
+        try:
+            df = read_cache_file(path)
+            missing = sorted(required_cols - set(df.columns)) if not df.empty else sorted(required_cols)
+            if df.empty or missing:
+                bad_samples.append(f"{path.name}: empty/missing={missing}")
+            elif len(df) < MIN_CACHE_ROWS:
+                short_samples.append(f"{path.name}: rows={len(df)}")
+        except Exception as exc:
+            bad_samples.append(f"{path.name}: err={str(exc)[:80]}")
+
+    sample_ok = not bad_samples and not short_samples
+    items.append(_selfcheck_item(
+        "cache::sample_schema",
+        sample_ok,
+        "hard" if bad_samples else "warn",
+        "缓存样本字段/行数正常" if sample_ok else "缓存样本存在问题: " + "；".join((bad_samples + short_samples)[:5]),
+        {"sample_checked": len(sample_files), "bad_samples": bad_samples, "short_samples": short_samples},
+    ))
+
+    return items
+
+def _check_runtime_switches() -> List[Dict[str, Any]]:
+
+    items: List[Dict[str, Any]] = []
+
+    tg_ok = True
+    tg_detail = "Telegram未启用"
+    if ENABLE_TELEGRAM == "1":
+        tg_ok = bool(BOT) and bool(CHAT) and requests is not None
+        tg_detail = f"ENABLE_TELEGRAM=1 token={bool(BOT)} chat={bool(CHAT)} requests={requests is not None}"
+
+    items.append(_selfcheck_item("runtime::telegram", tg_ok, "hard", tg_detail))
+
+    if ALLOW_BAOSTOCK_FALLBACK:
+        bs_ok = bs is not None
+        bs_detail = "BaoStock补拉已启用且包可导入" if bs_ok else "BaoStock补拉已启用但 baostock 包不可导入"
+        items.append(_selfcheck_item("runtime::baostock_refresh", bs_ok, "hard", bs_detail))
+    else:
+        items.append(_selfcheck_item("runtime::baostock_refresh", True, "info", "BaoStock补拉未启用，生产主流程不主动补拉"))
+
+    name_fallback_enabled = os.getenv("EMPLOYEE3_NAME_BAOSTOCK_FALLBACK", "0") == "1"
+    if name_fallback_enabled:
+        ok = bs is not None
+        detail = "名称BaoStock回填已启用" if ok else "名称BaoStock回填已启用但 baostock 包不可导入"
+        items.append(_selfcheck_item("runtime::baostock_name_fallback", ok, "hard", detail))
+    else:
+        items.append(_selfcheck_item("runtime::baostock_name_fallback", True, "info", "名称BaoStock回填默认关闭，避免名称映射阶段隐式联网"))
+
+    return items
+
+def run_startup_self_check() -> Dict[str, Any]:
+
+    started = now_bj()
+    checks: List[Dict[str, Any]] = []
+
+    ok, detail = _validate_target_date()
+    checks.append(_selfcheck_item("target::date", ok, "hard", detail))
+    checks.extend(_validate_numeric_config())
+    checks.append(_check_output_writable())
+    checks.extend(_check_cache_files())
+    checks.extend(_check_runtime_switches())
+
+    hard_errors = [x for x in checks if x.get("level") == "hard" and not bool(x.get("ok"))]
+    warnings = [x for x in checks if x.get("level") == "warn" and not bool(x.get("ok"))]
+
+    result = {
+        "enabled": True,
+        "status": "PASS" if not hard_errors else "FAIL",
+        "generated_at_bj": started.strftime("%Y-%m-%d %H:%M:%S"),
+        "target": TARGET,
+        "target_dash": TARGET_DASH,
+        "boot": BOOT,
+        "hard_error_count": len(hard_errors),
+        "warning_count": len(warnings),
+        "hard_errors": hard_errors,
+        "warnings": warnings,
+        "checks": checks,
+        "policy": {
+            "fail_fast": True,
+            "require_cache": os.getenv("EMPLOYEE3_SELF_CHECK_REQUIRE_CACHE", "1") == "1",
+            "allow_baostock_refresh": ALLOW_BAOSTOCK_FALLBACK,
+            "name_baostock_fallback": os.getenv("EMPLOYEE3_NAME_BAOSTOCK_FALLBACK", "0") == "1",
+        },
+    }
+
+    try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        SELF_CHECK_JSON.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        result["status"] = "FAIL"
+        result.setdefault("hard_errors", []).append(_selfcheck_item("selfcheck::write_json", False, "hard", f"自检JSON写入失败: {exc}"))
+        result["hard_error_count"] = len(result.get("hard_errors", []))
+
+    print(f"self_check status={result['status']} hard_errors={result['hard_error_count']} warnings={result['warning_count']}", flush=True)
+    for item in hard_errors[:10]:
+        print(f"SELF_CHECK_ERROR {item.get('name')}: {item.get('detail')}", flush=True)
+    for item in warnings[:10]:
+        print(f"SELF_CHECK_WARN {item.get('name')}: {item.get('detail')}", flush=True)
+
+    if result["status"] != "PASS":
+        raise SelfCheckError("启动自检失败，已停止筛选；详见 employee3_reports/employee3_self_check.json")
+
+    return result
 
 def send_report(md: str) -> None:
 
@@ -4435,15 +6407,7 @@ def main() -> None:
 
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
 
-    self_check = {
-
-        "enabled": False,
-
-        "status": "moved_to_employee3_coreline_selfcheck.py",
-
-        "note": "生产主流程不执行模拟自检；开发验证请单独运行 selfcheck 文件。",
-
-    }
+    self_check = run_startup_self_check()
 
     hist, names, stat = load_cache()
 
@@ -4461,7 +6425,7 @@ def main() -> None:
 
     write_outputs(rows, md, stat, self_check)
 
-    send_report(md[:9000])
+    send_report(md)
 
     print(f"Employee3 done. Report: {OUTPUT_MD}", flush=True)
 
