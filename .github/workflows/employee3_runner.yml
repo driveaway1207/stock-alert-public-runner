@@ -205,22 +205,6 @@ jobs:
           NO_COLOR: ""
         run: python -u employee3_runner.py
 
-      - name: write summary
-        if: always()
-        run: |
-          echo "## 三号员工" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 目标交易日：${{ steps.config.outputs.target_date }}" >> $GITHUB_STEP_SUMMARY
-          echo "- 日期来源：${{ steps.config.outputs.target_reason }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Telegram：${{ steps.config.outputs.send_telegram }}" >> $GITHUB_STEP_SUMMARY
-          echo "- BaoStock补拉：${{ steps.config.outputs.baostock_fallback }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f employee3_reports/core_line_breakout_screen.md ]; then
-            cat employee3_reports/core_line_breakout_screen.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "未生成三号员工报告。" >> $GITHUB_STEP_SUMMARY
-          fi
-
       - name: upload reports
         if: always()
         uses: actions/upload-artifact@v4
