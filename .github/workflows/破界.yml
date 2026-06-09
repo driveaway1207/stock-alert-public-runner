@@ -1,68 +1,233 @@
 name: 破界
 run-name: 破界
-on:
+
+"on":
   workflow_dispatch:
+    inputs:
+      pojie_date_choice:
+        description: "🎨 选择海选日期｜默认：上一个交易日"
+        required: false
+        type: choice
+        default: "🟦 上一个交易日"
+        options:
+          - "🟦 上一个交易日"
+          - "🟩 当前交易日"
+          - "🟨 上两个交易日"
+          - "🟧 上三个交易日"
+          - "🟥 上四个交易日"
+          - "🟪 上五个交易日"
+          - "🟫 上六个交易日"
+          - "⬛ 上七个交易日"
+
+      pojie_target_date:
+        description: "✍️ 手动日期｜可填0604、6.4、YYYY-MM-DD、YYYYMMDD｜填了优先"
+        required: false
+        default: ""
+
+      pojie_send_telegram:
+        description: "📨 是否发送Telegram"
+        required: false
+        type: choice
+        default: "🟩 是｜发送Telegram"
+        options:
+          - "🟩 是｜发送Telegram"
+          - "⬜ 否｜不发送Telegram"
+
+      pojie_baostock_fallback:
+        description: "🔄 是否允许BaoStock补拉最近K线｜默认：否，只读公共缓存"
+        required: false
+        type: choice
+        default: "⬜ 否｜只读公共缓存"
+        options:
+          - "⬜ 否｜只读公共缓存"
+          - "🟧 是｜允许补拉最近K线"
+
   schedule:
-    - cron: "0 7 * * 1-5"  # 每个交易日北京时间15:00后触发
+    - cron: "10 12 * * 1-5"
 
 concurrency:
   group: pojie-singleton-main
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   pojie:
+    name: 破界
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
+      - name: resolve target date
+        id: config
+        shell: bash
+        env:
+          POJIE_INPUT_DATE_CHOICE: ${{ github.event.inputs.pojie_date_choice }}
+          POJIE_INPUT_TARGET_DATE: ${{ github.event.inputs.pojie_target_date }}
+          POJIE_INPUT_SEND_TELEGRAM: ${{ github.event.inputs.pojie_send_telegram }}
+          POJIE_INPUT_BAOSTOCK_FALLBACK: ${{ github.event.inputs.pojie_baostock_fallback }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          from datetime import datetime, timedelta, timezone
 
-      - name: Install dependencies
+          def norm_date(x, today):
+              s = str(x or '').strip()
+              if not s:
+                  return ''
+              s = s.replace('年', '-').replace('月', '-').replace('日', '')
+              s = s.replace('/', '-').replace('.', '-').replace('_', '-').strip()
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              m = re.fullmatch(r'(\d{1,2})-(\d{1,2})', s)
+              if m:
+                  month, day = int(m.group(1)), int(m.group(2))
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
+              if len(s) in (3, 4) and s.isdigit():
+                  month, day = int(s[:-2]), int(s[-2:])
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
+              return s[:10]
+
+          def shift_trading_day(d, n):
+              if n == 0:
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  return d
+              moved = 0
+              while moved < n:
+                  d -= timedelta(days=1)
+                  if d.weekday() < 5:
+                      moved += 1
+              return d
+
+          now = datetime.now(timezone(timedelta(hours=8)))
+          today = now.date()
+
+          manual = norm_date(os.environ.get('POJIE_INPUT_TARGET_DATE'), today)
+          choice = str(os.environ.get('POJIE_INPUT_DATE_CHOICE') or '').strip()
+
+          choice_map = {
+              '当前交易日': 0,
+              '上一个交易日': 1,
+              '上两个交易日': 2,
+              '上三个交易日': 3,
+              '上四个交易日': 4,
+              '上五个交易日': 5,
+              '上六个交易日': 6,
+              '上七个交易日': 7,
+          }
+
+          offset = 1
+          for key, value in choice_map.items():
+              if key in choice:
+                  offset = value
+                  break
+
+          if manual:
+              target = manual
+              reason = 'manual_date'
+          else:
+              target = shift_trading_day(today, offset).isoformat()
+              reason = f'dropdown_offset_{offset}'
+
+          send_choice = str(os.environ.get('POJIE_INPUT_SEND_TELEGRAM') or '')
+          send_telegram = '0' if '不发送' in send_choice or '否' in send_choice else '1'
+
+          fallback_choice = str(os.environ.get('POJIE_INPUT_BAOSTOCK_FALLBACK') or '')
+          baostock_fallback = '1' if '允许' in fallback_choice or '是' in fallback_choice else '0'
+
+          print(f'target_date={target}')
+          print(f'target_reason={reason}')
+          print(f'date_choice={choice}')
+          print(f'send_telegram={send_telegram}')
+          print(f'baostock_fallback={baostock_fallback}')
+          PY
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: restore shared kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-pojie-check-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+            a-stock-kline-cache-v1-
+            a-stock-full-kline-cache-
+            employee5-kline-cache-
+            kline-cache-
+
+      - name: inspect cache before pojie
+        run: |
+          echo "target date: ${{ steps.config.outputs.target_date }}"
+          echo "target reason: ${{ steps.config.outputs.target_reason }}"
+          echo "date choice: ${{ steps.config.outputs.date_choice }}"
+          echo "send telegram: ${{ steps.config.outputs.send_telegram }}"
+          echo "baostock fallback: ${{ steps.config.outputs.baostock_fallback }}"
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
+
+      - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
-      - name: Run 破界海选
+      - name: run pojie
+        env:
+          PYTHONUNBUFFERED: 1
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POJIE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          EMPLOYEE3_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          SELECTION_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          POJIE_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          EMPLOYEE3_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          POJIE_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
+          EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
+          EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
+          EMPLOYEE3_PROGRESS_COLOR: "1"
+          NO_COLOR: ""
         run: python -u 破界.py
 
-      - name: Restore cache
-        uses: actions/cache@v3
+      - name: upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
+          name: pojie-reports
           path: |
-            kline_cache
-            employee5_kline_cache
-            data/kline_cache
-            cache/kline_cache
-          key: ${{ runner.os }}-kline-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-kline-
+            破界报告/
+            employee3_reports/
+          if-no-files-found: warn
+          retention-days: 30
 
-      - name: Upload Markdown report
-        uses: actions/upload-artifact@v3
+      - name: upload cache visibility snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: 破界报告MD
-          path: 破界报告/核心线突破海选报告.md
-
-      - name: Upload CSV details
-        uses: actions/upload-artifact@v3
-        with:
-          name: 破界明细CSV
-          path: 破界报告/核心线突破海选明细.csv
-
-      - name: Upload JSON data
-        uses: actions/upload-artifact@v3
-        with:
-          name: 破界数据JSON
-          path: 破界报告/核心线突破海选数据.json
-
-      - name: Upload self-check
-        uses: actions/upload-artifact@v3
-        with:
-          name: 破界启动自检
-          path: 破界报告/破界启动自检.json
+          name: pojie-cache-visibility-snapshot
+          path: |
+            kline_cache/
+            employee5_kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          if-no-files-found: ignore
+          retention-days: 3
