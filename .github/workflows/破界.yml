@@ -1,0 +1,68 @@
+name: 破界
+run-name: 破界
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1-5"  # 每个交易日北京时间15:00后触发
+
+concurrency:
+  group: pojie-singleton-main
+  cancel-in-progress: true
+
+jobs:
+  pojie:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run 破界海选
+        run: python -u 破界.py
+
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            kline_cache
+            employee5_kline_cache
+            data/kline_cache
+            cache/kline_cache
+          key: ${{ runner.os }}-kline-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-kline-
+
+      - name: Upload Markdown report
+        uses: actions/upload-artifact@v3
+        with:
+          name: 破界报告MD
+          path: 破界报告/核心线突破海选报告.md
+
+      - name: Upload CSV details
+        uses: actions/upload-artifact@v3
+        with:
+          name: 破界明细CSV
+          path: 破界报告/核心线突破海选明细.csv
+
+      - name: Upload JSON data
+        uses: actions/upload-artifact@v3
+        with:
+          name: 破界数据JSON
+          path: 破界报告/核心线突破海选数据.json
+
+      - name: Upload self-check
+        uses: actions/upload-artifact@v3
+        with:
+          name: 破界启动自检
+          path: 破界报告/破界启动自检.json
