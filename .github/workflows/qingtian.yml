@@ -4,6 +4,26 @@ run-name: 擎天
 "on":
   workflow_dispatch:
     inputs:
+      qingtian_date_choice:
+        description: "🎨 选择海选日期｜默认：上一个交易日"
+        required: false
+        type: choice
+        default: "🟦 上一个交易日"
+        options:
+          - "🟦 上一个交易日"
+          - "🟩 当前交易日"
+          - "🟨 上两个交易日"
+          - "🟧 上三个交易日"
+          - "🟥 上四个交易日"
+          - "🟪 上五个交易日"
+          - "🟫 上六个交易日"
+          - "⬛ 上七个交易日"
+
+      qingtian_target_date:
+        description: "✍️ 手动日期｜可填0604、6.4、YYYY-MM-DD、YYYYMMDD｜填了优先"
+        required: false
+        default: ""
+
       qingtian_send_telegram:
         description: "📨 是否发送Telegram"
         required: false
@@ -13,8 +33,29 @@ run-name: 擎天
           - "🟩 是｜发送Telegram"
           - "⬜ 否｜不发送Telegram"
 
+      qingtian_data_mode:
+        description: "🔄 数据模式｜默认：优先缓存，失败再补拉"
+        required: false
+        type: choice
+        default: "🟦 优先缓存｜失败补拉"
+        options:
+          - "🟦 优先缓存｜失败补拉"
+          - "🟧 强制刷新｜重新补拉"
+          - "⬜ 只读缓存｜不补拉"
+
+      qingtian_scan_mode:
+        description: "📊 扫描模式｜默认：全市场"
+        required: false
+        type: choice
+        default: "🟩 全市场扫描"
+        options:
+          - "🟩 全市场扫描"
+          - "🟨 快速调试100只"
+          - "🟧 调试300只"
+          - "⬜ 仅自检"
+
       qingtian_scan_limit:
-        description: "🔎 调试用扫描数量｜0=全市场"
+        description: "🔎 手动扫描数量｜0=按扫描模式｜填了优先"
         required: false
         default: "0"
 
@@ -43,24 +84,110 @@ jobs:
         id: config
         shell: bash
         env:
+          QINGTIAN_INPUT_DATE_CHOICE: ${{ github.event.inputs.qingtian_date_choice }}
+          QINGTIAN_INPUT_TARGET_DATE: ${{ github.event.inputs.qingtian_target_date }}
           QINGTIAN_INPUT_SEND_TELEGRAM: ${{ github.event.inputs.qingtian_send_telegram }}
+          QINGTIAN_INPUT_DATA_MODE: ${{ github.event.inputs.qingtian_data_mode }}
+          QINGTIAN_INPUT_SCAN_MODE: ${{ github.event.inputs.qingtian_scan_mode }}
           QINGTIAN_INPUT_SCAN_LIMIT: ${{ github.event.inputs.qingtian_scan_limit }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import os
+          import re
+          from datetime import datetime, timedelta, timezone
+
+          def norm_date(x, today):
+              s = str(x or '').strip()
+              if not s:
+                  return ''
+              s = s.replace('年', '-').replace('月', '-').replace('日', '')
+              s = s.replace('/', '-').replace('.', '-').replace('_', '-').strip()
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              m = re.fullmatch(r'(\d{1,2})-(\d{1,2})', s)
+              if m:
+                  month, day = int(m.group(1)), int(m.group(2))
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
+              if len(s) in (3, 4) and s.isdigit():
+                  month, day = int(s[:-2]), int(s[-2:])
+                  return f'{today.year:04d}-{month:02d}-{day:02d}'
+              return s[:10]
+
+          def shift_trading_day(d, n):
+              if n == 0:
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  return d
+              moved = 0
+              while moved < n:
+                  d -= timedelta(days=1)
+                  if d.weekday() < 5:
+                      moved += 1
+              return d
+
+          now = datetime.now(timezone(timedelta(hours=8)))
+          today = now.date()
+
+          manual = norm_date(os.environ.get('QINGTIAN_INPUT_TARGET_DATE'), today)
+          choice = str(os.environ.get('QINGTIAN_INPUT_DATE_CHOICE') or '').strip()
+          choice_map = {
+              '当前交易日': 0,
+              '上一个交易日': 1,
+              '上两个交易日': 2,
+              '上三个交易日': 3,
+              '上四个交易日': 4,
+              '上五个交易日': 5,
+              '上六个交易日': 6,
+              '上七个交易日': 7,
+          }
+          offset = 1
+          for key, value in choice_map.items():
+              if key in choice:
+                  offset = value
+                  break
+          if manual:
+              target = manual
+              reason = 'manual_date'
+          else:
+              target = shift_trading_day(today, offset).isoformat()
+              reason = f'dropdown_offset_{offset}'
 
           send_choice = str(os.environ.get('QINGTIAN_INPUT_SEND_TELEGRAM') or '')
           send_telegram = '0' if '不发送' in send_choice or '否' in send_choice else '1'
 
+          data_mode = str(os.environ.get('QINGTIAN_INPUT_DATA_MODE') or '')
+          force_refresh = '1' if '强制刷新' in data_mode else '0'
+          cache_only = '1' if '只读缓存' in data_mode else '0'
+
+          scan_mode = str(os.environ.get('QINGTIAN_INPUT_SCAN_MODE') or '')
+          self_test_only = '1' if '仅自检' in scan_mode else '0'
+          if '快速调试100' in scan_mode:
+              mode_limit = 100
+          elif '调试300' in scan_mode:
+              mode_limit = 300
+          else:
+              mode_limit = 0
+
           raw_limit = str(os.environ.get('QINGTIAN_INPUT_SCAN_LIMIT') or '0').strip()
           try:
-              scan_limit = int(raw_limit)
+              manual_limit = int(raw_limit)
           except Exception:
-              scan_limit = 0
-          if scan_limit < 0:
-              scan_limit = 0
+              manual_limit = 0
+          if manual_limit < 0:
+              manual_limit = 0
+          scan_limit = manual_limit if manual_limit > 0 else mode_limit
 
+          print(f'target_date={target}')
+          print(f'target_reason={reason}')
+          print(f'date_choice={choice}')
           print(f'send_telegram={send_telegram}')
+          print(f'data_mode={data_mode}')
+          print(f'force_refresh={force_refresh}')
+          print(f'cache_only={cache_only}')
+          print(f'scan_mode={scan_mode}')
+          print(f'self_test_only={self_test_only}')
           print(f'scan_limit={scan_limit}')
           PY
 
@@ -89,7 +216,14 @@ jobs:
 
       - name: inspect cache before qingtian
         run: |
+          echo "target date: ${{ steps.config.outputs.target_date }}"
+          echo "target reason: ${{ steps.config.outputs.target_reason }}"
+          echo "date choice: ${{ steps.config.outputs.date_choice }}"
           echo "send telegram: ${{ steps.config.outputs.send_telegram }}"
+          echo "data mode: ${{ steps.config.outputs.data_mode }}"
+          echo "force refresh: ${{ steps.config.outputs.force_refresh }}"
+          echo "cache only: ${{ steps.config.outputs.cache_only }}"
+          echo "scan mode: ${{ steps.config.outputs.scan_mode }}"
           echo "scan limit: ${{ steps.config.outputs.scan_limit }}"
           find kline_cache qingtian_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
           find kline_cache qingtian_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -80 || true
@@ -103,6 +237,7 @@ jobs:
         run: python -u 擎天.py --self-test
 
       - name: run qingtian
+        if: ${{ steps.config.outputs.self_test_only != '1' }}
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -110,14 +245,22 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
           QINGTIAN_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          QINGTIAN_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
           QINGTIAN_SCAN_LIMIT: ${{ steps.config.outputs.scan_limit }}
+          QINGTIAN_CACHE_ONLY: ${{ steps.config.outputs.cache_only }}
+          QINGTIAN_REQUEST_SLEEP: "0.12"
           NO_COLOR: ""
         run: |
-          if [ "${{ steps.config.outputs.send_telegram }}" = "1" ]; then
-            python -u 擎天.py --scan --limit "${{ steps.config.outputs.scan_limit }}" --telegram
-          else
-            python -u 擎天.py --scan --limit "${{ steps.config.outputs.scan_limit }}"
+          ARGS="--scan --limit ${{ steps.config.outputs.scan_limit }}"
+          if [ "${{ steps.config.outputs.force_refresh }}" = "1" ]; then
+            ARGS="$ARGS --force-refresh"
           fi
+          if [ "${{ steps.config.outputs.send_telegram }}" = "1" ]; then
+            ARGS="$ARGS --telegram"
+          fi
+          python -u 擎天.py $ARGS
 
       - name: upload reports
         if: always()
