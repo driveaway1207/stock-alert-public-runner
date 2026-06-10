@@ -1,0 +1,143 @@
+name: 擎天
+run-name: 擎天
+
+"on":
+  workflow_dispatch:
+    inputs:
+      qingtian_send_telegram:
+        description: "📨 是否发送Telegram"
+        required: false
+        type: choice
+        default: "🟩 是｜发送Telegram"
+        options:
+          - "🟩 是｜发送Telegram"
+          - "⬜ 否｜不发送Telegram"
+
+      qingtian_scan_limit:
+        description: "🔎 调试用扫描数量｜0=全市场"
+        required: false
+        default: "0"
+
+  schedule:
+    - cron: "25 12 * * 1-5"
+
+concurrency:
+  group: qingtian-singleton-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  qingtian:
+    name: 擎天
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: resolve config
+        id: config
+        shell: bash
+        env:
+          QINGTIAN_INPUT_SEND_TELEGRAM: ${{ github.event.inputs.qingtian_send_telegram }}
+          QINGTIAN_INPUT_SCAN_LIMIT: ${{ github.event.inputs.qingtian_scan_limit }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+
+          send_choice = str(os.environ.get('QINGTIAN_INPUT_SEND_TELEGRAM') or '')
+          send_telegram = '0' if '不发送' in send_choice or '否' in send_choice else '1'
+
+          raw_limit = str(os.environ.get('QINGTIAN_INPUT_SCAN_LIMIT') or '0').strip()
+          try:
+              scan_limit = int(raw_limit)
+          except Exception:
+              scan_limit = 0
+          if scan_limit < 0:
+              scan_limit = 0
+
+          print(f'send_telegram={send_telegram}')
+          print(f'scan_limit={scan_limit}')
+          PY
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: restore shared kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kline_cache
+            qingtian_cache
+          key: a-kline-cache-${{ github.ref_name }}-qingtian-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+            a-stock-kline-cache-v1-
+            a-stock-full-kline-cache-
+            employee5-kline-cache-
+            kline-cache-
+
+      - name: inspect cache before qingtian
+        run: |
+          echo "send telegram: ${{ steps.config.outputs.send_telegram }}"
+          echo "scan limit: ${{ steps.config.outputs.scan_limit }}"
+          find kline_cache qingtian_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          find kline_cache qingtian_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -80 || true
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm tabulate
+
+      - name: self test qingtian
+        run: python -u 擎天.py --self-test
+
+      - name: run qingtian
+        env:
+          PYTHONUNBUFFERED: 1
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          QINGTIAN_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          QINGTIAN_SCAN_LIMIT: ${{ steps.config.outputs.scan_limit }}
+          NO_COLOR: ""
+        run: |
+          if [ "${{ steps.config.outputs.send_telegram }}" = "1" ]; then
+            python -u 擎天.py --scan --limit "${{ steps.config.outputs.scan_limit }}" --telegram
+          else
+            python -u 擎天.py --scan --limit "${{ steps.config.outputs.scan_limit }}"
+          fi
+
+      - name: upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qingtian-reports
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: upload cache visibility snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qingtian-cache-visibility-snapshot
+          path: |
+            kline_cache/
+            qingtian_cache/
+            employee5_kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          if-no-files-found: ignore
+          retention-days: 3
