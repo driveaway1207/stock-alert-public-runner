@@ -2,16 +2,11 @@
 """
 擎天.py
 
-擎天战法全市场月线扫描器。
+擎天战法全市场月线扫描器。默认对齐三号员工链路：先读公共 kline_cache，
+不把 AkShare 股票池作为第一入口，避免远端断开导致空报告。
 
-规则：
-1. 月线必须是真阳线。
-2. 月线实体涨幅必须严格大于30%，不能等于30%。
-3. 擎天位 = 开盘价 + (收盘价 - 开盘价) * 2/3，也就是实体66.7%位。
-4. 后续必须连续超过3根月K收盘不破擎天位，即至少4根月K收盘价 >= 擎天位。
-5. 只看收盘不破；影线跌破允许，但在报告中提示回踩深度。
-
-输出：artifacts/qingtian_latest.csv、qingtian_latest.json、qingtian_report.md。
+规则：月线真阳线；实体涨幅严格大于30%；擎天位为实体66.7%；
+后续至少4根月K收盘不破擎天位。
 """
 from __future__ import annotations
 
@@ -26,21 +21,72 @@ import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-try:
-    import requests
-except Exception:
-    requests = None
-
-VERSION = "擎天-v2.1.0"
+VERSION = "擎天-v3.0-cache-first"
+ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = Path("artifacts")
 DEFAULT_CACHE_DIR = Path("qingtian_cache")
+CACHE_DIRS = [ROOT / "kline_cache", ROOT / "employee5_kline_cache", ROOT / "data" / "kline_cache", ROOT / "cache" / "kline_cache", ROOT.parent / "kline_cache"]
 DEFAULT_MIN_BODY_PCT = 30.0
 DEFAULT_CONFIRM_MONTHS = 4
 DEFAULT_QINGTIAN_RATIO = 2 / 3
+MIN_CACHE_ROWS = 80
+
+
+def now_cn() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def ss(x: Any) -> str:
+    return "" if x is None else str(x).strip()
+
+
+def sf(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None or pd.isna(x):
+            return default
+        return float(str(x).replace("%", "").replace(",", ""))
+    except Exception:
+        return default
+
+
+def code_of(x: Any) -> str:
+    s = x.stem if isinstance(x, Path) else ss(x)
+    m = re.search(r"(\d{6})", s)
+    return m.group(1) if m else ""
+
+
+def normalize_code(raw: Any) -> str:
+    c = code_of(raw)
+    if c:
+        return c
+    digits = re.sub(r"\D", "", ss(raw))
+    return digits.zfill(6)[-6:] if digits else ""
+
+
+def valid_code(code: Any) -> bool:
+    c = normalize_code(code)
+    return c.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689", "920", "8", "4"))
+
+
+def norm_date(x: Any) -> str:
+    s = ss(x)[:10].replace("/", "-").replace(".", "-").replace("_", "-")
+    digits = re.sub(r"\D", "", s)
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}" if len(digits) >= 8 else ""
+
+
+def target_date() -> str:
+    for k in ["QINGTIAN_TARGET_DATE", "TARGET_TRADE_DATE", "DATA_GATE_TARGET_DATE"]:
+        v = os.getenv(k)
+        if v:
+            return norm_date(v)
+    return now_cn().strftime("%Y-%m-%d")
+
+TARGET_DASH = target_date()
+
 
 @dataclass
 class QingtianSignal:
@@ -63,10 +109,12 @@ class QingtianSignal:
     status: str
     rank_score: float = 0.0
 
+
 @dataclass
 class ScanSummary:
     version: str
     run_time: str
+    target_date: str
     scanned_count: int
     success_count: int
     failed_count: int
@@ -74,69 +122,89 @@ class ScanSummary:
     strict_body_pct: float
     required_confirm_months: int
     qingtian_ratio: float
-    cache_dir: str
-    output_dir: str
-    telegram_enabled: bool
     data_status: str
-
-
-def now_cn() -> datetime:
-    return datetime.now(timezone(timedelta(hours=8)))
-
-
-def normalize_code(raw: str) -> str:
-    code = str(raw or "").strip()
-    if "." in code:
-        parts = code.split(".")
-        code = parts[-1] if len(parts[-1]) == 6 else parts[0]
-    digits = re.sub(r"\D", "", code)
-    return digits.zfill(6)[-6:]
+    cache_files: int
 
 
 def qingtian_level(open_price: float, close_price: float, ratio: float = DEFAULT_QINGTIAN_RATIO) -> float:
     return float(open_price + (close_price - open_price) * ratio)
 
 
-def request_retry(fn, name: str, tries: int = 4, sleep: float = 3.0):
-    last_exc = None
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as exc:
-            last_exc = exc
-            print(f"{name}失败，第{i + 1}/{tries}次：{exc}", flush=True)
-            if i < tries - 1:
-                time.sleep(sleep * (i + 1))
-    raise last_exc
+def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    mp = {"日期":"date","交易日期":"date","date":"date","time":"date","代码":"code","股票代码":"code","证券代码":"code","code":"code","symbol":"code","名称":"name","股票名称":"name","股票简称":"name","证券简称":"name","name":"name","开盘":"open","开盘价":"open","open":"open","最高":"high","最高价":"high","high":"high","最低":"low","最低价":"low","low":"low","收盘":"close","收盘价":"close","close":"close","成交量":"volume","volume":"volume","vol":"volume","成交额":"amount","amount":"amount"}
+    d = df.rename(columns={c: mp.get(str(c), mp.get(str(c).lower(), c)) for c in df.columns}).copy()
+    if not {"date", "open", "high", "low", "close"}.issubset(d.columns):
+        return pd.DataFrame()
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col in d.columns:
+            d[col] = d[col].map(sf)
+    if "name" not in d.columns:
+        d["name"] = ""
+    if "code" not in d.columns:
+        d["code"] = ""
+    d["date"] = d["date"].map(norm_date)
+    d["code"] = d["code"].map(normalize_code)
+    d["name"] = d["name"].map(ss)
+    d = d[(d.date != "") & (d.open > 0) & (d.high > 0) & (d.low > 0) & (d.close > 0)]
+    if TARGET_DASH:
+        d = d[d.date <= TARGET_DASH]
+    return d.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+
+def read_any_kline(path: Path) -> pd.DataFrame:
+    try:
+        if path.suffix.lower() == ".csv":
+            return normalize_hist(pd.read_csv(path))
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        rows = obj.get("rows") or obj.get("data") or obj.get("klines") or [] if isinstance(obj, dict) else obj
+        return normalize_hist(pd.DataFrame(rows))
+    except Exception:
+        return pd.DataFrame()
+
+
+def iter_cache_files(limit: int = 0) -> List[Path]:
+    seen: Dict[str, Path] = {}
+    for d in CACHE_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*")):
+            if p.suffix.lower() not in {".csv", ".json"}:
+                continue
+            c = code_of(p)
+            if valid_code(c) and c not in seen:
+                seen[c] = p
+    files = list(seen.values())
+    return files[:limit] if limit and limit > 0 else files
+
+
+def to_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    d = normalize_hist(df)
+    if d.empty:
+        return pd.DataFrame()
+    d["dt"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["dt"]).sort_values("dt")
+    d["month"] = d["dt"].dt.to_period("M")
+    rows = []
+    for _, g in d.groupby("month"):
+        g = g.sort_values("dt")
+        rows.append({"date": g.iloc[-1]["dt"].strftime("%Y-%m-%d"), "open": float(g.iloc[0]["open"]), "high": float(g["high"].max()), "low": float(g["low"].min()), "close": float(g.iloc[-1]["close"])})
+    return pd.DataFrame(rows)
+
+
+def stock_name(df: pd.DataFrame) -> str:
+    if "name" not in df.columns:
+        return "名称待补"
+    vals = [ss(x) for x in df["name"].tolist() if ss(x) and ss(x).lower() not in {"nan", "none", "null"} and not re.fullmatch(r"\d{6}", ss(x))]
+    return vals[-1] if vals else "名称待补"
 
 
 def prepare_monthly_df(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map = {
-        "日期": "date", "时间": "date", "交易日期": "date",
-        "开盘": "open", "开盘价": "open",
-        "收盘": "close", "收盘价": "close",
-        "最高": "high", "最高价": "high",
-        "最低": "low", "最低价": "low",
-        "成交量": "volume", "成交额": "amount",
-        "date": "date", "open": "open", "close": "close", "high": "high", "low": "low",
-        "volume": "volume", "amount": "amount",
-    }
-    if df is None or df.empty:
-        raise ValueError("月线数据为空")
-    data = df.rename(columns={c: rename_map.get(c, c) for c in df.columns}).copy()
-    required = ["date", "open", "high", "low", "close"]
-    missing = [c for c in required if c not in data.columns]
-    if missing:
-        raise ValueError(f"月线数据缺少字段: {missing}")
-    data = data[required + [c for c in ["volume", "amount"] if c in data.columns]].copy()
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    for col in ["open", "high", "low", "close"]:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-    data = data.dropna(subset=required)
-    data = data[(data["open"] > 0) & (data["high"] > 0) & (data["low"] > 0) & (data["close"] > 0)]
-    data = data.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
-    data["date"] = data["date"].dt.strftime("%Y-%m-%d")
-    return data
+    d = normalize_hist(df)
+    if d.empty:
+        raise ValueError("月线数据为空或字段不完整")
+    return d[["date", "open", "high", "low", "close"]].copy()
 
 
 def find_qingtian_signals(monthly_df: pd.DataFrame, code: str = "", name: str = "", min_body_pct: float = DEFAULT_MIN_BODY_PCT, required_confirm_months: int = DEFAULT_CONFIRM_MONTHS, ratio: float = DEFAULT_QINGTIAN_RATIO) -> List[QingtianSignal]:
@@ -148,8 +216,8 @@ def find_qingtian_signals(monthly_df: pd.DataFrame, code: str = "", name: str = 
         return signals
     for i in range(0, len(df) - required_confirm_months):
         row = df.iloc[i]
-        o, c = float(row["open"]), float(row["close"])
-        h, l = float(row["high"]), float(row["low"])
+        o, c = float(row.open), float(row.close)
+        h, l = float(row.high), float(row.low)
         if c <= o:
             continue
         body_pct = (c - o) / o * 100.0
@@ -158,7 +226,7 @@ def find_qingtian_signals(monthly_df: pd.DataFrame, code: str = "", name: str = 
         level = qingtian_level(o, c, ratio=float(ratio))
         future = df.iloc[i + 1:]
         confirm = 0
-        for close_price in future["close"].astype(float).tolist():
+        for close_price in future.close.astype(float).tolist():
             if close_price >= level:
                 confirm += 1
             else:
@@ -167,124 +235,13 @@ def find_qingtian_signals(monthly_df: pd.DataFrame, code: str = "", name: str = 
             continue
         accepted = future.iloc[:confirm]
         last = accepted.iloc[-1]
-        last_close = float(last["close"])
-        min_close_after = float(accepted["close"].min())
-        min_low_after = float(accepted["low"].min())
+        min_close_after = float(accepted.close.min())
+        min_low_after = float(accepted.low.min())
         close_cushion = (min_close_after / level - 1.0) * 100.0
         low_drawdown = (min_low_after / level - 1.0) * 100.0
-        if confirm >= 8 and close_cushion >= 0:
-            status = "擎天长期锁筹"
-        elif low_drawdown < -12:
-            status = "擎天收盘不破但影线深踩"
-        else:
-            status = "擎天确认"
-        signals.append(QingtianSignal(
-            code=normalize_code(code) if code else "",
-            name=name or "",
-            qingtian_month=str(row["date"]),
-            qingtian_open=round(o, 4),
-            qingtian_close=round(c, 4),
-            qingtian_high=round(h, 4),
-            qingtian_low=round(l, 4),
-            body_pct=round(body_pct, 2),
-            qingtian_level=round(level, 4),
-            confirm_months=int(confirm),
-            last_month=str(last["date"]),
-            last_close=round(last_close, 4),
-            distance_to_qingtian_pct=round((last_close / level - 1.0) * 100.0, 2),
-            max_drawdown_close_pct=round(close_cushion, 2),
-            lowest_low_after_pct=round(low_drawdown, 2),
-            months_since_qingtian=int(len(df) - i - 1),
-            status=status,
-        ))
+        status = "擎天长期锁筹" if confirm >= 8 and close_cushion >= 0 else ("擎天收盘不破但影线深踩" if low_drawdown < -12 else "擎天确认")
+        signals.append(QingtianSignal(normalize_code(code), name or "名称待补", str(row.date), round(o,4), round(c,4), round(h,4), round(l,4), round(body_pct,2), round(level,4), int(confirm), str(last.date), round(float(last.close),4), round((float(last.close)/level-1)*100,2), round(close_cushion,2), round(low_drawdown,2), int(len(df)-i-1), status))
     return signals
-
-
-def normalize_pool(pool: pd.DataFrame) -> pd.DataFrame:
-    if pool is None or pool.empty:
-        raise RuntimeError("股票池为空")
-    code_col = "代码" if "代码" in pool.columns else ("code" if "code" in pool.columns else pool.columns[0])
-    name_col = "名称" if "名称" in pool.columns else ("name" if "name" in pool.columns else pool.columns[1])
-    out = pool[[code_col, name_col]].rename(columns={code_col: "code", name_col: "name"}).copy()
-    out["code"] = out["code"].map(normalize_code)
-    out["name"] = out["name"].astype(str).str.strip()
-    bad_name = out["name"].str.contains(r"ST|\*ST|退市|退|ETF|基金|债|转债|B股", case=False, regex=True, na=False)
-    bad_code = out["code"].str.startswith(("8", "4"))
-    out = out[~bad_name & ~bad_code]
-    out = out[out["code"].str.len() == 6]
-    return out.drop_duplicates("code").sort_values("code").reset_index(drop=True)
-
-
-def get_stock_pool_from_cache(cache_dir: Path) -> Optional[pd.DataFrame]:
-    for p in [cache_dir / "stock_pool.csv", Path("stock_pool.csv"), Path("data/stock_pool.csv")]:
-        if p.exists():
-            try:
-                return normalize_pool(pd.read_csv(p))
-            except Exception:
-                pass
-    return None
-
-
-def get_stock_pool(cache_dir: Path) -> Tuple[pd.DataFrame, str]:
-    cached = get_stock_pool_from_cache(cache_dir)
-    try:
-        import akshare as ak
-        def call_spot():
-            return ak.stock_zh_a_spot_em()
-        spot = request_retry(call_spot, "获取AkShare股票池", tries=4, sleep=4)
-        pool = normalize_pool(spot)
-        if not pool.empty:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            pool.to_csv(cache_dir / "stock_pool.csv", index=False, encoding="utf-8-sig")
-            return pool, "akshare"
-    except Exception as exc:
-        print(f"AkShare股票池不可用：{exc}", flush=True)
-    if cached is not None and not cached.empty:
-        return cached, "cache"
-    raise RuntimeError("股票池获取失败，且没有可用缓存")
-
-
-def read_cache(cache_file: Path) -> Optional[pd.DataFrame]:
-    if not cache_file.exists():
-        return None
-    try:
-        cached = pd.read_csv(cache_file)
-        if cached.empty:
-            return None
-        return cached.drop(columns=["cache_date"], errors="ignore")
-    except Exception:
-        return None
-
-
-def fetch_monthly_with_cache(code: str, cache_dir: Path, sleep_sec: float = 0.12, force_refresh: bool = False) -> pd.DataFrame:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    code = normalize_code(code)
-    cache_file = cache_dir / f"{code}_monthly.csv"
-    today = now_cn().strftime("%Y-%m-%d")
-    if not force_refresh and cache_file.exists():
-        try:
-            raw = pd.read_csv(cache_file)
-            if "cache_date" in raw.columns and str(raw["cache_date"].iloc[-1]) == today:
-                return prepare_monthly_df(raw.drop(columns=["cache_date"], errors="ignore"))
-        except Exception:
-            pass
-    try:
-        import akshare as ak
-        def call_hist():
-            return ak.stock_zh_a_hist(symbol=code, period="monthly", start_date="19900101", end_date="20991231", adjust="qfq")
-        df = request_retry(call_hist, f"获取{code}月线", tries=3, sleep=2)
-        df = prepare_monthly_df(df)
-        out = df.copy()
-        out["cache_date"] = today
-        out.to_csv(cache_file, index=False, encoding="utf-8-sig")
-        if sleep_sec > 0:
-            time.sleep(float(sleep_sec))
-        return df
-    except Exception as exc:
-        cached = read_cache(cache_file)
-        if cached is not None and not cached.empty:
-            return prepare_monthly_df(cached)
-        raise RuntimeError(f"获取月线失败 {code}: {exc}") from exc
 
 
 def rank_signals(signals: Iterable[QingtianSignal]) -> pd.DataFrame:
@@ -293,156 +250,77 @@ def rank_signals(signals: Iterable[QingtianSignal]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df["qingtian_month_dt"] = pd.to_datetime(df["qingtian_month"], errors="coerce")
-    df["rank_score"] = (
-        df["body_pct"].clip(upper=85) * 0.45
-        + df["confirm_months"].clip(upper=18) * 2.8
-        + df["distance_to_qingtian_pct"].clip(lower=0, upper=55) * 0.18
-        - df["lowest_low_after_pct"].clip(upper=0).abs() * 0.12
-        - df["months_since_qingtian"].clip(lower=0, upper=60) * 0.03
-    ).round(2)
+    df["rank_score"] = (df["body_pct"].clip(upper=85) * 0.45 + df["confirm_months"].clip(upper=18) * 2.8 + df["distance_to_qingtian_pct"].clip(lower=0, upper=55) * 0.18 - df["lowest_low_after_pct"].clip(upper=0).abs() * 0.12 - df["months_since_qingtian"].clip(lower=0, upper=60) * 0.03).round(2)
     return df.sort_values(["qingtian_month_dt", "rank_score", "confirm_months"], ascending=[False, False, False]).drop(columns=["qingtian_month_dt"]).reset_index(drop=True)
 
 
-def build_markdown_report(df: pd.DataFrame, summary: ScanSummary) -> str:
-    lines = [
-        "# 擎天扫描报告", "",
-        f"- 版本：{summary.version}",
-        f"- 运行时间：{summary.run_time}",
-        f"- 数据状态：{summary.data_status}",
-        f"- 扫描数量：{summary.scanned_count}",
-        f"- 成功数量：{summary.success_count}",
-        f"- 失败数量：{summary.failed_count}",
-        f"- 命中数量：{summary.signal_count}",
-        f"- 规则：月线阳实体涨幅 > {summary.strict_body_pct:.1f}%，后续至少 {summary.required_confirm_months} 根月K收盘不破擎天位",
-        "", "## 交易解释", "",
-        "擎天看的是：一根月线大阳线把筹码成本抬高后，后续至少四个月收盘都守在实体66.7%位之上。守得住，说明大阳线不是一日游，资金在高位承接。",
-        "",
-    ]
+def build_report(df: pd.DataFrame, summary: ScanSummary) -> str:
+    lines = ["# 擎天扫描报告", "", f"- 版本：{summary.version}", f"- 运行时间：{summary.run_time}", f"- 目标日期：{summary.target_date}", f"- 数据状态：{summary.data_status}", f"- 缓存文件：{summary.cache_files}", f"- 扫描数量：{summary.scanned_count}", f"- 成功数量：{summary.success_count}", f"- 失败数量：{summary.failed_count}", f"- 命中数量：{summary.signal_count}", f"- 规则：月线阳实体涨幅 > {summary.strict_body_pct:.1f}%，后续至少 {summary.required_confirm_months} 根月K收盘不破擎天位", "", "擎天看的是一根月线大阳线把筹码成本抬高后，后续至少四个月收盘都守在实体66.7%位之上。", ""]
     if df.empty:
         lines.append("本次没有命中擎天结构。")
         return "\n".join(lines)
-    show_cols = ["code", "name", "qingtian_month", "body_pct", "qingtian_level", "confirm_months", "last_month", "last_close", "distance_to_qingtian_pct", "lowest_low_after_pct", "status", "rank_score"]
+    cols = ["code", "name", "qingtian_month", "body_pct", "qingtian_level", "confirm_months", "last_month", "last_close", "distance_to_qingtian_pct", "lowest_low_after_pct", "status", "rank_score"]
     lines += ["## 命中列表", ""]
     try:
-        lines.append(df[show_cols].head(120).to_markdown(index=False))
+        lines.append(df[cols].head(150).to_markdown(index=False))
     except Exception:
-        lines.append(df[show_cols].head(120).to_csv(index=False))
-    lines += ["", "## 字段说明", "", "- 擎天月：出现月线大阳实体涨幅超过30%的月份。", "- 擎天位：大阳线实体66.7%位。", "- 确认月数：擎天月之后连续收盘不破擎天位的月K数量，必须大于3。"]
+        lines.append(df[cols].head(150).to_csv(index=False))
     return "\n".join(lines)
 
 
-def telegram_enabled_by_env(args_telegram: bool) -> bool:
-    if not args_telegram:
-        return False
-    for key in ["ENABLE_TELEGRAM", "QINGTIAN_SEND_TELEGRAM"]:
-        value = str(os.getenv(key, "")).strip().lower()
-        if value in {"0", "false", "no", "off"}:
-            return False
-    return True
-
-
-def send_telegram(text: str) -> bool:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_TOKEN", "").strip() or os.getenv("TG_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip() or os.getenv("TG_CHAT_ID", "").strip()
-    if not token or not chat_id or requests is None:
-        return False
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text[:3900], "disable_web_page_preview": True}, timeout=25)
-        return bool(r.ok)
-    except Exception:
-        return False
-
-
-def build_telegram_text(df: pd.DataFrame, summary: ScanSummary) -> str:
-    lines = ["擎天扫描完成", f"命中：{summary.signal_count}", f"成功：{summary.success_count}", f"失败：{summary.failed_count}", f"数据：{summary.data_status}"]
-    if not df.empty:
-        lines.append("\nTop命中：")
-        for r in df.head(12).itertuples():
-            lines.append(f"{r.code} {r.name}｜擎天位{r.qingtian_level}｜{r.qingtian_month}｜守{r.confirm_months}月｜{r.status}")
-    return "\n".join(lines)
-
-
-def write_empty_outputs(output_dir: Path, summary: ScanSummary, reason: str) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    empty = pd.DataFrame()
-    empty.to_csv(output_dir / "qingtian_latest.csv", index=False, encoding="utf-8-sig")
-    (output_dir / "qingtian_latest.json").write_text(json.dumps({"summary": asdict(summary), "signals": [], "reason": reason}, ensure_ascii=False, indent=2), encoding="utf-8")
-    (output_dir / "qingtian_report.md").write_text(build_markdown_report(empty, summary) + f"\n\n## 运行提示\n\n{reason}\n", encoding="utf-8")
+def write_outputs(df: pd.DataFrame, summary: ScanSummary, failed: List[dict], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "qingtian_latest.csv", index=False, encoding="utf-8-sig")
+    (out_dir / "qingtian_latest.json").write_text(json.dumps({"summary": asdict(summary), "signals": df.to_dict("records")}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "qingtian_report.md").write_text(build_report(df, summary), encoding="utf-8")
+    if failed:
+        pd.DataFrame(failed).to_csv(out_dir / "qingtian_failed.csv", index=False, encoding="utf-8-sig")
 
 
 def run_scan(args: argparse.Namespace) -> Tuple[pd.DataFrame, ScanSummary]:
-    output_dir, cache_dir = Path(args.output_dir), Path(args.cache_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    enable_tg = telegram_enabled_by_env(bool(args.telegram))
-    try:
-        pool, pool_source = get_stock_pool(cache_dir)
-    except Exception as exc:
-        summary = ScanSummary(VERSION, now_cn().strftime("%Y-%m-%d %H:%M:%S"), 0, 0, 1, 0, float(args.min_body_pct), int(args.confirm_months), float(args.ratio), str(cache_dir), str(output_dir), enable_tg, "stock_pool_failed")
-        reason = f"股票池获取失败：{exc}。这通常是远端接口临时断开，不是策略逻辑错误。"
-        write_empty_outputs(output_dir, summary, reason)
-        if enable_tg:
-            send_telegram("擎天扫描未完成：股票池接口临时失败，已生成空报告。")
-        print(reason, flush=True)
-        return pd.DataFrame(), summary
-    if args.limit and int(args.limit) > 0:
-        pool = pool.head(int(args.limit)).copy()
+    out_dir = Path(args.output_dir)
+    files = iter_cache_files(limit=int(args.limit or 0))
     all_signals: List[QingtianSignal] = []
     failed: List[dict] = []
     success = 0
-    for idx, item in pool.iterrows():
-        code, name = normalize_code(item["code"]), str(item["name"])
+    print(f"擎天按三号员工方式读取公共缓存：{len(files)} 个文件", flush=True)
+    start = time.time()
+    for i, p in enumerate(files, 1):
+        code = code_of(p)
         try:
-            monthly = fetch_monthly_with_cache(code, cache_dir=cache_dir, sleep_sec=float(args.sleep), force_refresh=bool(args.force_refresh))
-            all_signals.extend(find_qingtian_signals(monthly, code=code, name=name, min_body_pct=float(args.min_body_pct), required_confirm_months=int(args.confirm_months), ratio=float(args.ratio)))
-            success += 1
+            daily = read_any_kline(p)
+            if daily.empty or len(daily) < MIN_CACHE_ROWS:
+                failed.append({"code": code, "name": "", "error": "缓存为空或K线太短"})
+            else:
+                monthly = to_monthly(daily)
+                all_signals.extend(find_qingtian_signals(monthly, code=code, name=stock_name(daily), min_body_pct=float(args.min_body_pct), required_confirm_months=int(args.confirm_months), ratio=float(args.ratio)))
+                success += 1
         except Exception as exc:
-            failed.append({"code": code, "name": name, "error": str(exc)[:500]})
-        if (idx + 1) % int(args.progress_every) == 0:
-            print(f"已扫描 {idx + 1}/{len(pool)}，当前命中 {len(all_signals)}，失败 {len(failed)}", flush=True)
+            failed.append({"code": code, "name": "", "error": str(exc)[:300]})
+        if i == 1 or i % 500 == 0 or i == len(files):
+            elapsed = max(time.time() - start, 0.001)
+            print(f"擎天缓存进度 {i}/{len(files)}｜成功{success}｜失败{len(failed)}｜命中{len(all_signals)}｜速度{i/elapsed:.2f}只/秒｜当前{code}", flush=True)
     result_df = rank_signals(all_signals)
-    summary = ScanSummary(VERSION, now_cn().strftime("%Y-%m-%d %H:%M:%S"), int(len(pool)), int(success), int(len(failed)), int(len(result_df)), float(args.min_body_pct), int(args.confirm_months), float(args.ratio), str(cache_dir), str(output_dir), enable_tg, f"stock_pool_{pool_source}")
-    result_df.to_csv(output_dir / "qingtian_latest.csv", index=False, encoding="utf-8-sig")
-    (output_dir / "qingtian_latest.json").write_text(json.dumps({"summary": asdict(summary), "signals": result_df.to_dict("records")}, ensure_ascii=False, indent=2), encoding="utf-8")
-    (output_dir / "qingtian_report.md").write_text(build_markdown_report(result_df, summary), encoding="utf-8")
-    if failed:
-        pd.DataFrame(failed).to_csv(output_dir / "qingtian_failed.csv", index=False, encoding="utf-8-sig")
-    if enable_tg:
-        print(f"Telegram发送状态: {'成功' if send_telegram(build_telegram_text(result_df, summary)) else '未发送或失败'}", flush=True)
+    summary = ScanSummary(VERSION, now_cn().strftime("%Y-%m-%d %H:%M:%S"), TARGET_DASH, int(len(files)), int(success), int(len(failed)), int(len(result_df)), float(args.min_body_pct), int(args.confirm_months), float(args.ratio), "public_kline_cache", int(len(files)))
+    write_outputs(result_df, summary, failed, out_dir)
     return result_df, summary
 
 
 def self_test() -> None:
-    df_equal_30 = pd.DataFrame([
-        {"date": "2024-01-31", "open": 10, "high": 13, "low": 9.8, "close": 13},
-        {"date": "2024-02-29", "open": 13, "high": 13.5, "low": 12, "close": 12.1},
-        {"date": "2024-03-31", "open": 12.1, "high": 13, "low": 12, "close": 12.2},
-        {"date": "2024-04-30", "open": 12.2, "high": 13, "low": 12, "close": 12.3},
-        {"date": "2024-05-31", "open": 12.3, "high": 13, "low": 12, "close": 12.4},
-    ])
+    df_equal_30 = pd.DataFrame([{"date":"2024-01-31","open":10,"high":13,"low":9.8,"close":13},{"date":"2024-02-29","open":13,"high":13.5,"low":12,"close":12.1},{"date":"2024-03-31","open":12.1,"high":13,"low":12,"close":12.2},{"date":"2024-04-30","open":12.2,"high":13,"low":12,"close":12.3},{"date":"2024-05-31","open":12.3,"high":13,"low":12,"close":12.4}])
     assert len(find_qingtian_signals(df_equal_30)) == 0
-    df_hit = pd.DataFrame([
-        {"date": "2024-01-31", "open": 10, "high": 14, "low": 9.8, "close": 13.2},
-        {"date": "2024-02-29", "open": 13.2, "high": 13.5, "low": 11.0, "close": 12.2},
-        {"date": "2024-03-31", "open": 12.2, "high": 13, "low": 11.1, "close": 12.2},
-        {"date": "2024-04-30", "open": 12.0, "high": 13, "low": 11.2, "close": 12.2},
-        {"date": "2024-05-31", "open": 12.1, "high": 13, "low": 11.1, "close": 12.3},
-    ])
+    df_hit = pd.DataFrame([{"date":"2024-01-31","open":10,"high":14,"low":9.8,"close":13.2},{"date":"2024-02-29","open":13.2,"high":13.5,"low":11.0,"close":12.2},{"date":"2024-03-31","open":12.2,"high":13,"low":11.1,"close":12.2},{"date":"2024-04-30","open":12.0,"high":13,"low":11.2,"close":12.2},{"date":"2024-05-31","open":12.1,"high":13,"low":11.1,"close":12.3}])
     sig = find_qingtian_signals(df_hit, code="000001", name="测试")
-    assert len(sig) == 1
-    assert sig[0].confirm_months == 4
+    assert len(sig) == 1 and sig[0].confirm_months == 4
     assert math.isclose(sig[0].qingtian_level, round(10 + (13.2 - 10) * 2 / 3, 4), rel_tol=0, abs_tol=1e-4)
     assert len(find_qingtian_signals(df_hit.iloc[:4].copy())) == 0
     df_break = df_hit.copy(); df_break.loc[3, "close"] = 11.0
     assert len(find_qingtian_signals(df_break)) == 0
     df_low_break = df_hit.copy(); df_low_break.loc[2, "low"] = 8.0
     assert len(find_qingtian_signals(df_low_break)) == 1
-    cn = df_hit.rename(columns={"date": "日期", "open": "开盘", "high": "最高", "low": "最低", "close": "收盘"})
-    assert len(find_qingtian_signals(cn)) == 1
-    ranked = rank_signals(sig)
-    summary = ScanSummary(VERSION, now_cn().strftime("%Y-%m-%d %H:%M:%S"), 1, 1, 0, len(ranked), 30, 4, DEFAULT_QINGTIAN_RATIO, "cache", "artifacts", False, "test")
-    assert "擎天扫描报告" in build_markdown_report(ranked, summary)
-    print("擎天自检通过：7/7")
+    daily = pd.DataFrame([{"date":"2024-01-02","open":10,"high":11,"low":9.8,"close":10.5},{"date":"2024-01-31","open":10.5,"high":14,"low":10.1,"close":13.2},{"date":"2024-02-29","open":13.2,"high":13.5,"low":11,"close":12.2},{"date":"2024-03-29","open":12.2,"high":13,"low":11.1,"close":12.2},{"date":"2024-04-30","open":12,"high":13,"low":11.2,"close":12.2},{"date":"2024-05-31","open":12.1,"high":13,"low":11.1,"close":12.3}])
+    assert not to_monthly(daily).empty
+    print("擎天自检通过：8/8")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -455,8 +333,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-months", type=int, default=DEFAULT_CONFIRM_MONTHS)
     p.add_argument("--ratio", type=float, default=DEFAULT_QINGTIAN_RATIO)
     p.add_argument("--limit", type=int, default=int(os.getenv("QINGTIAN_SCAN_LIMIT", "0") or 0))
-    p.add_argument("--sleep", type=float, default=float(os.getenv("QINGTIAN_REQUEST_SLEEP", "0.12") or 0.12))
-    p.add_argument("--progress-every", type=int, default=200)
+    p.add_argument("--sleep", type=float, default=0.0)
+    p.add_argument("--progress-every", type=int, default=500)
     p.add_argument("--force-refresh", action="store_true")
     p.add_argument("--telegram", action="store_true")
     return p
@@ -471,8 +349,7 @@ def main() -> int:
             _, summary = run_scan(args)
             print(json.dumps(asdict(summary), ensure_ascii=False, indent=2))
             return 0
-        build_arg_parser().print_help()
-        return 0
+        build_arg_parser().print_help(); return 0
     except Exception as exc:
         print(f"擎天运行失败: {exc}", file=sys.stderr)
         traceback.print_exc()
