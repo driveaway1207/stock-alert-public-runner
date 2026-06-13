@@ -1,208 +1,439 @@
 # -*- coding: utf-8 -*-
+"""擎天：原生月K扫描器。
+
+规则：月线真阳线实体涨幅严格大于30%；擎天位为阳线实体上1/3位
+（开盘 + 实体 * 2/3）；其后至少4根月K收盘价全部不破擎天位。
+输出和Telegram只使用：股票代码 + 中文简称。
+"""
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import math
 import os
 import re
 import sys
+import time
 import traceback
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-VERSION = "擎天-v4-code-name-only"
+try:
+    import baostock as bs
+except Exception:
+    bs = None
+
+VERSION = "擎天-v5-native-monthly-20260613"
 ROOT = Path(__file__).resolve().parent
-CACHE_DIRS = [ROOT / "kline_cache", ROOT / "employee5_kline_cache", ROOT / "data" / "kline_cache", ROOT / "cache" / "kline_cache", ROOT.parent / "kline_cache"]
-OUT_DIR = ROOT / "artifacts"
-MIN_ROWS = 80
+REPORT_DIR = ROOT / "artifacts"
+OUTPUT_CSV = REPORT_DIR / "qingtian_latest.csv"
+OUTPUT_JSON = REPORT_DIR / "qingtian_latest.json"
+OUTPUT_MD = REPORT_DIR / "qingtian_report.md"
+SELF_CHECK_JSON = REPORT_DIR / "qingtian_self_check.json"
+CACHE_DIRS = [
+    ROOT / "kline_cache",
+    ROOT / "employee5_kline_cache",
+    ROOT / "data" / "kline_cache",
+    ROOT / "cache" / "kline_cache",
+    ROOT.parent / "kline_cache",
+]
+MIN_BODY_PCT = 30.0
+QINGTIAN_RATIO = 2.0 / 3.0
+REQUIRED_CONFIRM_MONTHS = 4
+MONTHLY_START_DATE = os.getenv("QINGTIAN_MONTHLY_START_DATE", "1990-01-01")
+SCAN_PROGRESS_EVERY = int(os.getenv("QINGTIAN_PROGRESS_EVERY", "200"))
+MAX_STOCKS = int(os.getenv("QINGTIAN_MAX_STOCKS", "0") or "0")
+TARGET_RAW_KEYS = [
+    "QINGTIAN_TARGET_DATE",
+    "SELECTION_TRADE_DATE",
+    "DATA_GATE_TARGET_DATE",
+    "TARGET_TRADE_DATE",
+    "LAST_TRADE_DAY_OVERRIDE",
+]
 
 
-def s(x: Any) -> str:
-    return "" if x is None else str(x).strip()
+@dataclass
+class StockItem:
+    code: str
+    bs_code: str
+    name: str
 
 
-def f(x: Any, default: float = 0.0) -> float:
+@dataclass
+class QingtianHit:
+    code: str
+    name: str
+    anchor_month: str
+    body_pct: float
+    qingtian_level: float
+    confirm_months: int
+
+
+@dataclass
+class ScanStat:
+    version: str
+    target_date: str
+    stock_pool_count: int
+    scanned_count: int
+    monthly_success_count: int
+    failed_count: int
+    signal_count: int
+    data_source: str
+
+
+def now_bj() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def ss(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def sf(value: Any, default: float = 0.0) -> float:
     try:
-        return float(str(x).replace(",", "").replace("%", ""))
+        if value is None or pd.isna(value):
+            return default
+        return float(str(value).replace(",", "").replace("%", ""))
     except Exception:
         return default
 
 
-def code_of(x: Any) -> str:
-    raw = x.stem if isinstance(x, Path) else s(x)
+def normalize_code(value: Any) -> str:
+    raw = ss(value)
     m = re.search(r"(\d{6})", raw)
     return m.group(1) if m else ""
 
 
-def valid_code(code: str) -> bool:
-    return bool(code) and code.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689"))
+def valid_a_code(code: Any) -> bool:
+    c = normalize_code(code)
+    return bool(c) and c.startswith((
+        "000", "001", "002", "003",
+        "300", "301",
+        "600", "601", "603", "605",
+        "688", "689",
+        "920", "8", "4",
+    ))
 
 
-def norm_date(x: Any) -> str:
-    raw = s(x)[:10].replace("/", "-").replace(".", "-").replace("_", "-")
-    d = re.sub(r"\D", "", raw)
-    return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) >= 8 else ""
+def to_bs_code(code: str) -> str:
+    c = normalize_code(code)
+    if not c:
+        return ""
+    if c.startswith(("600", "601", "603", "605", "688", "689")):
+        return f"sh.{c}"
+    if c.startswith(("000", "001", "002", "003", "300", "301")):
+        return f"sz.{c}"
+    if c.startswith(("8", "4", "920")):
+        return f"bj.{c}"
+    return ""
+
+
+def norm_date(value: Any) -> str:
+    raw = ss(value)
+    if not raw:
+        return ""
+    raw = raw.replace("年", "-").replace("月", "-").replace("日", "")
+    raw = raw.replace("/", "-").replace(".", "-").replace("_", "-").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return ""
+
+
+def prev_workday(day: datetime) -> datetime:
+    d = day
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 
 def target_date() -> str:
-    for key in ["QINGTIAN_TARGET_DATE", "SELECTION_TRADE_DATE", "TARGET_TRADE_DATE", "DATA_GATE_TARGET_DATE"]:
-        v = os.getenv(key, "")
-        if v:
-            return norm_date(v)
-    return ""
+    for key in TARGET_RAW_KEYS:
+        value = os.getenv(key)
+        if value:
+            parsed = norm_date(value)
+            if parsed:
+                return parsed
+    now = now_bj()
+    if now.weekday() >= 5 or now.hour < 20 or (now.hour == 20 and now.minute < 35):
+        now = prev_workday(now - timedelta(days=1))
+    return now.strftime("%Y-%m-%d")
 
-TARGET = target_date()
+
+TARGET_DASH = target_date()
 
 
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    mp = {"日期":"date", "交易日期":"date", "date":"date", "开盘":"open", "open":"open", "最高":"high", "high":"high", "最低":"low", "low":"low", "收盘":"close", "close":"close", "名称":"name", "股票名称":"name", "股票简称":"name", "name":"name", "代码":"code", "股票代码":"code", "code":"code"}
-    d = df.rename(columns={c: mp.get(str(c), str(c)) for c in df.columns}).copy()
-    if not {"date", "open", "high", "low", "close"}.issubset(d.columns):
+def ensure_report_dir() -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def rows_from_baostock_query(rs: Any) -> List[List[str]]:
+    rows: List[List[str]] = []
+    while rs is not None and rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    return rows
+
+
+def query_all_stocks(target: str) -> List[StockItem]:
+    if bs is None:
+        raise RuntimeError("baostock未安装，无法获取原生月K股票池")
+    items: List[StockItem] = []
+    seen: set[str] = set()
+
+    def add(code_raw: Any, name_raw: Any) -> None:
+        code = normalize_code(code_raw)
+        if not valid_a_code(code) or code in seen:
+            return
+        bs_code = ss(code_raw) if "." in ss(code_raw) else to_bs_code(code)
+        if not bs_code:
+            return
+        seen.add(code)
+        items.append(StockItem(code=code, bs_code=bs_code, name=ss(name_raw) or "名称待补"))
+
+    rs = bs.query_all_stock(day=target)
+    fields = list(getattr(rs, "fields", []) or [])
+    for row in rows_from_baostock_query(rs):
+        rec = dict(zip(fields, row))
+        if ss(rec.get("tradeStatus")) not in {"", "1"}:
+            continue
+        add(rec.get("code"), rec.get("code_name") or rec.get("name"))
+
+    if items:
+        return items
+
+    basic = bs.query_stock_basic()
+    fields = list(getattr(basic, "fields", []) or [])
+    for row in rows_from_baostock_query(basic):
+        rec = dict(zip(fields, row))
+        if ss(rec.get("status")) not in {"", "1"}:
+            continue
+        if ss(rec.get("type")) not in {"", "1"}:
+            continue
+        add(rec.get("code"), rec.get("code_name") or rec.get("name"))
+    return items
+
+
+def load_monthly_kline(item: StockItem, target: str) -> pd.DataFrame:
+    if bs is None:
+        raise RuntimeError("baostock未安装")
+    fields = "date,code,open,high,low,close,volume,amount"
+    rs = bs.query_history_k_data_plus(
+        item.bs_code,
+        fields,
+        start_date=MONTHLY_START_DATE,
+        end_date=target,
+        frequency="m",
+        adjustflag="2",
+    )
+    rows = rows_from_baostock_query(rs)
+    if not rows:
         return pd.DataFrame()
-    for col in ["open", "high", "low", "close"]:
-        d[col] = d[col].map(f)
-    if "name" not in d.columns:
-        d["name"] = ""
-    d["date"] = d["date"].map(norm_date)
-    d["name"] = d["name"].map(s)
-    d = d[(d.date != "") & (d.open > 0) & (d.high > 0) & (d.low > 0) & (d.close > 0)]
-    if TARGET:
-        d = d[d.date <= TARGET]
-    return d.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = pd.DataFrame(rows, columns=fields.split(","))
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        df[col] = df[col].map(sf)
+    df["date"] = df["date"].map(norm_date)
+    df = df[(df["date"] != "") & (df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
+    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
-def read_kline(path: Path) -> pd.DataFrame:
-    try:
-        if path.suffix.lower() == ".csv":
-            return normalize(pd.read_csv(path))
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        rows = obj.get("rows") or obj.get("data") or obj.get("klines") or [] if isinstance(obj, dict) else obj
-        return normalize(pd.DataFrame(rows))
-    except Exception:
-        return pd.DataFrame()
-
-
-def cache_files(limit: int = 0) -> List[Path]:
-    seen: Dict[str, Path] = {}
-    for d in CACHE_DIRS:
-        if not d.exists():
+def find_qingtian_hit(monthly: pd.DataFrame, item: StockItem) -> Optional[QingtianHit]:
+    if monthly is None or monthly.empty or len(monthly) <= REQUIRED_CONFIRM_MONTHS:
+        return None
+    m = monthly.sort_values("date").reset_index(drop=True)
+    best: Optional[QingtianHit] = None
+    for idx in range(0, len(m) - REQUIRED_CONFIRM_MONTHS):
+        row = m.iloc[idx]
+        open_price = sf(row.get("open"))
+        close_price = sf(row.get("close"))
+        if open_price <= 0 or close_price <= open_price:
             continue
-        for p in sorted(d.glob("*")):
-            if p.suffix.lower() not in {".csv", ".json"}:
-                continue
-            code = code_of(p)
-            if valid_code(code) and code not in seen:
-                seen[code] = p
-    out = list(seen.values())
-    return out[:limit] if limit and limit > 0 else out
-
-
-def to_month(df: pd.DataFrame) -> pd.DataFrame:
-    d = normalize(df)
-    if d.empty:
-        return d
-    d["dt"] = pd.to_datetime(d["date"], errors="coerce")
-    d = d.dropna(subset=["dt"]).sort_values("dt")
-    d["m"] = d["dt"].dt.to_period("M")
-    rows = []
-    for _, g in d.groupby("m"):
-        g = g.sort_values("dt")
-        rows.append({"date": g.iloc[-1].dt.strftime("%Y-%m-%d"), "open": float(g.iloc[0].open), "high": float(g.high.max()), "low": float(g.low.min()), "close": float(g.iloc[-1].close)})
-    return pd.DataFrame(rows)
-
-
-def stock_name(df: pd.DataFrame) -> str:
-    if "name" not in df.columns:
-        return "名称待补"
-    vals = [s(x) for x in df.name.tolist() if s(x) and s(x).lower() not in {"nan", "none", "null"} and not re.fullmatch(r"\d{6}", s(x))]
-    return vals[-1] if vals else "名称待补"
-
-
-def hit_qingtian(month: pd.DataFrame) -> bool:
-    if month is None or len(month) < 5:
-        return False
-    m = month.sort_values("date").reset_index(drop=True)
-    for i in range(0, len(m) - 4):
-        o = float(m.loc[i, "open"])
-        c = float(m.loc[i, "close"])
-        if c <= o:
+        body_pct = (close_price - open_price) / open_price * 100.0
+        if body_pct <= MIN_BODY_PCT:
             continue
-        body_pct = (c - o) / o * 100.0
-        if body_pct <= 30.0:
+        level = open_price + (close_price - open_price) * QINGTIAN_RATIO
+        future = m.iloc[idx + 1:].copy()
+        if len(future) < REQUIRED_CONFIRM_MONTHS:
             continue
-        level = o + (c - o) * (2 / 3)
-        future = m.iloc[i + 1:]
-        ok = 0
-        for _, r in future.iterrows():
-            if float(r.close) >= level:
-                ok += 1
-            else:
-                break
-        if ok >= 4:
-            return True
-    return False
+        # 擎天是“后续收盘不破”，所以从大阳线之后到当前，所有月收盘都必须守住擎天位。
+        if bool((future["close"].astype(float) >= level).all()):
+            hit = QingtianHit(
+                code=item.code,
+                name=item.name,
+                anchor_month=ss(row.get("date")),
+                body_pct=round(body_pct, 2),
+                qingtian_level=round(level, 4),
+                confirm_months=int(len(future)),
+            )
+            best = hit
+    return best
 
 
-def run(limit: int) -> int:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    files = cache_files(limit)
-    hits: List[Dict[str, str]] = []
-    failed = 0
-    for idx, path in enumerate(files, 1):
-        code = code_of(path)
-        df = read_kline(path)
-        if df.empty or len(df) < MIN_ROWS:
-            failed += 1
-            continue
-        if hit_qingtian(to_month(df)):
-            hits.append({"code": code, "name": stock_name(df)})
-        if idx == 1 or idx % 500 == 0 or idx == len(files):
-            print(f"擎天扫描 {idx}/{len(files)} 命中{len(hits)} 当前{code}", flush=True)
-    out = pd.DataFrame(hits, columns=["code", "name"])
-    out.to_csv(OUT_DIR / "qingtian_latest.csv", index=False, encoding="utf-8-sig")
-    data = {"summary": {"version": VERSION, "cache_files": len(files), "scanned_count": len(files), "failed_count": failed, "signal_count": len(hits)}, "signals": hits}
-    (OUT_DIR / "qingtian_latest.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def build_report_text(hits: List[QingtianHit]) -> str:
     if hits:
-        text = "\n".join([f"{x['code']} {x['name']}" for x in hits[:200]])
-    else:
-        text = "无符合擎天条件股票"
-    (OUT_DIR / "qingtian_report.md").write_text(text, encoding="utf-8")
-    print(json.dumps(data["summary"], ensure_ascii=False, indent=2))
-    return 0
+        return "\n".join(f"{x.code} {x.name}" for x in hits)
+    return "无符合擎天条件股票"
 
 
-def self_test() -> None:
-    df = pd.DataFrame([
-        {"date":"2024-01-31","open":10,"high":14,"low":9,"close":13.2},
-        {"date":"2024-02-29","open":13,"high":13,"low":11,"close":12.2},
-        {"date":"2024-03-31","open":12,"high":13,"low":11,"close":12.2},
-        {"date":"2024-04-30","open":12,"high":13,"low":11,"close":12.2},
-        {"date":"2024-05-31","open":12,"high":13,"low":11,"close":12.2},
+def write_outputs(hits: List[QingtianHit], stat: ScanStat, failures: List[Dict[str, str]]) -> None:
+    ensure_report_dir()
+    rows = [asdict(x) for x in hits]
+    pd.DataFrame(rows, columns=["code", "name", "anchor_month", "body_pct", "qingtian_level", "confirm_months"]).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    payload = {"summary": asdict(stat), "signals": rows, "failures": failures[:300]}
+    OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    OUTPUT_MD.write_text(build_report_text(hits), encoding="utf-8")
+
+
+def run_scan(limit: int = 0) -> int:
+    if bs is None:
+        raise RuntimeError("baostock未安装，擎天无法获取原生月K")
+    ensure_report_dir()
+    lg = bs.login()
+    if getattr(lg, "error_code", "") != "0":
+        raise RuntimeError(f"baostock登录失败: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
+    try:
+        pool = query_all_stocks(TARGET_DASH)
+        if limit and limit > 0:
+            pool = pool[:limit]
+        if not pool:
+            raise RuntimeError("股票池为空，不能伪装成无符合擎天股票")
+        hits: List[QingtianHit] = []
+        failures: List[Dict[str, str]] = []
+        monthly_success = 0
+        start = time.time()
+        for idx, item in enumerate(pool, 1):
+            try:
+                monthly = load_monthly_kline(item, TARGET_DASH)
+                if monthly.empty:
+                    failures.append({"code": item.code, "name": item.name, "error": "原生月K为空"})
+                    continue
+                monthly_success += 1
+                hit = find_qingtian_hit(monthly, item)
+                if hit is not None:
+                    hits.append(hit)
+            except Exception as exc:
+                failures.append({"code": item.code, "name": item.name, "error": str(exc)[:180]})
+            if idx == 1 or idx % max(1, SCAN_PROGRESS_EVERY) == 0 or idx == len(pool):
+                elapsed = max(time.time() - start, 0.001)
+                print(f"擎天原生月K扫描 {idx}/{len(pool)}｜月K成功{monthly_success}｜命中{len(hits)}｜失败{len(failures)}｜速度{idx/elapsed:.2f}只/秒｜当前{item.code} {item.name}", flush=True)
+        if monthly_success == 0:
+            raise RuntimeError("原生月K成功数量为0，不能伪装成无符合擎天股票")
+        stat = ScanStat(
+            version=VERSION,
+            target_date=TARGET_DASH,
+            stock_pool_count=len(pool),
+            scanned_count=len(pool),
+            monthly_success_count=monthly_success,
+            failed_count=len(failures),
+            signal_count=len(hits),
+            data_source="baostock_frequency_m_native_monthly",
+        )
+        write_outputs(hits, stat, failures)
+        print(json.dumps(asdict(stat), ensure_ascii=False, indent=2), flush=True)
+        return 0
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def _synthetic_monthly(rows: List[Tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame([{"date": d, "open": o, "high": h, "low": l, "close": c} for d, o, h, l, c in rows])
+
+
+def self_check_once() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        items.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    src = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    function_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    called_names = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    add("source::no_daily_to_monthly_function", "to_month" not in function_names and "to_month" not in called_names, "生产代码不得存在日线聚合月线函数/调用")
+    add("source::native_monthly_frequency", 'frequency="m"' in src, "必须使用BaoStock原生月K frequency=m")
+    add("source::report_code_name_only", "OUTPUT_MD.write_text(text" in src, "Telegram报告只输出代码和简称")
+
+    item = StockItem("000001", "sz.000001", "测试股")
+    equal_30 = _synthetic_monthly([
+        ("2024-01-31", 10, 13, 9, 13),
+        ("2024-02-29", 13, 14, 8, 12.1),
+        ("2024-03-31", 12, 14, 8, 12.2),
+        ("2024-04-30", 12, 14, 8, 12.3),
+        ("2024-05-31", 12, 14, 8, 12.4),
     ])
-    assert hit_qingtian(df) is True
-    df.loc[0, "close"] = 13.0
-    assert hit_qingtian(df) is False
-    print("擎天自检通过")
+    add("rule::equal_30_not_hit", find_qingtian_hit(equal_30, item) is None, "实体涨幅等于30%不命中")
+
+    hit_df = _synthetic_monthly([
+        ("2024-01-31", 10, 14, 9, 13.2),
+        ("2024-02-29", 13, 14, 8, 12.2),
+        ("2024-03-31", 12, 14, 7, 12.2),
+        ("2024-04-30", 12, 14, 7, 12.2),
+        ("2024-05-31", 12, 14, 7, 12.2),
+    ])
+    add("rule::gt30_four_closes_hit", find_qingtian_hit(hit_df, item) is not None, "大于30%且后续4根收盘不破命中")
+
+    only3 = hit_df.iloc[:4].copy()
+    add("rule::only_three_future_not_hit", find_qingtian_hit(only3, item) is None, "后续仅3根月K不命中")
+
+    break_close = hit_df.copy()
+    break_close.loc[4, "close"] = 11.0
+    add("rule::future_close_break_not_hit", find_qingtian_hit(break_close, item) is None, "任一后续月收盘跌破擎天位不命中")
+
+    shadow_break = hit_df.copy()
+    shadow_break.loc[2, "low"] = 6.0
+    add("rule::shadow_break_still_hit", find_qingtian_hit(shadow_break, item) is not None, "影线跌破但收盘不破仍命中")
+
+    test_hits = [QingtianHit("000001", "测试股", "2024-01-31", 32.0, 12.1333, 4)]
+    report_text = build_report_text(test_hits).strip()
+    add("output::code_name_only", report_text == "000001 测试股", f"报告内容={report_text!r}")
+    empty_text = build_report_text([]).strip()
+    add("output::empty_hit_text", empty_text == "无符合擎天条件股票", f"空命中文案={empty_text!r}")
+    return items
+
+
+def run_self_check(rounds: int) -> None:
+    ensure_report_dir()
+    all_rounds: List[Dict[str, Any]] = []
+    for round_id in range(1, max(1, rounds) + 1):
+        items = self_check_once()
+        ok = all(x["ok"] for x in items)
+        all_rounds.append({"round": round_id, "ok": ok, "items": items})
+        print(f"擎天自检第{round_id}遍：{'通过' if ok else '失败'}", flush=True)
+        for item in items:
+            print(f"  [{'OK' if item['ok'] else 'FAIL'}] {item['name']}｜{item['detail']}", flush=True)
+        if not ok:
+            SELF_CHECK_JSON.write_text(json.dumps(all_rounds, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise RuntimeError(f"擎天自检第{round_id}遍失败")
+    SELF_CHECK_JSON.write_text(json.dumps(all_rounds, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--scan", action="store_true")
-    p.add_argument("--self-test", action="store_true")
-    p.add_argument("--limit", type=int, default=int(os.getenv("QINGTIAN_SCAN_LIMIT", "0") or 0))
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="擎天原生月K扫描器")
+    parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--self-test-rounds", type=int, default=3)
+    parser.add_argument("--limit", type=int, default=MAX_STOCKS)
+    args = parser.parse_args()
     try:
         if args.self_test:
-            self_test(); return 0
+            run_self_check(args.self_test_rounds)
+            return 0
         if args.scan:
-            return run(args.limit)
-        p.print_help(); return 0
+            return run_scan(args.limit)
+        parser.print_help()
+        return 0
     except Exception as exc:
-        print(f"擎天运行失败: {exc}", file=sys.stderr)
+        print(f"擎天运行失败: {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
