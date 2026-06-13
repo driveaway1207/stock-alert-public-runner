@@ -203,18 +203,21 @@ jobs:
         id: qingtian_message
         shell: bash
         run: |
-          if [ -f artifacts/qingtian_report.md ]; then
-            echo 'message<<EOF' >> "$GITHUB_OUTPUT"
-            head -n 120 artifacts/qingtian_report.md >> "$GITHUB_OUTPUT"
-            echo 'EOF' >> "$GITHUB_OUTPUT"
-          else
-            echo 'message<<EOF' >> "$GITHUB_OUTPUT"
-            echo '擎天扫描异常：未生成股票名单' >> "$GITHUB_OUTPUT"
-            echo 'EOF' >> "$GITHUB_OUTPUT"
-          fi
+          DELIM="QINGTIAN_MESSAGE_$(date +%s%N)"
+          echo "message<<${DELIM}" >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          p = Path("artifacts/qingtian_report.md")
+          if p.exists():
+              for line in p.read_text(encoding="utf-8", errors="replace").splitlines()[:120]:
+                  print(line)
+          else:
+              print("擎天扫描异常：未生成股票名单")
+          PY
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
 
       - name: send telegram result
-        if: ${{ always() && steps.config.outputs.send_telegram == '1' }}
+        if: ${{ success() && steps.config.outputs.send_telegram == '1' }}
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
