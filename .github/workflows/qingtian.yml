@@ -85,22 +85,37 @@ jobs:
           SELECTION_TRADE_DATE: ${{ github.event.inputs.qingtian_target_date }}
           TARGET_TRADE_DATE: ${{ github.event.inputs.qingtian_target_date }}
           DATA_GATE_TARGET_DATE: ${{ github.event.inputs.qingtian_target_date }}
-          ENABLE_TELEGRAM: ${{ github.event.inputs.qingtian_send_telegram == '🟩 是｜发送Telegram' && '1' || '0' }}
-          QINGTIAN_SEND_TELEGRAM: ${{ github.event.inputs.qingtian_send_telegram == '🟩 是｜发送Telegram' && '1' || '0' }}
+          ENABLE_TELEGRAM: "0"
+          QINGTIAN_SEND_TELEGRAM: "0"
           QINGTIAN_SCAN_LIMIT: ${{ github.event.inputs.qingtian_scan_limit }}
           NO_COLOR: ""
         run: python -u 擎天.py --scan --limit "${{ github.event.inputs.qingtian_scan_limit }}"
 
-      - name: send telegram summary
+      - name: build telegram report message
+        if: always()
+        id: qingtian_message
+        run: |
+          if [ -f artifacts/qingtian_report.md ]; then
+            {
+              echo 'message<<EOF'
+              head -n 90 artifacts/qingtian_report.md
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'message<<EOF'
+              echo '擎天扫描异常：未生成 qingtian_report.md'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: send telegram result
         if: ${{ always() && github.event.inputs.qingtian_send_telegram == '🟩 是｜发送Telegram' }}
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          message: |
-            擎天运行完成
-            状态：${{ job.status }}
-            详情请查看 GitHub Actions artifact: qingtian-reports
+          message: ${{ steps.qingtian_message.outputs.message }}
 
       - name: upload reports
         if: always()
