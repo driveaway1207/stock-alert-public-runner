@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import math
 import os
 import re
 import sys
@@ -19,7 +18,7 @@ import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -28,7 +27,7 @@ try:
 except Exception:
     bs = None
 
-VERSION = "擎天-v5-native-monthly-20260613"
+VERSION = "擎天-v5.1-native-monthly-stock-only-20260613"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "artifacts"
 OUTPUT_CSV = REPORT_DIR / "qingtian_latest.csv"
@@ -55,6 +54,11 @@ TARGET_RAW_KEYS = [
     "TARGET_TRADE_DATE",
     "LAST_TRADE_DAY_OVERRIDE",
 ]
+STOCK_NAME_BLOCK_WORDS = (
+    "指数", "B股指数", "A股指数", "综合指数", "成份指数",
+    "基金", "ETF", "LOF", "REIT", "债", "转债", "国债", "企债", "可转债",
+    "期货", "期权", "认购", "认沽", "CWB",
+)
 
 
 @dataclass
@@ -133,6 +137,32 @@ def to_bs_code(code: str) -> str:
     return ""
 
 
+def exchange_ok_for_common_stock(bs_code: str, code: str) -> bool:
+    raw = ss(bs_code).lower()
+    c = normalize_code(code or raw)
+    if not c:
+        return False
+    if raw.startswith("sh."):
+        return c.startswith(("600", "601", "603", "605", "688", "689"))
+    if raw.startswith("sz."):
+        return c.startswith(("000", "001", "002", "003", "300", "301"))
+    if raw.startswith("bj."):
+        return c.startswith(("8", "4", "920"))
+    return valid_a_code(c)
+
+
+def name_ok_for_common_stock(name: str) -> bool:
+    n = ss(name)
+    if not n:
+        return True
+    upper = n.upper()
+    return not any(word in upper for word in STOCK_NAME_BLOCK_WORDS)
+
+
+def is_common_a_stock(bs_code: str, code: str, name: str) -> bool:
+    return exchange_ok_for_common_stock(bs_code, code) and name_ok_for_common_stock(name)
+
+
 def norm_date(value: Any) -> str:
     raw = ss(value)
     if not raw:
@@ -186,14 +216,16 @@ def query_all_stocks(target: str) -> List[StockItem]:
     seen: set[str] = set()
 
     def add(code_raw: Any, name_raw: Any) -> None:
-        code = normalize_code(code_raw)
-        if not valid_a_code(code) or code in seen:
+        raw = ss(code_raw)
+        code = normalize_code(raw)
+        name = ss(name_raw) or "名称待补"
+        bs_code = raw if "." in raw else to_bs_code(code)
+        if not code or code in seen:
             return
-        bs_code = ss(code_raw) if "." in ss(code_raw) else to_bs_code(code)
-        if not bs_code:
+        if not is_common_a_stock(bs_code, code, name):
             return
         seen.add(code)
-        items.append(StockItem(code=code, bs_code=bs_code, name=ss(name_raw) or "名称待补"))
+        items.append(StockItem(code=code, bs_code=bs_code, name=name))
 
     rs = bs.query_all_stock(day=target)
     fields = list(getattr(rs, "fields", []) or [])
@@ -259,7 +291,6 @@ def find_qingtian_hit(monthly: pd.DataFrame, item: StockItem) -> Optional[Qingti
         future = m.iloc[idx + 1:].copy()
         if len(future) < REQUIRED_CONFIRM_MONTHS:
             continue
-        # 擎天是“后续收盘不破”，所以从大阳线之后到当前，所有月收盘都必须守住擎天位。
         if bool((future["close"].astype(float) >= level).all()):
             hit = QingtianHit(
                 code=item.code,
@@ -285,7 +316,7 @@ def write_outputs(hits: List[QingtianHit], stat: ScanStat, failures: List[Dict[s
     pd.DataFrame(rows, columns=["code", "name", "anchor_month", "body_pct", "qingtian_level", "confirm_months"]).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     payload = {"summary": asdict(stat), "signals": rows, "failures": failures[:300]}
     OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    OUTPUT_MD.write_text(build_report_text(hits), encoding="utf-8")
+    OUTPUT_MD.write_text(build_report_text(hits).rstrip() + "\n", encoding="utf-8")
 
 
 def run_scan(limit: int = 0) -> int:
@@ -358,7 +389,11 @@ def self_check_once() -> List[Dict[str, Any]]:
     called_names = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     add("source::no_daily_to_monthly_function", "to_month" not in function_names and "to_month" not in called_names, "生产代码不得存在日线聚合月线函数/调用")
     add("source::native_monthly_frequency", 'frequency="m"' in src, "必须使用BaoStock原生月K frequency=m")
-    add("source::report_code_name_only", "OUTPUT_MD.write_text(text" in src, "Telegram报告只输出代码和简称")
+    add("stock_pool::exclude_sh_000003_index", not is_common_a_stock("sh.000003", "000003", "上证B股指数"), "必须剔除sh.000003上证B股指数")
+    add("stock_pool::exclude_sh_000001_index", not is_common_a_stock("sh.000001", "000001", "上证指数"), "必须剔除sh.000001上证指数")
+    add("stock_pool::allow_sz_000001_stock", is_common_a_stock("sz.000001", "000001", "平安银行"), "允许sz.000001普通股票")
+    add("stock_pool::allow_sh_600000_stock", is_common_a_stock("sh.600000", "600000", "浦发银行"), "允许sh.600000普通股票")
+    add("stock_pool::allow_bj_920000_stock", is_common_a_stock("bj.920000", "920000", "测试北交所"), "允许bj.920000普通股票前缀")
 
     item = StockItem("000001", "sz.000001", "测试股")
     equal_30 = _synthetic_monthly([
@@ -378,9 +413,7 @@ def self_check_once() -> List[Dict[str, Any]]:
         ("2024-05-31", 12, 14, 7, 12.2),
     ])
     add("rule::gt30_four_closes_hit", find_qingtian_hit(hit_df, item) is not None, "大于30%且后续4根收盘不破命中")
-
-    only3 = hit_df.iloc[:4].copy()
-    add("rule::only_three_future_not_hit", find_qingtian_hit(only3, item) is None, "后续仅3根月K不命中")
+    add("rule::only_three_future_not_hit", find_qingtian_hit(hit_df.iloc[:4].copy(), item) is None, "后续仅3根月K不命中")
 
     break_close = hit_df.copy()
     break_close.loc[4, "close"] = 11.0
@@ -390,8 +423,7 @@ def self_check_once() -> List[Dict[str, Any]]:
     shadow_break.loc[2, "low"] = 6.0
     add("rule::shadow_break_still_hit", find_qingtian_hit(shadow_break, item) is not None, "影线跌破但收盘不破仍命中")
 
-    test_hits = [QingtianHit("000001", "测试股", "2024-01-31", 32.0, 12.1333, 4)]
-    report_text = build_report_text(test_hits).strip()
+    report_text = build_report_text([QingtianHit("000001", "测试股", "2024-01-31", 32.0, 12.1333, 4)]).strip()
     add("output::code_name_only", report_text == "000001 测试股", f"报告内容={report_text!r}")
     empty_text = build_report_text([]).strip()
     add("output::empty_hit_text", empty_text == "无符合擎天条件股票", f"空命中文案={empty_text!r}")
