@@ -22,7 +22,7 @@ try:
 except Exception:
     bs = None
 
-VERSION = "擎天-v7-position-age-sort"
+VERSION = "擎天-v9-confirm-window-runup-filter"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "artifacts"
 OUTPUT_CSV = REPORT_DIR / "qingtian_latest.csv"
@@ -51,7 +51,8 @@ CLOSE_POS_MAX = float(os.getenv("QINGTIAN_ANCHOR_CLOSE_MAX_POSITION", "0.88"))
 PRIOR_RUNUP_LOOKBACK = int(os.getenv("QINGTIAN_PRIOR_RUNUP_LOOKBACK", "24"))
 PRIOR_RUNUP_MAX = float(os.getenv("QINGTIAN_PRIOR_RUNUP_MAX_PCT", "120.0"))
 MAX_POST_QINGTIAN_HIGH_RUNUP_PCT = float(os.getenv("QINGTIAN_MAX_POST_HIGH_RUNUP_PCT", "30.0"))
-MAX_POST_QINGTIAN_CLOSE_RUNUP_PCT = float(os.getenv("QINGTIAN_MAX_POST_CLOSE_RUNUP_PCT", "12.0"))
+MAX_POST_QINGTIAN_CLOSE_RUNUP_PCT = float(os.getenv("QINGTIAN_MAX_POST_CLOSE_RUNUP_PCT", "18.0"))
+POST_QINGTIAN_CHECK_MONTHS = int(os.getenv("QINGTIAN_POST_CHECK_MONTHS", str(CONFIRM_MONTHS)))
 
 TARGET_KEYS = [
     "QINGTIAN_TARGET_DATE",
@@ -384,8 +385,14 @@ def post_qingtian_runup_ok(future: pd.DataFrame, anchor_close: float) -> Tuple[b
     if future is None or future.empty or anchor_close <= 0:
         return True, 0.0, 0.0
 
-    post_high = float(future["high"].astype(float).max())
-    post_close = float(future["close"].astype(float).max())
+    # 只检查擎天阳线之后的确认期，而不是一直检查到最新月份。
+    # 用户要排除的是“擎天后立刻继续大涨兑现”，
+    # 不是排除确认完成很久以后才出现的正常上涨。
+    check_months = max(1, min(int(POST_QINGTIAN_CHECK_MONTHS), len(future)))
+    window = future.iloc[:check_months].copy()
+
+    post_high = float(window["high"].astype(float).max())
+    post_close = float(window["close"].astype(float).max())
 
     high_runup_pct = max(0.0, (post_high - anchor_close) / anchor_close * 100.0)
     close_runup_pct = max(0.0, (post_close - anchor_close) / anchor_close * 100.0)
@@ -441,7 +448,7 @@ def find_qingtian_hit(monthly: pd.DataFrame, item: StockItem, target: str = TARG
         if not bool((future["close"].astype(float) >= qingtian_level).all()):
             continue
 
-        # 擎天硬筛验模版：擎天阳线之后允许小涨/试盘，
+        # 擎天硬筛验模版：确认期内允许小涨/试盘，
         # 但不能继续大涨远离锚定阳线；否则说明信号已经快速兑现，
         # 不符合“在上三分之一附近横住承接”的样本要求。
         post_ok, _, _ = post_qingtian_runup_ok(future, close_price)
@@ -670,7 +677,7 @@ def self_check_once() -> List[Dict[str, Any]]:
     add("source::volume_filter", "volume_ok" in function_names, "必须检查大阳月量能")
     add("source::position_filter", "position_ok" in function_names, "必须检查大阳月位置")
     add("source::recent_signal_limit", "MAX_CONFIRM_AGE" in src, "必须限制历史老信号反复推送")
-    add("source::post_qingtian_runup_filter", "post_qingtian_runup_ok" in function_names, "必须过滤擎天后继续大涨远离锚定阳线的样本")
+    add("source::post_qingtian_runup_filter", "post_qingtian_runup_ok" in function_names, "必须过滤擎天确认期内继续大涨远离锚定阳线的样本")
     add("source::hit_sort", "sort_hits" in function_names, "命中结果必须排序，不能按股票池原始顺序输出")
 
     add("stock_pool::exclude_sh_000003_index", not common_stock_ok("sh.000003", "000003", "上证B股指数"), "必须剔除 sh.000003 上证B股指数")
@@ -708,9 +715,17 @@ def self_check_once() -> List[Dict[str, Any]]:
     add("rule::post_qingtian_high_runup_not_hit", find_qingtian_hit(post_high_runup, item, "2023-05-31") is None, "擎天后影线最高价相对锚定收盘涨幅超过30%，不能命中")
 
     post_close_runup = valid_recent_qingtian_rows()
-    post_close_runup.loc[14, "high"] = 15.2
-    post_close_runup.loc[14, "close"] = 15.0
-    add("rule::post_qingtian_close_runup_not_hit", find_qingtian_hit(post_close_runup, item, "2023-05-31") is None, "擎天后最高收盘价相对锚定收盘涨幅超过12%，不能命中")
+    post_close_runup.loc[14, "high"] = 16.0
+    post_close_runup.loc[14, "close"] = 15.8
+    add("rule::post_qingtian_close_runup_not_hit", find_qingtian_hit(post_close_runup, item, "2023-05-31") is None, "擎天确认期最高收盘价相对锚定收盘涨幅超过18%，不能命中")
+
+    late_runup_after_window = pd.concat([
+        good,
+        synthetic_monthly([
+            ("2023-06-30", 12.2, 18.0, 11.5, 12.4, 120.0, 120.0),
+        ]),
+    ], ignore_index=True)
+    add("rule::late_runup_after_confirm_window_still_hit", find_qingtian_hit(late_runup_after_window, item, "2023-06-30") is not None, "擎天确认期之后才冲高，不应被确认期不过度拉升过滤误杀")
 
     high_position = valid_recent_qingtian_rows(anchor_open=30.0, anchor_close=40.0, anchor_amount=300.0)
     add("rule::high_position_big_yang_not_hit", find_qingtian_hit(high_position, item, "2023-05-31") is None, "高位大阳不能命中")
