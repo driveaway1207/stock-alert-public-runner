@@ -1,0 +1,60 @@
+name: 灵动
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "限制扫描股票数量；0 表示全市场"
+        required: false
+        default: "0"
+  # 如需定时运行，把擎天 workflow 里的 schedule 原样复制到这里。
+  # schedule:
+  #   - cron: "40 8 * * 1-5"
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+  LINGDONG_MAX_STOCKS: ${{ github.event.inputs.limit || '0' }}
+  LINGDONG_PROGRESS_EVERY: "200"
+
+jobs:
+  lingdong:
+    name: 运行灵动模型
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy baostock
+
+      - name: 灵动自检
+        run: |
+          python 灵动.py --self-test --self-test-rounds 3
+
+      - name: 运行灵动扫描
+        run: |
+          python 灵动.py --scan --limit "${{ github.event.inputs.limit || '0' }}"
+
+      - name: 上传灵动结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 灵动-report
+          path: |
+            artifacts/lingdong_report.md
+            artifacts/lingdong_latest.csv
+            artifacts/lingdong_latest.json
+            artifacts/lingdong_self_check.json
+          if-no-files-found: warn
