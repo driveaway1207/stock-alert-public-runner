@@ -187,7 +187,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
-      - name: run employee3
+      - name: run employee3 native engine
+        env:
+          PYTHONUNBUFFERED: 1
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMPLOYEE3_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          SELECTION_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          ENABLE_TELEGRAM: "0"
+          EMPLOYEE3_SEND_TELEGRAM: "0"
+          EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
+          EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
+          EMPLOYEE3_PROGRESS_COLOR: "1"
+          NO_COLOR: ""
+        run: python -u employee3_runner.py
+
+      - name: guard report and send employee3 telegram
+        if: always()
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -199,11 +218,7 @@ jobs:
           DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
           ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
           EMPLOYEE3_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
-          EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
-          EMPLOYEE5_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
-          EMPLOYEE3_PROGRESS_COLOR: "1"
-          NO_COLOR: ""
-        run: python -u employee3_runner.py
+        run: python -u employee3_report_guard.py
 
       - name: upload reports
         if: always()
