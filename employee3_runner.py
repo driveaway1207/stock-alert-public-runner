@@ -5739,11 +5739,36 @@ def deep_screen_dual_line_hit(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
     return row
 
+# EMPLOYEE3_TARGET_DATE_PREFILTER_V1
+LAST_SCREEN_PREFILTER_STAT: Dict[str, Any] = {}
+
+def get_df_last_trade_date_for_prefilter(df: pd.DataFrame) -> str:
+    # 读取单只股票缓存里的最后一根K线日期，用于三号员工源头日期预过滤。
+    try:
+        d = normalize_hist(df)
+        if d.empty or "date" not in d.columns:
+            return ""
+        return ss(d.iloc[-1].get("date", ""))
+    except Exception:
+        return ""
+
+def _format_prefilter_date_counts(counts: Dict[str, int], limit: int = 8) -> str:
+    if not counts:
+        return "无"
+    items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return "；".join(f"{k}:{v}" for k, v in items)
+
+
 def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dict[str, Any]]:
 
     items = list(hist.items())
 
     candidates: List[Dict[str, Any]] = []
+
+    stale_date_counts: Dict[str, int] = {}
+    stale_skipped = 0
+    target_fresh_checked = 0
+    invalid_date_skipped = 0
 
     start = time.time()
 
@@ -5761,9 +5786,31 @@ def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dic
 
         try:
 
+            data_last_date = get_df_last_trade_date_for_prefilter(df)
+
+            if TARGET_DASH:
+                if not data_last_date:
+                    invalid_date_skipped += 1
+                    stale_date_counts["未知"] = stale_date_counts.get("未知", 0) + 1
+                    if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
+                        progress("screen", i, len(items), start, f"hit={len(candidates)} stale_skip={stale_skipped} invalid_date={invalid_date_skipped} current={code}")
+                    continue
+
+                if data_last_date != TARGET_DASH:
+                    stale_skipped += 1
+                    stale_date_counts[data_last_date] = stale_date_counts.get(data_last_date, 0) + 1
+                    if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
+                        progress("screen", i, len(items), start, f"hit={len(candidates)} stale_skip={stale_skipped} current={code}")
+                    continue
+
+            target_fresh_checked += 1
+
             candidate = build_dual_line_hit_candidate(code, stock_display_name(code, name), df)
 
             if candidate:
+
+                candidate["data_last_date_prefilter"] = data_last_date
+                candidate["target_trade_date_prefilter"] = TARGET_DASH
 
                 candidates.append(candidate)
 
@@ -5773,7 +5820,29 @@ def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dic
 
         if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
 
-            progress("screen", i, len(items), start, f"hit={len(candidates)} current={code}")
+            progress("screen", i, len(items), start, f"hit={len(candidates)} stale_skip={stale_skipped} current={code}")
+
+    globals()["LAST_SCREEN_PREFILTER_STAT"] = {
+        "prefilter_total_cache_stocks": len(items),
+        "prefilter_target_date": TARGET_DASH,
+        "prefilter_target_fresh_checked": target_fresh_checked,
+        "prefilter_stale_skipped": stale_skipped,
+        "prefilter_invalid_date_skipped": invalid_date_skipped,
+        "prefilter_stale_date_counts": dict(sorted(stale_date_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "prefilter_stale_date_counts_text": _format_prefilter_date_counts(stale_date_counts),
+        "prefilter_raw_scan_hits_after_date_gate": len(candidates),
+    }
+
+    print(
+        "三号员工日期预检："
+        f"缓存股票{len(items)}只｜"
+        f"目标日通过{target_fresh_checked}只｜"
+        f"旧日期跳过{stale_skipped}只｜"
+        f"日期未知跳过{invalid_date_skipped}只｜"
+        f"进入核心线扫描命中{len(candidates)}只｜"
+        f"旧日期分布:{_format_prefilter_date_counts(stale_date_counts)}",
+        flush=True,
+    )
 
     rows: List[Dict[str, Any]] = []
 
@@ -6420,6 +6489,9 @@ def main() -> None:
         print("公共缓存为空：输出空报告。", flush=True)
 
     rows = screen_all(hist, names) if hist else []
+
+    if isinstance(stat, dict):
+        stat.update(globals().get("LAST_SCREEN_PREFILTER_STAT", {}))
 
     md = build_report(rows, stat)
 
