@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import traceback
+import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,45 +18,53 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+warnings.filterwarnings(
+    "ignore",
+    message="Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated.*",
+    category=FutureWarning,
+)
+try:
+    pd.set_option("future.no_silent_downcasting", True)
+except Exception:
+    pass
+
 try:
     import baostock as bs
 except Exception:
     bs = None
 
-VERSION = "擎天-v9-confirm-window-runup-filter"
+VERSION = "灵动-v2-clean-log-activity-label"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "artifacts"
-OUTPUT_CSV = REPORT_DIR / "qingtian_latest.csv"
-OUTPUT_JSON = REPORT_DIR / "qingtian_latest.json"
-OUTPUT_MD = REPORT_DIR / "qingtian_report.md"
-SELF_CHECK_JSON = REPORT_DIR / "qingtian_self_check.json"
+OUTPUT_CSV = REPORT_DIR / "lingdong_latest.csv"
+OUTPUT_JSON = REPORT_DIR / "lingdong_latest.json"
+OUTPUT_MD = REPORT_DIR / "lingdong_report.md"
+SELF_CHECK_JSON = REPORT_DIR / "lingdong_self_check.json"
 
-MIN_BODY_PCT = 30.0
-QINGTIAN_RATIO = 2.0 / 3.0
-CONFIRM_MONTHS = int(os.getenv("QINGTIAN_CONFIRM_MONTHS", "4"))
-MAX_CONFIRM_AGE = int(os.getenv("QINGTIAN_MAX_CONFIRM_AGE_MONTHS", "6"))
-START_DATE = os.getenv("QINGTIAN_MONTHLY_START_DATE", "1990-01-01")
-MAX_STOCKS = int(os.getenv("QINGTIAN_MAX_STOCKS", "0") or "0")
-PROGRESS_EVERY = int(os.getenv("QINGTIAN_PROGRESS_EVERY", "200"))
+START_DATE = os.getenv("LINGDONG_DAILY_START_DATE", "2020-01-01")
+MAX_STOCKS = int(os.getenv("LINGDONG_MAX_STOCKS", "0") or "0")
+PROGRESS_EVERY = int(os.getenv("LINGDONG_PROGRESS_EVERY", "200"))
 
-VOL_LOOKBACK = int(os.getenv("QINGTIAN_VOLUME_LOOKBACK_MONTHS", "12"))
-VOL_MIN_HIST = int(os.getenv("QINGTIAN_VOLUME_MIN_HISTORY", "6"))
-VOL_MEDIAN_MULT = float(os.getenv("QINGTIAN_VOLUME_MEDIAN_MULT", "1.35"))
-VOL_RANK_LOOKBACK = int(os.getenv("QINGTIAN_VOLUME_RANK_LOOKBACK", "36"))
-VOL_TOP_Q = float(os.getenv("QINGTIAN_VOLUME_TOP_QUANTILE", "0.70"))
+LOOKBACK_DAYS = int(os.getenv("LINGDONG_LOOKBACK_DAYS", "100"))
+RECENT_DAYS = int(os.getenv("LINGDONG_RECENT_DAYS", "20"))
+MID_DAYS = int(os.getenv("LINGDONG_MID_DAYS", "60"))
+MIN_HISTORY_DAYS = int(os.getenv("LINGDONG_MIN_HISTORY_DAYS", "120"))
 
-POS_LOOKBACK = int(os.getenv("QINGTIAN_POSITION_LOOKBACK_MONTHS", "60"))
-POS_MIN_HIST = int(os.getenv("QINGTIAN_POSITION_MIN_HISTORY", "12"))
-OPEN_POS_MAX = float(os.getenv("QINGTIAN_ANCHOR_OPEN_MAX_POSITION", "0.72"))
-CLOSE_POS_MAX = float(os.getenv("QINGTIAN_ANCHOR_CLOSE_MAX_POSITION", "0.88"))
-PRIOR_RUNUP_LOOKBACK = int(os.getenv("QINGTIAN_PRIOR_RUNUP_LOOKBACK", "24"))
-PRIOR_RUNUP_MAX = float(os.getenv("QINGTIAN_PRIOR_RUNUP_MAX_PCT", "120.0"))
-MAX_POST_QINGTIAN_HIGH_RUNUP_PCT = float(os.getenv("QINGTIAN_MAX_POST_HIGH_RUNUP_PCT", "30.0"))
-MAX_POST_QINGTIAN_CLOSE_RUNUP_PCT = float(os.getenv("QINGTIAN_MAX_POST_CLOSE_RUNUP_PCT", "18.0"))
-POST_QINGTIAN_CHECK_MONTHS = int(os.getenv("QINGTIAN_POST_CHECK_MONTHS", str(CONFIRM_MONTHS)))
+AMOUNT20_LOW = float(os.getenv("LINGDONG_AMOUNT20_LOW", "30000000"))
+AMOUNT20_BASIC = float(os.getenv("LINGDONG_AMOUNT20_BASIC", "50000000"))
+AMOUNT20_GOOD = float(os.getenv("LINGDONG_AMOUNT20_GOOD", "100000000"))
+
+BIG_BULL7_PCT = float(os.getenv("LINGDONG_BIG_BULL7_PCT", "7.0"))
+BIG_YANG5_PCT = float(os.getenv("LINGDONG_BIG_YANG5_PCT", "5.0"))
+BIG_YIN5_PCT = float(os.getenv("LINGDONG_BIG_YIN5_PCT", "-5.0"))
+GAP_PCT = float(os.getenv("LINGDONG_GAP_PCT", "1.0"))
+DEAD_RANGE20_MAX = float(os.getenv("LINGDONG_DEAD_RANGE20_MAX", "2.5"))
+DEAD_SMALL_BODY_RATIO_MIN = float(os.getenv("LINGDONG_DEAD_SMALL_BODY_RATIO_MIN", "0.55"))
+BAD_BIG_YIN_EXCESS = int(os.getenv("LINGDONG_BAD_BIG_YIN_EXCESS", "2"))
+BAD_VOL_LONG_BEAR_20 = int(os.getenv("LINGDONG_BAD_VOL_LONG_BEAR_20", "2"))
 
 TARGET_KEYS = [
-    "QINGTIAN_TARGET_DATE",
+    "LINGDONG_TARGET_DATE",
     "SELECTION_TRADE_DATE",
     "DATA_GATE_TARGET_DATE",
     "TARGET_TRADE_DATE",
@@ -69,6 +78,21 @@ BLOCK_NAME = (
     "期货", "期权", "认购", "认沽", "CWB",
 )
 
+GOOD_ACTIVE = "灵动充沛"
+NORMAL_ACTIVE = "灵动尚可"
+DEAD_ACTIVE = "死水无灵"
+BAD_ACTIVE = "邪动乱流"
+LOW_LIQUIDITY = "灵气枯竭"
+DATA_SHORT = "样本不足"
+
+STATUS_ORDER = {
+    GOOD_ACTIVE: 0,
+    NORMAL_ACTIVE: 1,
+    BAD_ACTIVE: 2,
+    DEAD_ACTIVE: 3,
+    LOW_LIQUIDITY: 4,
+    DATA_SHORT: 5,
+}
 
 @dataclass
 class StockItem:
@@ -78,19 +102,29 @@ class StockItem:
 
 
 @dataclass
-class QingtianHit:
+class LingdongHit:
     code: str
     name: str
-    anchor_month: str
-    confirm_month: str
-    latest_complete_month: str
-    body_pct: float
-    qingtian_level: float
-    confirm_months: int
-    confirm_age_months: int
-    amount_ratio: float
-    position_open: float
-    position_close: float
+    status: str
+    latest_trade_day: str
+    amount20: float
+    amount60: float
+    amount_ratio_20_60: float
+    limitup_count_100: int
+    big_bull7_count_100: int
+    big_yang5_count_100: int
+    big_yin5_count_100: int
+    gap_up_count_100: int
+    gap_down_count_100: int
+    range20_pct: float
+    small_body_ratio_60: float
+    volume_long_bear_20: int
+    long_upper_count_100: int
+    trend_efficiency_20: float
+    attack_memory: bool
+    bad_activity: bool
+    dead_activity: bool
+    detail: str
 
 
 @dataclass
@@ -99,7 +133,7 @@ class ScanStat:
     target_date: str
     stock_pool_count: int
     scanned_count: int
-    monthly_success_count: int
+    daily_success_count: int
     failed_count: int
     signal_count: int
     data_source: str
@@ -215,7 +249,7 @@ def bs_rows(rs: Any) -> List[List[str]]:
 
 def query_stock_pool(target: str) -> List[StockItem]:
     if bs is None:
-        raise RuntimeError("baostock未安装，无法获取原生月K股票池")
+        raise RuntimeError("baostock未安装，无法获取灵动股票池")
 
     out: List[StockItem] = []
     seen: set[str] = set()
@@ -224,15 +258,15 @@ def query_stock_pool(target: str) -> List[StockItem]:
         raw = s(code_raw)
         code = code6(raw)
         name = s(name_raw) or "名称待补"
-        bs_code = raw if "." in raw else bs_code_of(code)
+        bscode = raw if "." in raw else bs_code_of(code)
 
         if not code or code in seen:
             return
-        if not common_stock_ok(bs_code, code, name):
+        if not common_stock_ok(bscode, code, name):
             return
 
         seen.add(code)
-        out.append(StockItem(code=code, bs_code=bs_code, name=name))
+        out.append(StockItem(code=code, bs_code=bscode, name=name))
 
     rs = bs.query_all_stock(day=target)
     fields = list(getattr(rs, "fields", []) or [])
@@ -258,17 +292,17 @@ def query_stock_pool(target: str) -> List[StockItem]:
     return out
 
 
-def load_monthly(item: StockItem, target: str) -> pd.DataFrame:
+def load_daily(item: StockItem, target: str) -> pd.DataFrame:
     if bs is None:
         raise RuntimeError("baostock未安装")
 
-    fields = "date,code,open,high,low,close,volume,amount"
+    fields = "date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus"
     rs = bs.query_history_k_data_plus(
         item.bs_code,
         fields,
         start_date=START_DATE,
         end_date=target,
-        frequency="m",
+        frequency="d",
         adjustflag="2",
     )
 
@@ -277,8 +311,10 @@ def load_monthly(item: StockItem, target: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=fields.split(","))
-    for col in ["open", "high", "low", "close", "volume", "amount"]:
+    df = df[df["tradestatus"].map(s).isin({"", "1"})].copy()
+    for col in ["open", "high", "low", "close", "volume", "amount", "pctChg", "turn"]:
         df[col] = df[col].map(f)
+    df = df.rename(columns={"pctChg": "pct_chg", "turn": "turnover"})
     df["date"] = df["date"].map(norm_date)
 
     df = df[
@@ -288,232 +324,297 @@ def load_monthly(item: StockItem, target: str) -> pd.DataFrame:
         & (df["low"] > 0)
         & (df["close"] > 0)
     ]
-    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if "pct_chg" not in df.columns or float(df["pct_chg"].abs().sum()) == 0:
+        prev = df["close"].shift(1)
+        denom = prev.mask(prev <= 0, float("nan"))
+        df["pct_chg"] = (df["close"] / denom - 1.0) * 100.0
+        df["pct_chg"] = df["pct_chg"].fillna(0.0).astype("float64")
+    return df[["date", "code", "open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover"]].reset_index(drop=True)
 
 
-def month_finished(target: str) -> bool:
-    t = pd.to_datetime(target, errors="coerce")
-    if pd.isna(t):
-        return False
-    return int(t.day) >= calendar.monthrange(int(t.year), int(t.month))[1]
+def get_limit_threshold(code: str) -> float:
+    c = code6(code)
+    if c.startswith(("300", "301", "688", "689")):
+        return 19.3
+    if c.startswith(("8", "4", "920")):
+        return 29.0
+    return 9.3
 
 
-def complete_months(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+def add_lingdong_indicators(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    # 全部核心指标强制使用 float64/boolean，避免 pandas 在 .fillna() 上输出
+    # “Downcasting object dtype arrays” 这类未来版本警告，GitHub 日志保持干净。
+    d = df.sort_values("date").drop_duplicates("date").reset_index(drop=True).copy()
+    for col in ["open", "high", "low", "close", "volume", "amount", "pct_chg"]:
+        if col not in d.columns:
+            d[col] = 0.0
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0).astype("float64")
 
-    m = df.sort_values("date").drop_duplicates("date").reset_index(drop=True).copy()
-    t = pd.to_datetime(target, errors="coerce")
+    d["prev_close"] = d["close"].shift(1).astype("float64")
+    d["prev_close"] = d["prev_close"].mask(d["prev_close"] <= 0, float("nan"))
 
-    if pd.isna(t) or month_finished(target):
-        return m
+    d["ret_pct"] = d["pct_chg"].astype("float64")
+    missing_ret = d["ret_pct"].abs() <= 1e-12
+    d.loc[missing_ret, "ret_pct"] = (d.loc[missing_ret, "close"] / d.loc[missing_ret, "prev_close"] - 1.0) * 100.0
+    d["ret_pct"] = d["ret_pct"].fillna(0.0).astype("float64")
 
-    m["period"] = pd.to_datetime(m["date"], errors="coerce").dt.to_period("M")
-    if len(m) and m.iloc[-1]["period"] == t.to_period("M"):
-        m = m.iloc[:-1].copy()
+    denom = d["prev_close"]
+    raw_range = (d["high"] - d["low"]).astype("float64")
+    rng = raw_range.mask(raw_range <= 0, float("nan"))
 
-    return m.drop(columns=["period"], errors="ignore").reset_index(drop=True)
+    d["range_pct"] = ((d["high"] - d["low"]) / denom * 100.0).fillna(0.0).astype("float64")
+    d["body_pct_prev"] = ((d["close"] - d["open"]) / denom * 100.0).fillna(0.0).astype("float64")
+    d["abs_body_pct"] = d["body_pct_prev"].abs().astype("float64")
+    d["close_pos"] = ((d["close"] - d["low"]) / rng).fillna(0.5).astype("float64")
+    d["body_ratio"] = ((d["close"] - d["open"]).abs() / rng).fillna(0.0).astype("float64")
 
+    entity_top = d[["open", "close"]].max(axis=1)
+    entity_bottom = d[["open", "close"]].min(axis=1)
+    d["upper_shadow_ratio"] = ((d["high"] - entity_top) / rng).fillna(0.0).astype("float64")
+    d["lower_shadow_ratio"] = ((entity_bottom - d["low"]) / rng).fillna(0.0).astype("float64")
 
-def money(row: pd.Series) -> float:
-    amount = f(row.get("amount"))
-    if amount > 0:
-        return amount
-    return f(row.get("volume"))
+    d["is_yang"] = (d["close"] > d["open"]).fillna(False)
+    d["is_yin"] = (d["close"] < d["open"]).fillna(False)
+    d["vol_ma20"] = d["volume"].rolling(20, min_periods=5).mean().astype("float64")
+    d["amount_ma20"] = d["amount"].rolling(20, min_periods=5).mean().astype("float64")
+    d["limit_threshold"] = float(get_limit_threshold(code))
+    d["limit_up"] = (d["ret_pct"] >= d["limit_threshold"]).fillna(False)
 
+    d["big_bull7"] = (
+        (d["ret_pct"] >= BIG_BULL7_PCT)
+        & d["is_yang"]
+        & (d["close_pos"] >= 0.60)
+        & (d["upper_shadow_ratio"] <= 0.45)
+    ).fillna(False)
+    d["big_yang5"] = (
+        (d["ret_pct"] >= BIG_YANG5_PCT)
+        & d["is_yang"]
+        & (d["close_pos"] >= 0.55)
+    ).fillna(False)
+    d["big_yin5"] = (
+        (d["ret_pct"] <= BIG_YIN5_PCT)
+        | ((d["body_pct_prev"] <= BIG_YIN5_PCT) & d["is_yin"] & (d["close_pos"] <= 0.45))
+    ).fillna(False)
+    d["gap_up"] = (d["open"] >= d["high"].shift(1) * (1.0 + GAP_PCT / 100.0)).fillna(False)
+    d["gap_down"] = (d["open"] <= d["low"].shift(1) * (1.0 - GAP_PCT / 100.0)).fillna(False)
 
-def volume_ok(df: pd.DataFrame, idx: int) -> Tuple[bool, float]:
-    metric = df.apply(money, axis=1)
-    anchor = f(metric.iloc[idx])
-    prev = metric.iloc[max(0, idx - VOL_LOOKBACK):idx]
-    prev = prev[prev > 0]
-
-    if anchor <= 0 or len(prev) < VOL_MIN_HIST:
-        return False, 0.0
-
-    median = float(prev.median())
-    if median <= 0:
-        return False, 0.0
-
-    ratio = anchor / median
-    if anchor < median:
-        return False, round(ratio, 3)
-
-    rank_window = metric.iloc[max(0, idx - VOL_RANK_LOOKBACK):idx + 1]
-    rank_window = rank_window[rank_window > 0]
-    rank_pct = float((rank_window <= anchor).mean()) if len(rank_window) >= VOL_MIN_HIST else 0.0
-
-    ok = ratio >= VOL_MEDIAN_MULT or rank_pct >= VOL_TOP_Q
-    return ok, round(ratio, 3)
-
-
-def position_ok(df: pd.DataFrame, idx: int) -> Tuple[bool, float, float]:
-    # 位置过滤只判断“锚定大阳月启动前”的位置。
-    # 擎天月本身往往会突破阶段高点，如果把锚定月的高点/收盘纳入区间，
-    # 会用启动后的冲高结果反向误杀真正的大级别启动。
-    prior_window = df.iloc[max(0, idx - POS_LOOKBACK):idx]
-    if len(prior_window) < POS_MIN_HIST:
-        return False, 1.0, 1.0
-
-    low = float(prior_window["low"].min())
-    high = float(prior_window["high"].max())
-    if high <= low or low <= 0:
-        return False, 1.0, 1.0
-
-    row = df.iloc[idx]
-    open_pos = (f(row.get("open")) - low) / (high - low)
-    close_pos = (f(row.get("close")) - low) / (high - low)
-
-    # 硬过滤只看锚定月开盘是否已经处在启动前高位。
-    # 收盘突破到区间上方是擎天本身的正常结果，不再作为直接淘汰条件；
-    # close_pos 继续输出，用于排序和审计。
-    if open_pos > OPEN_POS_MAX:
-        return False, round(open_pos, 3), round(close_pos, 3)
-
-    prior = df.iloc[max(0, idx - PRIOR_RUNUP_LOOKBACK):idx]
-    if len(prior) >= 6:
-        prior_low = float(prior["low"].min())
-        if prior_low > 0:
-            runup_pct = (f(row.get("open")) - prior_low) / prior_low * 100.0
-            if runup_pct > PRIOR_RUNUP_MAX:
-                return False, round(open_pos, 3), round(close_pos, 3)
-
-    return True, round(open_pos, 3), round(close_pos, 3)
+    vol_base = d["vol_ma20"].fillna(float(d["volume"].median() or 0.0)).astype("float64")
+    d["volume_long_bear"] = (
+        d["is_yin"]
+        & (d["abs_body_pct"] >= 4.0)
+        & (d["close_pos"] <= 0.35)
+        & (d["volume"] >= vol_base * 1.20)
+    ).fillna(False)
+    d["long_upper_reversal"] = (
+        (d["high"] / denom - 1.0 >= 0.05)
+        & (d["close_pos"] <= 0.45)
+        & (d["upper_shadow_ratio"] >= 0.45)
+    ).fillna(False)
+    d["small_body_narrow"] = ((d["abs_body_pct"] <= 1.2) & (d["range_pct"] <= 3.0)).fillna(False)
+    return d
 
 
-def post_qingtian_runup_ok(future: pd.DataFrame, anchor_close: float) -> Tuple[bool, float, float]:
-    if future is None or future.empty or anchor_close <= 0:
-        return True, 0.0, 0.0
-
-    # 只检查擎天阳线之后的确认期，而不是一直检查到最新月份。
-    # 用户要排除的是“擎天后立刻继续大涨兑现”，
-    # 不是排除确认完成很久以后才出现的正常上涨。
-    check_months = max(1, min(int(POST_QINGTIAN_CHECK_MONTHS), len(future)))
-    window = future.iloc[:check_months].copy()
-
-    post_high = float(window["high"].astype(float).max())
-    post_close = float(window["close"].astype(float).max())
-
-    high_runup_pct = max(0.0, (post_high - anchor_close) / anchor_close * 100.0)
-    close_runup_pct = max(0.0, (post_close - anchor_close) / anchor_close * 100.0)
-
-    ok = (
-        high_runup_pct <= MAX_POST_QINGTIAN_HIGH_RUNUP_PCT
-        and close_runup_pct <= MAX_POST_QINGTIAN_CLOSE_RUNUP_PCT
-    )
-    return ok, round(high_runup_pct, 2), round(close_runup_pct, 2)
+def trend_efficiency(d: pd.DataFrame, days: int = 20) -> float:
+    if d is None or len(d) < days + 1:
+        return 0.0
+    seg = d.tail(days + 1).copy().reset_index(drop=True)
+    start = f(seg.iloc[0].get("close"))
+    end = f(seg.iloc[-1].get("close"))
+    if start <= 0 or end <= 0:
+        return 0.0
+    net = abs(end / start - 1.0)
+    rets = pd.to_numeric(seg["close"].pct_change(), errors="coerce").abs().dropna()
+    path = float(rets.sum()) if len(rets) else 0.0
+    if path <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, net / path)), 3)
 
 
-def find_qingtian_hit(monthly: pd.DataFrame, item: StockItem, target: str = TARGET_DASH) -> Optional[QingtianHit]:
-    m = complete_months(monthly, target)
-    if m.empty or len(m) <= CONFIRM_MONTHS:
-        return None
-
-    m = m.sort_values("date").reset_index(drop=True)
-    latest_idx = len(m) - 1
-    latest_month = s(m.iloc[-1].get("date"))
-
-    for idx in range(latest_idx - CONFIRM_MONTHS, -1, -1):
-        confirm_idx = idx + CONFIRM_MONTHS
-        confirm_age = latest_idx - confirm_idx
-
-        if confirm_age > MAX_CONFIRM_AGE:
-            break
-
-        row = m.iloc[idx]
-        open_price = f(row.get("open"))
-        close_price = f(row.get("close"))
-
-        if open_price <= 0 or close_price <= open_price:
-            continue
-
-        body_pct = (close_price - open_price) / open_price * 100.0
-        if body_pct <= MIN_BODY_PCT:
-            continue
-
-        vol_ok, vol_ratio = volume_ok(m, idx)
-        if not vol_ok:
-            continue
-
-        pos_ok, open_pos, close_pos = position_ok(m, idx)
-        if not pos_ok:
-            continue
-
-        qingtian_level = open_price + (close_price - open_price) * QINGTIAN_RATIO
-        future = m.iloc[idx + 1:].copy()
-
-        if len(future) < CONFIRM_MONTHS:
-            continue
-
-        if not bool((future["close"].astype(float) >= qingtian_level).all()):
-            continue
-
-        # 擎天硬筛验模版：确认期内允许小涨/试盘，
-        # 但不能继续大涨远离锚定阳线；否则说明信号已经快速兑现，
-        # 不符合“在上三分之一附近横住承接”的样本要求。
-        post_ok, _, _ = post_qingtian_runup_ok(future, close_price)
-        if not post_ok:
-            continue
-
-        return QingtianHit(
-            code=item.code,
-            name=item.name,
-            anchor_month=s(row.get("date")),
-            confirm_month=s(m.iloc[confirm_idx].get("date")),
-            latest_complete_month=latest_month,
-            body_pct=round(body_pct, 2),
-            qingtian_level=round(qingtian_level, 4),
-            confirm_months=int(len(future)),
-            confirm_age_months=int(confirm_age),
-            amount_ratio=round(vol_ratio, 3),
-            position_open=round(open_pos, 3),
-            position_close=round(close_pos, 3),
+def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DASH) -> LingdongHit:
+    d0 = df.copy() if df is not None else pd.DataFrame()
+    if d0.empty or len(d0) < MIN_HISTORY_DAYS:
+        return LingdongHit(
+            code=item.code, name=item.name, status=DATA_SHORT,
+            latest_trade_day="", amount20=0.0, amount60=0.0, amount_ratio_20_60=0.0,
+            limitup_count_100=0, big_bull7_count_100=0, big_yang5_count_100=0, big_yin5_count_100=0,
+            gap_up_count_100=0, gap_down_count_100=0, range20_pct=0.0, small_body_ratio_60=0.0,
+            volume_long_bear_20=0, long_upper_count_100=0, trend_efficiency_20=0.0,
+            attack_memory=False, bad_activity=False, dead_activity=False, detail="日K样本不足",
         )
 
-    return None
+    d = add_lingdong_indicators(d0, item.code)
+    if d.empty or len(d) < MIN_HISTORY_DAYS:
+        return LingdongHit(
+            code=item.code, name=item.name, status=DATA_SHORT,
+            latest_trade_day="", amount20=0.0, amount60=0.0, amount_ratio_20_60=0.0,
+            limitup_count_100=0, big_bull7_count_100=0, big_yang5_count_100=0, big_yin5_count_100=0,
+            gap_up_count_100=0, gap_down_count_100=0, range20_pct=0.0, small_body_ratio_60=0.0,
+            volume_long_bear_20=0, long_upper_count_100=0, trend_efficiency_20=0.0,
+            attack_memory=False, bad_activity=False, dead_activity=False, detail="日K有效样本不足",
+        )
+
+    w100 = d.tail(LOOKBACK_DAYS).copy()
+    w60 = d.tail(MID_DAYS).copy()
+    w20 = d.tail(RECENT_DAYS).copy()
+
+    amount20_series = w20["amount"].mask(w20["amount"] <= 0, float("nan")) if len(w20) else pd.Series(dtype="float64")
+    amount60_series = w60["amount"].mask(w60["amount"] <= 0, float("nan")) if len(w60) else pd.Series(dtype="float64")
+    amount20 = float(amount20_series.dropna().mean()) if len(amount20_series.dropna()) else 0.0
+    amount60 = float(amount60_series.dropna().mean()) if len(amount60_series.dropna()) else 0.0
+    amount_ratio = amount20 / amount60 if amount60 > 0 and amount20 > 0 else 0.0
+
+    limitups = int(w100["limit_up"].sum())
+    big_bull7 = int(w100["big_bull7"].sum())
+    big_yang5 = int(w100["big_yang5"].sum())
+    big_yin5 = int(w100["big_yin5"].sum())
+    gap_up = int(w100["gap_up"].sum())
+    gap_down = int(w100["gap_down"].sum())
+    range20 = float(w20["range_pct"].median()) if len(w20) else 0.0
+    small_body_ratio = float(w60["small_body_narrow"].mean()) if len(w60) else 0.0
+    vol_long_bear20 = int(w20["volume_long_bear"].sum())
+    long_upper100 = int(w100["long_upper_reversal"].sum())
+    eff20 = trend_efficiency(d, RECENT_DAYS)
+
+    attack_memory = bool(
+        limitups >= 1
+        or big_bull7 >= 2
+        or big_yang5 >= 4
+        or gap_up >= 2
+    )
+    bad_activity = bool(
+        big_yin5 > big_yang5 + BAD_BIG_YIN_EXCESS
+        or vol_long_bear20 >= BAD_VOL_LONG_BEAR_20
+        or (long_upper100 >= 6 and big_yang5 <= big_yin5)
+    )
+    dead_activity = bool(
+        limitups == 0
+        and big_bull7 < 2
+        and big_yang5 < 3
+        and gap_up < 2
+        and range20 < DEAD_RANGE20_MAX
+        and small_body_ratio >= DEAD_SMALL_BODY_RATIO_MIN
+    )
+
+    reasons: List[str] = []
+    if amount20 < AMOUNT20_LOW:
+        status = LOW_LIQUIDITY
+        reasons.append(f"20日均成交额{amount20/1e8:.2f}亿低于底线")
+    elif bad_activity:
+        status = BAD_ACTIVE
+        if big_yin5 > big_yang5 + BAD_BIG_YIN_EXCESS:
+            reasons.append(f"100日大阴{big_yin5}次明显多于大阳{big_yang5}次")
+        if vol_long_bear20 >= BAD_VOL_LONG_BEAR_20:
+            reasons.append(f"20日放量长阴{vol_long_bear20}次")
+        if long_upper100 >= 6 and big_yang5 <= big_yin5:
+            reasons.append(f"100日长上影冲高回落{long_upper100}次")
+    elif attack_memory and amount20 >= AMOUNT20_BASIC:
+        status = GOOD_ACTIVE
+        reasons.append("具备攻击记忆")
+    elif dead_activity:
+        status = DEAD_ACTIVE
+        reasons.append("缺少攻击记忆且近期振幅/实体偏窄")
+    else:
+        status = NORMAL_ACTIVE
+        reasons.append("普通可交易活性")
+
+    if attack_memory:
+        reasons.append(f"涨停{limitups}次/7%大阳{big_bull7}次/5%大阳{big_yang5}次/向上缺口{gap_up}次")
+    if amount_ratio > 0:
+        reasons.append(f"20/60日成交额比{amount_ratio:.2f}")
+    reasons.append(f"20日中位振幅{range20:.2f}%")
+    reasons.append(f"60日小实体窄振幅比例{small_body_ratio:.0%}")
+    reasons.append(f"方向效率20日{eff20:.2f}")
+
+    return LingdongHit(
+        code=item.code,
+        name=item.name,
+        status=status,
+        latest_trade_day=s(d.iloc[-1].get("date")),
+        amount20=round(amount20, 2),
+        amount60=round(amount60, 2),
+        amount_ratio_20_60=round(amount_ratio, 3),
+        limitup_count_100=limitups,
+        big_bull7_count_100=big_bull7,
+        big_yang5_count_100=big_yang5,
+        big_yin5_count_100=big_yin5,
+        gap_up_count_100=gap_up,
+        gap_down_count_100=gap_down,
+        range20_pct=round(range20, 3),
+        small_body_ratio_60=round(small_body_ratio, 3),
+        volume_long_bear_20=vol_long_bear20,
+        long_upper_count_100=long_upper100,
+        trend_efficiency_20=eff20,
+        attack_memory=attack_memory,
+        bad_activity=bad_activity,
+        dead_activity=dead_activity,
+        detail="；".join(reasons),
+    )
 
 
-def sort_hits(hits: List[QingtianHit]) -> List[QingtianHit]:
+def is_report_signal(hit: LingdongHit) -> bool:
+    return hit.status in {GOOD_ACTIVE, NORMAL_ACTIVE}
+
+
+def sort_hits(hits: List[LingdongHit]) -> List[LingdongHit]:
     return sorted(
         hits,
         key=lambda x: (
-            x.confirm_age_months,
-            x.position_open,
-            -x.amount_ratio,
-            -x.body_pct,
-            -x.confirm_months,
+            STATUS_ORDER.get(x.status, 99),
+            -x.big_bull7_count_100,
+            -x.limitup_count_100,
+            -x.big_yang5_count_100,
+            -x.amount_ratio_20_60,
+            -x.amount20,
             x.code,
         ),
     )
 
 
-def build_report_text(hits: List[QingtianHit]) -> str:
+def build_report_text(hits: List[LingdongHit]) -> str:
+    # Telegram/Markdown 主报告向擎天看齐，只输出最干净的股票代码+名称；
+    # 详细指标仍保留在 CSV/JSON，避免主日志和推送被指标字段刷屏。
     if hits:
         return "\n".join(f"{x.code} {x.name}" for x in hits)
-    return "无符合擎天条件股票"
+    return "无符合灵动条件股票"
 
 
-def write_outputs(hits: List[QingtianHit], stat: ScanStat, failures: List[Dict[str, str]]) -> None:
+def write_outputs(all_results: List[LingdongHit], stat: ScanStat, failures: List[Dict[str, str]]) -> None:
     ensure_report_dir()
-    rows = [asdict(x) for x in hits]
+    all_rows = [asdict(x) for x in all_results]
+    signal_rows = [asdict(x) for x in all_results if is_report_signal(x)]
 
-    pd.DataFrame(
-        rows,
-        columns=[
-            "code", "name", "anchor_month", "confirm_month", "latest_complete_month",
-            "body_pct", "qingtian_level", "confirm_months", "confirm_age_months",
-            "amount_ratio", "position_open", "position_close",
-        ],
-    ).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    columns = [
+        "code", "name", "status", "latest_trade_day",
+        "amount20", "amount60", "amount_ratio_20_60",
+        "limitup_count_100", "big_bull7_count_100", "big_yang5_count_100", "big_yin5_count_100",
+        "gap_up_count_100", "gap_down_count_100", "range20_pct", "small_body_ratio_60",
+        "volume_long_bear_20", "long_upper_count_100", "trend_efficiency_20",
+        "attack_memory", "bad_activity", "dead_activity", "detail",
+    ]
+    pd.DataFrame(signal_rows, columns=columns).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-    payload = {"summary": asdict(stat), "signals": rows, "failures": failures[:300]}
+    payload = {
+        "summary": asdict(stat),
+        "signals": signal_rows,
+        "all_status_count": status_counts(all_results),
+        "all_results": all_rows[:1000],
+        "failures": failures[:300],
+    }
     OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    OUTPUT_MD.write_text(build_report_text(hits).rstrip() + "\n", encoding="utf-8")
+    OUTPUT_MD.write_text(build_report_text([x for x in all_results if is_report_signal(x)]).rstrip() + "\n", encoding="utf-8")
+
+
+def status_counts(results: List[LingdongHit]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for x in results:
+        out[x.status] = out.get(x.status, 0) + 1
+    return out
 
 
 def run_scan(limit: int = 0) -> int:
     if bs is None:
-        raise RuntimeError("baostock未安装，擎天无法获取原生月K")
+        raise RuntimeError("baostock未安装，灵动无法获取日K")
 
     ensure_report_dir()
     login_result = bs.login()
@@ -528,26 +629,23 @@ def run_scan(limit: int = 0) -> int:
             pool = pool[:limit]
 
         if not pool:
-            raise RuntimeError("股票池为空，不能伪装成无符合擎天股票")
+            raise RuntimeError("股票池为空，不能伪装成无符合灵动股票")
 
-        hits: List[QingtianHit] = []
+        results: List[LingdongHit] = []
         failures: List[Dict[str, str]] = []
-        monthly_success = 0
+        daily_success = 0
         start = time.time()
 
         for idx, item in enumerate(pool, 1):
             try:
-                monthly = load_monthly(item, TARGET_DASH)
-                full_monthly = complete_months(monthly, TARGET_DASH)
-
-                if full_monthly.empty:
-                    failures.append({"code": item.code, "name": item.name, "error": "原生完整月K为空"})
+                daily = load_daily(item, TARGET_DASH)
+                if daily.empty:
+                    failures.append({"code": item.code, "name": item.name, "error": "日K为空"})
                     continue
 
-                monthly_success += 1
-                hit = find_qingtian_hit(full_monthly, item, TARGET_DASH)
-                if hit is not None:
-                    hits.append(hit)
+                daily_success += 1
+                hit = evaluate_lingdong(daily, item, TARGET_DASH)
+                results.append(hit)
 
             except Exception as exc:
                 failures.append({"code": item.code, "name": item.name, "error": str(exc)[:180]})
@@ -555,33 +653,35 @@ def run_scan(limit: int = 0) -> int:
             if idx == 1 or idx % max(1, PROGRESS_EVERY) == 0 or idx == len(pool):
                 elapsed = max(time.time() - start, 0.001)
                 print(
-                    f"擎天原生月K扫描 {idx}/{len(pool)}"
-                    f"｜完整月K成功{monthly_success}"
-                    f"｜命中{len(hits)}"
+                    f"灵动日K扫描 {idx}/{len(pool)}"
+                    f"｜日K成功{daily_success}"
+                    f"｜信号{sum(1 for x in results if is_report_signal(x))}"
                     f"｜失败{len(failures)}"
                     f"｜速度{idx / elapsed:.2f}只/秒"
                     f"｜当前{item.code} {item.name}",
                     flush=True,
                 )
 
-        if monthly_success == 0:
-            raise RuntimeError("原生完整月K成功数量为0，不能伪装成无符合擎天股票")
+        if daily_success == 0:
+            raise RuntimeError("日K成功数量为0，不能伪装成无符合灵动股票")
 
-        hits = sort_hits(hits)
+        results = sort_hits(results)
+        signal_count = sum(1 for x in results if is_report_signal(x))
 
         stat = ScanStat(
             version=VERSION,
             target_date=TARGET_DASH,
             stock_pool_count=len(pool),
             scanned_count=len(pool),
-            monthly_success_count=monthly_success,
+            daily_success_count=daily_success,
             failed_count=len(failures),
-            signal_count=len(hits),
-            data_source="baostock_frequency_m_native_monthly_complete_month_only",
+            signal_count=signal_count,
+            data_source="baostock_frequency_d_qfq_activity_label",
         )
 
-        write_outputs(hits, stat, failures)
+        write_outputs(results, stat, failures)
         print(json.dumps(asdict(stat), ensure_ascii=False, indent=2), flush=True)
+        print(json.dumps(status_counts(results), ensure_ascii=False, indent=2), flush=True)
         return 0
 
     finally:
@@ -591,69 +691,94 @@ def run_scan(limit: int = 0) -> int:
             pass
 
 
-def synthetic_monthly(rows: List[Tuple[Any, ...]]) -> pd.DataFrame:
+def synthetic_daily(rows: List[Tuple[Any, ...]], code: str = "000001") -> pd.DataFrame:
     normalized: List[Dict[str, Any]] = []
-
     for row in rows:
         if len(row) == 5:
             d, o, h, l, c = row
-            volume = 100.0
-            amount = 100.0
+            volume = 1000000.0
+            amount = c * volume
+            pct = 0.0
         elif len(row) == 7:
             d, o, h, l, c, volume, amount = row
+            pct = 0.0
+        elif len(row) == 8:
+            d, o, h, l, c, volume, amount, pct = row
         else:
-            raise ValueError("synthetic row must have 5 or 7 fields")
+            raise ValueError("synthetic row must have 5, 7 or 8 fields")
+        normalized.append({"date": d, "code": code, "open": o, "high": h, "low": l, "close": c, "volume": volume, "amount": amount, "pct_chg": pct, "turnover": 0.0})
+    df = pd.DataFrame(normalized)
+    df["date"] = df["date"].map(norm_date)
+    return df
 
-        normalized.append({"date": d, "open": o, "high": h, "low": l, "close": c, "volume": volume, "amount": amount})
 
-    return pd.DataFrame(normalized)
-
-
-def base_low_months(start_year: int = 2022, count: int = 12, amount: float = 100.0) -> List[Tuple[Any, ...]]:
+def base_daily_rows(days: int = 130, start: str = "2025-01-01", price: float = 10.0, amount: float = 80000000.0) -> List[Tuple[Any, ...]]:
+    base = pd.Timestamp(start)
     rows: List[Tuple[Any, ...]] = []
-    y, m = start_year, 1
-
-    for _ in range(count):
-        rows.append((f"{y:04d}-{m:02d}-28", 10.0, 18.0, 9.5, 10.2, amount, amount))
-        m += 1
-        if m > 12:
-            y += 1
-            m = 1
-
+    cur = price
+    trade_i = 0
+    calendar_i = 0
+    while trade_i < days:
+        day = base + pd.Timedelta(days=calendar_i)
+        calendar_i += 1
+        if day.weekday() >= 5:
+            continue
+        open_ = cur * 0.998
+        close = cur * 1.002
+        high = max(open_, close) * 1.008
+        low = min(open_, close) * 0.992
+        volume = amount / max(close, 1e-9)
+        rows.append((day.strftime("%Y-%m-%d"), round(open_, 3), round(high, 3), round(low, 3), round(close, 3), volume, amount))
+        cur = close
+        trade_i += 1
     return rows
 
 
-def valid_recent_qingtian_rows(anchor_amount: float = 180.0, anchor_open: float = 10.0, anchor_close: float = 13.2) -> pd.DataFrame:
-    rows = base_low_months()
-    rows.extend([
-        ("2023-01-31", anchor_open, max(anchor_close, 13.5), 9.8, anchor_close, anchor_amount, anchor_amount),
-        ("2023-02-28", 12.8, 13.0, 8.0, 12.2, 120.0, 120.0),
-        ("2023-03-31", 12.2, 12.8, 7.0, 12.2, 120.0, 120.0),
-        ("2023-04-30", 12.2, 12.9, 7.0, 12.2, 120.0, 120.0),
-        ("2023-05-31", 12.2, 12.9, 7.0, 12.2, 120.0, 120.0),
-    ])
-    return synthetic_monthly(rows)
+def make_good_active_rows() -> pd.DataFrame:
+    rows = base_daily_rows(amount=120000000.0)
+    # 插入两根7%以上强阳和若干5%阳，保留足够成交额。
+    for idx, pct in [(80, 8.2), (105, 7.5), (115, 5.8), (122, 5.2)]:
+        d, o, h, l, c, v, a = rows[idx]
+        new_o = c
+        new_c = c * (1 + pct / 100.0)
+        rows[idx] = (d, round(new_o, 3), round(new_c * 1.01, 3), round(new_o * 0.995, 3), round(new_c, 3), v * 2.0, a * 2.0, pct)
+    return synthetic_daily(rows)
 
 
-def realistic_breakout_qingtian_rows() -> pd.DataFrame:
-    rows: List[Tuple[Any, ...]] = []
-    y, m = 2022, 1
-    for i in range(12):
-        high = 10.8 + (0.02 if i % 3 == 0 else 0.0)
-        rows.append((f"{y:04d}-{m:02d}-28", 9.6, high, 8.8, 9.9, 100.0, 100.0))
-        m += 1
-        if m > 12:
-            y += 1
-            m = 1
+def make_low_liquidity_rows() -> pd.DataFrame:
+    return synthetic_daily(base_daily_rows(amount=12000000.0))
 
-    rows.extend([
-        ("2023-01-31", 10.0, 13.7, 9.8, 13.5, 190.0, 190.0),
-        ("2023-02-28", 13.0, 13.6, 12.0, 12.6, 120.0, 120.0),
-        ("2023-03-31", 12.6, 13.4, 11.8, 12.7, 120.0, 120.0),
-        ("2023-04-30", 12.7, 13.5, 11.9, 12.8, 120.0, 120.0),
-        ("2023-05-31", 12.8, 13.6, 11.9, 12.9, 120.0, 120.0),
-    ])
-    return synthetic_monthly(rows)
+
+def make_dead_rows() -> pd.DataFrame:
+    rows = base_daily_rows(amount=70000000.0)
+    new_rows = []
+    for d, o, h, l, c, v, a in rows:
+        mid = c
+        new_rows.append((d, mid * 0.999, mid * 1.006, mid * 0.994, mid * 1.001, v, a))
+    return synthetic_daily(new_rows)
+
+
+def make_bad_active_rows() -> pd.DataFrame:
+    rows = base_daily_rows(amount=100000000.0)
+    for idx in [111, 114, 118, 122, 126]:
+        d, o, h, l, c, v, a = rows[idx]
+        prev = c
+        new_o = prev * 1.01
+        new_c = prev * 0.94
+        rows[idx] = (d, round(new_o, 3), round(new_o * 1.005, 3), round(new_c * 0.990, 3), round(new_c, 3), v * 2.4, a * 2.4, -6.0)
+    return synthetic_daily(rows)
+
+
+def make_normal_rows() -> pd.DataFrame:
+    rows = base_daily_rows(amount=90000000.0)
+    new_rows = []
+    for idx, (d, o, h, l, c, v, a) in enumerate(rows):
+        # 普通活性：成交额够、不是坏活跃、没有明显攻击记忆，但振幅不至于死水。
+        if idx % 4 == 0:
+            new_rows.append((d, round(c * 0.995, 3), round(c * 1.028, 3), round(c * 0.982, 3), round(c * 1.006, 3), v, a))
+        else:
+            new_rows.append((d, round(c * 0.998, 3), round(c * 1.022, 3), round(c * 0.980, 3), round(c * 1.002, 3), v, a))
+    return synthetic_daily(new_rows)
 
 
 def self_check_once() -> List[Dict[str, Any]]:
@@ -665,20 +790,11 @@ def self_check_once() -> List[Dict[str, Any]]:
     src = Path(__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     function_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-    called_names = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
 
-    add("source::native_monthly_frequency", 'frequency="m"' in src, "必须使用BaoStock原生月K frequency=m")
-    add("source::no_daily_to_monthly_function", "to_month" not in function_names and "to_month" not in called_names, "生产代码不得存在日线聚合月线函数/调用")
-    add("source::complete_month_filter", "complete_months" in function_names, "必须剔除未完成当前月K")
-    add("source::volume_filter", "volume_ok" in function_names, "必须检查大阳月量能")
-    add("source::position_filter", "position_ok" in function_names, "必须检查大阳月位置")
-    add("source::recent_signal_limit", "MAX_CONFIRM_AGE" in src, "必须限制历史老信号反复推送")
-    add("source::post_qingtian_runup_filter", "post_qingtian_runup_ok" in function_names, "必须过滤擎天确认期内继续大涨远离锚定阳线的样本")
-    add("source::hit_sort", "sort_hits" in function_names, "命中结果必须排序，不能按股票池原始顺序输出")
+    add("source::daily_frequency", 'frequency="d"' in src, "必须使用BaoStock日K frequency=d")
+    add("source::qfq_adjustflag", 'adjustflag="2"' in src, "必须使用前复权日K adjustflag=2")
+    add("source::workflow_scan", "run_scan" in function_names and "write_outputs" in function_names, "必须保留扫描与三件套输出链路")
+    add("source::activity_evaluator", "evaluate_lingdong" in function_names, "必须存在灵动评价函数")
 
     add("stock_pool::exclude_sh_000003_index", not common_stock_ok("sh.000003", "000003", "上证B股指数"), "必须剔除 sh.000003 上证B股指数")
     add("stock_pool::exclude_sh_000001_index", not common_stock_ok("sh.000001", "000001", "上证指数"), "必须剔除 sh.000001 上证指数")
@@ -686,90 +802,31 @@ def self_check_once() -> List[Dict[str, Any]]:
     add("stock_pool::allow_sh_600000_stock", common_stock_ok("sh.600000", "600000", "浦发银行"), "必须保留 sh.600000 普通股票")
 
     item = StockItem("000001", "sz.000001", "测试股")
-    good = valid_recent_qingtian_rows()
+    good = evaluate_lingdong(make_good_active_rows(), item)
+    add("rule::good_active_hit", good.status == GOOD_ACTIVE, f"状态={good.status}，详情={good.detail}")
+    add("rule::good_active_has_attack_memory", good.attack_memory, f"7%阳={good.big_bull7_count_100}，5%阳={good.big_yang5_count_100}")
 
-    add("rule::gt30_four_closes_hit", find_qingtian_hit(good, item, "2023-05-31") is not None, "大于30%且后续4根完整月收盘不破，必须命中")
+    low = evaluate_lingdong(make_low_liquidity_rows(), item)
+    add("rule::low_liquidity", low.status == LOW_LIQUIDITY, f"状态={low.status}，20日额={low.amount20}")
 
-    realistic = realistic_breakout_qingtian_rows()
-    add("rule::real_breakout_position_not_mis killed".replace(" ", "_"), find_qingtian_hit(realistic, item, "2023-05-31") is not None, "真实突破型擎天：锚定月收盘可突破前高，不能因close_pos过高误杀")
+    dead = evaluate_lingdong(make_dead_rows(), item)
+    add("rule::dead_activity", dead.status == DEAD_ACTIVE, f"状态={dead.status}，振幅={dead.range20_pct}，小实体={dead.small_body_ratio_60}")
 
-    equal_30 = valid_recent_qingtian_rows(anchor_close=13.0)
-    add("rule::equal_30_not_hit", find_qingtian_hit(equal_30, item, "2023-05-31") is None, "实体涨幅等于30%，不能命中")
+    bad = evaluate_lingdong(make_bad_active_rows(), item)
+    add("rule::bad_active", bad.status == BAD_ACTIVE, f"状态={bad.status}，大阴={bad.big_yin5_count_100}，大阳={bad.big_yang5_count_100}，长阴={bad.volume_long_bear_20}")
 
-    only_3 = good.iloc[:-1].copy()
-    add("rule::only_three_future_not_hit", find_qingtian_hit(only_3, item, "2023-04-30") is None, "后续仅3根完整月K，不能命中")
+    normal = evaluate_lingdong(make_normal_rows(), item)
+    add("rule::normal_active", normal.status == NORMAL_ACTIVE, f"状态={normal.status}，详情={normal.detail}")
 
-    break_close = good.copy()
-    break_close.loc[16, "close"] = 11.0
-    add("rule::future_close_break_not_hit", find_qingtian_hit(break_close, item, "2023-05-31") is None, "任意后续完整月收盘跌破擎天位，原结构作废")
+    unordered = [bad, normal, good, low, dead]
+    sorted_status = [x.status for x in sort_hits(unordered)]
+    add("output::sort_hits_status_priority", sorted_status[0] == GOOD_ACTIVE and sorted_status[-1] in {DATA_SHORT, LOW_LIQUIDITY}, f"排序={sorted_status}")
 
-    shadow_break = good.copy()
-    shadow_break.loc[14, "low"] = 6.0
-    add("rule::shadow_break_still_hit", find_qingtian_hit(shadow_break, item, "2023-05-31") is not None, "影线跌破但收盘不破，仍然有效")
-
-    low_volume = valid_recent_qingtian_rows(anchor_amount=90.0)
-    add("rule::low_volume_big_yang_not_hit", find_qingtian_hit(low_volume, item, "2023-05-31") is None, "缩量大阳不能命中")
-
-    post_high_runup = valid_recent_qingtian_rows()
-    post_high_runup.loc[14, "high"] = 17.5
-    add("rule::post_qingtian_high_runup_not_hit", find_qingtian_hit(post_high_runup, item, "2023-05-31") is None, "擎天后影线最高价相对锚定收盘涨幅超过30%，不能命中")
-
-    post_close_runup = valid_recent_qingtian_rows()
-    post_close_runup.loc[14, "high"] = 16.0
-    post_close_runup.loc[14, "close"] = 15.8
-    add("rule::post_qingtian_close_runup_not_hit", find_qingtian_hit(post_close_runup, item, "2023-05-31") is None, "擎天确认期最高收盘价相对锚定收盘涨幅超过18%，不能命中")
-
-    late_runup_after_window = pd.concat([
-        good,
-        synthetic_monthly([
-            ("2023-06-30", 12.2, 18.0, 11.5, 12.4, 120.0, 120.0),
-        ]),
-    ], ignore_index=True)
-    add("rule::late_runup_after_confirm_window_still_hit", find_qingtian_hit(late_runup_after_window, item, "2023-06-30") is not None, "擎天确认期之后才冲高，不应被确认期不过度拉升过滤误杀")
-
-    high_position = valid_recent_qingtian_rows(anchor_open=30.0, anchor_close=40.0, anchor_amount=300.0)
-    add("rule::high_position_big_yang_not_hit", find_qingtian_hit(high_position, item, "2023-05-31") is None, "高位大阳不能命中")
-
-    sustained_signal = pd.concat([
-        good,
-        synthetic_monthly([
-            ("2023-06-30", 12.1, 13.0, 11.5, 12.2, 120.0, 120.0),
-            ("2023-07-31", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0),
-            ("2023-08-31", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0),
-            ("2023-09-30", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0),
-            ("2023-10-31", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0),
-            ("2023-11-30", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0),
-        ]),
-    ], ignore_index=True)
-    add("rule::sustained_signal_age6_still_hit", find_qingtian_hit(sustained_signal, item, "2023-11-30") is not None, "确认完成后6个月内仍未跌破擎天位，允许作为持续有效擎天")
-
-    too_old_signal = pd.concat([
-        sustained_signal,
-        synthetic_monthly([("2023-12-31", 12.2, 13.0, 11.5, 12.2, 120.0, 120.0)]),
-    ], ignore_index=True)
-    add("rule::too_old_signal_not_hit", find_qingtian_hit(too_old_signal, item, "2023-12-31") is None, "确认完成超过默认6个月的历史擎天，不允许反复推送")
-
-    unfinished = pd.concat([
-        good,
-        synthetic_monthly([("2023-06-15", 12.0, 13.0, 5.0, 5.5, 130.0, 130.0)]),
-    ], ignore_index=True)
-    add("rule::unfinished_current_month_ignored", find_qingtian_hit(unfinished, item, "2023-06-15") is not None, "当前月未走完时，必须剔除最后一根月K")
-
-    unordered_hits = [
-        QingtianHit("000003", "慢确认", "2023-01-31", "2023-05-31", "2023-07-31", 40.0, 12.2, 6, 2, 2.5, 0.2, 1.4),
-        QingtianHit("000002", "新确认高开", "2023-01-31", "2023-05-31", "2023-05-31", 35.0, 12.2, 4, 0, 2.0, 0.6, 1.3),
-        QingtianHit("000001", "新确认低开", "2023-01-31", "2023-05-31", "2023-05-31", 32.0, 12.2, 4, 0, 1.8, 0.3, 1.2),
-    ]
-    sorted_codes = [x.code for x in sort_hits(unordered_hits)]
-    add("output::sort_hits_priority", sorted_codes == ["000001", "000002", "000003"], f"排序结果={sorted_codes}")
-
-    report_text = build_report_text([
-        QingtianHit("000001", "测试股", "2023-01-31", "2023-05-31", "2023-05-31", 32.0, 12.1333, 4, 0, 1.8, 0.3, 0.7)
-    ]).strip()
+    report_text = build_report_text([good]).strip()
     add("output::code_name_only", report_text == "000001 测试股", f"报告内容={report_text!r}")
 
     empty_text = build_report_text([]).strip()
-    add("output::empty_hit_text", empty_text == "无符合擎天条件股票", f"空命中文案={empty_text!r}")
+    add("output::empty_text", empty_text == "无符合灵动条件股票", f"空文案={empty_text!r}")
 
     return items
 
@@ -783,19 +840,19 @@ def run_self_check(rounds: int) -> None:
         ok = all(x["ok"] for x in items)
         all_rounds.append({"round": round_id, "ok": ok, "items": items})
 
-        print(f"擎天自检第{round_id}遍：{'通过' if ok else '失败'}", flush=True)
+        print(f"灵动自检第{round_id}遍：{'通过' if ok else '失败'}", flush=True)
         for item in items:
             print(f"  [{'OK' if item['ok'] else 'FAIL'}] {item['name']}｜{item['detail']}", flush=True)
 
         if not ok:
             SELF_CHECK_JSON.write_text(json.dumps(all_rounds, ensure_ascii=False, indent=2), encoding="utf-8")
-            raise RuntimeError(f"擎天自检第{round_id}遍失败")
+            raise RuntimeError(f"灵动自检第{round_id}遍失败")
 
     SELF_CHECK_JSON.write_text(json.dumps(all_rounds, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="擎天原生月K扫描器")
+    parser = argparse.ArgumentParser(description="灵动日K活性扫描器")
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-rounds", type=int, default=3)
@@ -811,7 +868,7 @@ def main() -> int:
         parser.print_help()
         return 0
     except Exception as exc:
-        print(f"擎天运行失败: {exc}", file=sys.stderr, flush=True)
+        print(f"灵动运行失败: {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
         return 1
 
