@@ -97,10 +97,16 @@ def is_data_mismatch(row: Dict[str, Any], target: str) -> bool:
     return bool(target and d and d != target)
 
 
+def is_target_row(row: Dict[str, Any], target: str) -> bool:
+    if not target:
+        return True
+    return get_row_date(row) == target and not is_data_mismatch(row, target)
+
+
 def classify_row(row: Dict[str, Any], target: str) -> str:
     text = row_text(row)
     if is_data_mismatch(row, target) or "数据日期未对齐" in text:
-        return "数据日期未对齐"
+        return "旧日期跳过"
     if bool(row.get("risk_block")):
         if "突破失败" in text or "跌回线下" in text:
             return "突破失败跌回线下"
@@ -123,7 +129,7 @@ def classify_row(row: Dict[str, Any], target: str) -> str:
 
 def is_hard_rejected(row: Dict[str, Any], target: str) -> bool:
     return classify_row(row, target) in {
-        "数据日期未对齐", "突破失败跌回线下", "risk_block硬风险", "次新专项约束", "硬风险", "其他硬剔除"
+        "旧日期跳过", "突破失败跌回线下", "risk_block硬风险", "次新专项约束", "硬风险", "其他硬剔除"
     }
 
 
@@ -142,30 +148,38 @@ def top_rows(rows: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]
 
 
 def summarize(rows: List[Dict[str, Any]], target: str) -> Dict[str, Any]:
-    by_reason: Dict[str, int] = {}
+    by_reason_all: Dict[str, int] = {}
+    by_reason_target: Dict[str, int] = {}
     by_date: Dict[str, int] = {}
-    hard = 0
-    target_fresh_rows = 0
+    hard_all = 0
+    hard_target = 0
+    target_rows: List[Dict[str, Any]] = []
+    stale_rows: List[Dict[str, Any]] = []
     for row in rows:
         reason = classify_row(row, target)
-        by_reason[reason] = by_reason.get(reason, 0) + 1
-        hard += 1 if is_hard_rejected(row, target) else 0
+        by_reason_all[reason] = by_reason_all.get(reason, 0) + 1
+        hard_all += 1 if is_hard_rejected(row, target) else 0
         d = get_row_date(row) or "未知"
         by_date[d] = by_date.get(d, 0) + 1
-        if target and d == target:
-            target_fresh_rows += 1
+        if is_target_row(row, target):
+            target_rows.append(row)
+            by_reason_target[reason] = by_reason_target.get(reason, 0) + 1
+            hard_target += 1 if is_hard_rejected(row, target) else 0
+        else:
+            stale_rows.append(row)
     total = len(rows)
-    data_mismatch = by_reason.get("数据日期未对齐", 0)
-    fresh = total - data_mismatch
+    target_total = len(target_rows)
+    stale_total = len(stale_rows)
     return {
-        "total_rows": total,
-        "hard_rejected": hard,
-        "data_mismatch": data_mismatch,
-        "fresh_rows": fresh,
-        "target_fresh_rows": target_fresh_rows,
-        "candidate_target_coverage": round(target_fresh_rows / total, 4) if total else 0.0,
-        "fresh_coverage": round(fresh / total, 4) if total else 0.0,
-        "reason_counts": dict(sorted(by_reason.items(), key=lambda kv: kv[1], reverse=True)),
+        "raw_total_rows": total,
+        "target_rows": target_total,
+        "stale_rows": stale_total,
+        "hard_rejected_all": hard_all,
+        "hard_rejected_target": hard_target,
+        "target_usable_rows": max(0, target_total - hard_target),
+        "candidate_target_coverage": round(target_total / total, 4) if total else 0.0,
+        "reason_counts_all": dict(sorted(by_reason_all.items(), key=lambda kv: kv[1], reverse=True)),
+        "reason_counts_target": dict(sorted(by_reason_target.items(), key=lambda kv: kv[1], reverse=True)),
         "date_counts": dict(sorted(by_date.items(), key=lambda kv: kv[1], reverse=True)),
     }
 
@@ -198,64 +212,67 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     stat = payload.get("stat") if isinstance(payload.get("stat"), dict) else {}
     target = norm_date(payload.get("target_dash") or os.getenv("EMPLOYEE3_TARGET_DATE") or os.getenv("TARGET_TRADE_DATE"))
     summary = summarize(rows, target)
-    total = int(summary["total_rows"])
-    hard = int(summary["hard_rejected"])
-    data_mismatch = int(summary["data_mismatch"])
-    target_fresh_rows = int(summary["target_fresh_rows"])
+    raw_total = int(summary["raw_total_rows"])
+    target_total = int(summary["target_rows"])
+    stale_total = int(summary["stale_rows"])
+    hard_target = int(summary["hard_rejected_target"])
+    usable_target = int(summary["target_usable_rows"])
     coverage = float(summary["candidate_target_coverage"])
     load_error = ss(payload.get("load_error"))
     cache_count = cache_file_count(stat)
+    target_pool = [r for r in rows if is_target_row(r, target)]
 
     guard_status = "PASS"
-    guard_action = "正常展示三号员工结果"
+    guard_action = "正常展示目标日三号员工结果"
     title = f"三号员工Top5深度精选｜{target or payload.get('target') or ''}"
     if load_error:
         guard_status = "FAIL"
         guard_action = "报告JSON读取失败，停止正式推送"
         title = f"三号员工数据异常｜停止选股｜{target or ''}"
-    elif total == 0:
+    elif raw_total == 0:
         guard_status = "WARN"
         guard_action = "今日无核心线突破深度命中"
         title = f"三号员工Top5｜无深度命中｜{target or ''}"
-    elif data_mismatch == total or target_fresh_rows == 0 or cache_count < 1000:
+    elif target_total == 0 or cache_count < 1000:
         guard_status = "DATA_STALE"
         guard_action = "目标日有效候选为0或缓存文件明显不足，停止正式选股"
         title = f"三号员工数据未更新｜停止选股｜{target or ''}"
-    elif data_mismatch > 0:
+    elif stale_total > 0:
         guard_status = "PARTIAL_STALE"
-        guard_action = "部分候选数据日期未对齐，已按旧日期候选硬剔除；继续展示目标日有效结果"
-        formal = [r for r in rows if ss(r.get("深度等级") or r.get("deep_grade")).upper() in {"S", "A"} and not is_hard_rejected(r, target)]
-        title = f"三号员工Top5深度精选｜部分旧日期已剔除｜{target or ''}" if formal else f"三号员工Top5观察池｜部分旧日期已剔除｜{target or ''}"
-    elif hard == total:
+        guard_action = "旧日期股票不算今日命中，已从Top5和正式判断中跳过；只展示目标日数据"
+        formal = [r for r in target_pool if ss(r.get("深度等级") or r.get("deep_grade")).upper() in {"S", "A"} and not is_hard_rejected(r, target)]
+        title = f"三号员工Top5深度精选｜旧日期已跳过｜{target or ''}" if formal else f"三号员工Top5观察池｜旧日期已跳过｜{target or ''}"
+    elif hard_target == target_total:
         guard_status = "ALL_HARD_REJECTED"
-        guard_action = "全部命中票被硬剔除，需按原因分布复盘"
+        guard_action = "目标日命中票全部被硬剔除，需按原因分布复盘"
         title = f"三号员工Top5观察池｜全硬剔除复盘｜{target or ''}"
     else:
-        formal = [r for r in rows if ss(r.get("深度等级") or r.get("deep_grade")).upper() in {"S", "A"} and not is_hard_rejected(r, target)]
+        formal = [r for r in target_pool if ss(r.get("深度等级") or r.get("deep_grade")).upper() in {"S", "A"} and not is_hard_rejected(r, target)]
         title = f"三号员工Top5深度精选｜{target or ''}" if formal else f"三号员工Top5观察池｜无A级/S级｜{target or ''}"
 
     lines: List[str] = [
         title,
         f"守门状态:{guard_status}｜处理:{guard_action}",
-        f"核心线突破深度命中{total}只｜硬剔除{hard}只｜旧日期候选{data_mismatch}只｜目标日有效候选{target_fresh_rows}只｜候选目标日覆盖率{coverage:.1%}",
+        f"今日有效命中{target_total}只｜旧日期跳过{stale_total}只｜原始扫描命中{raw_total}只｜目标日覆盖率{coverage:.1%}",
+        f"今日硬剔除{hard_target}只｜今日可继续观察/评估{usable_target}只",
         f"缓存文件{stat.get('cache_files', '未知')}｜有效缓存{stat.get('cache_hit', '未知')}｜坏缓存{stat.get('bad', 0)}｜短缓存{stat.get('short', 0)}",
-        f"硬剔除/状态分布:{format_counts(summary['reason_counts'])}",
-        f"数据日期分布:{format_dates(summary['date_counts'])}",
+        f"今日状态分布:{format_counts(summary['reason_counts_target'])}",
+        f"全部数据日期分布:{format_dates(summary['date_counts'])}",
     ]
     if guard_status == "DATA_STALE":
         lines += ["", "结论：目标日有效候选不足，当前结果按数据异常处理，不按‘市场无票’处理。", "动作：先更新公共K线缓存，或手动允许三号员工 BaoStock 补拉最近K线后重跑。"]
     elif guard_status == "PARTIAL_STALE":
-        lines += ["", "结论：缓存总量充足，不是缓存不足；只是部分命中票仍停在旧日期，旧日期票已按数据未对齐剔除。", "动作：不需要因这类部分旧日期直接停止选股；若想清洗到全量目标日，可允许 BaoStock 补拉后重跑。"]
+        lines += ["", "结论：缓存总量充足，不是缓存不足；旧日期股票不算今日突破命中，已单独跳过。", "动作：今天只看目标日数据里的Top5/观察池；若要清洗旧日期，可允许 BaoStock 补拉后重跑。"]
     elif guard_status == "ALL_HARD_REJECTED":
-        lines += ["", "结论：有深度命中，但全部被硬闸门挡住；按上方原因分布复盘。"]
-    elif total == 0:
+        lines += ["", "结论：目标日有深度命中，但全部被硬闸门挡住；按上方今日状态分布复盘。"]
+    elif raw_total == 0:
         lines += ["", "结论：今日没有识别到最近20日高质量突破核心线的深度命中。"]
     if load_error:
         lines.append(f"读取错误:{load_error}")
 
-    display = top_rows(rows, 5)
+    display = top_rows(target_pool, 5)
     if display:
-        lines += ["", "排查Top5｜仅按深度分/等级排序，不等于买入："]
+        lines += ["", "目标日Top5｜仅按深度分/等级排序，不等于买入："]
         for idx, r in enumerate(display, 1):
             code = ss(r.get("股票代码") or r.get("code"))
             name = ss(r.get("股票中文名称") or r.get("name"))
@@ -270,6 +287,8 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
                 f"{idx}. {code} {name}｜{grade} {score}分｜线:{line_price}｜破:{br_date}｜数据:{data_date}",
                 f"   状态:{reason}｜{action}",
             ]
+    elif raw_total > 0:
+        lines += ["", "目标日Top5：无。旧日期命中已跳过，不参与今日排序。"]
 
     report = "\n".join(lines)
     if len(report) > 3900:
