@@ -33,7 +33,7 @@ try:
 except Exception:
     bs = None
 
-VERSION = "灵动-v8-public-cache-target-day-refresh-only"
+VERSION = "灵动-v10-telegram-top5-cache-target-day-refresh-only"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "artifacts"
 OUTPUT_CSV = REPORT_DIR / "lingdong_latest.csv"
@@ -54,6 +54,8 @@ CACHE_DIRS = [
 MAX_STOCKS = int(os.getenv("LINGDONG_MAX_STOCKS", os.getenv("MAX_STOCKS", "0")) or "0")
 PROGRESS_EVERY = int(os.getenv("LINGDONG_PROGRESS_EVERY", "200"))
 CACHE_SCAN_PROGRESS_EVERY = int(os.getenv("LINGDONG_CACHE_SCAN_PROGRESS_EVERY", "800"))
+REPORT_TOP_N = int(os.getenv("LINGDONG_REPORT_TOP_N", "5"))
+REPORT_MAX_CHARS = int(os.getenv("LINGDONG_REPORT_MAX_CHARS", "3500"))
 
 LOOKBACK_DAYS = int(os.getenv("LINGDONG_LOOKBACK_DAYS", "100"))
 RECENT_DAYS = int(os.getenv("LINGDONG_RECENT_DAYS", "20"))
@@ -690,7 +692,9 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
 
 
 def is_report_signal(hit: LingdongHit) -> bool:
-    return hit.status in {GOOD_ACTIVE, NORMAL_ACTIVE}
+    # Telegram正式报告只推真正有攻击记忆的“灵动充沛”。
+    # “灵动尚可”只保留在JSON统计/全量结果里，避免消息过长和普通票刷屏。
+    return hit.status == GOOD_ACTIVE
 
 
 def sort_hits(hits: List[LingdongHit]) -> List[LingdongHit]:
@@ -708,16 +712,68 @@ def sort_hits(hits: List[LingdongHit]) -> List[LingdongHit]:
     )
 
 
-def build_report_text(hits: List[LingdongHit]) -> str:
-    if hits:
-        lines = []
-        for x in hits:
-            lines.append(
-                f"{x.code} {x.name}｜{x.status}｜7%阳{x.big_bull7_count_100}｜涨停{x.limitup_count_100}｜"
-                f"5%阳{x.big_yang5_count_100}｜5%阴{x.big_yin5_count_100}｜20日额{x.amount20/1e8:.2f}亿"
-            )
-        return "\n".join(lines)
-    return "无符合灵动条件股票"
+def _telegram_safe_text(lines: List[str], max_chars: int = REPORT_MAX_CHARS) -> str:
+    limit = max(1200, min(int(max_chars), 3900))
+    out: List[str] = []
+    total = 0
+    for line in lines:
+        item = s(line)
+        add_len = len(item) + (1 if out else 0)
+        if out and total + add_len > limit:
+            out.append("……消息已截断，完整明细见 CSV/JSON artifact")
+            break
+        out.append(item)
+        total += add_len
+    return "\n".join(out).strip()
+
+
+def build_report_text(
+    hits: List[LingdongHit],
+    all_results: Optional[List[LingdongHit]] = None,
+    stat: Optional[ScanStat] = None,
+) -> str:
+    # Telegram有4096字符限制。主报告只做“可读摘要 + 灵动充沛Top 5”，
+    # 全字段明细继续放在 CSV/JSON，避免 send telegram result 报 message is too long。
+    rows = all_results if all_results is not None else hits
+    counts = status_counts(rows) if rows else {}
+    good_hits = [x for x in hits if x.status == GOOD_ACTIVE]
+
+    if not good_hits and all_results is None and stat is None:
+        return "无符合灵动充沛条件股票"
+
+    lines: List[str] = []
+    lines.append("【灵动｜日K股性活跃度】")
+    if stat is not None:
+        stale_note = f"｜过期{stat.stale_count}" if stat.stale_count else ""
+        refresh_note = f"｜补今{stat.refreshed_count}" if stat.refreshed_count else ""
+        lines.append(
+            f"目标日{stat.target_date}｜缓存命中{stat.cache_hit_count}/{stat.cache_files}"
+            f"｜扫描{stat.daily_success_count}{stale_note}{refresh_note}"
+        )
+
+    lines.append(
+        f"灵动充沛{counts.get(GOOD_ACTIVE, 0)}｜灵动尚可{counts.get(NORMAL_ACTIVE, 0)}｜"
+        f"邪动乱流{counts.get(BAD_ACTIVE, 0)}｜死水无灵{counts.get(DEAD_ACTIVE, 0)}｜"
+        f"灵气枯竭{counts.get(LOW_LIQUIDITY, 0)}｜样本不足{counts.get(DATA_SHORT, 0)}"
+    )
+
+    if not good_hits:
+        lines.append("无符合灵动充沛条件股票；普通活性票详见 CSV/JSON")
+        return _telegram_safe_text(lines)
+
+    top_n = max(1, int(REPORT_TOP_N))
+    top = good_hits[:top_n]
+    lines.append(f"【灵动充沛 Top {len(top)}/{len(good_hits)}】")
+    for i, x in enumerate(top, 1):
+        lines.append(
+            f"{i}. {x.code} {x.name}｜7%阳{x.big_bull7_count_100}｜涨停{x.limitup_count_100}｜"
+            f"5%阳{x.big_yang5_count_100}｜5%阴{x.big_yin5_count_100}｜20日额{x.amount20/1e8:.2f}亿"
+        )
+
+    if len(good_hits) > len(top):
+        lines.append(f"其余{len(good_hits) - len(top)}只灵动充沛详见 CSV/JSON artifact")
+
+    return _telegram_safe_text(lines)
 
 
 def status_counts(results: List[LingdongHit]) -> Dict[str, int]:
@@ -750,7 +806,7 @@ def write_outputs(all_results: List[LingdongHit], stat: ScanStat, failures: List
         "failures": failures[:300],
     }
     OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    OUTPUT_MD.write_text(build_report_text([x for x in all_results if is_report_signal(x)]).rstrip() + "\n", encoding="utf-8")
+    OUTPUT_MD.write_text(build_report_text([x for x in all_results if is_report_signal(x)], all_results, stat).rstrip() + "\n", encoding="utf-8")
 
 
 def run_scan(limit: int = 0) -> int:
@@ -1009,8 +1065,12 @@ def self_check_once() -> List[Dict[str, Any]]:
     report_text = build_report_text([good]).strip()
     add("output::report_contains_status", GOOD_ACTIVE in report_text and "000001" in report_text, f"报告内容={report_text!r}")
 
+    many_hits = [good] * 200
+    limited_text = build_report_text(many_hits, many_hits, None)
+    add("output::telegram_safe_length", len(limited_text) <= REPORT_MAX_CHARS + 80, f"报告长度={len(limited_text)}")
+
     empty_text = build_report_text([]).strip()
-    add("output::empty_text", empty_text == "无符合灵动条件股票", f"空文案={empty_text!r}")
+    add("output::empty_text", empty_text == "无符合灵动充沛条件股票", f"空文案={empty_text!r}")
 
     return items
 
