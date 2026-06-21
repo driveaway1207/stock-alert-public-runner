@@ -33,7 +33,7 @@ try:
 except Exception:
     bs = None
 
-VERSION = "灵动-v20-effective-date-fallback-no-empty-telegram"
+VERSION = "灵动-v21-early-rise-selected-stage-score"
 ROOT = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "artifacts"
 OUTPUT_CSV = REPORT_DIR / "lingdong_latest.csv"  # 兼容旧workflow：等同于 active_pool
@@ -114,6 +114,16 @@ ACTIVITY_SCORE_GAP_UP = float(os.getenv("LINGDONG_SCORE_GAP_UP", "1"))
 ACTIVITY_PENALTY_BIG_YIN5 = float(os.getenv("LINGDONG_PENALTY_BIG_YIN5", "2"))
 ACTIVITY_PENALTY_VOL_LONG_BEAR = float(os.getenv("LINGDONG_PENALTY_VOL_LONG_BEAR", "3"))
 ACTIVITY_PENALTY_LONG_UPPER = float(os.getenv("LINGDONG_PENALTY_LONG_UPPER", "1.5"))
+
+# 灵动精选新增“初升段/新启动度”：用于把刚开始上涨没多久、未过度炒高的活跃票往前排。
+EARLY_RISE_SCORE_WEIGHT = float(os.getenv("LINGDONG_EARLY_RISE_SCORE_WEIGHT", "1.8"))
+EARLY_RISE_MAX_SCORE = float(os.getenv("LINGDONG_EARLY_RISE_MAX_SCORE", "10"))
+EARLY_RISE_30D_LOW_BEST_MIN = float(os.getenv("LINGDONG_EARLY_RISE_30D_LOW_BEST_MIN", "8"))
+EARLY_RISE_30D_LOW_BEST_MAX = float(os.getenv("LINGDONG_EARLY_RISE_30D_LOW_BEST_MAX", "35"))
+EARLY_RISE_60D_LOW_BEST_MIN = float(os.getenv("LINGDONG_EARLY_RISE_60D_LOW_BEST_MIN", "10"))
+EARLY_RISE_60D_LOW_BEST_MAX = float(os.getenv("LINGDONG_EARLY_RISE_60D_LOW_BEST_MAX", "45"))
+EARLY_RISE_OVERHEAT_30D = float(os.getenv("LINGDONG_EARLY_RISE_OVERHEAT_30D", "55"))
+EARLY_RISE_OVERHEAT_60D = float(os.getenv("LINGDONG_EARLY_RISE_OVERHEAT_60D", "80"))
 
 TARGET_KEYS = [
     "LINGDONG_TARGET_DATE",
@@ -244,6 +254,12 @@ class LingdongHit:
     volume_long_bear_20: int
     long_upper_count_100: int
     trend_efficiency_20: float
+    early_rise_score: float
+    stage_label: str
+    rise_from_30d_low_pct: float
+    rise_from_60d_low_pct: float
+    days_since_first_attack_30: int
+    pre_attack_activity_score: float
     attack_memory: bool
     bad_activity: bool
     dead_activity: bool
@@ -1042,6 +1058,175 @@ def trend_efficiency(d: pd.DataFrame, days: int = 20) -> float:
     return round(max(0.0, min(1.0, net / path)), 3)
 
 
+def _bool_col(d: pd.DataFrame, col: str) -> pd.Series:
+    if d is None or d.empty or col not in d.columns:
+        return pd.Series(False, index=d.index if d is not None else None)
+    return d[col].fillna(False).astype(bool)
+
+
+def calc_early_rise_profile(d: pd.DataFrame) -> Dict[str, Any]:
+    """计算“刚开始上涨没多久”的新启动度。
+
+    它不是买点，只用于灵动精选排序/阶段标签：
+    - 要有近端资金攻击；
+    - 从30/60日低点涨幅不能太夸张；
+    - 第一次攻击最好发生在最近3-15个交易日；
+    - 启动前最好有沉寂期；
+    - 风险K不能太多。
+    """
+    if d is None or d.empty or len(d) < 60:
+        return {
+            "early_rise_score": 0.0,
+            "stage_label": "样本不足",
+            "rise_from_30d_low_pct": 0.0,
+            "rise_from_60d_low_pct": 0.0,
+            "days_since_first_attack_30": 999,
+            "pre_attack_activity_score": 0.0,
+        }
+
+    dd = d.copy().reset_index(drop=True)
+    latest_close = f(dd.iloc[-1].get("close"))
+    w30 = dd.tail(30).copy()
+    w60 = dd.tail(60).copy()
+    low30 = f(w30["low"].min()) if "low" in w30.columns and len(w30) else 0.0
+    low60 = f(w60["low"].min()) if "low" in w60.columns and len(w60) else 0.0
+    rise30 = (latest_close / low30 - 1.0) * 100.0 if latest_close > 0 and low30 > 0 else 0.0
+    rise60 = (latest_close / low60 - 1.0) * 100.0 if latest_close > 0 and low60 > 0 else 0.0
+
+    event_cols = [
+        "limit_up",
+        "primary_jump_separation",
+        "primary_separation_line",
+        "primary_strong_bullish_engulf",
+        "primary_big_bull7",
+        "primary_big_yang5",
+        "primary_gap_up",
+    ]
+    event_mask = pd.Series(False, index=dd.index)
+    for col in event_cols:
+        if col in dd.columns:
+            event_mask = event_mask | _bool_col(dd, col)
+
+    recent_idx = list(dd.tail(30).index)
+    recent_events = [idx for idx in recent_idx if bool(event_mask.loc[idx])]
+    if recent_events:
+        first_attack_idx = int(recent_events[0])
+        days_since_first = int(len(dd) - 1 - first_attack_idx)
+    else:
+        first_attack_idx = -1
+        days_since_first = 999
+
+    pre_score = 0.0
+    if first_attack_idx > 0:
+        pre_start = max(0, first_attack_idx - 25)
+        pre_seg = dd.iloc[pre_start:first_attack_idx].copy()
+        if not pre_seg.empty:
+            pre_score = float(window_activity_counts(pre_seg, min(20, len(pre_seg))).get("score", 0.0) or 0.0)
+
+    a10 = window_activity_counts(dd, 10)
+    a20 = window_activity_counts(dd, 20)
+    a30 = window_activity_counts(dd, 30)
+    limitup10 = int(a10.get("limitup", 0) or 0)
+    limitup20 = int(a20.get("limitup", 0) or 0)
+    limitup30 = int(a30.get("limitup", 0) or 0)
+    yin20 = int(a20.get("big_yin5", 0) or 0)
+    vol_bear20 = int(a20.get("vol_long_bear", 0) or 0)
+    upper20 = int(a20.get("long_upper", 0) or 0)
+
+    ma5 = float(dd["close"].tail(5).mean()) if len(dd) >= 5 else 0.0
+    ma10 = float(dd["close"].tail(10).mean()) if len(dd) >= 10 else 0.0
+    ma20 = float(dd["close"].tail(20).mean()) if len(dd) >= 20 else 0.0
+
+    score = 0.0
+    # 低点以来涨幅：要动起来，但不能离低点太远。
+    if EARLY_RISE_30D_LOW_BEST_MIN <= rise30 <= EARLY_RISE_30D_LOW_BEST_MAX:
+        score += 3.0
+    elif 3.0 <= rise30 < EARLY_RISE_30D_LOW_BEST_MIN:
+        score += 1.2
+    elif EARLY_RISE_30D_LOW_BEST_MAX < rise30 <= EARLY_RISE_OVERHEAT_30D:
+        score += 0.8
+    elif rise30 > EARLY_RISE_OVERHEAT_30D:
+        score -= 2.5
+
+    if EARLY_RISE_60D_LOW_BEST_MIN <= rise60 <= EARLY_RISE_60D_LOW_BEST_MAX:
+        score += 2.0
+    elif 5.0 <= rise60 < EARLY_RISE_60D_LOW_BEST_MIN:
+        score += 0.8
+    elif EARLY_RISE_60D_LOW_BEST_MAX < rise60 <= EARLY_RISE_OVERHEAT_60D:
+        score += 0.4
+    elif rise60 > EARLY_RISE_OVERHEAT_60D:
+        score -= 2.0
+
+    # 第一次攻击出现的时间：刚启动不久最好。
+    if 3 <= days_since_first <= 15:
+        score += 2.5
+    elif 0 <= days_since_first <= 2:
+        score += 1.6
+    elif 16 <= days_since_first <= 25:
+        score += 1.1
+    elif days_since_first > 30:
+        score -= 1.2
+
+    # 启动前沉寂期。
+    if days_since_first < 999:
+        if pre_score <= 2.0:
+            score += 1.3
+        elif pre_score <= 6.0:
+            score += 0.6
+        elif pre_score > 12.0:
+            score -= 1.2
+
+    # 近端确认：不是完全没动，而是已经出现资金痕迹。
+    if float(a10.get("score", 0.0) or 0.0) > 0 or float(a20.get("score", 0.0) or 0.0) >= 6:
+        score += 1.2
+    if limitup10 > 0 or int(a10.get("primary_jump_separation", 0) or 0) > 0 or int(a10.get("primary_separation_line", 0) or 0) > 0:
+        score += 0.6
+
+    # 均线初步转多。
+    if latest_close > 0 and ma5 > 0 and ma10 > 0 and latest_close >= ma5 >= ma10:
+        score += 0.8
+    if ma10 > 0 and ma20 > 0 and ma10 >= ma20:
+        score += 0.4
+
+    # 过热/风险扣分。
+    if limitup10 >= 3:
+        score -= 1.8
+    if limitup20 >= 5:
+        score -= 2.2
+    if limitup30 >= 8:
+        score -= 1.5
+    if yin20 > 2:
+        score -= min(2.0, (yin20 - 2) * 0.7)
+    if vol_bear20 > 1:
+        score -= min(1.5, (vol_bear20 - 1) * 0.8)
+    if upper20 > 2:
+        score -= min(1.5, (upper20 - 2) * 0.5)
+
+    score = round(max(0.0, min(float(EARLY_RISE_MAX_SCORE), score)), 3)
+
+    if (rise30 > EARLY_RISE_OVERHEAT_30D or rise60 > EARLY_RISE_OVERHEAT_60D or limitup20 >= 5 or limitup30 >= 8):
+        stage = "高热延续"
+    elif (yin20 >= 4 or vol_bear20 >= 2 or upper20 >= 5):
+        stage = "风险乱流"
+    elif score >= 7.0 and days_since_first <= 18 and rise30 <= 45:
+        stage = "初升段"
+    elif score >= 5.0 and days_since_first <= 25 and rise30 <= 60:
+        stage = "主升初段"
+    elif score >= 3.0:
+        stage = "普通活跃"
+    else:
+        stage = "非初升"
+
+    return {
+        "early_rise_score": score,
+        "stage_label": stage,
+        "rise_from_30d_low_pct": round(float(rise30), 3),
+        "rise_from_60d_low_pct": round(float(rise60), 3),
+        "days_since_first_attack_30": int(days_since_first),
+        "pre_attack_activity_score": round(float(pre_score), 3),
+    }
+
+
 def window_activity_counts(d: pd.DataFrame, days: int) -> Dict[str, Any]:
     w = d.tail(max(1, int(days))).copy() if d is not None and not d.empty else pd.DataFrame()
     if w.empty:
@@ -1143,6 +1328,7 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
             primary_big_bull7_count_30=0, primary_big_yang5_count_30=0, primary_gap_up_count_30=0, big_yin5_count_30=0, gap_up_count_30=0, jump_separation_count_30=0, separation_line_count_30=0, strong_bullish_engulf_count_30=0, volume_long_bear_count_30=0, long_upper_count_30=0, recent_activity_score_30=0.0,
             gap_up_count_100=0, gap_down_count_100=0, range20_pct=0.0, small_body_ratio_60=0.0,
             volume_long_bear_20=0, long_upper_count_100=0, trend_efficiency_20=0.0,
+            early_rise_score=0.0, stage_label="样本不足", rise_from_30d_low_pct=0.0, rise_from_60d_low_pct=0.0, days_since_first_attack_30=999, pre_attack_activity_score=0.0,
             attack_memory=False, bad_activity=False, dead_activity=False, detail="日K样本不足",
         )
 
@@ -1166,6 +1352,7 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
             primary_big_bull7_count_30=0, primary_big_yang5_count_30=0, primary_gap_up_count_30=0, big_yin5_count_30=0, gap_up_count_30=0, jump_separation_count_30=0, separation_line_count_30=0, strong_bullish_engulf_count_30=0, volume_long_bear_count_30=0, long_upper_count_30=0, recent_activity_score_30=0.0,
             gap_up_count_100=0, gap_down_count_100=0, range20_pct=0.0, small_body_ratio_60=0.0,
             volume_long_bear_20=0, long_upper_count_100=0, trend_efficiency_20=0.0,
+            early_rise_score=0.0, stage_label="样本不足", rise_from_30d_low_pct=0.0, rise_from_60d_low_pct=0.0, days_since_first_attack_30=999, pre_attack_activity_score=0.0,
             attack_memory=False, bad_activity=False, dead_activity=False, detail="日K有效样本不足",
         )
 
@@ -1194,6 +1381,7 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
     vol_long_bear20 = int(w20["volume_long_bear"].sum())
     long_upper100 = int(w100["long_upper_reversal"].sum())
     eff20 = trend_efficiency(d, RECENT_DAYS)
+    early_profile = calc_early_rise_profile(d)
 
     primary_reversal_100 = int(a100["primary_jump_separation"]) + int(a100["primary_separation_line"]) + int(a100["primary_strong_bullish_engulf"])
     primary_gap_up_100 = int(a100["primary_gap_up"])
@@ -1274,6 +1462,11 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
     reasons.append(f"20日中位振幅{range20:.2f}%")
     reasons.append(f"60日小实体窄振幅比例{small_body_ratio:.0%}")
     reasons.append(f"上涨效率20日{eff20:.2f}")
+    reasons.append(
+        f"阶段{early_profile['stage_label']}/初升段分{early_profile['early_rise_score']:.1f}"
+        f"/30日低点涨幅{early_profile['rise_from_30d_low_pct']:.1f}%"
+        f"/首次攻击{early_profile['days_since_first_attack_30']}日前"
+    )
     latest_day = s(d.iloc[-1].get("date"))
     if target and latest_day != target:
         reasons.append(f"缓存未覆盖目标日，当前按{latest_day}股性参考")
@@ -1363,6 +1556,12 @@ def evaluate_lingdong(df: pd.DataFrame, item: StockItem, target: str = TARGET_DA
         volume_long_bear_20=vol_long_bear20,
         long_upper_count_100=long_upper100,
         trend_efficiency_20=eff20,
+        early_rise_score=float(early_profile["early_rise_score"]),
+        stage_label=str(early_profile["stage_label"]),
+        rise_from_30d_low_pct=float(early_profile["rise_from_30d_low_pct"]),
+        rise_from_60d_low_pct=float(early_profile["rise_from_60d_low_pct"]),
+        days_since_first_attack_30=int(early_profile["days_since_first_attack_30"]),
+        pre_attack_activity_score=float(early_profile["pre_attack_activity_score"]),
         attack_memory=attack_memory,
         bad_activity=bad_activity,
         dead_activity=dead_activity,
@@ -1570,8 +1769,10 @@ def report_rank_key(hit: LingdongHit) -> Tuple[float, float, float, float, float
     amount_lift = min(max(hit.amount_ratio_20_60, 0.0), 3.0)
     up_efficiency = max(hit.trend_efficiency_20, 0.0)
     recent_boost = min(recent20, 20.0) * 0.35 + min(recent30, 30.0) * 0.15
-    score = attack + recent_boost + liquidity * 1.5 + amount_lift * 2.0 + up_efficiency * 5.0 - risk_drag
-    return (score, recent20, amount_lift, liquidity, -hit.big_yin5_count_100, hit.code)
+    early_score = max(float(getattr(hit, "early_rise_score", 0.0) or 0.0), 0.0)
+    stage_bonus = {"初升段": 4.0, "主升初段": 2.5, "普通活跃": 0.5, "高热延续": -4.0, "风险乱流": -5.0, "非初升": -1.0}.get(str(getattr(hit, "stage_label", "")), 0.0)
+    score = attack + recent_boost + early_score * EARLY_RISE_SCORE_WEIGHT + stage_bonus + liquidity * 1.5 + amount_lift * 2.0 + up_efficiency * 5.0 - risk_drag
+    return (score, early_score, recent20, amount_lift, liquidity, -hit.big_yin5_count_100, hit.code)
 
 
 def select_report_hits(hits: List[LingdongHit]) -> List[LingdongHit]:
@@ -1619,6 +1820,8 @@ def recent_window_line(hit: LingdongHit, days: int, idx: int) -> str:
     return (
         f"{idx}. {hit.code} {hit.name}"
         f"｜{hit.status}"
+        f"｜{getattr(hit, 'stage_label', '未知')}"
+        f"｜初升{float(getattr(hit, 'early_rise_score', 0.0) or 0.0):.1f}"
         f"｜涨停{limitup}"
         f"｜非停7%阳{price7}"
         f"｜普通5%阳{price5}"
@@ -1681,6 +1884,8 @@ def build_report_text(
             limitup, price7, price5 = price_attack_counts(x, 100)
             lines.append(
                 f"{i}. {x.code} {x.name}"
+                f"｜{x.stage_label}"
+                f"｜初升{x.early_rise_score:.1f}"
                 f"｜涨停{limitup}"
                 f"｜非停7%阳{price7}"
                 f"｜普通5%阳{price5}"
@@ -1730,6 +1935,7 @@ def write_outputs(all_results: List[LingdongHit], stat: ScanStat, failures: List
         "limitup_count_30", "big_bull7_count_30", "big_yang5_count_30", "price_attack7_ex_limitup_count_30", "price_attack5_plain_count_30", "primary_jump_separation_count_30", "primary_separation_line_count_30", "primary_strong_bullish_engulf_count_30", "primary_big_bull7_count_30", "primary_big_yang5_count_30", "primary_gap_up_count_30", "big_yin5_count_30", "gap_up_count_30", "jump_separation_count_30", "separation_line_count_30", "strong_bullish_engulf_count_30", "volume_long_bear_count_30", "long_upper_count_30", "recent_activity_score_30",
         "gap_up_count_100", "gap_down_count_100", "range20_pct", "small_body_ratio_60",
         "volume_long_bear_20", "long_upper_count_100", "trend_efficiency_20",
+        "early_rise_score", "stage_label", "rise_from_30d_low_pct", "rise_from_60d_low_pct", "days_since_first_attack_30", "pre_attack_activity_score",
         "attack_memory", "bad_activity", "dead_activity", "detail",
     ]
     # 兼容旧workflow：lingdong_latest.csv 仍输出广义灵动充沛池；新增三份命名清晰的复盘文件。
@@ -1761,18 +1967,18 @@ def refresh_priority_codes(
     if limit <= 0:
         return None
     ranked: List[Tuple[float, str]] = []
-    for code, cached in items:
+    for cache_key, cached in items:
         try:
-            daily = normalize_hist(cached, code)
+            daily = normalize_hist(cached, cache_key)
             if daily.empty or s(daily.iloc[-1].get("date")) == target:
                 continue
-            display_code = code6(code)
+            display_code = code6(cache_key)
             name = stock_display_name(display_code, names.get(cache_key, names.get(display_code, "")))
             if name == "名称待补" and "name" in daily.columns:
                 vals = [s(x) for x in daily["name"].tolist() if valid_stock_display_name(display_code, x)]
                 if vals:
                     name = vals[-1]
-            item = StockItem(code=display_code, bs_code=bs_code_of(code), name=name)
+            item = StockItem(code=display_code, bs_code=cache_key, name=name)
             hit = evaluate_lingdong(daily, item, target)
             if not telegram_name_ok(hit) or not telegram_stock_ok(hit):
                 continue
@@ -1783,11 +1989,11 @@ def refresh_priority_codes(
                 continue
             status_bonus = {GOOD_ACTIVE: 30.0, NORMAL_ACTIVE: 16.0, BAD_ACTIVE: 8.0}.get(hit.status, 0.0)
             score = status_bonus + activity + min(hit.amount20 / 1e8, 10.0) + min(hit.amount_ratio_20_60, 3.0)
-            ranked.append((score, code))
+            ranked.append((score, cache_key))
         except Exception:
             continue
     ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return {code for _, code in ranked[:max(1, int(limit))]}
+    return {cache_key for _, cache_key in ranked[:max(1, int(limit))]}
 
 
 def run_scan(limit: int = 0) -> int:
@@ -2313,6 +2519,30 @@ def self_check_once() -> List[Dict[str, Any]]:
     add("edge::target_inference_ignores_future_dates", inferred_no_future != "2099-12-31" and bool(inferred_no_future), f"推断={inferred_no_future}")
 
     add("rule::sort_hits_uses_report_rank_key", "report_rank_key(x)[0]" in src or "report_rank_key(x)" in src, "sort_hits必须统一使用互斥事件综合排序，不再用原始big_bull7/big_yang5排序")
+
+    # v21边界：初升段/新启动度必须进入精选排序、报告和导出。
+    add("rule::early_rise_profile_exists", "calc_early_rise_profile" in function_names and "early_rise_score" in src and "stage_label" in src, "必须新增初升段分和阶段标签")
+    add("rule::early_rise_affects_selected_rank", "early_score * EARLY_RISE_SCORE_WEIGHT" in src and "stage_bonus" in src, "灵动精选排序必须纳入初升段分/阶段标签")
+    add("output::early_rise_in_report", "｜初升{x.early_rise_score:.1f}" in src and "｜{x.stage_label}" in src, "Telegram精选行必须显示初升段分和阶段标签")
+
+    early_rows = base_daily_rows(days=130, start="2025-01-01", price=10.0, amount=120000000.0)
+    # 前期沉寂，最近10日出现一次7%攻击，低点以来涨幅适中。
+    idx = len(early_rows) - 8
+    d0, o0, h0, l0, c0, v0, a0 = early_rows[idx]
+    new_c = c0 * 1.08
+    early_rows[idx] = (d0, round(c0, 3), round(new_c * 1.01, 3), round(c0 * 0.99, 3), round(new_c, 3), v0 * 2.0, a0 * 2.0, 8.0)
+    early_hit = evaluate_lingdong(synthetic_daily(early_rows), StockItem("000001", "sz.000001", "平安银行"))
+    add("edge::early_rise_scores_new_start", early_hit.early_rise_score >= 4.0 and early_hit.stage_label in {"初升段", "主升初段", "普通活跃"}, f"score={early_hit.early_rise_score}, stage={early_hit.stage_label}, rise30={early_hit.rise_from_30d_low_pct}")
+
+    hot_rows = base_daily_rows(days=130, start="2025-01-01", price=10.0, amount=120000000.0)
+    # 连续多次大涨，模拟已经明显高热，不应被标成初升。
+    for k in range(12, 3, -2):
+        idx = len(hot_rows) - k
+        d0, o0, h0, l0, c0, v0, a0 = hot_rows[idx]
+        new_c = c0 * 1.10
+        hot_rows[idx] = (d0, round(c0, 3), round(new_c * 1.01, 3), round(c0 * 0.99, 3), round(new_c, 3), v0 * 2.5, a0 * 2.5, 10.0)
+    hot_hit = evaluate_lingdong(synthetic_daily(hot_rows), StockItem("000002", "sz.000002", "测试二"))
+    add("edge::early_rise_blocks_overheated_stage", hot_hit.stage_label != "初升段" or hot_hit.early_rise_score < early_hit.early_rise_score, f"early={early_hit.early_rise_score}/{early_hit.stage_label}, hot={hot_hit.early_rise_score}/{hot_hit.stage_label}")
 
     # v20深度边界：目标日全市场未覆盖时，Telegram必须按最近有效缓存日兜底，不能空推。
     old_target_dash = TARGET_DASH
