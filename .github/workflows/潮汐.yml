@@ -119,9 +119,23 @@ jobs:
       - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests pyarrow openpyxl lxml beautifulsoup4 html5lib tqdm
+          pip install pandas numpy requests pyarrow openpyxl lxml beautifulsoup4 html5lib tqdm akshare
 
       - name: run 潮汐
+        env:
+          PYTHONUNBUFFERED: 1
+          CHAOXI_SEND_TELEGRAM: "0"
+        shell: bash
+        run: |
+          set -e
+          args=(python -u "潮汐.py" --date "${{ steps.config.outputs.target_date }}" --out-dir "潮汐输出")
+          if [ "${{ steps.config.outputs.no_pool_filter }}" = "1" ]; then
+            args+=(--no-pool-filter)
+          fi
+          "${args[@]}"
+
+      - name: 补全 潮汐 报告并发送Telegram
+        if: always()
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -130,10 +144,9 @@ jobs:
           CHAOXI_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
         shell: bash
         run: |
-          set -e
-          args=(python -u "潮汐.py" --date "${{ steps.config.outputs.target_date }}" --out-dir "潮汐输出" --print-report)
-          if [ "${{ steps.config.outputs.no_pool_filter }}" = "1" ]; then
-            args+=(--no-pool-filter)
+          args=(python -u "潮汐补全.py" --out-dir "潮汐输出" --print-report)
+          if [ "${{ steps.config.outputs.target_date }}" != "latest" ]; then
+            args+=(--date "${{ steps.config.outputs.target_date }}")
           fi
           if [ "${{ steps.config.outputs.send_telegram }}" = "1" ]; then
             args+=(--send-telegram)
