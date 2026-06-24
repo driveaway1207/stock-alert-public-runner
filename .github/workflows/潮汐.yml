@@ -37,7 +37,7 @@ permissions:
   actions: read
 
 jobs:
-  潮汐:
+  chaoxi:
     name: 潮汐
     runs-on: ubuntu-latest
     timeout-minutes: 360
