@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """
 破界.py
-核心线突破海选器｜V19全量20日召回候选限额深评并行准备版
+核心线突破海选器｜V20全量20日召回多进程并行扫描版
 
 定位：
 1）不是一号员工/三号员工的完整替代品；
@@ -23,6 +23,7 @@ import math
 import os
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 
-启动标识 = "破界_核心线突破海选器_V19_全量20日召回_候选限额深评_进度日志_Top3_Telegram"
+启动标识 = "破界_核心线突破海选器_V20_全量20日召回_多进程并行扫描_进度日志_Top3_Telegram"
 
 根目录 = Path(__file__).resolve().parent
 报告目录 = 根目录 / "破界报告"
@@ -80,14 +81,19 @@ Telegram推送TopN = int(os.getenv("POJIE_TELEGRAM_TOP_N", os.getenv("POJIE_TOP_
 启用原始价位预检 = os.getenv("POJIE_RAW_PRICE_PREFILTER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 启用突破窗口快照复用 = os.getenv("POJIE_REUSE_WINDOW_BASELINE_LINES", "1").strip() not in {"0", "false", "False", "no", "NO"}
 基准命中后仍动态补充 = os.getenv("POJIE_DYNAMIC_REFINE_AFTER_BASE_HIT", "0").strip() not in {"0", "false", "False", "no", "NO"}
-# V19：20日召回仍完整，但不再对同一只票的所有轻量候选线做深度交易定价。
+# V20：20日召回仍完整，但不再对同一只票的所有轻量候选线做深度交易定价。
 # 先用轻量分数保留最可能有交易价值的候选，再深评，避免慢票单只跑到几十秒。
 候选深评最大选项数 = max(3, int(os.getenv("POJIE_MAX_DEEP_OPTIONS_PER_STOCK", "8")))
+# V20：真正提速靠多进程并行扫描，不缩短20日召回、不减少股票池。
+# GitHub ubuntu runner 通常 2 核，默认最多开 4 个进程；若机器较弱可用 POJIE_WORKERS=2。
+启用并行扫描 = os.getenv("POJIE_PARALLEL", "1").strip() not in {"0", "false", "False", "no", "NO"}
+默认进程数 = min(4, max(1, os.cpu_count() or 1))
+并行进程数 = max(1, int(os.getenv("POJIE_WORKERS", str(默认进程数))))
 启动时刻 = time.time()
 
 def 日志(msg: str) -> None:
     elapsed = time.time() - 启动时刻
-    print(f"[破界V19][{elapsed:8.1f}s] {msg}", flush=True)
+    print(f"[破界V20][{elapsed:8.1f}s] {msg}", flush=True)
 
 # ---------- 可调参数 ----------
 突破回看天数 = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))
@@ -3822,7 +3828,7 @@ def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if not options:
         return None
 
-    # V19：保留20日完整召回，但深评阶段限额。
+    # V20：保留20日完整召回，但深评阶段限额。
     # options 是轻量突破候选；深度评估会继续计算承接、压力、RR、风险，成本高。
     # 这里按“已正式突破优先、突破质量、核心线净分/带量共振、近期突破、实际突破线距离”排序，
     # 只把最有交易价值的候选送入深评。这样不牺牲20日召回窗口，也不让低质量重复线拖死整票。
@@ -3981,6 +3987,31 @@ def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     return best
 
 
+
+
+# ---------- V20 多进程单票任务 ----------
+def 处理单文件任务(path_text: str) -> Dict[str, Any]:
+    """单只股票扫描任务。
+
+    设计原则：
+    1）每个 worker 自己读取 CSV，主进程不传 pandas DataFrame，避免序列化大对象；
+    2）返回轻量 dict，主进程统一排序、写报告、发 Telegram；
+    3）单票异常只返回失败，不让整轮海选中断。
+    """
+    item_t0 = time.time()
+    path = Path(path_text)
+    code = 标准代码(path.stem if re.search(r"\d{6}", path.stem) else path.name)
+    try:
+        df = 读取缓存文件(path)
+        if df.empty:
+            return {"ok": False, "status": "读取失败", "code": code, "path": path_text, "cost": time.time() - item_t0, "row": None, "error": "empty"}
+        if len(df) < 最少K线数:
+            return {"ok": False, "status": "样本不足", "code": code, "path": path_text, "cost": time.time() - item_t0, "row": None, "error": "rows_lt_min"}
+        row = 筛选单票(code, df)
+        return {"ok": True, "status": "命中" if row else "未命中", "code": code, "path": path_text, "cost": time.time() - item_t0, "row": row, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "status": "读取失败", "code": code, "path": path_text, "cost": time.time() - item_t0, "row": None, "error": str(exc)[:500]}
+
 # ---------- Telegram 推送 ----------
 def Telegram安全文本(x: Any, limit: int = 900) -> str:
     s = str(x or "").replace("\r", " ").strip()
@@ -4045,7 +4076,7 @@ def main() -> None:
     日志(f"目标日期：{目标日期输入 or '未指定/使用缓存最新'}｜严格目标日={要求严格目标日}")
     日志(f"TopN：正式{正式输出数量}｜观察{观察输出数量}｜TelegramTop{Telegram推送TopN}")
     日志(f"突破召回窗口：最近{突破回看天数}日｜快速模式={快速日跑模式}｜实际快速日数={快速扫描回看天数 if 快速日跑模式 else 突破回看天数}｜延迟精修={延迟核心线精修}")
-    日志(f"V19提速：原始价位预检={启用原始价位预检}｜窗口基准快照复用={启用突破窗口快照复用}｜深评候选上限={候选深评最大选项数}｜基准命中后动态补充={基准命中后仍动态补充}")
+    日志(f"V20提速：多进程并行={启用并行扫描}｜workers={并行进程数}｜原始价位预检={启用原始价位预检}｜窗口基准快照复用={启用突破窗口快照复用}｜深评候选上限={候选深评最大选项数}")
     日志(f"Telegram：enabled={启用Telegram推送}｜token={'有' if bool(TelegramToken) else '无'}｜chat_id={'有' if bool(TelegramChatID) else '无'}")
     日志(f"BaoStock fallback 环境：POJIE_ALLOW_BAOSTOCK_FALLBACK={os.getenv('POJIE_ALLOW_BAOSTOCK_FALLBACK','0')}｜本脚本默认只读缓存")
     报告目录.mkdir(parents=True, exist_ok=True)
@@ -4057,34 +4088,53 @@ def main() -> None:
 
     scan_t0 = time.time()
     slow_count = 0
-    for idx, path in enumerate(files, 1):
-        item_t0 = time.time()
-        code = 标准代码(path.stem if re.search(r"\d{6}", path.stem) else path.name)
-        try:
-            df = 读取缓存文件(path)
-            if df.empty:
-                stat["读取失败"] += 1
-                continue
-            if len(df) < 最少K线数:
-                stat["样本不足"] += 1
-                continue
-            row = 筛选单票(code, df)
-            if row:
-                rows.append(row)
-                stat["命中"] += 1
-        except Exception as exc:
+    completed = 0
+
+    def 处理任务结果(res: Dict[str, Any]) -> None:
+        nonlocal slow_count, completed
+        completed += 1
+        status = str(res.get("status", ""))
+        code = str(res.get("code", ""))
+        path_text = str(res.get("path", ""))
+        cost = 安全浮点(res.get("cost"))
+        if status == "读取失败":
             stat["读取失败"] += 1
-            日志(f"筛选异常 {code}: {exc}")
-        finally:
-            cost = time.time() - item_t0
-            if cost >= 慢票告警秒:
-                slow_count += 1
-                日志(f"慢票告警 code={code} cost={cost:.1f}s path={path}")
-            if idx % 进度日志间隔 == 0 or idx == len(files):
-                elapsed = time.time() - scan_t0
-                speed = idx / elapsed if elapsed > 0 else 0.0
-                eta = (len(files) - idx) / speed if speed > 0 else 0.0
-                日志(f"海选进度 {idx}/{len(files)}｜命中={len(rows)}｜读取失败={stat['读取失败']}｜样本不足={stat['样本不足']}｜慢票={slow_count}｜速度={speed:.2f}只/秒｜预计剩余={eta/60:.1f}分钟｜当前={code}")
+            if res.get("error"):
+                # 只打印真实异常；empty 类失败太多时不刷屏。
+                err = str(res.get("error", ""))
+                if err not in {"empty", "rows_lt_min"}:
+                    日志(f"筛选异常 {code}: {err}")
+        elif status == "样本不足":
+            stat["样本不足"] += 1
+        row = res.get("row")
+        if isinstance(row, dict) and row:
+            rows.append(row)
+            stat["命中"] += 1
+        if cost >= 慢票告警秒:
+            slow_count += 1
+            日志(f"慢票告警 code={code} cost={cost:.1f}s path={path_text}")
+        if completed % 进度日志间隔 == 0 or completed == len(files):
+            elapsed = time.time() - scan_t0
+            speed = completed / elapsed if elapsed > 0 else 0.0
+            eta = (len(files) - completed) / speed if speed > 0 else 0.0
+            日志(f"海选进度 {completed}/{len(files)}｜命中={len(rows)}｜读取失败={stat['读取失败']}｜样本不足={stat['样本不足']}｜慢票={slow_count}｜速度={speed:.2f}只/秒｜预计剩余={eta/60:.1f}分钟｜当前={code}")
+
+    if 启用并行扫描 and len(files) > 1 and 并行进程数 > 1:
+        日志(f"并行扫描启动：workers={并行进程数}｜任务数={len(files)}")
+        with ProcessPoolExecutor(max_workers=并行进程数) as ex:
+            future_map = {ex.submit(处理单文件任务, str(path)): str(path) for path in files}
+            for fut in as_completed(future_map):
+                try:
+                    处理任务结果(fut.result())
+                except Exception as exc:
+                    completed += 1
+                    stat["读取失败"] += 1
+                    日志(f"并行任务异常 path={future_map.get(fut, '')}: {exc}")
+    else:
+        日志("串行扫描启动：POJIE_PARALLEL=0 或 workers=1")
+        for path in files:
+            处理任务结果(处理单文件任务(str(path)))
+
     日志(f"海选扫描完成：总耗时={(time.time()-scan_t0)/60:.1f}分钟｜命中={len(rows)}｜读取失败={stat['读取失败']}｜样本不足={stat['样本不足']}｜慢票={slow_count}")
 
     def 行分层优先级(x: Dict[str, Any]) -> int:
