@@ -5,13 +5,13 @@ run-name: 三号员工
   workflow_dispatch:
     inputs:
       employee3_date_choice:
-        description: "🎨 选择海选日期｜默认：上一个交易日"
+        description: "🎨 选择海选日期｜默认：当前交易日"
         required: false
         type: choice
-        default: "🟦 上一个交易日"
+        default: "🟩 当前交易日"
         options:
-          - "🟦 上一个交易日"
           - "🟩 当前交易日"
+          - "🟦 上一个交易日"
           - "🟨 上两个交易日"
           - "🟧 上三个交易日"
           - "🟥 上四个交易日"
@@ -125,7 +125,9 @@ jobs:
               '上七个交易日': 7,
           }
 
-          offset = 1
+          # 三号员工定时任务在北京时间20:10运行，默认必须扫描当天完整日K；
+          # 只有用户手动选择“上一个交易日”等回看选项时，才向前偏移。
+          offset = 0
           for key, value in choice_map.items():
               if key in choice:
                   offset = value
@@ -146,7 +148,7 @@ jobs:
 
           print(f'target_date={target}')
           print(f'target_reason={reason}')
-          print(f'date_choice={choice}')
+          print(f'date_choice={choice or "定时默认当前交易日"}')
           print(f'send_telegram={send_telegram}')
           print(f'baostock_fallback={baostock_fallback}')
           PY
