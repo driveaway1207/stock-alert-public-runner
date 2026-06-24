@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """
 破界.py
-核心线突破海选器｜V17全量20日召回延迟精修工程版
+核心线突破海选器｜V18全量20日召回原始价位预检快照复用工程版
 
 定位：
 1）不是一号员工/三号员工的完整替代品；
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 
-启动标识 = "破界_核心线突破海选器_V17_全量20日召回_延迟精修_进度日志_Top3_Telegram"
+启动标识 = "破界_核心线突破海选器_V18_全量20日召回_原始价位预检_快照复用_进度日志_Top3_Telegram"
 
 根目录 = Path(__file__).resolve().parent
 报告目录 = 根目录 / "破界报告"
@@ -70,17 +70,21 @@ Telegram推送TopN = int(os.getenv("POJIE_TELEGRAM_TOP_N", os.getenv("POJIE_TOP_
 进度日志间隔 = max(1, int(os.getenv("POJIE_PROGRESS_EVERY", "50")))
 慢票告警秒 = float(os.getenv("POJIE_SLOW_STOCK_SECONDS", "8"))
 缓存索引日志间隔 = max(100, int(os.getenv("POJIE_CACHE_INDEX_PROGRESS_EVERY", "1000")))
-# V17：默认保留最近20日完整突破召回，避免漏掉“早突破、后承接”的好股票。
+# V18：默认保留最近20日完整突破召回，避免漏掉“早突破、后承接”的好股票。
 # 加速只来自候选线延迟精修/进度日志，不再默认缩短突破回看窗口。
 # 如需临时极速排错，可显式设置 POJIE_FAST_DAILY_MODE=1 且 POJIE_FAST_SCAN_DAYS=3。
 快速日跑模式 = os.getenv("POJIE_FAST_DAILY_MODE", "0").strip() not in {"0", "false", "False", "no", "NO"}
 快速扫描回看天数 = max(1, int(os.getenv("POJIE_FAST_SCAN_DAYS", os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))))
 延迟核心线精修 = os.getenv("POJIE_DELAY_LINE_REFINEMENT", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# V18：不缩短20日召回窗口，用轻量原始价位预检 + 突破窗口基准快照复用提速。
+启用原始价位预检 = os.getenv("POJIE_RAW_PRICE_PREFILTER", "1").strip() not in {"0", "false", "False", "no", "NO"}
+启用突破窗口快照复用 = os.getenv("POJIE_REUSE_WINDOW_BASELINE_LINES", "1").strip() not in {"0", "false", "False", "no", "NO"}
+基准命中后仍动态补充 = os.getenv("POJIE_DYNAMIC_REFINE_AFTER_BASE_HIT", "0").strip() not in {"0", "false", "False", "no", "NO"}
 启动时刻 = time.time()
 
 def 日志(msg: str) -> None:
     elapsed = time.time() - 启动时刻
-    print(f"[破界V17][{elapsed:8.1f}s] {msg}", flush=True)
+    print(f"[破界V18][{elapsed:8.1f}s] {msg}", flush=True)
 
 # ---------- 可调参数 ----------
 突破回看天数 = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))
@@ -3665,6 +3669,56 @@ def 深度评估(code: str, df: pd.DataFrame, line_info: Dict[str, Any], br: Dic
 
 
 
+def 突破日原始价位预检(d: pd.DataFrame, bidx: int) -> bool:
+    """V18轻量预检：先确认突破日附近确实存在历史价位记忆，再进入重核心线计算。
+
+    这不是缩短回看，也不是少看股票。它只排除一种情况：突破K再强，但突破区间附近没有任何
+    历史 high/open/close/body_top 价位可作为核心线来源。核心线候选本来就来自这些历史价位或
+    其周期聚合价，若原始价位区间完全没有候选，继续跑多周期/VBP/精修只会浪费时间。
+    """
+    if not 启用原始价位预检:
+        return True
+    try:
+        if bidx <= 0 or bidx >= len(d):
+            return False
+        r = d.iloc[bidx]
+        prev = d.iloc[bidx - 1]
+        close = 安全浮点(r.get("close")); high = 安全浮点(r.get("high")); low = 安全浮点(r.get("low")); open_ = 安全浮点(r.get("open"))
+        prev_close = 安全浮点(prev.get("close"))
+        if close <= 0 or high <= 0 or prev_close <= 0:
+            return False
+        # 跳空/强突破允许线位略高于前收、略低于突破K实体区；价格发现票允许比普通更宽。
+        lower = max(0.01, min(prev_close, open_, low) * 0.965)
+        upper = max(close, high) * 1.018
+        prior = d.iloc[:bidx].tail(max(近端日线窗口, 520)).copy()
+        if prior.empty:
+            return False
+        arrs = []
+        for col in ("high", "close", "open", "body_top"):
+            if col in prior.columns:
+                arrs.append(pd.to_numeric(prior[col], errors="coerce").to_numpy(dtype=float))
+        if not arrs:
+            return True
+        vals = np.concatenate(arrs)
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        if vals.size == 0:
+            return True
+        # 第一层：突破区间附近是否有原始价位记忆。
+        if bool(((vals >= lower) & (vals <= upper)).any()):
+            return True
+        # 第二层：强趋势价格发现。若是涨停/强阳且量能过关，允许继续，不在预检阶段误杀。
+        pct_chg = 安全浮点(r.get("pct_chg"), 涨幅百分比(close, prev_close))
+        close_pos = 安全浮点(r.get("close_pos"))
+        body_ratio = 安全浮点(r.get("body_ratio"))
+        vol_ratio = 安全浮点(r.get("volume_ratio"))
+        if pct_chg >= 7.5 or (pct_chg >= 4.0 and close_pos >= 0.78 and body_ratio >= 0.45 and vol_ratio >= 1.15):
+            return True
+        return False
+    except Exception:
+        # 预检只用于提速，异常时宁可放行，不能误杀。
+        return True
+
+
 def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     d = 加基础指标(df)
     if len(d) < 最少K线数:
@@ -3674,32 +3728,38 @@ def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if bool(amount_state0.get("observe_low")) and 安全浮点(amount_state0.get("observe_amount20")) < 极低成交额20日前置跳过:
         return None
 
-    # V17：实盘默认保持最近20日完整召回。
-    # 只有显式打开 POJIE_FAST_DAILY_MODE=1 时，才临时缩短窗口用于排错/测速。
+    # V18：实盘默认保持最近20日完整召回，不牺牲“早突破、后承接”召回。
+    # 提速方式：
+    # 1）先用原始历史价位预检，确认突破区间附近确实存在可成线价位；
+    # 2）用窗口起点前的基准快照先扫全20日；若基准快照没有命中，再对该突破日做动态冻结精算。
     scan_days = min(突破回看天数, 快速扫描回看天数) if 快速日跑模式 else 突破回看天数
     start_idx = max(1, len(d) - scan_days)
-    options: List[Dict[str, Any]] = []
-    frozen_line_cache: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
-
+    candidate_bidxs: List[int] = []
     for bidx in range(start_idx, len(d)):
         if not 突破日基础预过滤(d, bidx, code):
             continue
-        # 核心线必须冻结在突破日前，不能用突破日及之后的数据反推。
-        if bidx not in frozen_line_cache:
-            frozen_line_cache[bidx] = 选择突破日前双线(d, bidx)
-        historical_line, trigger_line = frozen_line_cache[bidx]
-        breakout_date = d.iloc[bidx]["date"].strftime("%Y-%m-%d")
+        if not 突破日原始价位预检(d, bidx):
+            continue
+        candidate_bidxs.append(bidx)
+    if not candidate_bidxs:
+        return None
 
+    options: List[Dict[str, Any]] = []
+    frozen_line_cache: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+
+    def 收集某快照选项(bidx: int, historical_line: Dict[str, Any], trigger_line: Dict[str, Any], snapshot_tag: str) -> List[Dict[str, Any]]:
+        local: List[Dict[str, Any]] = []
+        breakout_date = d.iloc[bidx]["date"].strftime("%Y-%m-%d")
         line_groups = [
             ("历史核心共振线", 展开核心线候选(historical_line, 历史核心线候选数量)),
             ("近500日日线共振触发线", 展开核心线候选(trigger_line, 近端触发线候选数量)),
         ]
+        latest_close = 安全浮点(d.iloc[-1].get("close"))
         for line_type, line_candidates in line_groups:
             for line_info_raw in line_candidates:
                 L = 安全浮点(line_info_raw.get("line"))
                 if L <= 0:
                     continue
-                latest_close = 安全浮点(d.iloc[-1].get("close"))
                 # 评测线不能离当前太离谱；破界是突破/接受，不是远距离历史画线。
                 if L > latest_close * 1.25 or L < latest_close * 0.55:
                     continue
@@ -3715,13 +3775,46 @@ def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     line_info["effective_confirm_layer"] = "主核心线早期交易确认"
                     line_info = 规范化融合界字段(line_info)
                 elif str(br.get("确认层级", "")) == "主核心线第一层突破":
-                    # 配置不允许主核心线早期正式时，保留事件，但不降低交易确认线。
                     line_info["actual_break_line"] = L
                     line_info = 规范化融合界字段(line_info)
                 line_info["line_label"] = line_type
                 line_info["line_frozen_before_date"] = breakout_date
                 line_info["line_frozen_data_end"] = d.iloc[bidx - 1]["date"].strftime("%Y-%m-%d") if bidx > 0 else ""
-                options.append({"line_type": line_type, "line_info": line_info, "breakout": br, "breakout_idx": bidx})
+                line_info["line_snapshot_mode"] = snapshot_tag
+                local.append({"line_type": line_type, "line_info": line_info, "breakout": br, "breakout_idx": bidx})
+        return local
+
+    # 基准快照：冻结在召回窗口第一根候选突破K之前。它只使用更早历史数据，不会产生未来函数。
+    # 多数核心线本来就是20日窗口前已存在的大周期/平台记忆，用这个快照可避免每个候选日重复重建核心线。
+    baseline_idx = min(candidate_bidxs)
+    baseline_pair: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
+    if 启用突破窗口快照复用:
+        try:
+            baseline_pair = 选择突破日前双线(d, baseline_idx)
+        except Exception:
+            baseline_pair = None
+
+    for bidx in candidate_bidxs:
+        used_baseline_hit = False
+        if baseline_pair is not None:
+            base_opts = 收集某快照选项(bidx, baseline_pair[0], baseline_pair[1], "窗口基准快照")
+            if base_opts:
+                options.extend(base_opts)
+                frozen_line_cache[bidx] = baseline_pair
+                used_baseline_hit = any(bool(x.get("breakout", {}).get("hit")) for x in base_opts)
+        # 若基准快照没有打到正式突破线，或用户要求命中后也动态补充，则用该突破日前一日重新冻结精算，避免漏掉窗口内新形成的平台触发线。
+        if (not used_baseline_hit) or 基准命中后仍动态补充:
+            if bidx not in frozen_line_cache or 基准命中后仍动态补充:
+                frozen_line_cache[bidx] = 选择突破日前双线(d, bidx)
+            historical_line, trigger_line = frozen_line_cache[bidx]
+            dyn_opts = 收集某快照选项(bidx, historical_line, trigger_line, "逐日动态冻结")
+            # 去重：同日同线同类型只保留一次，避免基准和动态完全相同时重复评分。
+            seen_local = {(str(x.get("line_type")), 四舍五入(x.get("line_info", {}).get("line"), 3), str(x.get("breakout", {}).get("event_stage", ""))) for x in options if int(x.get("breakout_idx", -1)) == bidx}
+            for opt in dyn_opts:
+                key = (str(opt.get("line_type")), 四舍五入(opt.get("line_info", {}).get("line"), 3), str(opt.get("breakout", {}).get("event_stage", "")))
+                if key not in seen_local:
+                    options.append(opt)
+                    seen_local.add(key)
 
     if not options:
         return None
@@ -3915,6 +4008,7 @@ def main() -> None:
     日志(f"目标日期：{目标日期输入 or '未指定/使用缓存最新'}｜严格目标日={要求严格目标日}")
     日志(f"TopN：正式{正式输出数量}｜观察{观察输出数量}｜TelegramTop{Telegram推送TopN}")
     日志(f"突破召回窗口：最近{突破回看天数}日｜快速模式={快速日跑模式}｜实际快速日数={快速扫描回看天数 if 快速日跑模式 else 突破回看天数}｜延迟精修={延迟核心线精修}")
+    日志(f"V18提速：原始价位预检={启用原始价位预检}｜窗口基准快照复用={启用突破窗口快照复用}｜基准命中后动态补充={基准命中后仍动态补充}")
     日志(f"Telegram：enabled={启用Telegram推送}｜token={'有' if bool(TelegramToken) else '无'}｜chat_id={'有' if bool(TelegramChatID) else '无'}")
     日志(f"BaoStock fallback 环境：POJIE_ALLOW_BAOSTOCK_FALLBACK={os.getenv('POJIE_ALLOW_BAOSTOCK_FALLBACK','0')}｜本脚本默认只读缓存")
     报告目录.mkdir(parents=True, exist_ok=True)
