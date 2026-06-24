@@ -2,6 +2,7 @@ name: 五号员工
 run-name: 五号员工
 
 "on":
+  # 自动定时运行已关闭；只保留手动 workflow_dispatch。
   workflow_dispatch:
     inputs:
       employee5_date_choice:
@@ -22,9 +23,6 @@ run-name: 五号员工
         description: "✍️ 手动日期｜可填0604、6.4、YYYY-MM-DD、YYYYMMDD｜填了优先"
         required: false
         default: ""
-  schedule:
-    # 北京时间 20:00 = UTC 12:00；周一到周五自动运行。
-    - cron: '0 12 * * 1-5'
 
 concurrency:
   group: fifth-employee-singleton-main
