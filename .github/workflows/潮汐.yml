@@ -1,0 +1,163 @@
+name: 潮汐
+run-name: 潮汐
+
+"on":
+  workflow_dispatch:
+    inputs:
+      chaoxi_target_date:
+        description: "✍️ 潮汐手动日期｜可填0604、6.4、YYYY-MM-DD、YYYYMMDD｜留空=缓存最新交易日"
+        required: false
+        default: ""
+      chaoxi_send_telegram:
+        description: "📨 潮汐是否发送Telegram"
+        required: false
+        type: choice
+        default: "🟩 是｜发送Telegram"
+        options:
+          - "🟩 是｜发送Telegram"
+          - "⬜ 否｜不发送Telegram"
+      chaoxi_pool_filter:
+        description: "🧹 潮汐股票池过滤｜默认按建议过滤ST/北交所/新股/低成交额"
+        required: false
+        type: choice
+        default: "🟩 按建议过滤"
+        options:
+          - "🟩 按建议过滤"
+          - "⬜ 全A不额外过滤"
+
+  schedule:
+    - cron: "25 12 * * 1-5"
+
+concurrency:
+  group: 潮汐-singleton-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  潮汐:
+    name: 潮汐
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: resolve 潮汐 config
+        id: config
+        shell: bash
+        env:
+          CHAOXI_INPUT_TARGET_DATE: ${{ github.event.inputs.chaoxi_target_date }}
+          CHAOXI_INPUT_SEND_TELEGRAM: ${{ github.event.inputs.chaoxi_send_telegram }}
+          CHAOXI_INPUT_POOL_FILTER: ${{ github.event.inputs.chaoxi_pool_filter }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          from datetime import datetime, timezone, timedelta
+
+          def norm_date(x, today):
+              s = str(x or '').strip()
+              if not s:
+                  return 'latest'
+              s = s.replace('年', '-').replace('月', '-').replace('日', '')
+              s = s.replace('/', '-').replace('.', '-').replace('_', '-').strip()
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              if len(s) == 8 and s.isdigit():
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              m = re.fullmatch(r'(\d{1,2})-(\d{1,2})', s)
+              if m:
+                  return f'{today.year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}'
+              if len(s) in (3, 4) and s.isdigit():
+                  return f'{today.year:04d}-{int(s[:-2]):02d}-{int(s[-2:]):02d}'
+              return s[:10]
+
+          today = datetime.now(timezone(timedelta(hours=8))).date()
+          target_date = norm_date(os.environ.get('CHAOXI_INPUT_TARGET_DATE'), today)
+          send_choice = str(os.environ.get('CHAOXI_INPUT_SEND_TELEGRAM') or '')
+          send_telegram = '0' if '不发送' in send_choice or '否' in send_choice else '1'
+          filter_choice = str(os.environ.get('CHAOXI_INPUT_POOL_FILTER') or '')
+          no_pool_filter = '1' if '全A' in filter_choice or '不额外过滤' in filter_choice else '0'
+          print(f'target_date={target_date}')
+          print(f'send_telegram={send_telegram}')
+          print(f'no_pool_filter={no_pool_filter}')
+          PY
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: restore shared kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-潮汐-check-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+            a-stock-kline-cache-v1-
+            a-stock-full-kline-cache-
+            employee5-kline-cache-
+            kline-cache-
+
+      - name: inspect cache before 潮汐
+        shell: bash
+        run: |
+          echo "潮汐 target date: ${{ steps.config.outputs.target_date }}"
+          echo "潮汐 send telegram: ${{ steps.config.outputs.send_telegram }}"
+          echo "潮汐 no pool filter: ${{ steps.config.outputs.no_pool_filter }}"
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests pyarrow openpyxl lxml beautifulsoup4 html5lib tqdm
+
+      - name: run 潮汐
+        env:
+          PYTHONUNBUFFERED: 1
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAOXI_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+        shell: bash
+        run: |
+          set -e
+          args=(python -u "潮汐.py" --date "${{ steps.config.outputs.target_date }}" --out-dir "潮汐输出" --print-report)
+          if [ "${{ steps.config.outputs.no_pool_filter }}" = "1" ]; then
+            args+=(--no-pool-filter)
+          fi
+          if [ "${{ steps.config.outputs.send_telegram }}" = "1" ]; then
+            args+=(--send-telegram)
+          fi
+          "${args[@]}"
+
+      - name: upload 潮汐 output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 潮汐输出
+          path: 潮汐输出/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: upload 潮汐 cache visibility snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 潮汐缓存可见性快照
+          path: |
+            kline_cache/
+            employee5_kline_cache/
+            data/kline_cache/
+            cache/kline_cache/
+          if-no-files-found: ignore
+          retention-days: 3
