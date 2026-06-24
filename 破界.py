@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """
 破界.py
-核心线突破海选器｜V18全量20日召回原始价位预检快照复用工程版
+核心线突破海选器｜V19全量20日召回候选限额深评并行准备版
 
 定位：
 1）不是一号员工/三号员工的完整替代品；
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 
-启动标识 = "破界_核心线突破海选器_V18_全量20日召回_原始价位预检_快照复用_进度日志_Top3_Telegram"
+启动标识 = "破界_核心线突破海选器_V19_全量20日召回_候选限额深评_进度日志_Top3_Telegram"
 
 根目录 = Path(__file__).resolve().parent
 报告目录 = 根目录 / "破界报告"
@@ -80,11 +80,14 @@ Telegram推送TopN = int(os.getenv("POJIE_TELEGRAM_TOP_N", os.getenv("POJIE_TOP_
 启用原始价位预检 = os.getenv("POJIE_RAW_PRICE_PREFILTER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 启用突破窗口快照复用 = os.getenv("POJIE_REUSE_WINDOW_BASELINE_LINES", "1").strip() not in {"0", "false", "False", "no", "NO"}
 基准命中后仍动态补充 = os.getenv("POJIE_DYNAMIC_REFINE_AFTER_BASE_HIT", "0").strip() not in {"0", "false", "False", "no", "NO"}
+# V19：20日召回仍完整，但不再对同一只票的所有轻量候选线做深度交易定价。
+# 先用轻量分数保留最可能有交易价值的候选，再深评，避免慢票单只跑到几十秒。
+候选深评最大选项数 = max(3, int(os.getenv("POJIE_MAX_DEEP_OPTIONS_PER_STOCK", "8")))
 启动时刻 = time.time()
 
 def 日志(msg: str) -> None:
     elapsed = time.time() - 启动时刻
-    print(f"[破界V18][{elapsed:8.1f}s] {msg}", flush=True)
+    print(f"[破界V19][{elapsed:8.1f}s] {msg}", flush=True)
 
 # ---------- 可调参数 ----------
 突破回看天数 = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))
@@ -3819,6 +3822,40 @@ def 筛选单票(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if not options:
         return None
 
+    # V19：保留20日完整召回，但深评阶段限额。
+    # options 是轻量突破候选；深度评估会继续计算承接、压力、RR、风险，成本高。
+    # 这里按“已正式突破优先、突破质量、核心线净分/带量共振、近期突破、实际突破线距离”排序，
+    # 只把最有交易价值的候选送入深评。这样不牺牲20日召回窗口，也不让低质量重复线拖死整票。
+    if len(options) > 候选深评最大选项数:
+        latest_close_for_rank = 安全浮点(d.iloc[-1].get("close"))
+        def 轻量候选排序键(opt: Dict[str, Any]) -> Tuple[float, float, float, float, float, float, float]:
+            br = opt.get("breakout", {}) or {}
+            li = opt.get("line_info", {}) or {}
+            actual_line = 安全浮点(br.get("实际突破线"), 安全浮点(li.get("trade_confirm_line"), 安全浮点(li.get("line"))))
+            dist_penalty = abs(涨幅百分比(latest_close_for_rank, actual_line)) if latest_close_for_rank > 0 and actual_line > 0 else 99.0
+            return (
+                1.0 if bool(br.get("hit")) else 0.0,
+                安全浮点(br.get("突破质量分"), 安全浮点(br.get("quality"))),
+                安全浮点(li.get("net_score")),
+                安全浮点(li.get("volume_quality_score")),
+                安全浮点(li.get("effective_resonance_count")),
+                -float(int(opt.get("breakout_idx", 0))),  # 后续用 reverse=True；这里仅作稳定项，下面另行修正
+                -dist_penalty,
+            )
+        # 更近的突破日应优先；单独排序，避免上面的负号误读。
+        options = sorted(
+            options,
+            key=lambda opt: (
+                1.0 if bool((opt.get("breakout", {}) or {}).get("hit")) else 0.0,
+                安全浮点((opt.get("breakout", {}) or {}).get("突破质量分"), 安全浮点((opt.get("breakout", {}) or {}).get("quality"))),
+                int(opt.get("breakout_idx", 0)),
+                安全浮点((opt.get("line_info", {}) or {}).get("net_score")),
+                安全浮点((opt.get("line_info", {}) or {}).get("volume_quality_score")),
+                安全浮点((opt.get("line_info", {}) or {}).get("effective_resonance_count")),
+            ),
+            reverse=True,
+        )[:候选深评最大选项数]
+
     evaluated: List[Dict[str, Any]] = []
     context_cache: Dict[int, Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
     for opt in options:
@@ -4008,7 +4045,7 @@ def main() -> None:
     日志(f"目标日期：{目标日期输入 or '未指定/使用缓存最新'}｜严格目标日={要求严格目标日}")
     日志(f"TopN：正式{正式输出数量}｜观察{观察输出数量}｜TelegramTop{Telegram推送TopN}")
     日志(f"突破召回窗口：最近{突破回看天数}日｜快速模式={快速日跑模式}｜实际快速日数={快速扫描回看天数 if 快速日跑模式 else 突破回看天数}｜延迟精修={延迟核心线精修}")
-    日志(f"V18提速：原始价位预检={启用原始价位预检}｜窗口基准快照复用={启用突破窗口快照复用}｜基准命中后动态补充={基准命中后仍动态补充}")
+    日志(f"V19提速：原始价位预检={启用原始价位预检}｜窗口基准快照复用={启用突破窗口快照复用}｜深评候选上限={候选深评最大选项数}｜基准命中后动态补充={基准命中后仍动态补充}")
     日志(f"Telegram：enabled={启用Telegram推送}｜token={'有' if bool(TelegramToken) else '无'}｜chat_id={'有' if bool(TelegramChatID) else '无'}")
     日志(f"BaoStock fallback 环境：POJIE_ALLOW_BAOSTOCK_FALLBACK={os.getenv('POJIE_ALLOW_BAOSTOCK_FALLBACK','0')}｜本脚本默认只读缓存")
     报告目录.mkdir(parents=True, exist_ok=True)
