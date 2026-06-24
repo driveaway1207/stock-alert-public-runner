@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """
 破界.py
-核心线突破海选器｜V14固定入口Telegram推送目标日期实盘版
+核心线突破海选器｜V15三号员工链路进度日志卡点保护实盘版
 
 定位：
 1）不是一号员工/三号员工的完整替代品；
@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 
-启动标识 = "破界_核心线突破海选器_V14_固定入口_Top3_Telegram_目标日期_深层逻辑修复"
+启动标识 = "破界_核心线突破海选器_V15_三号员工链路_进度日志_卡点保护_Top3_Telegram"
 
 根目录 = Path(__file__).resolve().parent
 报告目录 = 根目录 / "破界报告"
@@ -64,6 +65,16 @@ Telegram开关文本 = (os.getenv("POJIE_SEND_TELEGRAM") or os.getenv("ENABLE_TE
 TelegramToken = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 TelegramChatID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 Telegram推送TopN = int(os.getenv("POJIE_TELEGRAM_TOP_N", os.getenv("POJIE_TOP_LIMIT", "3")))
+
+# ---------- V15 工程稳定参数：参考三号员工链路，保证 GitHub Actions 不再无声长跑 ----------
+进度日志间隔 = max(1, int(os.getenv("POJIE_PROGRESS_EVERY", "50")))
+慢票告警秒 = float(os.getenv("POJIE_SLOW_STOCK_SECONDS", "8"))
+缓存索引日志间隔 = max(100, int(os.getenv("POJIE_CACHE_INDEX_PROGRESS_EVERY", "1000")))
+启动时刻 = time.time()
+
+def 日志(msg: str) -> None:
+    elapsed = time.time() - 启动时刻
+    print(f"[破界V15][{elapsed:8.1f}s] {msg}", flush=True)
 
 # ---------- 可调参数 ----------
 突破回看天数 = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))
@@ -381,19 +392,49 @@ def 读取缓存文件(path: Path) -> pd.DataFrame:
 
     return df
 
-def 找缓存文件() -> List[Path]:
-    """为每个代码选择最新缓存文件。
+def 快速缓存最后日期(path: Path) -> pd.Timestamp:
+    """快速读取缓存文件尾部日期，避免为了择新而全量读几千个CSV。"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - 65536))
+            raw = f.read()
+        text = raw.decode("utf-8", errors="ignore")
+        if not text.strip():
+            text = raw.decode("gbk", errors="ignore")
+        matches = re.findall(r"(?:20\d{2}[-/]?\d{1,2}[-/]?\d{1,2}|\d{8})", text)
+        for token in reversed(matches):
+            t = token.replace("/", "-")
+            if len(t) == 8 and t.isdigit():
+                dt = pd.to_datetime(t, format="%Y%m%d", errors="coerce")
+            else:
+                dt = pd.to_datetime(t, errors="coerce")
+            if not pd.isna(dt):
+                return pd.Timestamp(dt).normalize()
+    except Exception:
+        pass
+    return pd.Timestamp.min
 
-    多个缓存目录同时存在同一股票时，历史问题按目录顺序拿第一个，容易读到旧数据。
-    新版先按数据最后交易日，再按文件修改时间择新；只有单一候选时不额外读文件。
-    """
+
+def 找缓存文件() -> List[Path]:
+    """为每个代码选择最新缓存文件。V15：三号员工式可见进度 + 快速尾部日期择新。"""
+    日志("开始索引K线缓存文件")
     candidates: Dict[str, List[Path]] = {}
+    total_seen = 0
     for d in 缓存目录列表:
         if not d.exists():
+            日志(f"缓存目录不存在，跳过：{d}")
             continue
-        for p in sorted(d.glob("*")):
-            if p.suffix.lower() not in {".csv"}:
-                continue
+        dir_seen = 0
+        try:
+            iterator = d.rglob("*.csv")
+        except Exception:
+            iterator = d.glob("*.csv")
+        for p in iterator:
+            total_seen += 1
+            dir_seen += 1
+            if total_seen % 缓存索引日志间隔 == 0:
+                日志(f"缓存索引中：已查看{total_seen}个CSV，候选代码{len(candidates)}")
             name = p.name.lower()
             if any(x in name for x in ["report", "result", "summary", "明细", "报告"]):
                 continue
@@ -403,17 +444,10 @@ def 找缓存文件() -> List[Path]:
             code = 标准代码(m.group(1))
             if A股有效代码(code):
                 candidates.setdefault(显示代码(code), []).append(p)
+        日志(f"缓存目录扫描完成：{d}｜CSV={dir_seen}｜累计候选代码={len(candidates)}")
 
     def file_key(path: Path) -> Tuple[pd.Timestamp, float]:
-        last_date = pd.Timestamp.min
-        try:
-            df = 读取缓存文件(path)
-            if not df.empty and "date" in df.columns:
-                last_date = pd.to_datetime(df["date"].max(), errors="coerce")
-                if pd.isna(last_date):
-                    last_date = pd.Timestamp.min
-        except Exception:
-            last_date = pd.Timestamp.min
+        last_date = 快速缓存最后日期(path)
         try:
             mtime = path.stat().st_mtime
         except Exception:
@@ -421,12 +455,18 @@ def 找缓存文件() -> List[Path]:
         return last_date, mtime
 
     picked: List[Path] = []
-    for _, paths in candidates.items():
+    duplicate_codes = 0
+    for i, (_, paths) in enumerate(candidates.items(), 1):
         if len(paths) == 1:
             picked.append(paths[0])
         else:
+            duplicate_codes += 1
             picked.append(max(paths, key=file_key))
+        if i % 缓存索引日志间隔 == 0:
+            日志(f"缓存去重中：{i}/{len(candidates)}，重复代码={duplicate_codes}")
+    日志(f"缓存索引完成：原始CSV={total_seen}｜有效代码={len(candidates)}｜重复代码={duplicate_codes}｜最终文件={len(picked)}")
     return picked
+
 
 def 成交额20日状态(df: pd.DataFrame) -> Dict[str, Any]:
     """20日成交额状态。
@@ -3806,14 +3846,23 @@ def 发送Telegram文本(text: str) -> bool:
 
 # ---------- 主程序 ----------
 def main() -> None:
-    print(启动标识, flush=True)
+    日志(启动标识)
+    日志(f"入口文件：{Path(__file__).resolve()}")
+    日志(f"目标日期：{目标日期输入 or '未指定/使用缓存最新'}｜严格目标日={要求严格目标日}")
+    日志(f"TopN：正式{正式输出数量}｜观察{观察输出数量}｜TelegramTop{Telegram推送TopN}")
+    日志(f"Telegram：enabled={启用Telegram推送}｜token={'有' if bool(TelegramToken) else '无'}｜chat_id={'有' if bool(TelegramChatID) else '无'}")
+    日志(f"BaoStock fallback 环境：POJIE_ALLOW_BAOSTOCK_FALLBACK={os.getenv('POJIE_ALLOW_BAOSTOCK_FALLBACK','0')}｜本脚本默认只读缓存")
     报告目录.mkdir(parents=True, exist_ok=True)
 
     files = 找缓存文件()
+    日志(f"进入海选扫描：缓存文件数={len(files)}")
     rows: List[Dict[str, Any]] = []
     stat = {"缓存文件": len(files), "读取失败": 0, "样本不足": 0, "命中": 0}
 
+    scan_t0 = time.time()
+    slow_count = 0
     for idx, path in enumerate(files, 1):
+        item_t0 = time.time()
         code = 标准代码(path.stem if re.search(r"\d{6}", path.stem) else path.name)
         try:
             df = 读取缓存文件(path)
@@ -3828,9 +3877,19 @@ def main() -> None:
                 rows.append(row)
                 stat["命中"] += 1
         except Exception as exc:
-            print(f"筛选异常 {code}: {exc}", flush=True)
-        if idx % 300 == 0:
-            print(f"破界海选 {idx}/{len(files)} 命中={len(rows)}", flush=True)
+            stat["读取失败"] += 1
+            日志(f"筛选异常 {code}: {exc}")
+        finally:
+            cost = time.time() - item_t0
+            if cost >= 慢票告警秒:
+                slow_count += 1
+                日志(f"慢票告警 code={code} cost={cost:.1f}s path={path}")
+            if idx % 进度日志间隔 == 0 or idx == len(files):
+                elapsed = time.time() - scan_t0
+                speed = idx / elapsed if elapsed > 0 else 0.0
+                eta = (len(files) - idx) / speed if speed > 0 else 0.0
+                日志(f"海选进度 {idx}/{len(files)}｜命中={len(rows)}｜读取失败={stat['读取失败']}｜样本不足={stat['样本不足']}｜慢票={slow_count}｜速度={speed:.2f}只/秒｜预计剩余={eta/60:.1f}分钟｜当前={code}")
+    日志(f"海选扫描完成：总耗时={(time.time()-scan_t0)/60:.1f}分钟｜命中={len(rows)}｜读取失败={stat['读取失败']}｜样本不足={stat['样本不足']}｜慢票={slow_count}")
 
     def 行分层优先级(x: Dict[str, Any]) -> int:
         bucket = str(x.get("输出分层", ""))
@@ -3920,6 +3979,7 @@ def main() -> None:
         写入结果段("事件记录", event_top)
 
     md = "\n".join(lines)
+    日志("开始写入报告与明细")
     报告文件.write_text(md, encoding="utf-8")
     live_rows = 剥离未来标签(rows) if 实盘明细剥离未来标签 else rows
     label_rows = 仅未来标签(rows)
@@ -3928,6 +3988,7 @@ def main() -> None:
         pd.DataFrame(label_rows).to_csv(标签明细文件, index=False, encoding="utf-8-sig")
     数据文件.write_text(json.dumps({"启动标识": 启动标识, "生成时间": 北京时间(), "统计": stat, "结果": live_rows, "标签文件": str(标签明细文件) if label_rows else ""}, ensure_ascii=False, indent=2), encoding="utf-8")
     自检文件.write_text(json.dumps({"启动标识": 启动标识, "生成时间": 北京时间(), "统计": stat, "输出字段": list(live_rows[0].keys()) if live_rows else [], "标签字段已剥离实盘明细": bool(实盘明细剥离未来标签), "猴子代码自检": 猴子代码自检()}, ensure_ascii=False, indent=2), encoding="utf-8")
+    日志("报告与明细写入完成")
 
     print(md, flush=True)
     print(f"报告文件：{报告文件}", flush=True)
@@ -3939,7 +4000,11 @@ def main() -> None:
 
     tg_text = 构建Telegram摘要(formal_top, observe_top, event_top, stat, len(rows))
     if 启用Telegram推送:
+        日志(f"准备Telegram推送：正式Top={len(formal_top)}｜观察Top={len(observe_top)}｜事件Top={len(event_top)}｜总命中={len(rows)}")
         发送Telegram文本(tg_text)
+    else:
+        日志("Telegram未开启，本次只生成报告")
+    日志("破界任务结束")
 
 
 if __name__ == "__main__":
