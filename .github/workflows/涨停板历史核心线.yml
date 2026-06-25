@@ -2,6 +2,7 @@ name: 涨停板历史核心线
 run-name: 涨停板历史核心线
 
 "on":
+  # 自动定时运行已关闭；只保留手动 workflow_dispatch。
   workflow_dispatch:
     inputs:
       limitup_core_date_choice:
@@ -41,9 +42,6 @@ run-name: 涨停板历史核心线
         options:
           - "⬜ 否｜只读公共缓存"
           - "🟧 是｜允许补拉最近K线"
-
-  schedule:
-    - cron: "20 12 * * 1-5"
 
 concurrency:
   group: limit-up-core-line-singleton-main
