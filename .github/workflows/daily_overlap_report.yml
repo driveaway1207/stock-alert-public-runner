@@ -17,10 +17,12 @@ on:
           - "1"
   schedule:
     - cron: "0 15 * * 1-5"
+    - cron: "0 16 * * 1-5"
+    - cron: "0 17 * * 1-5"
 
 concurrency:
   group: daily-overlap-stock-report-main
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -28,7 +30,52 @@ permissions:
   id-token: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Decide whether this scheduled run should continue
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          if os.getenv("EVENT_NAME") != "schedule" or os.getenv("TARGET_DATE", "").strip():
+              print("should_run=true")
+              print("reason=manual_or_explicit_target")
+              raise SystemExit
+
+          bj = timezone(timedelta(hours=8))
+          now = datetime.now(bj)
+          url = "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.json?nocache=" + str(int(now.timestamp()))
+          try:
+              with urllib.request.urlopen(url, timeout=20) as resp:
+                  payload = json.loads(resp.read().decode("utf-8"))
+              generated = str(payload.get("generated_at_bj") or "")
+              ts = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=bj)
+              age_hours = (now - ts).total_seconds() / 3600
+              if 0 <= age_hours <= 4:
+                  print("should_run=false")
+                  print(f"reason=recent_report_exists_age_hours_{age_hours:.2f}")
+              else:
+                  print("should_run=true")
+                  print(f"reason=report_stale_or_missing_age_hours_{age_hours:.2f}")
+          except Exception as exc:
+              print("should_run=true")
+              print("reason=no_recent_report_json_" + type(exc).__name__)
+          PY
+
   run-modules:
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
     name: Run ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -105,8 +152,8 @@ jobs:
           retention-days: 7
 
   build-report:
-    needs: run-modules
-    if: always()
+    needs: [preflight, run-modules]
+    if: always() && needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     environment:
