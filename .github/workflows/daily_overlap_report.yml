@@ -36,6 +36,16 @@ jobs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
     steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install preflight dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas akshare
+
       - name: Decide whether this scheduled run should continue
         id: gate
         env:
@@ -55,10 +65,43 @@ jobs:
 
           bj = timezone(timedelta(hours=8))
           now = datetime.now(bj)
+
+          def completed_trade_date():
+              cutoff_hour = int(os.getenv("OVERLAP_TRADE_DATE_CUTOFF_HOUR_BJ", "18"))
+              include_today = now.hour >= cutoff_hour
+              try:
+                  import akshare as ak
+                  import pandas as pd
+
+                  cal = ak.tool_trade_date_hist_sina()
+                  col = "trade_date" if "trade_date" in cal.columns else cal.columns[0]
+                  today = now.date()
+                  dates = pd.to_datetime(cal[col], errors="coerce").dt.date.dropna()
+                  valid = [d for d in dates if d <= today] if include_today else [d for d in dates if d < today]
+                  if valid:
+                      return max(valid).isoformat()
+              except Exception:
+                  d = now.date()
+                  if not include_today:
+                      d -= timedelta(days=1)
+                  while d.weekday() >= 5:
+                      d -= timedelta(days=1)
+                  return d.isoformat()
+
+          target_trade_date = completed_trade_date()
           url = "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.json?nocache=" + str(int(now.timestamp()))
           try:
               with urllib.request.urlopen(url, timeout=20) as resp:
                   payload = json.loads(resp.read().decode("utf-8"))
+              published_target = str(payload.get("target_date") or "")
+              stats = payload.get("module_stats") or []
+              required = {"pojie", "lingdong", "qingtian", "employee3"}
+              ok_keys = {str(x.get("key")) for x in stats if x.get("ok") is True}
+              complete_report = required.issubset(ok_keys)
+              if published_target == target_trade_date and complete_report:
+                  print("should_run=false")
+                  print(f"reason=target_trade_date_already_published_complete_{target_trade_date}")
+                  raise SystemExit
               generated = str(payload.get("generated_at_bj") or "")
               ts = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=bj)
               age_hours = (now - ts).total_seconds() / 3600
@@ -135,6 +178,30 @@ jobs:
           OVERLAP_SEND_TELEGRAM: "0"
         run: python -u tools/run_overlap_module.py
 
+      - name: Save module status
+        if: always()
+        env:
+          MODULE_KEY: ${{ matrix.key }}
+        run: |
+          mkdir -p overlap_status
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          key = os.environ["MODULE_KEY"]
+          src = Path("public_reports/stock_pool_report.json")
+          out = Path("overlap_status") / f"{key}.json"
+          if src.exists():
+              payload = json.loads(src.read_text(encoding="utf-8"))
+          else:
+              payload = {
+                  "module_stats": [{"key": key, "name": key, "ok": False, "count": 0, "outputs": []}],
+                  "module_results": {key: {"ok": False, "tail": "module wrapper did not produce status json"}},
+              }
+          out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+
       - name: Upload module outputs
         if: always()
         uses: actions/upload-artifact@v4
@@ -147,6 +214,7 @@ jobs:
             */*.csv
             */*.json
             */*.md
+            overlap_status/
             public_reports/
           if-no-files-found: ignore
           retention-days: 7
@@ -210,6 +278,33 @@ jobs:
           REPORT_PUBLIC_URL: "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.html"
         run: python -u tools/run_overlap_module.py
 
+      - name: Merge real module statuses into final report
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "tools")
+          import daily_overlap_report as report
+
+          final_path = Path("public_reports/stock_pool_report.json")
+          payload = json.loads(final_path.read_text(encoding="utf-8"))
+          merged_stats = []
+          merged_results = {}
+          for path in sorted(Path("overlap_status").glob("*.json")):
+              item = json.loads(path.read_text(encoding="utf-8"))
+              stats = item.get("module_stats") or []
+              if stats:
+                  merged_stats.append(stats[0])
+              merged_results.update(item.get("module_results") or {})
+          if merged_stats:
+              payload["module_stats"] = merged_stats
+              payload["module_results"] = merged_results
+              final_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+              report.REPORT_HTML.write_text(report.build_html(payload), encoding="utf-8")
+          PY
+
       - name: Prepare Pages artifact
         run: |
           mkdir -p _site
@@ -232,10 +327,23 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OVERLAP_SKIP_MODULE_RUN: "1"
-          OVERLAP_SEND_TELEGRAM: "1"
           REPORT_PUBLIC_URL: ${{ steps.deployment.outputs.page_url }}stock_pool_report.html
-        run: python -u tools/run_overlap_module.py
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "tools")
+          import daily_overlap_report as report
+
+          payload = json.loads(Path("public_reports/stock_pool_report.json").read_text(encoding="utf-8"))
+          ok = report.send_telegram(os.environ["REPORT_PUBLIC_URL"], payload)
+          payload["telegram_sent"] = ok
+          Path("public_reports/stock_pool_report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps({"telegram_sent": ok}, ensure_ascii=False))
+          PY
 
       - name: Upload report artifact
         if: always()
