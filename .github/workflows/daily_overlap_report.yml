@@ -208,7 +208,7 @@ jobs:
           OVERLAP_SKIP_MODULE_RUN: "1"
           OVERLAP_SEND_TELEGRAM: "0"
           REPORT_PUBLIC_URL: "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.html"
-        run: python -u tools/daily_overlap_report.py
+        run: python -u tools/run_overlap_module.py
 
       - name: Prepare Pages artifact
         run: |
@@ -235,7 +235,7 @@ jobs:
           OVERLAP_SKIP_MODULE_RUN: "1"
           OVERLAP_SEND_TELEGRAM: "1"
           REPORT_PUBLIC_URL: ${{ steps.deployment.outputs.page_url }}stock_pool_report.html
-        run: python -u tools/daily_overlap_report.py
+        run: python -u tools/run_overlap_module.py
 
       - name: Upload report artifact
         if: always()
