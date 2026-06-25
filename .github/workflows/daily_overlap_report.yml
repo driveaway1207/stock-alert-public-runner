@@ -1,0 +1,115 @@
+name: Daily overlap stock report
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Optional target date, for example 2026-06-25"
+        required: false
+        default: ""
+      skip_module_run:
+        description: "Use existing module CSV outputs only"
+        required: false
+        type: choice
+        default: "0"
+        options:
+          - "0"
+          - "1"
+  schedule:
+    - cron: "0 15 * * 1-5"
+
+concurrency:
+  group: daily-overlap-stock-report-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Restore shared kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-overlap-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+            a-stock-kline-cache-v1-
+            a-stock-full-kline-cache-
+            employee5-kline-cache-
+            kline-cache-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install tabulate
+
+      - name: Build overlap HTML report
+        env:
+          PYTHONUNBUFFERED: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OVERLAP_TARGET_DATE: ${{ github.event.inputs.target_date }}
+          OVERLAP_SKIP_MODULE_RUN: ${{ github.event.inputs.skip_module_run || '0' }}
+          OVERLAP_SEND_TELEGRAM: "0"
+          REPORT_PUBLIC_URL: "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.html"
+        run: python -u tools/daily_overlap_report.py
+
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p _site
+          cp public_reports/stock_pool_report.html _site/stock_pool_report.html
+          cp public_reports/stock_pool_report.json _site/stock_pool_report.json
+          cp public_reports/stock_pool_report.html _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Send Telegram link
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OVERLAP_SKIP_MODULE_RUN: "1"
+          OVERLAP_SEND_TELEGRAM: "1"
+          REPORT_PUBLIC_URL: ${{ steps.deployment.outputs.page_url }}stock_pool_report.html
+        run: python -u tools/daily_overlap_report.py
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-overlap-stock-report
+          path: public_reports/
+          if-no-files-found: warn
+          retention-days: 30
