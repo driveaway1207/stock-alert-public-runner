@@ -26,6 +26,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -51,6 +52,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -88,6 +91,30 @@ jobs:
                       d -= timedelta(days=1)
                   return d.isoformat()
 
+          def latest_scheduled_run_conclusion():
+              token = os.getenv("GITHUB_TOKEN")
+              repo = os.getenv("GITHUB_REPOSITORY")
+              if not token or not repo:
+                  return "unknown"
+              api = f"https://api.github.com/repos/{repo}/actions/workflows/daily_overlap_report.yml/runs?branch=main&event=schedule&status=completed&per_page=1"
+              try:
+                  req = urllib.request.Request(
+                      api,
+                      headers={
+                          "Authorization": f"Bearer {token}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                  runs = data.get("workflow_runs") or []
+                  if not runs:
+                      return "none"
+                  return str(runs[0].get("conclusion") or "unknown")
+              except Exception:
+                  return "unknown"
+
           target_trade_date = completed_trade_date()
           url = "https://driveaway1207.github.io/stock-alert-public-runner/stock_pool_report.json?nocache=" + str(int(now.timestamp()))
           try:
@@ -99,8 +126,13 @@ jobs:
               ok_keys = {str(x.get("key")) for x in stats if x.get("ok") is True}
               complete_report = required.issubset(ok_keys)
               if published_target == target_trade_date and complete_report:
-                  print("should_run=false")
-                  print(f"reason=target_trade_date_already_published_complete_{target_trade_date}")
+                  latest_conclusion = latest_scheduled_run_conclusion()
+                  if latest_conclusion in {"success", "unknown"}:
+                      print("should_run=false")
+                      print(f"reason=target_trade_date_already_published_complete_{target_trade_date}_latest_{latest_conclusion}")
+                      raise SystemExit
+                  print("should_run=true")
+                  print(f"reason=complete_report_but_latest_scheduled_run_{latest_conclusion}_retry")
                   raise SystemExit
               generated = str(payload.get("generated_at_bj") or "")
               ts = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=bj)
@@ -322,7 +354,7 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Send Telegram link
-        if: always()
+        if: always() && steps.deployment.outcome == 'success'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -343,6 +375,8 @@ jobs:
           payload["telegram_sent"] = ok
           Path("public_reports/stock_pool_report.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
           print(json.dumps({"telegram_sent": ok}, ensure_ascii=False))
+          if not ok:
+              raise SystemExit(1)
           PY
 
       - name: Upload report artifact
