@@ -127,22 +127,15 @@ jobs:
               complete_report = required.issubset(ok_keys)
               if published_target == target_trade_date and complete_report:
                   latest_conclusion = latest_scheduled_run_conclusion()
-                  if latest_conclusion in {"success", "unknown"}:
+                  if latest_conclusion == "success":
                       print("should_run=false")
-                      print(f"reason=target_trade_date_already_published_complete_{target_trade_date}_latest_{latest_conclusion}")
+                      print(f"reason=target_trade_date_already_published_complete_{target_trade_date}_latest_success")
                       raise SystemExit
                   print("should_run=true")
                   print(f"reason=complete_report_but_latest_scheduled_run_{latest_conclusion}_retry")
                   raise SystemExit
-              generated = str(payload.get("generated_at_bj") or "")
-              ts = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=bj)
-              age_hours = (now - ts).total_seconds() / 3600
-              if 0 <= age_hours <= 4:
-                  print("should_run=false")
-                  print(f"reason=recent_report_exists_age_hours_{age_hours:.2f}")
-              else:
-                  print("should_run=true")
-                  print(f"reason=report_stale_or_missing_age_hours_{age_hours:.2f}")
+              print("should_run=true")
+              print(f"reason=target_trade_date_{target_trade_date}_not_complete_or_not_published")
           except Exception as exc:
               print("should_run=true")
               print("reason=no_recent_report_json_" + type(exc).__name__)
