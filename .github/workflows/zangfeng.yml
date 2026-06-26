@@ -1,8 +1,21 @@
 name: 藏锋
+run-name: 藏锋
 
-on:
+"on":
   workflow_dispatch:
     inputs:
+      target_date:
+        description: "目标日期：可填0626、6.26、YYYY-MM-DD、YYYYMMDD；空=当前交易日"
+        required: false
+        default: ""
+      send_telegram:
+        description: "是否发送Telegram"
+        required: false
+        type: choice
+        default: "是"
+        options:
+          - "是"
+          - "否"
       min_score:
         description: "藏锋最低入选分"
         required: false
@@ -11,69 +24,158 @@ on:
         description: "输出候选数量"
         required: false
         default: "20"
+      scan_limit:
+        description: "调试扫描数量，0=全市场"
+        required: false
+        default: "0"
   schedule:
-    # 北京时间周一到周五 17:20 自动运行；GitHub cron 使用 UTC。
-    - cron: "20 9 * * 1-5"
+    - cron: "45 12 * * 1-5"
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: zangfeng-${{ github.ref }}
+  group: zangfeng-singleton-main
   cancel-in-progress: true
 
 jobs:
   zangfeng:
+    name: zangfeng
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      ZANGFENG_MIN_SCORE: ${{ github.event.inputs.min_score || '60' }}
-      ZANGFENG_TOP_N: ${{ github.event.inputs.top_n || '20' }}
-      ENABLE_TELEGRAM: ${{ secrets.ENABLE_TELEGRAM || '0' }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
+    timeout-minutes: 360
     steps:
-      - name: Checkout
+      - name: checkout
         uses: actions/checkout@v4
 
-      - name: Restore kline cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            kline_cache
-            employee5_kline_cache
-            data/kline_cache
-            cache/kline_cache
-          key: zangfeng-kline-cache-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            kline-cache-
-            baostock-kline-
-            stock-kline-
-            employee5-kline-
-            zangfeng-kline-cache-
+      - name: resolve target date
+        id: config
+        shell: bash
+        env:
+          RAW_DATE: ${{ github.event.inputs.target_date }}
+          RAW_SEND: ${{ github.event.inputs.send_telegram }}
+          RAW_MIN_SCORE: ${{ github.event.inputs.min_score }}
+          RAW_TOP_N: ${{ github.event.inputs.top_n }}
+          RAW_SCAN_LIMIT: ${{ github.event.inputs.scan_limit }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          from datetime import datetime, timedelta, timezone
+          now = datetime.now(timezone(timedelta(hours=8)))
+          today = now.date()
+          raw = str(os.getenv('RAW_DATE') or '').strip().replace('/', '-').replace('.', '-').replace('_', '-')
+          def current_trade_day(d):
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+              return d.isoformat()
+          def norm(s):
+              if not s:
+                  return ''
+              if len(s) >= 10 and s[4:5] == '-' and s[7:8] == '-':
+                  return s[:10]
+              r = re.sub(r'\D', '', s)
+              if len(r) >= 8:
+                  return f'{r[:4]}-{r[4:6]}-{r[6:8]}'
+              if len(r) in (3, 4):
+                  return f'{today.year:04d}-{int(r[:-2]):02d}-{int(r[-2:]):02d}'
+              return ''
+          target = norm(raw) or current_trade_day(today)
+          send = '0' if '否' in str(os.getenv('RAW_SEND') or '') else '1'
+          def intval(name, default):
+              try:
+                  return max(0, int(str(os.getenv(name) or default).strip()))
+              except Exception:
+                  return default
+          def fltval(name, default):
+              try:
+                  return max(0.0, float(str(os.getenv(name) or default).strip()))
+              except Exception:
+                  return default
+          print(f'target_date={target}')
+          print(f'send_telegram={send}')
+          print(f'min_score={fltval("RAW_MIN_SCORE", 60)}')
+          print(f'top_n={intval("RAW_TOP_N", 20)}')
+          print(f'scan_limit={intval("RAW_SCAN_LIMIT", 0)}')
+          PY
 
-      - name: Setup Python
+      - name: setup python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: restore shared kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-zangfeng-${{ github.run_id }}
+          restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-
+            a-kline-cache-
+            full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
+            full-kline-cache-${{ runner.os }}-
+            full-kline-cache-
+            a-stock-kline-cache-v1-
+            a-stock-full-kline-cache-
+            employee5-kline-cache-
+            kline-cache-
+
+      - name: inspect runtime
+        run: |
+          echo "target date: ${{ steps.config.outputs.target_date }}"
+          echo "send telegram: ${{ steps.config.outputs.send_telegram }}"
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -type f 2>/dev/null | wc -l || true
+          find kline_cache employee5_kline_cache data/kline_cache cache/kline_cache -maxdepth 2 -type f 2>/dev/null | head -50 || true
+
+      - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests
+          pip install pandas numpy requests baostock openpyxl lxml beautifulsoup4 html5lib tqdm tabulate
 
-      - name: Run 藏锋
+      - name: self test zangfeng
+        env:
+          PYTHONUNBUFFERED: 1
+          ZANGFENG_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+        run: python -u zangfeng_runner.py --self-test --self-test-rounds 7
+
+      - name: run zangfeng
+        env:
+          PYTHONUNBUFFERED: 1
+          ZANGFENG_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
+          ZANGFENG_MIN_SCORE: ${{ steps.config.outputs.min_score }}
+          ZANGFENG_TOP_N: ${{ steps.config.outputs.top_n }}
+          ZANGFENG_MAX_STOCKS: ${{ steps.config.outputs.scan_limit }}
+          ZANGFENG_ALLOW_BAOSTOCK_FALLBACK: "1"
+        run: python -u zangfeng_runner.py --scan --limit "${{ steps.config.outputs.scan_limit }}"
+
+      - name: build telegram message
+        if: always()
+        id: msg
         run: |
-          python zangfeng_runner.py
+          echo 'message<<EOF' >> "$GITHUB_OUTPUT"
+          if [ -f artifacts/zangfeng_report.md ]; then
+            head -n 120 artifacts/zangfeng_report.md >> "$GITHUB_OUTPUT"
+          else
+            echo '藏锋扫描异常：未生成报告' >> "$GITHUB_OUTPUT"
+          fi
+          echo 'EOF' >> "$GITHUB_OUTPUT"
 
-      - name: Upload 藏锋 report
+      - name: send telegram result
+        if: ${{ success() && steps.config.outputs.send_telegram == '1' }}
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: ${{ steps.msg.outputs.message }}
+
+      - name: upload reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zangfeng-report
-          path: |
-            zangfeng_reports/zangfeng_report.md
-            zangfeng_reports/zangfeng_candidates.json
-          if-no-files-found: error
+          name: zangfeng-reports
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
