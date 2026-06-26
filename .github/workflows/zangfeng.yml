@@ -1,0 +1,79 @@
+name: 藏锋
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_score:
+        description: "藏锋最低入选分"
+        required: false
+        default: "60"
+      top_n:
+        description: "输出候选数量"
+        required: false
+        default: "20"
+  schedule:
+    # 北京时间周一到周五 17:20 自动运行；GitHub cron 使用 UTC。
+    - cron: "20 9 * * 1-5"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zangfeng-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zangfeng:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ZANGFENG_MIN_SCORE: ${{ github.event.inputs.min_score || '60' }}
+      ZANGFENG_TOP_N: ${{ github.event.inputs.top_n || '20' }}
+      ENABLE_TELEGRAM: ${{ secrets.ENABLE_TELEGRAM || '0' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore kline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kline_cache
+            employee5_kline_cache
+            data/kline_cache
+            cache/kline_cache
+          key: zangfeng-kline-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            kline-cache-
+            baostock-kline-
+            stock-kline-
+            employee5-kline-
+            zangfeng-kline-cache-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run 藏锋
+        run: |
+          python zangfeng_runner.py
+
+      - name: Upload 藏锋 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zangfeng-report
+          path: |
+            zangfeng_reports/zangfeng_report.md
+            zangfeng_reports/zangfeng_candidates.json
+          if-no-files-found: error
