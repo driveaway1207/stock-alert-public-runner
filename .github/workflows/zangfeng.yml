@@ -19,11 +19,11 @@ run-name: 藏锋
       min_score:
         description: "藏锋最低入选分"
         required: false
-        default: "60"
+        default: "72"
       top_n:
         description: "输出候选数量"
         required: false
-        default: "20"
+        default: "10"
       scan_limit:
         description: "调试扫描数量，0=全市场"
         required: false
@@ -93,8 +93,8 @@ jobs:
                   return default
           print(f'target_date={target}')
           print(f'send_telegram={send}')
-          print(f'min_score={fltval("RAW_MIN_SCORE", 60)}')
-          print(f'top_n={intval("RAW_TOP_N", 20)}')
+          print(f'min_score={fltval("RAW_MIN_SCORE", 72)}')
+          print(f'top_n={intval("RAW_TOP_N", 10)}')
           print(f'scan_limit={intval("RAW_SCAN_LIMIT", 0)}')
           PY
 
@@ -137,7 +137,7 @@ jobs:
           ZANGFENG_TARGET_DATE: ${{ steps.config.outputs.target_date }}
           DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
           TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
-        run: python -u zangfeng_runner.py --self-test --self-test-rounds 7
+        run: python -u 藏锋.py --self-test --self-test-rounds 7
 
       - name: run zangfeng
         env:
@@ -149,19 +149,27 @@ jobs:
           ZANGFENG_TOP_N: ${{ steps.config.outputs.top_n }}
           ZANGFENG_MAX_STOCKS: ${{ steps.config.outputs.scan_limit }}
           ZANGFENG_ALLOW_BAOSTOCK_FALLBACK: "1"
-        run: python -u zangfeng_runner.py --scan --limit "${{ steps.config.outputs.scan_limit }}"
+        run: python -u 藏锋.py --scan --limit "${{ steps.config.outputs.scan_limit }}"
 
       - name: build telegram message
         if: always()
         id: msg
+        shell: bash
         run: |
-          echo 'message<<EOF' >> "$GITHUB_OUTPUT"
-          if [ -f artifacts/zangfeng_report.md ]; then
-            head -n 120 artifacts/zangfeng_report.md >> "$GITHUB_OUTPUT"
-          else
-            echo '藏锋扫描异常：未生成报告' >> "$GITHUB_OUTPUT"
-          fi
-          echo 'EOF' >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          p = Path('artifacts/zangfeng_telegram.txt')
+          if p.exists():
+              text = p.read_text(encoding='utf-8', errors='ignore')
+          elif Path('artifacts/zangfeng_report.md').exists():
+              text = Path('artifacts/zangfeng_report.md').read_text(encoding='utf-8', errors='ignore')[:3500]
+          else:
+              text = '藏锋扫描异常：未生成报告'
+          text = text[:3500].rstrip()
+          print('message<<EOF')
+          print(text)
+          print('EOF')
+          PY
 
       - name: send telegram result
         if: ${{ success() && steps.config.outputs.send_telegram == '1' }}
