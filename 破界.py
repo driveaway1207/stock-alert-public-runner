@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V10
+破界.py｜三号员工｜600584 单票验证版 V10.1
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -32,17 +32,12 @@ import numpy as np
 import pandas as pd
 
 try:
-    import baostock as bs
-except Exception:
-    bs = None
-
-try:
     import requests
 except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_DIRECT_YQM_EASTMONEY_V10_20260628"
+BOOT = "POJIE_SINGLE_600584_DIRECT_YQM_EASTMONEY_V10_1_20260628"
 RUN_MODE = "single_stock_only; direct_yqm_kline_source; no_full_market_scan"
 START_TS = time.time()
 
@@ -102,7 +97,7 @@ PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BRE
 
 
 def log(msg: str) -> None:
-    print(f"[破界V10][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V10.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -170,6 +165,99 @@ def resolve_target_raw() -> str:
 TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
+
+
+
+def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    col_map = {
+        "日期": "date", "交易日期": "date", "date": "date", "time": "date",
+        "代码": "code", "股票代码": "code", "证券代码": "code", "symbol": "code", "code": "code",
+        "名称": "name", "股票名称": "name", "股票简称": "name", "证券简称": "name", "name": "name",
+        "开盘": "open", "开盘价": "open", "open": "open",
+        "最高": "high", "最高价": "high", "high": "high",
+        "最低": "low", "最低价": "low", "low": "low",
+        "收盘": "close", "收盘价": "close", "close": "close",
+        "成交量": "volume", "volume": "volume", "vol": "volume",
+        "成交额": "amount", "amount": "amount",
+        "涨跌幅": "pct_chg", "涨幅": "pct_chg", "pct_chg": "pct_chg", "pctChg": "pct_chg",
+    }
+
+    d = df.rename(columns={c: col_map.get(str(c), col_map.get(str(c).lower(), c)) for c in df.columns}).copy()
+
+    if not {"date", "open", "high", "low", "close"}.issubset(d.columns):
+        return pd.DataFrame()
+
+    for col in ["open", "high", "low", "close", "volume", "amount", "pct_chg"]:
+        if col in d.columns:
+            d[col] = d[col].map(sf)
+
+    for col, default in [("volume", 0.0), ("amount", 0.0), ("code", ""), ("name", "")]:
+        if col not in d.columns:
+            d[col] = default
+
+    d["date"] = d["date"].map(norm_date)
+    d["code"] = d["code"].map(code_of)
+    d["name"] = d["name"].map(ss)
+
+    d = d[
+        (d["date"] != "")
+        & (d["open"] > 0)
+        & (d["high"] > 0)
+        & (d["low"] > 0)
+        & (d["close"] > 0)
+    ].sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    if TARGET_DASH:
+        d = d[d["date"] <= TARGET_DASH].reset_index(drop=True)
+
+    if d.empty:
+        return d
+
+    if "pct_chg" not in d.columns or float(d["pct_chg"].abs().sum()) == 0:
+        prev = d["close"].shift(1)
+        d["pct_chg"] = (d["close"] / prev - 1.0) * 100.0
+        d.loc[prev <= 0, "pct_chg"] = 0.0
+
+    return d
+
+
+def find_cache_file(code: str) -> Optional[Path]:
+    hits: List[Path] = []
+    for root in CACHE_DIRS:
+        if not root.exists():
+            continue
+        hits.extend([p for p in root.glob(f"*{code}*") if p.suffix.lower() in {".csv", ".json"}])
+    if not hits:
+        return None
+    return sorted(hits, key=lambda p: (len(str(p)), str(p)))[0]
+
+
+def read_cache(path: Path) -> pd.DataFrame:
+    try:
+        if path.suffix.lower() == ".csv":
+            return normalize_hist(pd.read_csv(path))
+
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            rows = obj.get("rows") or obj.get("data") or obj.get("klines") or obj.get("items") or []
+        else:
+            rows = obj
+        return normalize_hist(pd.DataFrame(rows))
+    except Exception:
+        return pd.DataFrame()
+
+
+def cache_reference_close(code: str) -> Tuple[float, str]:
+    p = find_cache_file(code)
+    if not p:
+        return 0.0, ""
+    d = read_cache(p)
+    if d.empty:
+        return 0.0, str(p)
+    return sf(d.iloc[-1]["close"]), str(p)
 
 
 def eastmoney_secid(code: str) -> str:
@@ -1071,7 +1159,7 @@ def main() -> None:
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
     print("target_codes=" + ",".join(TARGET_CODES), flush=True)
-    print("data_source=eastmoney_direct_yqm", flush=True)
+    print("data_source=eastmoney_direct_yqm_fixed", flush=True)
 
     rows: List[Dict[str, Any]] = []
 
@@ -1090,9 +1178,6 @@ def main() -> None:
             "状态": f"失败：{exc}",
         })
         log(f"运行失败：{exc}")
-    finally:
-        baostock_logout()
-
     report_text = build_report(rows)
     write_outputs(rows, report_text)
     send_telegram(report_text)
