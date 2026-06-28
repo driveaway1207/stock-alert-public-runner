@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜破界｜全市场直接年季月K版 V12.1
+破界.py｜破界｜全市场直接年季月K版 V12.2
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -13,7 +13,8 @@ from __future__ import annotations
 6）默认全市场扫描；设置 POJIE_TARGET_CODES 时进入单票/多票验证模式；
 7）V12：默认采用年线→季线→月线渐进核心线扫描，命中上级核心线后不再无意义拉取低级周期；
 8）V12：修复破界事件为0时 event_score 空表排序崩溃；
-9）V12.1：修复东方财富股票池分页，避免全市场模式只拿到第一页100只。
+9）V12.1：修复东方财富股票池分页，避免全市场模式只拿到第一页100只；
+10）V12.2：加速全市场扫描：自动提高并发、HTTP长连接、请求超时/重试、短日线窗口、断点续跑。
 
 说明：
 BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
@@ -27,6 +28,7 @@ import math
 import os
 import re
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,8 +43,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_1_OPT_20260628"
-RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_2_FAST_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination; fast_http; resume_checkpoint"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -97,7 +99,19 @@ EASTMONEY_UNIVERSE_FS = os.getenv(
     "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80"
 )
 MAX_STOCKS = int(os.getenv("POJIE_MAX_STOCKS", "0"))
-WORKERS = max(1, int(os.getenv("POJIE_WORKERS", "6")))
+REQUESTED_WORKERS = max(1, int(os.getenv("POJIE_WORKERS", "6")))
+MIN_FULLMARKET_WORKERS = max(1, int(os.getenv("POJIE_MIN_FULLMARKET_WORKERS", "32")))
+MAX_EFFECTIVE_WORKERS = max(1, int(os.getenv("POJIE_MAX_EFFECTIVE_WORKERS", "48")))
+if RUN_FULL_MARKET:
+    WORKERS = min(MAX_EFFECTIVE_WORKERS, max(REQUESTED_WORKERS, MIN_FULLMARKET_WORKERS))
+else:
+    WORKERS = REQUESTED_WORKERS
+
+REQUEST_TIMEOUT = float(os.getenv("POJIE_REQUEST_TIMEOUT", "12"))
+REQUEST_RETRIES = max(0, int(os.getenv("POJIE_REQUEST_RETRIES", "1")))
+HTTP_POOL_SIZE = max(WORKERS + 8, int(os.getenv("POJIE_HTTP_POOL_SIZE", "64")))
+RESUME_ENABLED = os.getenv("POJIE_RESUME_ENABLED", "1").strip() not in {"0", "false", "False", "no", "NO"}
+PARTIAL_SAVE_EVERY = max(1, int(os.getenv("POJIE_PARTIAL_SAVE_EVERY", "25")))
 EVENT_LOOKBACK_DAYS = int(os.getenv("POJIE_EVENT_LOOKBACK_DAYS", "20"))
 TOP_PUSH_LIMIT = int(os.getenv("POJIE_TOP_PUSH_LIMIT", "20"))
 
@@ -121,10 +135,14 @@ CORE_SELECTION_MODE = os.getenv("POJIE_CORE_SELECTION_MODE", "super_first").stri
 
 BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
 PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
+EVENT_DAILY_DAYS = max(420, int(os.getenv("POJIE_EVENT_DAILY_DAYS", str(BREAKOUT_LOOKBACK_DAYS + PULLBACK_LOOKBACK_AFTER_BREAK + 120))))
+PROGRESS_DIR = EASTMONEY_CACHE_DIR / "pojie_progress"
+PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_2.jsonl"
+_THREAD_LOCAL = threading.local()
 
 
 def log(msg: str) -> None:
-    print(f"[破界V12.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V12.2][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -193,6 +211,56 @@ TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
 
+
+def get_http_session() -> Any:
+    if requests is None:
+        raise RuntimeError("requests 不可用")
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is not None:
+        return session
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
+    })
+    try:
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=HTTP_POOL_SIZE, pool_maxsize=HTTP_POOL_SIZE, max_retries=0)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    except Exception:
+        pass
+    _THREAD_LOCAL.session = session
+    return session
+
+
+def http_get_json(url: str, params: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
+    last_exc: Optional[Exception] = None
+    timeout = REQUEST_TIMEOUT if timeout is None else timeout
+    for attempt in range(REQUEST_RETRIES + 1):
+        try:
+            resp = get_http_session().get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < REQUEST_RETRIES:
+                time.sleep(min(1.5, 0.25 * (attempt + 1)))
+    raise RuntimeError(f"HTTP JSON拉取失败 url={url} params={params} error={last_exc}")
+
+
+def kline_lmt(period: str) -> str:
+    if period == "D":
+        return str(max(EVENT_DAILY_DAYS + 80, 520))
+    if period == "M":
+        return "520"
+    if period == "Q":
+        return "180"
+    if period == "Y":
+        return "80"
+    return "1000"
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -349,12 +417,11 @@ def fetch_eastmoney_kline(code: str, period: str, fqt: str, begin: str, end: str
         "fqt": fqt,
         "beg": begin,
         "end": end,
-        "lmt": "1000000",
+        "lmt": kline_lmt(period),
     }
 
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    obj = resp.json()
+    params["lmt"] = kline_lmt(period)
+    obj = http_get_json(url, params=params)
     data = obj.get("data") or {}
     klines = data.get("klines") or []
     rows: List[Dict[str, Any]] = []
@@ -513,9 +580,7 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
             "fs": EASTMONEY_UNIVERSE_FS,
             "fields": "f12,f14,f2,f3,f4,f5,f6,f8,f20",
         }
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        obj = resp.json()
+        obj = http_get_json(url, params=params)
         data = obj.get("data") or {}
         diff = data.get("diff") or []
         total = int(sf(data.get("total"), total))
@@ -1294,7 +1359,8 @@ def fetch_direct_period_bars_for_core(code: str, period: str, fqt: str) -> pd.Da
 
 
 def fetch_daily_direct_for_event(code: str, fqt: str) -> pd.DataFrame:
-    begin = EASTMONEY_START
+    # 日线只用于最近突破/回踩事件，不需要从1990年拉到现在。
+    begin = (TARGET_TS - pd.Timedelta(days=EVENT_DAILY_DAYS)).strftime("%Y%m%d")
     end = TARGET.replace("-", "")
     return fetch_eastmoney_kline(code, "D", fqt, begin, end)
 
@@ -1458,7 +1524,7 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
             f"RUN_MODE={RUN_MODE}",
             "数据：东方财富直接日/月/季/年K；默认前复权；不再用本地日线或月线捏合年季月。",
             "核心线：年线超级核心线优先；年线无，再季线；季线无，再月线；命中核心线后才拉日线判定突破/回踩。",
-            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}｜扫描上限={MAX_STOCKS if MAX_STOCKS > 0 else '全市场/不限'}",
+            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}｜扫描上限={MAX_STOCKS if MAX_STOCKS > 0 else '全市场/不限'}｜并发={WORKERS}｜断点续跑={RESUME_ENABLED}",
             "",
         ]
 
@@ -1610,6 +1676,13 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "shadow_reaction_weight": SHADOW_REACTION_WEIGHT,
             "event_lookback_days": EVENT_LOOKBACK_DAYS,
             "workers": WORKERS,
+            "requested_workers": REQUESTED_WORKERS,
+            "min_fullmarket_workers": MIN_FULLMARKET_WORKERS,
+            "request_timeout": REQUEST_TIMEOUT,
+            "request_retries": REQUEST_RETRIES,
+            "event_daily_days": EVENT_DAILY_DAYS,
+            "resume_enabled": RESUME_ENABLED,
+            "progress_jsonl": str(PROGRESS_JSONL),
             "max_stocks": MAX_STOCKS,
             "core_selection_mode": CORE_SELECTION_MODE,
             "progressive_period_fetch": True,
@@ -1631,6 +1704,50 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "breakout_events": str(OUTPUT_EVENTS),
         },
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_progress_rows(valid_codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not RESUME_ENABLED or not PROGRESS_JSONL.exists():
+        return {}
+    valid_set = set(valid_codes)
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for line in PROGRESS_JSONL.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if ss(obj.get("boot")) != BOOT or ss(obj.get("target")) != TARGET:
+                continue
+            row = obj.get("row") or {}
+            code = code_of(row.get("股票代码"))
+            if code not in valid_set:
+                continue
+            if ss(row.get("状态")) != "完成":
+                continue
+            out[code] = row
+    except Exception as exc:
+        log(f"断点续跑读取失败，忽略旧进度：{exc}")
+        return {}
+    return out
+
+
+def append_progress_row(row: Dict[str, Any]) -> None:
+    if not RESUME_ENABLED:
+        return
+    try:
+        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "boot": BOOT,
+            "target": TARGET,
+            "target_dash": TARGET_DASH,
+            "ts_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+            "row": json_safe(row),
+        }
+        with PROGRESS_JSONL.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log(f"断点续跑写入失败：{exc}")
 
 
 def send_telegram(text: str) -> None:
@@ -1673,29 +1790,40 @@ def main() -> None:
     print(f"run_full_market={RUN_FULL_MARKET}", flush=True)
     print("target_codes=" + (",".join(TARGET_CODES) if TARGET_CODES else "FULL_MARKET"), flush=True)
     print("data_source=eastmoney_direct_yqm_fullmarket", flush=True)
-    print(f"workers={WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS} core_selection_mode={CORE_SELECTION_MODE}", flush=True)
+    print(f"workers={WORKERS} requested_workers={REQUESTED_WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS} core_selection_mode={CORE_SELECTION_MODE} timeout={REQUEST_TIMEOUT}s resume={RESUME_ENABLED}", flush=True)
 
     codes, name_map = resolve_run_universe()
     log(f"准备扫描：{len(codes)} 只")
 
-    rows: List[Dict[str, Any]] = []
+    resumed = load_progress_rows(codes)
+    rows: List[Dict[str, Any]] = [resumed[c] for c in codes if c in resumed]
+    scan_codes = [c for c in codes if c not in resumed]
+    if resumed:
+        log(f"断点续跑命中：跳过已完成 {len(resumed)} 只｜剩余 {len(scan_codes)} 只｜progress={PROGRESS_JSONL}")
 
-    if RUN_FULL_MARKET and WORKERS > 1:
+    if scan_codes and RUN_FULL_MARKET and WORKERS > 1:
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = {ex.submit(safe_analyze, code, name_map.get(code, "")): code for code in codes}
+            futs = {ex.submit(safe_analyze, code, name_map.get(code, "")): code for code in scan_codes}
             done = 0
             for fut in as_completed(futs):
                 row = fut.result()
                 rows.append(row)
+                append_progress_row(row)
                 done += 1
-                if done % 50 == 0 or done == len(codes):
+                if done % PARTIAL_SAVE_EVERY == 0 or done == len(scan_codes):
                     event_count = sum(1 for r in rows if int(r.get("破界事件数", 0)) > 0)
-                    log(f"进度 {done}/{len(codes)}｜事件 {event_count}")
+                    completed_count = sum(1 for r in rows if ss(r.get("状态")) == "完成")
+                    log(f"进度 {done}/{len(scan_codes)}｜总完成 {completed_count}/{len(codes)}｜事件 {event_count}")
     else:
-        for idx, code in enumerate(codes, 1):
+        for idx, code in enumerate(scan_codes, 1):
             row = safe_analyze(code, name_map.get(code, ""))
             rows.append(row)
-            log(f"完成 {idx}/{len(codes)} {code}｜事件={row.get('破界事件数')}｜近端={row.get('近端核心线')}｜等级={row.get('最终等级')}")
+            append_progress_row(row)
+            log(f"完成 {idx}/{len(scan_codes)} {code}｜事件={row.get('破界事件数')}｜近端={row.get('近端核心线')}｜等级={row.get('最终等级')}")
+
+    # 输出前按原股票池顺序恢复，避免并发完成顺序影响报告稳定性。
+    row_map = {code_of(r.get("股票代码")): r for r in rows}
+    rows = [row_map[c] for c in codes if c in row_map]
 
     report_text = build_report(rows)
     write_outputs(rows, report_text)
