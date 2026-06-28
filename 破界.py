@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜破界｜全市场直接年季月K版 V12.2.1
+破界.py｜破界｜全市场直接年季月K版 V12.3
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -16,6 +16,7 @@ from __future__ import annotations
 9）V12.1：修复东方财富股票池分页，避免全市场模式只拿到第一页100只；
 10）V12.2：加速全市场扫描：自动提高并发、HTTP长连接、请求超时/重试、短日线窗口、断点续跑。
 11）V12.2.1：修复断点进度文件在 TARGET 定义前引用导致启动即崩的问题。
+12）V12.2.2：强制确认断点文件初始化顺序，避免旧文件误跑时日志混淆。
 
 说明：
 BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
@@ -44,8 +45,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_2_1_FASTFIX_20260628"
-RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination; fast_http; resume_checkpoint; target_order_fixed"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_3_FASTREF_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination; fast_http; resume_checkpoint; target_order_fixed; progress_after_target; skip_cache_reference_glob"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -108,10 +109,14 @@ if RUN_FULL_MARKET:
 else:
     WORKERS = REQUESTED_WORKERS
 
-REQUEST_TIMEOUT = float(os.getenv("POJIE_REQUEST_TIMEOUT", "12"))
-REQUEST_RETRIES = max(0, int(os.getenv("POJIE_REQUEST_RETRIES", "1")))
+REQUEST_TIMEOUT = float(os.getenv("POJIE_REQUEST_TIMEOUT", "6"))
+REQUEST_RETRIES = max(0, int(os.getenv("POJIE_REQUEST_RETRIES", "0")))
 HTTP_POOL_SIZE = max(WORKERS + 8, int(os.getenv("POJIE_HTTP_POOL_SIZE", "64")))
 RESUME_ENABLED = os.getenv("POJIE_RESUME_ENABLED", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# 全市场扫描时，不能每只股票都 glob 本地缓存找参考收盘。
+# GitHub artifact 恢复后缓存文件可能有几千个，逐票 glob 会把扫描拖成 O(股票数×缓存文件数)。
+# 复权口径已经固定为前复权/后复权/不复权时，参考收盘只用于辅助展示，不应卡住主扫描。
+FAST_SKIP_CACHE_REF = os.getenv("POJIE_FAST_SKIP_CACHE_REF", "1").strip() not in {"0", "false", "False", "no", "NO"}
 PARTIAL_SAVE_EVERY = max(1, int(os.getenv("POJIE_PARTIAL_SAVE_EVERY", "25")))
 EVENT_LOOKBACK_DAYS = int(os.getenv("POJIE_EVENT_LOOKBACK_DAYS", "20"))
 TOP_PUSH_LIMIT = int(os.getenv("POJIE_TOP_PUSH_LIMIT", "20"))
@@ -143,7 +148,7 @@ _THREAD_LOCAL = threading.local()
 
 
 def log(msg: str) -> None:
-    print(f"[破界V12.2.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V12.3][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -211,7 +216,7 @@ def resolve_target_raw() -> str:
 TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
-PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_2_1.jsonl"
+PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_3.jsonl"
 
 
 def get_http_session() -> Any:
@@ -355,6 +360,15 @@ def cache_reference_close(code: str) -> Tuple[float, str]:
     if d.empty:
         return 0.0, str(p)
     return sf(d.iloc[-1]["close"]), str(p)
+
+
+def reference_close_for_run(code: str) -> Tuple[float, str]:
+    # 关键加速：全市场 + 固定复权口径时，跳过逐票缓存 glob。
+    # 旧版每只股票都调用 find_cache_file(code)，在几千个缓存文件目录里反复 glob，
+    # 比真正的核心线计算还慢。单票验证或自动复权匹配时仍保留原逻辑。
+    if RUN_FULL_MARKET and FAST_SKIP_CACHE_REF and ADJUST_FLAG_ENV in {"0", "1", "2"}:
+        return 0.0, "skipped_for_full_market_speed"
+    return cache_reference_close(code)
 
 
 def eastmoney_secid(code: str) -> str:
@@ -1398,7 +1412,7 @@ def fetch_core_lines_progressive(code: str, fqt: str) -> Tuple[List[Dict[str, An
 
 
 def analyze_one(code: str, name_hint: str = "") -> Dict[str, Any]:
-    ref_close, cache_path = cache_reference_close(code)
+    ref_close, cache_path = reference_close_for_run(code)
     adjust_flag, adjust_info = choose_adjust_flag(code, ref_close)
 
     core_lines, period_bars, core_selection_path = fetch_core_lines_progressive(code, adjust_flag)
@@ -1682,6 +1696,7 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "min_fullmarket_workers": MIN_FULLMARKET_WORKERS,
             "request_timeout": REQUEST_TIMEOUT,
             "request_retries": REQUEST_RETRIES,
+            "fast_skip_cache_reference_glob": FAST_SKIP_CACHE_REF,
             "event_daily_days": EVENT_DAILY_DAYS,
             "resume_enabled": RESUME_ENABLED,
             "progress_jsonl": str(PROGRESS_JSONL),
@@ -1792,7 +1807,7 @@ def main() -> None:
     print(f"run_full_market={RUN_FULL_MARKET}", flush=True)
     print("target_codes=" + (",".join(TARGET_CODES) if TARGET_CODES else "FULL_MARKET"), flush=True)
     print("data_source=eastmoney_direct_yqm_fullmarket", flush=True)
-    print(f"workers={WORKERS} requested_workers={REQUESTED_WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS} core_selection_mode={CORE_SELECTION_MODE} timeout={REQUEST_TIMEOUT}s resume={RESUME_ENABLED}", flush=True)
+    print(f"workers={WORKERS} requested_workers={REQUESTED_WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS} core_selection_mode={CORE_SELECTION_MODE} timeout={REQUEST_TIMEOUT}s retries={REQUEST_RETRIES} resume={RESUME_ENABLED} fast_skip_cache_ref={FAST_SKIP_CACHE_REF}", flush=True)
 
     codes, name_map = resolve_run_universe()
     log(f"准备扫描：{len(codes)} 只")
