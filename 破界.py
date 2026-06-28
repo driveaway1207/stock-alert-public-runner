@@ -2,19 +2,20 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V8
+破界.py｜三号员工｜600584 单票验证版 V9
 
-本版核心修正：
-1）候选线仍然来自实体顶 body_top；
-2）high / body_top / close 是离散主反应点；
-3）上影线穿越不再无条件等于主共振，但会作为“外部影线接受/反应”计入有效共振；
-4）新增年线/K线粘合性：同一主簇里先选代表性最强、最粘合的实顶，不机械选最高实顶；
-5）最终线必须零切实体；
-6）正式核心线只保留 S-Core / A-Core；
-7）默认只跑 600584 长电科技，不做全市场扫描。
+核心修正：
+1）不再用本地缓存日线聚合年/季/月；
+2）直接从 BaoStock 拉月线 frequency="m"；
+3）年线、季线只从 BaoStock 月线 OHLC 聚合，不再从日线捏合；
+4）复权口径自动选择：优先匹配本地缓存最新收盘，匹配不到则用 POJIE_ADJUST_FLAG；
+5）核心线逻辑仍然是：实体顶候选 + 离散反应点 + 外部影线有效反应 + K线粘合代表性；
+6）默认只跑 600584，不扫全市场。
 
-workflow 不需要改，仍然执行：
-python -u 破界.py
+说明：
+BaoStock 常用 K 线接口支持 d/w/m；没有稳定的 q/y 直接频率。
+因此本版“月线直接拿 BaoStock”，季线/年线从 BaoStock 月线聚合。
+这比用本地日线缓存聚合更容易和 BaoStock/常规图表复权口径保持一致。
 """
 
 import json
@@ -30,13 +31,18 @@ import numpy as np
 import pandas as pd
 
 try:
+    import baostock as bs
+except Exception:
+    bs = None
+
+try:
     import requests
 except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_ADHESION_BODYTOP_V8_20260628"
-RUN_MODE = "single_stock_only; no_full_market_scan"
+BOOT = "POJIE_SINGLE_600584_BAOSTOCK_MONTHLY_YQM_V9_20260628"
+RUN_MODE = "single_stock_only; baostock_monthly_source; no_full_market_scan"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -75,46 +81,27 @@ TARGET_CODES = [
     if re.fullmatch(r"\d{6}", x)
 ] or ["600584"]
 
-MIN_ROWS = int(os.getenv("POJIE_MIN_ROWS", "80"))
+BAOSTOCK_START_DATE = os.getenv("POJIE_BAOSTOCK_START_DATE", "1990-01-01")
+ADJUST_FLAG_ENV = os.getenv("POJIE_ADJUST_FLAG", "").strip()
+# BaoStock adjustflag: 1=后复权, 2=前复权, 3=不复权。
+ADJUST_FLAG_NAMES = {"1": "后复权", "2": "前复权", "3": "不复权"}
 
-# 主反应点聚类容差。这里是核心容差，不是上影线穿越容差。
 POINT_TOL = float(os.getenv("POJIE_POINT_TOL", "0.005"))
-
-# 实顶贴线容差。线压在实顶边缘不算切实体。
 BODY_EDGE_TOL = float(os.getenv("POJIE_BODY_EDGE_TOL", "0.005"))
-
-# 上影线共振不再作为任意穿越直接成立，但可以作为外部有效反应。
-# 影线共振要求：line 在上影线内部，且不是极端长影中随便穿过的孤立位置。
-# 为避免过严，默认允许上影线内部穿越，但排序上低于 high/body_top/close 离散点。
 SHADOW_REACTION_WEIGHT = float(os.getenv("POJIE_SHADOW_REACTION_WEIGHT", "0.70"))
 
 PERIOD_SPECS = [
-    # period, label, min_effective_unique, period_rank
     ("Y", "年线", 4, 3),
     ("Q", "季线", 8, 2),
     ("M", "月线", 10, 1),
 ]
-
-
-def min_seed_discrete_count(min_effective_unique: int) -> int:
-    """
-    V7 修正：
-    主簇种子不能直接要求达到年/季/月完整共振门槛。
-    因为你的逻辑是“实顶 + 其他影线能共振上”，影线也属于有效反应。
-    如果建簇阶段就强制年线离散点>=4，会把“2个离散点 + 2个影线反应”的正确核心线直接杀掉。
-    """
-    if min_effective_unique <= 4:
-        return 2
-    if min_effective_unique <= 8:
-        return 3
-    return 4
 
 BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
 PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
 
 
 def log(msg: str) -> None:
-    print(f"[破界V5][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V9][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -181,6 +168,18 @@ def resolve_target_raw() -> str:
 
 TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
+TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
+
+
+def bs_code(code: str) -> str:
+    c = code_of(code)
+    if c.startswith(("6", "9")):
+        return f"sh.{c}"
+    if c.startswith(("0", "3")):
+        return f"sz.{c}"
+    if c.startswith(("8", "4")):
+        return f"bj.{c}"
+    return c
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -245,10 +244,8 @@ def find_cache_file(code: str) -> Optional[Path]:
         if not root.exists():
             continue
         hits.extend([p for p in root.glob(f"*{code}*") if p.suffix.lower() in {".csv", ".json"}])
-
     if not hits:
         return None
-
     return sorted(hits, key=lambda p: (len(str(p)), str(p)))[0]
 
 
@@ -262,14 +259,121 @@ def read_cache(path: Path) -> pd.DataFrame:
             rows = obj.get("rows") or obj.get("data") or obj.get("klines") or obj.get("items") or []
         else:
             rows = obj
-
         return normalize_hist(pd.DataFrame(rows))
     except Exception:
         return pd.DataFrame()
 
 
-def aggregate_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    d = normalize_hist(df)
+def cache_reference_close(code: str) -> Tuple[float, str]:
+    p = find_cache_file(code)
+    if not p:
+        return 0.0, ""
+    df = read_cache(p)
+    if df.empty:
+        return 0.0, str(p)
+    return sf(df.iloc[-1]["close"]), str(p)
+
+
+def baostock_login() -> None:
+    if bs is None:
+        raise RuntimeError("baostock 未安装或导入失败")
+    lg = bs.login()
+    if getattr(lg, "error_code", "0") != "0":
+        raise RuntimeError(f"BaoStock 登录失败：{getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
+
+
+def baostock_logout() -> None:
+    try:
+        if bs is not None:
+            bs.logout()
+    except Exception:
+        pass
+
+
+def fetch_baostock_k(code: str, frequency: str, adjustflag: str, start_date: str, end_date: str) -> pd.DataFrame:
+    fields = "date,code,open,high,low,close,volume,amount,adjustflag"
+    rs = bs.query_history_k_data_plus(
+        bs_code(code),
+        fields,
+        start_date=start_date,
+        end_date=end_date,
+        frequency=frequency,
+        adjustflag=adjustflag,
+    )
+
+    if getattr(rs, "error_code", "0") != "0":
+        raise RuntimeError(f"BaoStock查询失败 frequency={frequency} adjust={adjustflag}: {getattr(rs, 'error_msg', '')}")
+
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+
+    df = pd.DataFrame(rows, columns=rs.fields)
+    return normalize_hist(df)
+
+
+def choose_adjust_flag(code: str, reference_close: float) -> Tuple[str, Dict[str, Any]]:
+    if ADJUST_FLAG_ENV in {"1", "2", "3"}:
+        return ADJUST_FLAG_ENV, {"reason": "env", "reference_close": reference_close}
+
+    # 没有参考价时默认后复权。长电科技当前 100.89 更像后复权口径。
+    if reference_close <= 0:
+        return "1", {"reason": "default_hfq_no_reference", "reference_close": reference_close}
+
+    probe_start = (TARGET_TS - pd.Timedelta(days=80)).strftime("%Y-%m-%d")
+    end = TARGET_DASH
+
+    candidates: List[Dict[str, Any]] = []
+
+    for flag in ["1", "2", "3"]:
+        try:
+            d = fetch_baostock_k(code, "d", flag, probe_start, end)
+            latest = sf(d.iloc[-1]["close"]) if not d.empty else 0.0
+            candidates.append({
+                "flag": flag,
+                "name": ADJUST_FLAG_NAMES.get(flag, flag),
+                "latest_close": rd(latest),
+                "diff": abs(latest - reference_close) if latest > 0 else 1e18,
+            })
+        except Exception as exc:
+            candidates.append({
+                "flag": flag,
+                "name": ADJUST_FLAG_NAMES.get(flag, flag),
+                "latest_close": 0.0,
+                "diff": 1e18,
+                "error": str(exc)[:120],
+            })
+
+    best = min(candidates, key=lambda x: sf(x["diff"], 1e18))
+    return ss(best["flag"]), {
+        "reason": "match_cache_reference_close",
+        "reference_close": rd(reference_close),
+        "candidates": candidates,
+        "chosen": best,
+    }
+
+
+def complete_monthly_bars(monthly: pd.DataFrame) -> pd.DataFrame:
+    d = normalize_hist(monthly)
+    if d.empty:
+        return d
+
+    periods = pd.to_datetime(d["date"]).dt.to_period("M")
+    target_period = pd.Timestamp(TARGET_DASH).to_period("M") if TARGET_DASH else pd.Timestamp.today().to_period("M")
+    d = d[periods < target_period].reset_index(drop=True)
+    return d
+
+
+def aggregate_from_monthly(monthly: pd.DataFrame, period: str) -> pd.DataFrame:
+    """
+    从 BaoStock 月线聚合：
+    - open = 周期内第一根月K开盘
+    - close = 周期内最后一根月K收盘
+    - high = 周期内月K高点最大值
+    - low = 周期内月K低点最小值
+    - volume/amount = 累加
+    """
+    d = complete_monthly_bars(monthly)
     if d.empty:
         return pd.DataFrame()
 
@@ -278,29 +382,47 @@ def aggregate_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     if d.empty:
         return pd.DataFrame()
 
-    d["_period"] = pd.to_datetime(d["date"]).dt.to_period(period).astype(str)
+    if period == "M":
+        k = d.copy()
+        k["period"] = pd.to_datetime(k["date"]).dt.to_period("M").astype(str)
+        k["start"] = k["date"]
+        k["end"] = k["date"]
+    else:
+        d["_period"] = pd.to_datetime(d["date"]).dt.to_period(period).astype(str)
+        rows: List[Dict[str, Any]] = []
+        for p, g in d.groupby("_period", sort=True):
+            g = g.sort_values("date").reset_index(drop=True)
+            rows.append({
+                "period": ss(p),
+                "start": ss(g.iloc[0]["date"]),
+                "end": ss(g.iloc[-1]["date"]),
+                "open": sf(g.iloc[0]["open"]),
+                "high": sf(g["high"].max()),
+                "low": sf(g["low"].min()),
+                "close": sf(g.iloc[-1]["close"]),
+                "volume": sf(g["volume"].sum()),
+                "amount": sf(g["amount"].sum()) if "amount" in g.columns else 0.0,
+            })
+        k = pd.DataFrame(rows)
 
-    rows: List[Dict[str, Any]] = []
-    for p, g in d.groupby("_period", sort=True):
-        g = g.sort_values("date").reset_index(drop=True)
-        rows.append({
-            "period": ss(p),
-            "start": ss(g.iloc[0]["date"]),
-            "end": ss(g.iloc[-1]["date"]),
-            "open": sf(g.iloc[0]["open"]),
-            "high": sf(g["high"].max()),
-            "low": sf(g["low"].min()),
-            "close": sf(g.iloc[-1]["close"]),
-            "volume": sf(g["volume"].sum()),
-            "amount": sf(g["amount"].sum()) if "amount" in g.columns else 0.0,
-        })
-
-    k = pd.DataFrame(rows).sort_values("end").reset_index(drop=True)
     if k.empty:
         return pd.DataFrame()
 
+    # 排除未完成年/季。月线已在 complete_monthly_bars 里排除了当前月。
+    if period == "Y":
+        target_year = int(TARGET_DASH[:4])
+        k = k[pd.to_datetime(k["end"]).dt.year < target_year].reset_index(drop=True)
+    elif period == "Q":
+        target_q = pd.Timestamp(TARGET_DASH).to_period("Q")
+        k = k[pd.to_datetime(k["end"]).dt.to_period("Q") < target_q].reset_index(drop=True)
+
+    if k.empty:
+        return pd.DataFrame()
+
+    k = k.sort_values("end").reset_index(drop=True)
     k["body_top"] = k[["open", "close"]].max(axis=1)
     k["body_bottom"] = k[["open", "close"]].min(axis=1)
+
     rng = (k["high"] - k["low"]).replace(0, np.nan)
     k["body_ratio"] = ((k["close"] - k["open"]).abs() / rng).fillna(0.0)
     k["close_pos"] = ((k["close"] - k["low"]) / rng).fillna(0.0)
@@ -308,11 +430,15 @@ def aggregate_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     k["is_bull"] = k["close"] > k["open"]
     k["vol_ratio_prev"] = k["volume"] / k["volume"].shift(1).replace(0, np.nan)
     k["vol_ratio_prev"] = k["vol_ratio_prev"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return k.reset_index(drop=True)
 
-    # 排除当前未完成的大周期K，避免正在形成的年/季/月K污染核心线。
-    if len(k) <= 1:
-        return pd.DataFrame()
-    return k.iloc[:-1].reset_index(drop=True)
+
+def min_seed_discrete_count(min_effective_unique: int) -> int:
+    if min_effective_unique <= 4:
+        return 2
+    if min_effective_unique <= 8:
+        return 3
+    return 4
 
 
 def is_volume_bodytop(row: Any) -> bool:
@@ -338,10 +464,7 @@ def reaction_point_weight(kind: str, row: Any) -> float:
         if is_double_bodytop(row):
             return 1.8
         if is_volume_bodytop(row):
-            vr = sf(row["vol_ratio_prev"])
-            if vr >= 1.60:
-                return 1.6
-            return 1.4
+            return 1.6 if sf(row["vol_ratio_prev"]) >= 1.60 else 1.4
         return 1.2
     if kind == "high":
         return 1.0
@@ -352,7 +475,6 @@ def reaction_point_weight(kind: str, row: Any) -> float:
 
 def build_reaction_points(k: pd.DataFrame) -> List[Dict[str, Any]]:
     points: List[Dict[str, Any]] = []
-
     for idx, row in k.iterrows():
         for kind, price in [
             ("high", sf(row["high"])),
@@ -378,7 +500,6 @@ def build_reaction_points(k: pd.DataFrame) -> List[Dict[str, Any]]:
                 "volume": rd(row["volume"]),
                 "vol_ratio_prev": rd(row["vol_ratio_prev"]),
             })
-
     return sorted(points, key=lambda x: sf(x["price"]))
 
 
@@ -407,42 +528,29 @@ def choose_best_point_per_bar(points: List[Dict[str, Any]], prefer_line: Optiona
 def cluster_from_seed(points: List[Dict[str, Any]], seed_price: float, min_seed_unique: int) -> Optional[Dict[str, Any]]:
     raw = points_near(points, seed_price, POINT_TOL)
     uniq = choose_best_point_per_bar(raw, seed_price)
-
     if len(uniq) < min_seed_unique:
         return None
 
-    bodytops = [p for p in raw if ss(p["kind"]) == "body_top"]
-    if not bodytops:
-        return None
-
     prices = [sf(p["price"]) for p in uniq]
-    center = float(np.average(prices, weights=[max(sf(p["weight"]), 0.1) for p in uniq]))
-    low = min(prices)
-    high = max(prices)
-
+    weights = [max(sf(p["weight"]), 0.1) for p in uniq]
+    center = float(np.average(prices, weights=weights))
     return {
         "seed": rd(seed_price),
         "center": rd(center),
-        "low": rd(low),
-        "high": rd(high),
+        "low": rd(min(prices)),
+        "high": rd(max(prices)),
         "primary_unique": len(uniq),
         "primary_points": uniq,
         "raw_points": raw,
-        "bodytop_candidates": sorted(bodytops, key=lambda x: sf(x["price"])),
-        "primary_weight": rd(sum(sf(p["weight"]) for p in uniq)),
+        "primary_weight": rd(sum(weights)),
         "primary_periods": ",".join(ss(p["period"]) for p in uniq),
         "primary_kinds": ",".join(ss(p["kind"]) for p in uniq),
     }
 
 
 def dedupe_clusters(clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not clusters:
-        return []
-
-    ordered = sorted(clusters, key=lambda c: sf(c["center"]))
     groups: List[List[Dict[str, Any]]] = []
-
-    for c in ordered:
+    for c in sorted(clusters, key=lambda z: sf(z["center"])):
         placed = False
         for g in groups:
             if abs(sf(c["center"]) - sf(g[0]["center"])) / max(sf(g[0]["center"]), 1e-9) <= POINT_TOL:
@@ -452,51 +560,32 @@ def dedupe_clusters(clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not placed:
             groups.append([c])
 
-    def cluster_rank(c: Dict[str, Any]) -> Tuple[Any, ...]:
-        return (
-            int(c["primary_unique"]),
-            sf(c["primary_weight"]),
-            len(c["bodytop_candidates"]),
-            sf(c["center"]),
-        )
+    def rank(c: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (int(c["primary_unique"]), sf(c["primary_weight"]), sf(c["center"]))
 
-    return [max(g, key=cluster_rank) for g in groups]
+    return [max(g, key=rank) for g in groups]
 
 
 def count_cut_entities(k: pd.DataFrame, line: float) -> int:
     cuts = 0
-
     for _, r in k.iterrows():
         body_top = sf(r["body_top"])
         body_bottom = sf(r["body_bottom"])
-
-        inside_body = body_bottom < line < body_top
+        inside = body_bottom < line < body_top
         near_top = abs(body_top - line) / max(line, 1e-9) <= BODY_EDGE_TOL
-
-        if inside_body and not near_top:
+        if inside and not near_top:
             cuts += 1
-
     return cuts
 
 
 def shadow_reactions(k: pd.DataFrame, line: float, used_bars: set[int], anchor_bar: int) -> List[Dict[str, Any]]:
-    """
-    外部影线反应：
-    - 只看锚点之外的大周期K；
-    - 如果 line 落在上影线 body_top~high 之间，说明该价位在影线供应区被打到过；
-    - 但它的权重低于 high/body_top/close 离散点；
-    - 同一根K如果已经有 high/body_top/close 离散点命中，不重复计数。
-    """
     out: List[Dict[str, Any]] = []
-
     for idx, r in k.iterrows():
         i = int(idx)
         if i == int(anchor_bar) or i in used_bars:
             continue
-
         body_top = sf(r["body_top"])
         high = sf(r["high"])
-
         if body_top < line < high:
             out.append({
                 "bar_index": i,
@@ -515,67 +604,56 @@ def shadow_reactions(k: pd.DataFrame, line: float, used_bars: set[int], anchor_b
                 "volume": rd(r["volume"]),
                 "vol_ratio_prev": rd(r["vol_ratio_prev"]),
             })
-
     return out
 
 
-def weighted_center_of_points(points: List[Dict[str, Any]]) -> float:
+def weighted_center(points: List[Dict[str, Any]]) -> float:
     if not points:
         return 0.0
+    prices = [sf(p["price"]) for p in points]
     weights = [max(sf(p.get("weight")), 0.1) for p in points]
-    prices = [sf(p.get("price")) for p in points]
-    try:
-        return float(np.average(prices, weights=weights))
-    except Exception:
-        return float(np.mean(prices)) if prices else 0.0
+    return float(np.average(prices, weights=weights))
 
 
-def adhesion_metrics(k: pd.DataFrame, line: float, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    K线粘合性：
-    - 不看单一最高点，而看多根大周期K在同一价格带的实体顶/收盘/高点/影线是否共同认账；
-    - 线越贴近这些离散反应点的加权中心，代表性越强；
-    - 同一簇里两个实顶很接近时，优先选粘合代表性更强、右侧确认更强的实顶，而不是机械选最高。
-    """
+def adhesion_metrics(line: float, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     primary = [p for p in samples if ss(p.get("kind")) in {"high", "body_top", "close"}]
+    shadows = [p for p in samples if ss(p.get("kind")) == "shadow"]
     bodytops = [p for p in primary if ss(p.get("kind")) == "body_top"]
     highs = [p for p in primary if ss(p.get("kind")) == "high"]
     closes = [p for p in primary if ss(p.get("kind")) == "close"]
-    shadows = [p for p in samples if ss(p.get("kind")) == "shadow"]
 
-    center = weighted_center_of_points(primary) or line
-    compact_error = 0.0
+    center = weighted_center(primary) or line
     if primary:
-        compact_error = sum(abs(sf(p["price"]) - line) / max(line, 1e-9) * max(sf(p["weight"]), 0.1) for p in primary) / sum(max(sf(p["weight"]), 0.1) for p in primary)
+        total_w = sum(max(sf(p["weight"]), 0.1) for p in primary)
+        compact = sum(abs(sf(p["price"]) - line) / max(line, 1e-9) * max(sf(p["weight"]), 0.1) for p in primary) / total_w
+    else:
+        compact = 0.0
 
     center_bias = abs(line - center) / max(center, 1e-9)
-
-    # 右侧确认：同样粘合时，后来的实顶/反应点优先，避免早期孤立高实顶抢线。
     latest_bar = max([int(p.get("bar_index", -1)) for p in samples] or [-1])
 
-    adhesion_score = (
+    score = (
         1.25 * len(bodytops)
         + 1.00 * len(highs)
         + 0.85 * len(closes)
         + 0.55 * len(shadows)
         + 0.35 * sum(1 for p in bodytops if bool(p.get("is_volume_bodytop")))
         + 0.45 * sum(1 for p in bodytops if bool(p.get("is_double_bodytop")))
-        - 10.0 * compact_error
+        - 10.0 * compact
         - 6.0 * center_bias
     )
 
     return {
-        "adhesion_score": rd(adhesion_score, 4),
-        "bodytop_sticky_count": int(len(bodytops)),
-        "high_sticky_count": int(len(highs)),
-        "close_sticky_count": int(len(closes)),
-        "shadow_sticky_count": int(len(shadows)),
+        "adhesion_score": rd(score, 4),
         "reaction_center": rd(center, 4),
-        "compact_error_pct": rd(compact_error * 100, 4),
+        "compact_error_pct": rd(compact * 100, 4),
         "center_bias_pct": rd(center_bias * 100, 4),
         "latest_reaction_bar": int(latest_bar),
+        "bodytop_sticky_count": len(bodytops),
+        "high_sticky_count": len(highs),
+        "close_sticky_count": len(closes),
+        "shadow_sticky_count": len(shadows),
     }
-
 
 
 def validate_bodytop_line(
@@ -583,45 +661,33 @@ def validate_bodytop_line(
     points: List[Dict[str, Any]],
     cluster: Dict[str, Any],
     bodytop_point: Dict[str, Any],
-    min_primary_unique: int,
+    min_effective_unique: int,
 ) -> Optional[Dict[str, Any]]:
     line = sf(bodytop_point["price"])
     if line <= 0:
         return None
 
-    # 离散主反应点：high/body_top/close。
     primary_raw = points_near(points, line, POINT_TOL)
     primary = choose_best_point_per_bar(primary_raw, line)
+    primary_bars = {int(p["bar_index"]) for p in primary}
 
     anchor_bar = int(bodytop_point["bar_index"])
-    primary_bar_set = {int(p["bar_index"]) for p in primary}
     external_primary = [p for p in primary if int(p["bar_index"]) != anchor_bar]
+    shadows = shadow_reactions(k, line, primary_bars, anchor_bar)
 
-    # 外部影线反应：允许 line 穿过影线，但低权重，不重复同一根K。
-    shadows = shadow_reactions(k, line, primary_bar_set, anchor_bar)
+    samples = sorted(primary + shadows, key=lambda x: int(x["bar_index"]))
+    sample_bars = {int(p["bar_index"]) for p in samples}
+    external_effective = [p for p in samples if int(p["bar_index"]) != anchor_bar]
 
-    effective_samples = sorted(primary + shadows, key=lambda x: int(x["bar_index"]))
-    effective_bar_set = {int(p["bar_index"]) for p in effective_samples}
-    external_effective = [p for p in effective_samples if int(p["bar_index"]) != anchor_bar]
-
-    # 这是 V6 的关键：不是只看离散点，也不是只看影线穿越；
-    # 而是要求“锚点实顶 + 外部离散/影线有效反应”共同达到周期门槛。
-    if len(effective_bar_set) < min_primary_unique:
+    if len(sample_bars) < min_effective_unique:
+        return None
+    if len(external_effective) < max(2, min_effective_unique - 1):
+        return None
+    if len(primary_bars) < 2:
         return None
 
-    if len(external_effective) < max(2, min_primary_unique - 1):
-        return None
-
-    # 至少要有 2 个 high/body_top/close 离散点，其中一个是锚点实顶。
-    # 这样防止“单个实顶 + 一堆长上影内部穿越”乱成线。
-    if len(primary_bar_set) < 2:
-        return None
-
-    # 候选实顶必须落在离散主簇附近。这里允许略超出 cluster 高低点 0.5%，
-    # 因为主簇可能由 high/close 点形成，而最高实顶刚好在簇边缘。
-    cluster_low = sf(cluster["low"])
-    cluster_high = sf(cluster["high"])
-    if not (cluster_low * (1 - POINT_TOL) <= line <= cluster_high * (1 + POINT_TOL)):
+    center = sf(cluster["center"])
+    if center > 0 and abs(line - center) / center > POINT_TOL:
         return None
 
     cut_count = count_cut_entities(k, line)
@@ -630,7 +696,6 @@ def validate_bodytop_line(
 
     volume_bodytop_count = sum(1 for p in primary if bool(p.get("is_volume_bodytop")))
     double_bodytop_count = sum(1 for p in primary if bool(p.get("is_double_bodytop")))
-
     if volume_bodytop_count >= 2 and double_bodytop_count >= 1:
         grade = "S-Core"
     elif volume_bodytop_count >= 1:
@@ -638,24 +703,22 @@ def validate_bodytop_line(
     else:
         return None
 
-    effective_weight = sum(sf(p["weight"]) for p in effective_samples)
-    shadow_periods = [ss(p["period"]) for p in shadows]
-    stick = adhesion_metrics(k, line, effective_samples)
+    stick = adhesion_metrics(line, samples)
 
     out = {
         "line": rd(line),
         "core_grade": grade,
-        "touch_count": len(effective_bar_set),
-        "primary_unique_count": len(primary_bar_set),
-        "effective_unique_count": len(effective_bar_set),
+        "touch_count": len(sample_bars),
+        "effective_unique_count": len(sample_bars),
+        "primary_unique_count": len(primary_bars),
+        "external_effective_count": len(external_effective),
         "external_primary_count": len(external_primary),
         "external_shadow_count": len(shadows),
-        "external_effective_count": len(external_effective),
         "volume_bodytop_count": int(volume_bodytop_count),
         "double_bodytop_count": int(double_bodytop_count),
         "cut_count": int(cut_count),
         "primary_weight": rd(sum(sf(p["weight"]) for p in primary)),
-        "effective_weight": rd(effective_weight),
+        "effective_weight": rd(sum(sf(p["weight"]) for p in samples)),
         "cluster_center": rd(cluster["center"]),
         "cluster_low": rd(cluster["low"]),
         "cluster_high": rd(cluster["high"]),
@@ -663,25 +726,23 @@ def validate_bodytop_line(
         "cluster_primary_weight": rd(cluster["primary_weight"]),
         "anchor_period": ss(bodytop_point["period"]),
         "anchor_end": ss(bodytop_point["end"]),
-        "anchor_bar_index": int(bodytop_point["bar_index"]),
+        "anchor_bar_index": int(anchor_bar),
         "anchor_kind": ss(bodytop_point["kind"]),
         "anchor_price": rd(bodytop_point["price"]),
-        "sample_periods": ",".join(ss(p["period"]) for p in effective_samples),
-        "sample_kinds": ",".join(ss(p["kind"]) for p in effective_samples),
+        "sample_periods": ",".join(ss(p["period"]) for p in samples),
+        "sample_kinds": ",".join(ss(p["kind"]) for p in samples),
         "primary_sample_periods": ",".join(ss(p["period"]) for p in primary),
         "primary_sample_kinds": ",".join(ss(p["kind"]) for p in primary),
         "external_sample_periods": ",".join(ss(p["period"]) for p in external_effective),
         "external_sample_kinds": ",".join(ss(p["kind"]) for p in external_effective),
-        "shadow_count": int(len(shadows)),
-        "shadow_periods": ",".join(shadow_periods),
-        "samples": effective_samples,
+        "samples": samples,
     }
     out.update(stick)
     return out
 
 
-def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
-    k = aggregate_period(df, period)
+def scan_period_core_lines(monthly: pd.DataFrame, period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
+    k = aggregate_from_monthly(monthly, period)
     if k.empty:
         return []
 
@@ -689,8 +750,6 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effect
     if not points:
         return []
 
-    # V7：建簇阶段只要求“离散反应种子”够形成区域，不要求直接满足完整共振门槛；
-    # 完整门槛留到 validate_bodytop_line，用“离散点 + 外部影线有效反应”一起验证。
     seed_need = min_seed_discrete_count(min_effective_unique)
 
     clusters = []
@@ -698,43 +757,29 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effect
         c = cluster_from_seed(points, sf(p["price"]), seed_need)
         if c:
             clusters.append(c)
-
     clusters = dedupe_clusters(clusters)
 
     lines: List[Dict[str, Any]] = []
 
     for cluster in clusters:
-        # V7：候选实顶不只取 cluster raw points 里的 body_top。
-        # 如果某个 body_top 位于主簇容差范围内，也应该参与定线。
         bodytop_candidates: List[Dict[str, Any]] = []
         for p in points:
             if ss(p.get("kind")) != "body_top":
                 continue
-            price = sf(p.get("price"))
-            center = sf(cluster.get("center"))
-            if center > 0 and abs(price - center) / center <= POINT_TOL:
+            center = sf(cluster["center"])
+            if center > 0 and abs(sf(p["price"]) - center) / center <= POINT_TOL:
                 bodytop_candidates.append(p)
 
-        # 保留旧 raw bodytops 作为补充。
-        for p in cluster.get("bodytop_candidates", []):
-            if all(int(p["bar_index"]) != int(q["bar_index"]) or abs(sf(p["price"]) - sf(q["price"])) > 1e-9 for q in bodytop_candidates):
-                bodytop_candidates.append(p)
-
-        valid_candidates: List[Dict[str, Any]] = []
-        for bodytop in bodytop_candidates:
-            v = validate_bodytop_line(k, points, cluster, bodytop, min_effective_unique)
+        valid: List[Dict[str, Any]] = []
+        for bp in bodytop_candidates:
+            v = validate_bodytop_line(k, points, cluster, bp, min_effective_unique)
             if v:
-                valid_candidates.append(v)
+                valid.append(v)
 
-        if not valid_candidates:
+        if not valid:
             continue
 
-        # V7：最高实顶是最后的 tie-breaker；
-        # 先看外部有效反应是否足够、有效共振是否够多、外部离散和外部影线是否共同支撑。
-        def candidate_rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
-            # V8：避免“同一主簇内机械选最高实顶”。
-            # 先看粘合代表性、外部有效反应、反应中心贴近度和右侧确认；
-            # 价格更高只作为极弱 tie-breaker。
+        def rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
             return (
                 int(x["external_effective_count"]),
                 int(x["effective_unique_count"]),
@@ -748,17 +793,16 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effect
                 int(x["double_bodytop_count"]),
                 int(x["volume_bodytop_count"]),
                 sf(x["effective_weight"]),
-                -abs(sf(x["line"]) - sf(x.get("reaction_center", x["line"]))),
                 sf(x["line"]) * 0.000001,
             )
 
-        best = max(valid_candidates, key=candidate_rank)
+        best = max(valid, key=rank)
         best.update({
             "period_type": period,
             "period_label": label,
             "period_rank": int(period_rank),
             "core_rank": {"S-Core": 3, "A-Core": 2}.get(ss(best["core_grade"]), 0),
-            "min_primary_unique": int(min_effective_unique),
+            "min_effective_unique": int(min_effective_unique),
             "seed_discrete_need": int(seed_need),
         })
         lines.append(best)
@@ -767,23 +811,18 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effect
 
 
 def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not lines:
-        return []
-
-    ordered = sorted(lines, key=lambda x: sf(x["line"]))
     groups: List[List[Dict[str, Any]]] = []
-
-    for line in ordered:
+    for x in sorted(lines, key=lambda z: sf(z["line"])):
         placed = False
         for g in groups:
-            if abs(sf(line["line"]) - sf(g[0]["line"])) / max(sf(g[0]["line"]), 1e-9) <= POINT_TOL:
-                g.append(line)
+            if abs(sf(x["line"]) - sf(g[0]["line"])) / max(sf(g[0]["line"]), 1e-9) <= POINT_TOL:
+                g.append(x)
                 placed = True
                 break
         if not placed:
-            groups.append([line])
+            groups.append([x])
 
-    def line_rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
+    def rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
         return (
             int(x.get("core_rank", 0)),
             int(x.get("period_rank", 0)),
@@ -793,49 +832,36 @@ def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             -sf(x.get("center_bias_pct")),
             -sf(x.get("compact_error_pct")),
             int(x.get("latest_reaction_bar", -1)),
-            int(x.get("external_primary_count", 0)),
-            int(x.get("external_shadow_count", 0)),
             int(x.get("double_bodytop_count", 0)),
             int(x.get("volume_bodytop_count", 0)),
             sf(x.get("effective_weight")),
             sf(x.get("line")) * 0.000001,
         )
 
-    return sorted([max(g, key=line_rank) for g in groups], key=lambda x: sf(x["line"]))
+    return sorted([max(g, key=rank) for g in groups], key=lambda z: sf(z["line"]))
 
 
-def scan_core_lines(df: pd.DataFrame) -> List[Dict[str, Any]]:
+def scan_core_lines(monthly: pd.DataFrame) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-
-    for period, label, min_primary_unique, period_rank in PERIOD_SPECS:
-        out.extend(scan_period_core_lines(df, period, label, min_primary_unique, period_rank))
-
+    for period, label, min_effective_unique, period_rank in PERIOD_SPECS:
+        out.extend(scan_period_core_lines(monthly, period, label, min_effective_unique, period_rank))
     return dedupe_lines(out)
 
 
 def select_near_far(lines: List[Dict[str, Any]], current_close: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     valid = []
     for x in lines:
-        price = sf(x.get("line"))
-        if price <= 0:
-            continue
         y = dict(x)
-        y["distance_pct"] = abs(pct(current_close, price))
+        y["distance_pct"] = abs(pct(current_close, sf(y["line"])))
         valid.append(y)
 
     if not valid:
         return None, None
 
     near = min(valid, key=lambda x: sf(x["distance_pct"]))
-    rest = [
-        x for x in valid
-        if abs(sf(x["line"]) - sf(near["line"])) / max(sf(near["line"]), 1e-9) > POINT_TOL
-    ]
-
+    rest = [x for x in valid if abs(sf(x["line"]) - sf(near["line"])) / max(sf(near["line"]), 1e-9) > POINT_TOL]
     if not rest:
         return near, None
-
-    # 远端也按距离选第二条正式核心线；近端/远端只是实操距离，不改变线本身等级。
     far = min(rest, key=lambda x: sf(x["distance_pct"]))
     return near, far
 
@@ -848,20 +874,11 @@ def daily_features(row: Any, prev: Any, line: float) -> Dict[str, Any]:
     volume = sf(row["volume"])
     prev_close = sf(prev["close"])
     prev_volume = sf(prev["volume"])
-
     rng = max(high - low, 1e-9)
     body = abs(close - open_)
     body_top = max(open_, close)
     body_bottom = min(open_, close)
-
     return {
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-        "prev_close": prev_close,
-        "prev_volume": prev_volume,
         "vol_ratio_prev": volume / prev_volume if prev_volume > 0 else 0.0,
         "gap_break": open_ >= line * 1.003 and prev_close < line,
         "close_pos": (close - low) / rng,
@@ -880,12 +897,9 @@ def classify_breakout(f: Dict[str, Any]) -> Tuple[str, int]:
         and sf(f["upper_shadow_ratio"]) <= 0.35
         and sf(f["entity_above_line_ratio"]) >= 0.35
     )
-
     if not base_ok:
         return "C突破", 1
-
     vr = sf(f["vol_ratio_prev"])
-
     if bool(f["gap_break"]) and 1.80 <= vr <= 2.50:
         return "S突破", 5
     if 1.80 <= vr <= 2.50:
@@ -894,229 +908,116 @@ def classify_breakout(f: Dict[str, Any]) -> Tuple[str, int]:
         return "A突破", 3
     if vr >= 1.45:
         return "B突破", 2
-
     return "C突破", 1
 
 
-def best_breakout(df: pd.DataFrame, line: float) -> Dict[str, Any]:
-    d = normalize_hist(df)
-    best: Dict[str, Any] = {"grade": "无突破", "score_rank": 0}
-
+def best_breakout(daily: pd.DataFrame, line: float) -> Dict[str, Any]:
+    d = normalize_hist(daily)
+    best = {"grade": "无突破", "score_rank": 0}
     if d.empty or line <= 0:
         return best
 
     start = max(1, len(d) - BREAKOUT_LOOKBACK_DAYS)
-
     for idx in range(start, len(d)):
         row = d.iloc[idx]
         prev = d.iloc[idx - 1]
-
         prev_close = sf(prev["close"])
         prev_low = sf(prev["low"])
         close = sf(row["close"])
         high = sf(row["high"])
-
-        from_below = prev_close <= line * 1.002 and prev_low < line
-        close_above = close >= line * 1.005
-        high_above = high >= line * 1.005
-
-        if not (from_below and close_above and high_above):
+        if not (prev_close <= line * 1.002 and prev_low < line and close >= line * 1.005 and high >= line * 1.005):
             continue
-
         f = daily_features(row, prev, line)
         grade, rank = classify_breakout(f)
-        distance = pct(close, line)
-
-        if distance > 10:
-            note = "突破有效但离线过远，等待回踩"
-        elif distance > 6:
-            note = "突破偏高，谨慎追高"
-        else:
-            note = "突破距离可接受"
-
+        dist = pct(close, line)
+        note = "突破有效但离线过远，等待回踩" if dist > 10 else ("突破偏高，谨慎追高" if dist > 6 else "突破距离可接受")
         obj = {
             "grade": grade,
             "score_rank": int(rank),
             "date": ss(row["date"]),
             "idx": int(idx),
             "close": rd(close),
-            "distance_pct": rd(distance),
+            "distance_pct": rd(dist),
             "note": note,
             "vol_ratio_prev": rd(f["vol_ratio_prev"]),
             "gap_break": bool(f["gap_break"]),
-            "body_ratio": rd(f["body_ratio"]),
-            "close_pos": rd(f["close_pos"]),
-            "upper_shadow_ratio": rd(f["upper_shadow_ratio"]),
-            "entity_above_line_ratio": rd(f["entity_above_line_ratio"]),
         }
-
-        if (
-            int(obj["score_rank"]),
-            -sf(obj["distance_pct"]),
-            int(obj["idx"]),
-        ) > (
+        if (int(obj["score_rank"]), -sf(obj["distance_pct"]), int(obj["idx"])) > (
             int(best.get("score_rank", 0)),
             -sf(best.get("distance_pct", 999)),
             int(best.get("idx", 0)),
         ):
             best = obj
-
     return best
 
 
-def best_pullback(df: pd.DataFrame, line: float, breakout: Dict[str, Any]) -> Dict[str, Any]:
-    d = normalize_hist(df)
-    best: Dict[str, Any] = {"grade": "无回踩", "score_rank": 0}
-
+def best_pullback(daily: pd.DataFrame, line: float, breakout: Dict[str, Any]) -> Dict[str, Any]:
+    d = normalize_hist(daily)
+    best = {"grade": "无回踩", "score_rank": 0}
     if d.empty or line <= 0 or breakout.get("idx") is None:
         return best
-
     bidx = int(breakout["idx"])
     if bidx < 0 or bidx >= len(d):
         return best
-
-    breakout_volume = sf(d.iloc[bidx]["volume"])
+    bvol = sf(d.iloc[bidx]["volume"])
     end = min(len(d), bidx + 1 + PULLBACK_LOOKBACK_AFTER_BREAK)
-
     for idx in range(bidx + 1, end):
         row = d.iloc[idx]
         prev = d.iloc[idx - 1]
-
         low = sf(row["low"])
         close = sf(row["close"])
         open_ = sf(row["open"])
-        volume = sf(row["volume"])
+        vol = sf(row["volume"])
         prev_close = sf(prev["close"])
-
         if low > line * 1.03:
             continue
-
         close_ok = close >= line * 0.995
         defense_ok = close >= line * 0.985
-        shrink = breakout_volume > 0 and volume <= breakout_volume * 0.75
-
-        pct_chg = pct(close, prev_close)
-        bad_long_bear = (
-            close < open_
-            and pct_chg <= -3
-            and breakout_volume > 0
-            and volume >= breakout_volume * 0.80
-        )
-
-        if not defense_ok or bad_long_bear:
-            obj = {
-                "grade": "失败",
-                "score_rank": -1,
-                "date": ss(row["date"]),
-                "note": "跌破防守或放量长阴",
-                "low": rd(low),
-                "close": rd(close),
-                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
-            }
+        shrink = bvol > 0 and vol <= bvol * 0.75
+        bad = close < open_ and pct(close, prev_close) <= -3 and bvol > 0 and vol >= bvol * 0.80
+        if not defense_ok or bad:
+            obj = {"grade": "失败", "score_rank": -1, "date": ss(row["date"]), "note": "跌破防守或放量长阴", "low": rd(low), "close": rd(close)}
         elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 4:
-            obj = {
-                "grade": "S回踩",
-                "score_rank": 5,
-                "date": ss(row["date"]),
-                "note": "强突破后的缩量回踩不破",
-                "low": rd(low),
-                "close": rd(close),
-                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
-            }
+            obj = {"grade": "S回踩", "score_rank": 5, "date": ss(row["date"]), "note": "强突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
         elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 2:
-            obj = {
-                "grade": "A回踩",
-                "score_rank": 4,
-                "date": ss(row["date"]),
-                "note": "有效突破后的缩量回踩不破",
-                "low": rd(low),
-                "close": rd(close),
-                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
-            }
+            obj = {"grade": "A回踩", "score_rank": 4, "date": ss(row["date"]), "note": "有效突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
         elif close_ok:
-            obj = {
-                "grade": "B观察",
-                "score_rank": 2,
-                "date": ss(row["date"]),
-                "note": "回踩不破但量能或前置突破不足",
-                "low": rd(low),
-                "close": rd(close),
-                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
-            }
+            obj = {"grade": "B观察", "score_rank": 2, "date": ss(row["date"]), "note": "回踩不破但量能或前置突破不足", "low": rd(low), "close": rd(close)}
         else:
-            obj = {
-                "grade": "弱回踩",
-                "score_rank": 1,
-                "date": ss(row["date"]),
-                "note": "触线但收盘偏弱",
-                "low": rd(low),
-                "close": rd(close),
-                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
-            }
-
+            obj = {"grade": "弱回踩", "score_rank": 1, "date": ss(row["date"]), "note": "触线但收盘偏弱", "low": rd(low), "close": rd(close)}
         if int(obj["score_rank"]) > int(best.get("score_rank", 0)):
             best = obj
-
     return best
 
 
 def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not x:
         return {
-            f"{prefix}核心线": None,
-            f"{prefix}等级": "无",
-            f"{prefix}周期": "",
-            f"{prefix}有效共振": 0,
-            f"{prefix}离散共振": 0,
-            f"{prefix}外部有效": 0,
-            f"{prefix}外部离散": 0,
-            f"{prefix}外部影线": 0,
-            f"{prefix}放量实顶": 0,
-            f"{prefix}倍量实顶": 0,
-            f"{prefix}切实体": 0,
-            f"{prefix}距现价%": None,
-            f"{prefix}锚点": "",
-            f"{prefix}样本": "",
-            f"{prefix}样本类型": "",
-            f"{prefix}簇区间": "",
-            f"{prefix}粘合分": None,
-            f"{prefix}反应中心": None,
-            f"{prefix}中心偏离%": None,
-            f"{prefix}紧密误差%": None,
+            f"{prefix}核心线": None, f"{prefix}等级": "无", f"{prefix}周期": "",
+            f"{prefix}有效共振": 0, f"{prefix}离散共振": 0, f"{prefix}外部有效": 0, f"{prefix}外部影线": 0,
+            f"{prefix}放量实顶": 0, f"{prefix}倍量实顶": 0, f"{prefix}切实体": 0, f"{prefix}距现价%": None,
+            f"{prefix}锚点": "", f"{prefix}主簇": "", f"{prefix}反应中心": None, f"{prefix}粘合分": None,
+            f"{prefix}中心偏离%": None, f"{prefix}紧密误差%": None, f"{prefix}样本": "", f"{prefix}类型": "",
         }
-
     return {
-        f"{prefix}核心线": rd(x.get("line")),
-        f"{prefix}等级": ss(x.get("core_grade")),
-        f"{prefix}周期": ss(x.get("period_label")),
-        f"{prefix}有效共振": int(x.get("effective_unique_count", x.get("primary_unique_count", 0))),
-        f"{prefix}离散共振": int(x.get("primary_unique_count", 0)),
-        f"{prefix}外部有效": int(x.get("external_effective_count", 0)),
-        f"{prefix}外部离散": int(x.get("external_primary_count", 0)),
-        f"{prefix}外部影线": int(x.get("external_shadow_count", 0)),
-        f"{prefix}放量实顶": int(x.get("volume_bodytop_count", 0)),
-        f"{prefix}倍量实顶": int(x.get("double_bodytop_count", 0)),
-        f"{prefix}切实体": int(x.get("cut_count", 0)),
-        f"{prefix}距现价%": rd(x.get("distance_pct")),
-        f"{prefix}锚点": ss(x.get("anchor_period")),
-        f"{prefix}样本": ss(x.get("sample_periods")),
-        f"{prefix}样本类型": ss(x.get("sample_kinds")),
-        f"{prefix}簇区间": f"{rd(x.get('cluster_low'))}-{rd(x.get('cluster_high'))}",
-        f"{prefix}粘合分": rd(x.get("adhesion_score")),
-        f"{prefix}反应中心": rd(x.get("reaction_center")),
-        f"{prefix}中心偏离%": rd(x.get("center_bias_pct")),
-        f"{prefix}紧密误差%": rd(x.get("compact_error_pct")),
+        f"{prefix}核心线": rd(x.get("line")), f"{prefix}等级": ss(x.get("core_grade")), f"{prefix}周期": ss(x.get("period_label")),
+        f"{prefix}有效共振": int(x.get("effective_unique_count", 0)), f"{prefix}离散共振": int(x.get("primary_unique_count", 0)),
+        f"{prefix}外部有效": int(x.get("external_effective_count", 0)), f"{prefix}外部影线": int(x.get("external_shadow_count", 0)),
+        f"{prefix}放量实顶": int(x.get("volume_bodytop_count", 0)), f"{prefix}倍量实顶": int(x.get("double_bodytop_count", 0)),
+        f"{prefix}切实体": int(x.get("cut_count", 0)), f"{prefix}距现价%": rd(x.get("distance_pct")),
+        f"{prefix}锚点": ss(x.get("anchor_period")), f"{prefix}主簇": f"{rd(x.get('cluster_low'))}-{rd(x.get('cluster_high'))}",
+        f"{prefix}反应中心": rd(x.get("reaction_center")), f"{prefix}粘合分": rd(x.get("adhesion_score")),
+        f"{prefix}中心偏离%": rd(x.get("center_bias_pct")), f"{prefix}紧密误差%": rd(x.get("compact_error_pct")),
+        f"{prefix}样本": ss(x.get("sample_periods")), f"{prefix}类型": ss(x.get("sample_kinds")),
     }
 
 
 def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullback: Dict[str, Any]) -> str:
     if not near:
         return "无核心线"
-
     core = ss(near.get("core_grade"))
     pb = ss(pullback.get("grade"))
     br = ss(breakout.get("grade"))
-
     if core == "S-Core" and pb == "S回踩":
         return "S"
     if core in {"S-Core", "A-Core"} and pb in {"S回踩", "A回踩"}:
@@ -1127,35 +1028,36 @@ def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullba
 
 
 def analyze_one(code: str) -> Dict[str, Any]:
-    path = find_cache_file(code)
-    if not path:
-        return {"股票代码": code, "状态": "未找到缓存"}
+    ref_close, cache_path = cache_reference_close(code)
+    adjust_flag, adjust_info = choose_adjust_flag(code, ref_close)
+    daily = fetch_baostock_k(code, "d", adjust_flag, (TARGET_TS - pd.Timedelta(days=900)).strftime("%Y-%m-%d"), TARGET_DASH)
+    monthly = fetch_baostock_k(code, "m", adjust_flag, BAOSTOCK_START_DATE, TARGET_DASH)
 
-    df = read_cache(path)
-    if df.empty or len(df) < MIN_ROWS:
-        return {"股票代码": code, "状态": "缓存无效", "缓存路径": str(path), "行数": len(df)}
+    if daily.empty or monthly.empty:
+        return {"股票代码": code, "状态": "BaoStock数据为空", "adjust_flag": adjust_flag}
 
+    current_close = sf(daily.iloc[-1]["close"])
     name = "长电科技" if code == "600584" else "名称待补"
-    if "name" in df.columns:
-        vals = [ss(x) for x in df["name"].tolist() if ss(x)]
-        if vals:
-            name = vals[-1]
 
-    current_close = sf(df.iloc[-1]["close"])
-
-    core_lines = scan_core_lines(df)
+    core_lines = scan_core_lines(monthly)
     near, far = select_near_far(core_lines, current_close)
 
-    breakout = best_breakout(df, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0}
-    pullback = best_pullback(df, sf(near["line"]), breakout) if near else {"grade": "无回踩", "score_rank": 0}
+    breakout = best_breakout(daily, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0}
+    pullback = best_pullback(daily, sf(near["line"]), breakout) if near else {"grade": "无回踩", "score_rank": 0}
 
     row: Dict[str, Any] = {
         "股票代码": code,
         "股票中文名称": name,
-        "最新日期": ss(df.iloc[-1]["date"]),
+        "最新日期": ss(daily.iloc[-1]["date"]),
         "当前收盘": rd(current_close),
         "状态": "完成",
-        "缓存路径": str(path),
+        "数据源": "BaoStock日线+BaoStock月线",
+        "年季来源": "从BaoStock月线聚合，不从本地日线捏合",
+        "adjust_flag": adjust_flag,
+        "复权口径": ADJUST_FLAG_NAMES.get(adjust_flag, adjust_flag),
+        "adjust_info": adjust_info,
+        "cache_reference_close": rd(ref_close),
+        "cache_path": cache_path,
         "正式核心线数量": len(core_lines),
         "突破等级": breakout.get("grade"),
         "突破日期": breakout.get("date", ""),
@@ -1169,10 +1071,8 @@ def analyze_one(code: str) -> Dict[str, Any]:
         "突破详情": breakout,
         "回踩详情": pullback,
     }
-
     row.update(pack_core("近端", near))
     row.update(pack_core("远端", far))
-
     return row
 
 
@@ -1201,22 +1101,21 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
-        "逻辑：实体顶候选；离散种子簇 + 外部影线有效反应；新增年线/K线粘合性，主簇内先选代表性最强的实顶，不机械选最高实顶。",
+        "数据：BaoStock月线直取；年线/季线从BaoStock月线聚合；不再用本地日线捏合年季月。",
         "",
     ]
-
     for r in rows:
         lines.extend([
             f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}",
+            f"数据源：{r.get('数据源')}｜年季来源：{r.get('年季来源')}｜复权：{r.get('复权口径')}({r.get('adjust_flag')})｜缓存参考收盘{r.get('cache_reference_close')}",
             f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜有效共振{r.get('近端有效共振')}｜离散{r.get('近端离散共振')}｜外部有效{r.get('近端外部有效')}｜外部影线{r.get('近端外部影线')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
             f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜有效共振{r.get('远端有效共振')}｜离散{r.get('远端离散共振')}｜外部有效{r.get('远端外部有效')}｜外部影线{r.get('远端外部影线')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
-            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端簇区间')}｜反应中心{r.get('近端反应中心')}｜粘合分{r.get('近端粘合分')}｜中心偏离{r.get('近端中心偏离%')}%｜紧密误差{r.get('近端紧密误差%')}%｜样本{r.get('近端样本')}｜类型{r.get('近端样本类型')}",
-            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端簇区间')}｜反应中心{r.get('远端反应中心')}｜粘合分{r.get('远端粘合分')}｜中心偏离{r.get('远端中心偏离%')}%｜紧密误差{r.get('远端紧密误差%')}%｜样本{r.get('远端样本')}｜类型{r.get('远端样本类型')}",
+            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端主簇')}｜反应中心{r.get('近端反应中心')}｜粘合分{r.get('近端粘合分')}｜中心偏离{r.get('近端中心偏离%')}%｜紧密误差{r.get('近端紧密误差%')}%｜样本{r.get('近端样本')}｜类型{r.get('近端类型')}",
+            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端主簇')}｜反应中心{r.get('远端反应中心')}｜粘合分{r.get('远端粘合分')}｜中心偏离{r.get('远端中心偏离%')}%｜紧密误差{r.get('远端紧密误差%')}%｜样本{r.get('远端样本')}｜类型{r.get('远端类型')}",
             f"突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}",
             f"回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
             "",
         ])
-
     text = "\n".join(lines)
     if len(text) > 3900:
         text = text[:3850].rstrip() + "\n……\n报告过长，完整明细见 artifact。"
@@ -1225,12 +1124,9 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
 
 def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-
     OUTPUT_MD.write_text(report_text, encoding="utf-8")
-
     flat_rows = [{k: v for k, v in r.items() if not isinstance(v, (dict, list))} for r in rows]
     pd.DataFrame(flat_rows).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-
     payload = {
         "boot": BOOT,
         "run_mode": RUN_MODE,
@@ -1239,27 +1135,22 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
         "target_codes": TARGET_CODES,
         "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
         "config": {
+            "source": "baostock",
+            "baostock_monthly_frequency": "m",
+            "adjust_flag_env": ADJUST_FLAG_ENV,
             "point_tol": POINT_TOL,
             "body_edge_tol": BODY_EDGE_TOL,
             "shadow_reaction_weight": SHADOW_REACTION_WEIGHT,
-            "adhesion_logic": "representative_bodytop_before_highest_bodytop",
-            "period_specs": PERIOD_SPECS,
-            "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
-            "pullback_lookback_after_break": PULLBACK_LOOKBACK_AFTER_BREAK,
         },
         "rows": rows,
     }
     OUTPUT_JSON.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-
-    self_check = {
+    SELF_CHECK_JSON.write_text(json.dumps({
         "status": "PASS",
         "boot": BOOT,
         "run_mode": RUN_MODE,
-        "target": TARGET,
         "target_codes": TARGET_CODES,
-        "cache_dirs": [str(x) for x in CACHE_DIRS],
-    }
-    SELF_CHECK_JSON.write_text(json.dumps(self_check, ensure_ascii=False, indent=2), encoding="utf-8")
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def send_telegram(text: str) -> None:
@@ -1285,20 +1176,32 @@ def main() -> None:
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
     print("target_codes=" + ",".join(TARGET_CODES), flush=True)
-    print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
+    print("data_source=baostock_monthly_direct", flush=True)
 
     rows: List[Dict[str, Any]] = []
 
-    for code in TARGET_CODES:
-        log(f"开始单票分析 {code}")
-        row = analyze_one(code)
-        rows.append(row)
-        log(f"完成 {code}｜近端={row.get('近端核心线')}｜远端={row.get('远端核心线')}｜等级={row.get('最终等级')}")
+    try:
+        baostock_login()
+        for code in TARGET_CODES:
+            log(f"开始单票分析 {code}")
+            row = analyze_one(code)
+            rows.append(row)
+            log(f"完成 {code}｜近端={row.get('近端核心线')}｜远端={row.get('远端核心线')}｜复权={row.get('复权口径')}｜等级={row.get('最终等级')}")
+    except Exception as exc:
+        rows.append({
+            "股票代码": ",".join(TARGET_CODES),
+            "股票中文名称": "",
+            "当前收盘": None,
+            "最终等级": "运行失败",
+            "状态": f"失败：{exc}",
+        })
+        log(f"运行失败：{exc}")
+    finally:
+        baostock_logout()
 
     report_text = build_report(rows)
     write_outputs(rows, report_text)
     send_telegram(report_text)
-
     log(f"done report={OUTPUT_MD} csv={OUTPUT_CSV} json={OUTPUT_JSON}")
 
 
