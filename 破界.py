@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜破界｜全市场直接年季月K版 V11
+破界.py｜破界｜全市场直接年季月K版 V12.1
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -10,7 +10,10 @@ from __future__ import annotations
 3）直接拉东方财富前复权/后复权/不复权的日线、月线、季线、年线 K；
 4）年线/季线/月线全部使用交易端直接多周期 K，不再捏合；
 5）核心线逻辑仍然是：实体顶候选 + 离散反应点 + 外部影线有效反应 + K线粘合代表性；
-6）默认全市场扫描；设置 POJIE_TARGET_CODES 时进入单票/多票验证模式。
+6）默认全市场扫描；设置 POJIE_TARGET_CODES 时进入单票/多票验证模式；
+7）V12：默认采用年线→季线→月线渐进核心线扫描，命中上级核心线后不再无意义拉取低级周期；
+8）V12：修复破界事件为0时 event_score 空表排序崩溃；
+9）V12.1：修复东方财富股票池分页，避免全市场模式只拿到第一页100只。
 
 说明：
 BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
@@ -38,8 +41,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_OPT_20260628"
-RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_1_OPT_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -121,7 +124,7 @@ PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BRE
 
 
 def log(msg: str) -> None:
-    print(f"[破界V11][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V12.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -488,12 +491,20 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
 
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     all_rows: List[Dict[str, Any]] = []
+    seen_codes: set[str] = set()
     page = 1
 
-    while True:
+    # 东方财富 clist 接口实际经常按 100 条一页返回。
+    # V11/V12 旧写法请求 pz=5000 后看到第一页 len(diff)<5000 就停止，
+    # 会导致“全市场模式”实际只扫第一页约100只。这里改成稳定分页。
+    page_size = max(20, min(100, int(os.getenv("POJIE_UNIVERSE_PAGE_SIZE", "100"))))
+    max_pages = max(1, int(os.getenv("POJIE_UNIVERSE_MAX_PAGES", "120")))
+    total = 0
+
+    while page <= max_pages:
         params = {
             "pn": page,
-            "pz": 5000,
+            "pz": page_size,
             "po": 1,
             "np": 1,
             "fltt": 2,
@@ -505,19 +516,26 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         obj = resp.json()
-        diff = ((obj.get("data") or {}).get("diff") or [])
+        data = obj.get("data") or {}
+        diff = data.get("diff") or []
+        total = int(sf(data.get("total"), total))
+
         if not diff:
             break
 
+        before = len(seen_codes)
         for x in diff:
             code = code_of(x.get("f12"))
             name = ss(x.get("f14"))
             if not re.fullmatch(r"\d{6}", code):
                 continue
+            if code in seen_codes:
+                continue
             if not code.startswith(("0", "3", "6")):
                 continue
             if any(bad in name for bad in ["退市", "退"]):
                 continue
+            seen_codes.add(code)
             all_rows.append({
                 "code": code,
                 "name": name,
@@ -529,13 +547,23 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
                 "mkt_cap": sf(x.get("f20")),
             })
 
-        if len(diff) < 5000:
+        # 有 total 时，以 total 为准；无 total 时，最后一页通常会少于 page_size。
+        if total > 0 and page * page_size >= total:
             break
+        if total <= 0 and len(diff) < page_size:
+            break
+
+        # 防接口异常重复返回同一页导致死循环。
+        if len(seen_codes) == before and page > 1:
+            break
+
         page += 1
 
     df = pd.DataFrame(all_rows).drop_duplicates("code").sort_values("code").reset_index(drop=True)
     if df.empty:
         raise RuntimeError("东方财富股票池为空")
+
+    log(f"股票池拉取完成：{len(df)}只｜page_size={page_size}｜pages={page}｜total={total or 'NA'}")
 
     try:
         UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -567,8 +595,12 @@ def resolve_run_universe() -> Tuple[List[str], Dict[str, str]]:
         return TARGET_CODES, {c: ("长电科技" if c == "600584" else "") for c in TARGET_CODES}
 
     universe = load_stock_universe()
+    raw_universe_count = len(universe)
     if MAX_STOCKS > 0:
         universe = universe.head(MAX_STOCKS).copy()
+        log(f"扫描上限启用：POJIE_MAX_STOCKS={MAX_STOCKS}｜股票池{raw_universe_count}只→实际扫描{len(universe)}只")
+    else:
+        log(f"扫描上限关闭：POJIE_MAX_STOCKS=0｜实际扫描股票池{len(universe)}只")
 
     codes = [code_of(x) for x in universe["code"].tolist() if code_of(x)]
     names = {code_of(r["code"]): ss(r.get("name", "")) for _, r in universe.iterrows()}
@@ -1426,7 +1458,7 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
             f"RUN_MODE={RUN_MODE}",
             "数据：东方财富直接日/月/季/年K；默认前复权；不再用本地日线或月线捏合年季月。",
             "核心线：年线超级核心线优先；年线无，再季线；季线无，再月线；命中核心线后才拉日线判定突破/回踩。",
-            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}｜扫描上限={MAX_STOCKS if MAX_STOCKS > 0 else '全市场'}",
+            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}｜扫描上限={MAX_STOCKS if MAX_STOCKS > 0 else '全市场/不限'}",
             "",
         ]
 
