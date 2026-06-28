@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜破界｜全市场直接年季月K版 V12.2
+破界.py｜破界｜全市场直接年季月K版 V12.2.1
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -15,6 +15,7 @@ from __future__ import annotations
 8）V12：修复破界事件为0时 event_score 空表排序崩溃；
 9）V12.1：修复东方财富股票池分页，避免全市场模式只拿到第一页100只；
 10）V12.2：加速全市场扫描：自动提高并发、HTTP长连接、请求超时/重试、短日线窗口、断点续跑。
+11）V12.2.1：修复断点进度文件在 TARGET 定义前引用导致启动即崩的问题。
 
 说明：
 BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
@@ -43,8 +44,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_2_FAST_20260628"
-RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination; fast_http; resume_checkpoint"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_2_1_FASTFIX_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch; fixed_universe_pagination; fast_http; resume_checkpoint; target_order_fixed"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -137,12 +138,12 @@ BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
 PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
 EVENT_DAILY_DAYS = max(420, int(os.getenv("POJIE_EVENT_DAILY_DAYS", str(BREAKOUT_LOOKBACK_DAYS + PULLBACK_LOOKBACK_AFTER_BREAK + 120))))
 PROGRESS_DIR = EASTMONEY_CACHE_DIR / "pojie_progress"
-PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_2.jsonl"
+PROGRESS_JSONL = None  # TARGET 解析后再初始化，避免启动阶段 NameError
 _THREAD_LOCAL = threading.local()
 
 
 def log(msg: str) -> None:
-    print(f"[破界V12.2][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V12.2.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -210,6 +211,7 @@ def resolve_target_raw() -> str:
 TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
+PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_2_1.jsonl"
 
 
 def get_http_session() -> Any:
