@@ -2,20 +2,21 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V9
+破界.py｜三号员工｜600584 单票验证版 V10
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
-2）直接从 BaoStock 拉月线 frequency="m"；
-3）年线、季线只从 BaoStock 月线 OHLC 聚合，不再从日线捏合；
-4）复权口径自动选择：优先匹配本地缓存最新收盘，匹配不到则用 POJIE_ADJUST_FLAG；
+2）不再用 BaoStock 月线聚合年线/季线；
+3）直接拉东方财富前复权/后复权/不复权的日线、月线、季线、年线 K；
+4）年线/季线/月线全部使用交易端直接多周期 K，不再捏合；
 5）核心线逻辑仍然是：实体顶候选 + 离散反应点 + 外部影线有效反应 + K线粘合代表性；
 6）默认只跑 600584，不扫全市场。
 
 说明：
-BaoStock 常用 K 线接口支持 d/w/m；没有稳定的 q/y 直接频率。
-因此本版“月线直接拿 BaoStock”，季线/年线从 BaoStock 月线聚合。
-这比用本地日线缓存聚合更容易和 BaoStock/常规图表复权口径保持一致。
+BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
+为了按你说的“年线、季线、月线直接拿回来”，本版改用东方财富 K 线接口直接取：
+日线 klt=101，月线 klt=103，季线 klt=104，年线 klt=106。
+前复权 fqt=1，后复权 fqt=2，不复权 fqt=0。
 """
 
 import json
@@ -41,8 +42,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_BAOSTOCK_MONTHLY_YQM_V9_20260628"
-RUN_MODE = "single_stock_only; baostock_monthly_source; no_full_market_scan"
+BOOT = "POJIE_SINGLE_600584_DIRECT_YQM_EASTMONEY_V10_20260628"
+RUN_MODE = "single_stock_only; direct_yqm_kline_source; no_full_market_scan"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -81,10 +82,10 @@ TARGET_CODES = [
     if re.fullmatch(r"\d{6}", x)
 ] or ["600584"]
 
-BAOSTOCK_START_DATE = os.getenv("POJIE_BAOSTOCK_START_DATE", "1990-01-01")
-ADJUST_FLAG_ENV = os.getenv("POJIE_ADJUST_FLAG", "").strip()
-# BaoStock adjustflag: 1=后复权, 2=前复权, 3=不复权。
-ADJUST_FLAG_NAMES = {"1": "后复权", "2": "前复权", "3": "不复权"}
+EASTMONEY_START = os.getenv("POJIE_EASTMONEY_START", "19900101")
+ADJUST_FLAG_ENV = os.getenv("POJIE_ADJUST_FLAG", os.getenv("POJIE_FQT", "1")).strip()
+# Eastmoney fqt: 1=前复权, 2=后复权, 0=不复权。
+ADJUST_FLAG_NAMES = {"1": "前复权", "2": "后复权", "0": "不复权"}
 
 POINT_TOL = float(os.getenv("POJIE_POINT_TOL", "0.005"))
 BODY_EDGE_TOL = float(os.getenv("POJIE_BODY_EDGE_TOL", "0.005"))
@@ -101,7 +102,7 @@ PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BRE
 
 
 def log(msg: str) -> None:
-    print(f"[破界V9][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V10][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -171,163 +172,85 @@ TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 el
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
 
 
-def bs_code(code: str) -> str:
+def eastmoney_secid(code: str) -> str:
     c = code_of(code)
     if c.startswith(("6", "9")):
-        return f"sh.{c}"
+        return f"1.{c}"
     if c.startswith(("0", "3")):
-        return f"sz.{c}"
+        return f"0.{c}"
     if c.startswith(("8", "4")):
-        return f"bj.{c}"
+        return f"0.{c}"
     return c
 
 
-def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+def eastmoney_klt(period: str) -> int:
+    # 东方财富 K 线周期：101日，103月，104季，106年。
+    return {"D": 101, "M": 103, "Q": 104, "Y": 106}[period]
 
-    col_map = {
-        "日期": "date", "交易日期": "date", "date": "date", "time": "date",
-        "代码": "code", "股票代码": "code", "证券代码": "code", "symbol": "code", "code": "code",
-        "名称": "name", "股票名称": "name", "股票简称": "name", "证券简称": "name", "name": "name",
-        "开盘": "open", "开盘价": "open", "open": "open",
-        "最高": "high", "最高价": "high", "high": "high",
-        "最低": "low", "最低价": "low", "low": "low",
-        "收盘": "close", "收盘价": "close", "close": "close",
-        "成交量": "volume", "volume": "volume", "vol": "volume",
-        "成交额": "amount", "amount": "amount",
-        "涨跌幅": "pct_chg", "涨幅": "pct_chg", "pct_chg": "pct_chg", "pctChg": "pct_chg",
+
+def fetch_eastmoney_kline(code: str, period: str, fqt: str, begin: str, end: str) -> pd.DataFrame:
+    if requests is None:
+        raise RuntimeError("requests 不可用，无法拉取东方财富K线")
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": eastmoney_secid(code),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": eastmoney_klt(period),
+        "fqt": fqt,
+        "beg": begin,
+        "end": end,
+        "lmt": "1000000",
     }
 
-    d = df.rename(columns={c: col_map.get(str(c), col_map.get(str(c).lower(), c)) for c in df.columns}).copy()
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    obj = resp.json()
+    data = obj.get("data") or {}
+    klines = data.get("klines") or []
+    rows: List[Dict[str, Any]] = []
 
-    if not {"date", "open", "high", "low", "close"}.issubset(d.columns):
-        return pd.DataFrame()
+    for item in klines:
+        parts = str(item).split(",")
+        if len(parts) < 11:
+            continue
+        rows.append({
+            "date": parts[0],
+            "open": parts[1],
+            "close": parts[2],
+            "high": parts[3],
+            "low": parts[4],
+            "volume": parts[5],
+            "amount": parts[6],
+            "amplitude": parts[7],
+            "pct_chg": parts[8],
+            "change": parts[9],
+            "turnover": parts[10],
+            "code": code,
+        })
 
-    for col in ["open", "high", "low", "close", "volume", "amount", "pct_chg"]:
-        if col in d.columns:
-            d[col] = d[col].map(sf)
-
-    for col, default in [("volume", 0.0), ("amount", 0.0), ("code", ""), ("name", "")]:
-        if col not in d.columns:
-            d[col] = default
-
-    d["date"] = d["date"].map(norm_date)
-    d["code"] = d["code"].map(code_of)
-    d["name"] = d["name"].map(ss)
-
-    d = d[
-        (d["date"] != "")
-        & (d["open"] > 0)
-        & (d["high"] > 0)
-        & (d["low"] > 0)
-        & (d["close"] > 0)
-    ].sort_values("date").drop_duplicates("date").reset_index(drop=True)
-
-    if TARGET_DASH:
-        d = d[d["date"] <= TARGET_DASH].reset_index(drop=True)
-
+    d = normalize_hist(pd.DataFrame(rows))
     if d.empty:
-        return d
-
-    if "pct_chg" not in d.columns or float(d["pct_chg"].abs().sum()) == 0:
-        prev = d["close"].shift(1)
-        d["pct_chg"] = (d["close"] / prev - 1.0) * 100.0
-        d.loc[prev <= 0, "pct_chg"] = 0.0
-
+        raise RuntimeError(f"东方财富K线为空 code={code} period={period} fqt={fqt}")
     return d
 
 
-def find_cache_file(code: str) -> Optional[Path]:
-    hits: List[Path] = []
-    for root in CACHE_DIRS:
-        if not root.exists():
-            continue
-        hits.extend([p for p in root.glob(f"*{code}*") if p.suffix.lower() in {".csv", ".json"}])
-    if not hits:
-        return None
-    return sorted(hits, key=lambda p: (len(str(p)), str(p)))[0]
-
-
-def read_cache(path: Path) -> pd.DataFrame:
-    try:
-        if path.suffix.lower() == ".csv":
-            return normalize_hist(pd.read_csv(path))
-
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(obj, dict):
-            rows = obj.get("rows") or obj.get("data") or obj.get("klines") or obj.get("items") or []
-        else:
-            rows = obj
-        return normalize_hist(pd.DataFrame(rows))
-    except Exception:
-        return pd.DataFrame()
-
-
-def cache_reference_close(code: str) -> Tuple[float, str]:
-    p = find_cache_file(code)
-    if not p:
-        return 0.0, ""
-    df = read_cache(p)
-    if df.empty:
-        return 0.0, str(p)
-    return sf(df.iloc[-1]["close"]), str(p)
-
-
-def baostock_login() -> None:
-    if bs is None:
-        raise RuntimeError("baostock 未安装或导入失败")
-    lg = bs.login()
-    if getattr(lg, "error_code", "0") != "0":
-        raise RuntimeError(f"BaoStock 登录失败：{getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
-
-
-def baostock_logout() -> None:
-    try:
-        if bs is not None:
-            bs.logout()
-    except Exception:
-        pass
-
-
-def fetch_baostock_k(code: str, frequency: str, adjustflag: str, start_date: str, end_date: str) -> pd.DataFrame:
-    fields = "date,code,open,high,low,close,volume,amount,adjustflag"
-    rs = bs.query_history_k_data_plus(
-        bs_code(code),
-        fields,
-        start_date=start_date,
-        end_date=end_date,
-        frequency=frequency,
-        adjustflag=adjustflag,
-    )
-
-    if getattr(rs, "error_code", "0") != "0":
-        raise RuntimeError(f"BaoStock查询失败 frequency={frequency} adjust={adjustflag}: {getattr(rs, 'error_msg', '')}")
-
-    rows = []
-    while rs.next():
-        rows.append(rs.get_row_data())
-
-    df = pd.DataFrame(rows, columns=rs.fields)
-    return normalize_hist(df)
-
-
 def choose_adjust_flag(code: str, reference_close: float) -> Tuple[str, Dict[str, Any]]:
-    if ADJUST_FLAG_ENV in {"1", "2", "3"}:
-        return ADJUST_FLAG_ENV, {"reason": "env", "reference_close": reference_close}
+    if ADJUST_FLAG_ENV in {"0", "1", "2"}:
+        return ADJUST_FLAG_ENV, {"reason": "env_or_default", "reference_close": rd(reference_close)}
 
-    # 没有参考价时默认后复权。长电科技当前 100.89 更像后复权口径。
+    # 正常不会走到这里；保留自动匹配能力。
     if reference_close <= 0:
-        return "1", {"reason": "default_hfq_no_reference", "reference_close": reference_close}
+        return "1", {"reason": "default_qfq_no_reference", "reference_close": reference_close}
 
-    probe_start = (TARGET_TS - pd.Timedelta(days=80)).strftime("%Y-%m-%d")
-    end = TARGET_DASH
+    begin = (TARGET_TS - pd.Timedelta(days=80)).strftime("%Y%m%d")
+    end = TARGET.replace("-", "")
 
     candidates: List[Dict[str, Any]] = []
-
-    for flag in ["1", "2", "3"]:
+    for flag in ["1", "2", "0"]:
         try:
-            d = fetch_baostock_k(code, "d", flag, probe_start, end)
+            d = fetch_eastmoney_kline(code, "D", flag, begin, end)
             latest = sf(d.iloc[-1]["close"]) if not d.empty else 0.0
             candidates.append({
                 "flag": flag,
@@ -353,27 +276,8 @@ def choose_adjust_flag(code: str, reference_close: float) -> Tuple[str, Dict[str
     }
 
 
-def complete_monthly_bars(monthly: pd.DataFrame) -> pd.DataFrame:
-    d = normalize_hist(monthly)
-    if d.empty:
-        return d
-
-    periods = pd.to_datetime(d["date"]).dt.to_period("M")
-    target_period = pd.Timestamp(TARGET_DASH).to_period("M") if TARGET_DASH else pd.Timestamp.today().to_period("M")
-    d = d[periods < target_period].reset_index(drop=True)
-    return d
-
-
-def aggregate_from_monthly(monthly: pd.DataFrame, period: str) -> pd.DataFrame:
-    """
-    从 BaoStock 月线聚合：
-    - open = 周期内第一根月K开盘
-    - close = 周期内最后一根月K收盘
-    - high = 周期内月K高点最大值
-    - low = 周期内月K低点最小值
-    - volume/amount = 累加
-    """
-    d = complete_monthly_bars(monthly)
+def prepare_direct_period_bars(raw: pd.DataFrame, period: str) -> pd.DataFrame:
+    d = normalize_hist(raw)
     if d.empty:
         return pd.DataFrame()
 
@@ -382,55 +286,47 @@ def aggregate_from_monthly(monthly: pd.DataFrame, period: str) -> pd.DataFrame:
     if d.empty:
         return pd.DataFrame()
 
-    if period == "M":
-        k = d.copy()
-        k["period"] = pd.to_datetime(k["date"]).dt.to_period("M").astype(str)
-        k["start"] = k["date"]
-        k["end"] = k["date"]
-    else:
-        d["_period"] = pd.to_datetime(d["date"]).dt.to_period(period).astype(str)
-        rows: List[Dict[str, Any]] = []
-        for p, g in d.groupby("_period", sort=True):
-            g = g.sort_values("date").reset_index(drop=True)
-            rows.append({
-                "period": ss(p),
-                "start": ss(g.iloc[0]["date"]),
-                "end": ss(g.iloc[-1]["date"]),
-                "open": sf(g.iloc[0]["open"]),
-                "high": sf(g["high"].max()),
-                "low": sf(g["low"].min()),
-                "close": sf(g.iloc[-1]["close"]),
-                "volume": sf(g["volume"].sum()),
-                "amount": sf(g["amount"].sum()) if "amount" in g.columns else 0.0,
-            })
-        k = pd.DataFrame(rows)
-
-    if k.empty:
-        return pd.DataFrame()
-
-    # 排除未完成年/季。月线已在 complete_monthly_bars 里排除了当前月。
     if period == "Y":
-        target_year = int(TARGET_DASH[:4])
-        k = k[pd.to_datetime(k["end"]).dt.year < target_year].reset_index(drop=True)
+        d["period"] = pd.to_datetime(d["date"]).dt.to_period("Y").astype(str)
+        target_period = pd.Timestamp(TARGET_DASH).to_period("Y")
     elif period == "Q":
-        target_q = pd.Timestamp(TARGET_DASH).to_period("Q")
-        k = k[pd.to_datetime(k["end"]).dt.to_period("Q") < target_q].reset_index(drop=True)
+        d["period"] = pd.to_datetime(d["date"]).dt.to_period("Q").astype(str)
+        target_period = pd.Timestamp(TARGET_DASH).to_period("Q")
+    else:
+        d["period"] = pd.to_datetime(d["date"]).dt.to_period("M").astype(str)
+        target_period = pd.Timestamp(TARGET_DASH).to_period("M")
 
-    if k.empty:
+    # 直接多周期K也要排除当前未完成周期。
+    d = d[pd.to_datetime(d["date"]).dt.to_period(period) < target_period].copy()
+    if d.empty:
         return pd.DataFrame()
 
-    k = k.sort_values("end").reset_index(drop=True)
-    k["body_top"] = k[["open", "close"]].max(axis=1)
-    k["body_bottom"] = k[["open", "close"]].min(axis=1)
+    d = d.sort_values("date").reset_index(drop=True)
+    d["start"] = d["date"]
+    d["end"] = d["date"]
+    d["body_top"] = d[["open", "close"]].max(axis=1)
+    d["body_bottom"] = d[["open", "close"]].min(axis=1)
 
-    rng = (k["high"] - k["low"]).replace(0, np.nan)
-    k["body_ratio"] = ((k["close"] - k["open"]).abs() / rng).fillna(0.0)
-    k["close_pos"] = ((k["close"] - k["low"]) / rng).fillna(0.0)
-    k["upper_shadow_ratio"] = ((k["high"] - k["body_top"]) / rng).fillna(0.0)
-    k["is_bull"] = k["close"] > k["open"]
-    k["vol_ratio_prev"] = k["volume"] / k["volume"].shift(1).replace(0, np.nan)
-    k["vol_ratio_prev"] = k["vol_ratio_prev"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return k.reset_index(drop=True)
+    rng = (d["high"] - d["low"]).replace(0, np.nan)
+    d["body_ratio"] = ((d["close"] - d["open"]).abs() / rng).fillna(0.0)
+    d["close_pos"] = ((d["close"] - d["low"]) / rng).fillna(0.0)
+    d["upper_shadow_ratio"] = ((d["high"] - d["body_top"]) / rng).fillna(0.0)
+    d["is_bull"] = d["close"] > d["open"]
+    d["vol_ratio_prev"] = d["volume"] / d["volume"].shift(1).replace(0, np.nan)
+    d["vol_ratio_prev"] = d["vol_ratio_prev"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return d.reset_index(drop=True)
+
+
+def fetch_all_direct_bars(code: str, fqt: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    begin = EASTMONEY_START
+    end = TARGET.replace("-", "")
+
+    daily = fetch_eastmoney_kline(code, "D", fqt, begin, end)
+    yearly = prepare_direct_period_bars(fetch_eastmoney_kline(code, "Y", fqt, begin, end), "Y")
+    quarterly = prepare_direct_period_bars(fetch_eastmoney_kline(code, "Q", fqt, begin, end), "Q")
+    monthly = prepare_direct_period_bars(fetch_eastmoney_kline(code, "M", fqt, begin, end), "M")
+
+    return daily, {"Y": yearly, "Q": quarterly, "M": monthly}
 
 
 def min_seed_discrete_count(min_effective_unique: int) -> int:
@@ -741,9 +637,9 @@ def validate_bodytop_line(
     return out
 
 
-def scan_period_core_lines(monthly: pd.DataFrame, period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
-    k = aggregate_from_monthly(monthly, period)
-    if k.empty:
+def scan_period_core_lines(period_bars: Dict[str, pd.DataFrame], period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
+    k = period_bars.get(period, pd.DataFrame())
+    if k is None or k.empty:
         return []
 
     points = build_reaction_points(k)
@@ -841,10 +737,10 @@ def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted([max(g, key=rank) for g in groups], key=lambda z: sf(z["line"]))
 
 
-def scan_core_lines(monthly: pd.DataFrame) -> List[Dict[str, Any]]:
+def scan_core_lines(period_bars: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for period, label, min_effective_unique, period_rank in PERIOD_SPECS:
-        out.extend(scan_period_core_lines(monthly, period, label, min_effective_unique, period_rank))
+        out.extend(scan_period_core_lines(period_bars, period, label, min_effective_unique, period_rank))
     return dedupe_lines(out)
 
 
@@ -1030,16 +926,15 @@ def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullba
 def analyze_one(code: str) -> Dict[str, Any]:
     ref_close, cache_path = cache_reference_close(code)
     adjust_flag, adjust_info = choose_adjust_flag(code, ref_close)
-    daily = fetch_baostock_k(code, "d", adjust_flag, (TARGET_TS - pd.Timedelta(days=900)).strftime("%Y-%m-%d"), TARGET_DASH)
-    monthly = fetch_baostock_k(code, "m", adjust_flag, BAOSTOCK_START_DATE, TARGET_DASH)
+    daily, period_bars = fetch_all_direct_bars(code, adjust_flag)
 
-    if daily.empty or monthly.empty:
-        return {"股票代码": code, "状态": "BaoStock数据为空", "adjust_flag": adjust_flag}
+    if daily.empty or not period_bars or all(v.empty for v in period_bars.values()):
+        return {"股票代码": code, "状态": "东方财富直接K线为空", "adjust_flag": adjust_flag}
 
     current_close = sf(daily.iloc[-1]["close"])
     name = "长电科技" if code == "600584" else "名称待补"
 
-    core_lines = scan_core_lines(monthly)
+    core_lines = scan_core_lines(period_bars)
     near, far = select_near_far(core_lines, current_close)
 
     breakout = best_breakout(daily, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0}
@@ -1051,8 +946,8 @@ def analyze_one(code: str) -> Dict[str, Any]:
         "最新日期": ss(daily.iloc[-1]["date"]),
         "当前收盘": rd(current_close),
         "状态": "完成",
-        "数据源": "BaoStock日线+BaoStock月线",
-        "年季来源": "从BaoStock月线聚合，不从本地日线捏合",
+        "数据源": "东方财富直接日/月/季/年K",
+        "年季来源": "直接取东方财富年线/季线/月线，不从日线或月线捏合",
         "adjust_flag": adjust_flag,
         "复权口径": ADJUST_FLAG_NAMES.get(adjust_flag, adjust_flag),
         "adjust_info": adjust_info,
@@ -1101,7 +996,7 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
-        "数据：BaoStock月线直取；年线/季线从BaoStock月线聚合；不再用本地日线捏合年季月。",
+        "数据：东方财富直接日/月/季/年K；不再用本地日线或月线捏合年季月。",
         "",
     ]
     for r in rows:
@@ -1135,8 +1030,8 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
         "target_codes": TARGET_CODES,
         "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
         "config": {
-            "source": "baostock",
-            "baostock_monthly_frequency": "m",
+            "source": "eastmoney_direct_kline",
+            "klt": {"D": 101, "M": 103, "Q": 104, "Y": 106},
             "adjust_flag_env": ADJUST_FLAG_ENV,
             "point_tol": POINT_TOL,
             "body_edge_tol": BODY_EDGE_TOL,
@@ -1176,12 +1071,11 @@ def main() -> None:
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
     print("target_codes=" + ",".join(TARGET_CODES), flush=True)
-    print("data_source=baostock_monthly_direct", flush=True)
+    print("data_source=eastmoney_direct_yqm", flush=True)
 
     rows: List[Dict[str, Any]] = []
 
     try:
-        baostock_login()
         for code in TARGET_CODES:
             log(f"开始单票分析 {code}")
             row = analyze_one(code)
