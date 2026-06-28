@@ -38,8 +38,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V11_20260628"
-RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V12_OPT_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional; super_core_first; progressive_period_fetch"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -107,6 +107,14 @@ PERIOD_SPECS = [
     ("Q", "季线", 8, 2),
     ("M", "月线", 10, 1),
 ]
+
+# 核心线选择口径：
+# 1）先找年线超级核心线：年线有效共振 >=4，且严格 0 切实体；
+# 2）年线没有，再找季线超级核心线：季线有效共振 >=8，且严格 0 切实体；
+# 3）年线/季线都没有，再回到月线普通核心线。
+# 当前 scan_period_core_lines 内部已经强制 cut_count == 0，并要求放量实顶参与，
+# 所以这里不再额外放松口径，避免把普通线误升级为核心线。
+CORE_SELECTION_MODE = os.getenv("POJIE_CORE_SELECTION_MODE", "super_first").strip().lower()
 
 BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
 PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
@@ -975,11 +983,33 @@ def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted([max(g, key=rank) for g in groups], key=lambda z: sf(z["line"]))
 
 
+def mark_selection_path(lines: List[Dict[str, Any]], path: str) -> List[Dict[str, Any]]:
+    for x in lines:
+        x["selection_path"] = path
+    return lines
+
+
 def scan_core_lines(period_bars: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for period, label, min_effective_unique, period_rank in PERIOD_SPECS:
-        out.extend(scan_period_core_lines(period_bars, period, label, min_effective_unique, period_rank))
-    return dedupe_lines(out)
+    # 默认改为“年线超级核心线优先”。如需旧版并行扫描，可设置 POJIE_CORE_SELECTION_MODE=parallel。
+    if CORE_SELECTION_MODE in {"parallel", "old", "all"}:
+        out: List[Dict[str, Any]] = []
+        for period, label, min_effective_unique, period_rank in PERIOD_SPECS:
+            out.extend(scan_period_core_lines(period_bars, period, label, min_effective_unique, period_rank))
+        return mark_selection_path(dedupe_lines(out), "parallel_all_periods")
+
+    y_lines = scan_period_core_lines(period_bars, "Y", "年线", 4, 3)
+    if y_lines:
+        return mark_selection_path(dedupe_lines(y_lines), "year_super_core_first")
+
+    q_lines = scan_period_core_lines(period_bars, "Q", "季线", 8, 2)
+    if q_lines:
+        return mark_selection_path(dedupe_lines(q_lines), "quarter_super_core_after_no_year")
+
+    m_lines = scan_period_core_lines(period_bars, "M", "月线", 10, 1)
+    if m_lines:
+        return mark_selection_path(dedupe_lines(m_lines), "monthly_fallback_after_no_year_quarter")
+
+    return []
 
 
 def select_near_far(lines: List[Dict[str, Any]], current_close: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -1225,18 +1255,99 @@ def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullba
     return "C｜核心线成立，等触发"
 
 
+def fetch_direct_period_bars_for_core(code: str, period: str, fqt: str) -> pd.DataFrame:
+    begin = EASTMONEY_START
+    end = TARGET.replace("-", "")
+    return prepare_direct_period_bars(fetch_eastmoney_kline(code, period, fqt, begin, end), period)
+
+
+def fetch_daily_direct_for_event(code: str, fqt: str) -> pd.DataFrame:
+    begin = EASTMONEY_START
+    end = TARGET.replace("-", "")
+    return fetch_eastmoney_kline(code, "D", fqt, begin, end)
+
+
+def fetch_core_lines_progressive(code: str, fqt: str) -> Tuple[List[Dict[str, Any]], Dict[str, pd.DataFrame], str]:
+    # 旧版一次性拉 D/Y/Q/M；全市场时会非常慢。
+    # V12 改为按核心线优先级渐进拉取：先年线，年线没有再季线，季线没有再月线。
+    # 只有找到核心线后，analyze_one 才会继续拉日线做突破/回踩事件判断。
+    period_bars: Dict[str, pd.DataFrame] = {}
+
+    if CORE_SELECTION_MODE in {"parallel", "old", "all"}:
+        for period in ["Y", "Q", "M"]:
+            period_bars[period] = fetch_direct_period_bars_for_core(code, period, fqt)
+        lines = scan_core_lines(period_bars)
+        return lines, period_bars, "parallel_all_periods"
+
+    period_bars["Y"] = fetch_direct_period_bars_for_core(code, "Y", fqt)
+    y_lines = scan_period_core_lines(period_bars, "Y", "年线", 4, 3)
+    if y_lines:
+        return mark_selection_path(dedupe_lines(y_lines), "year_super_core_first"), period_bars, "year_super_core_first"
+
+    period_bars["Q"] = fetch_direct_period_bars_for_core(code, "Q", fqt)
+    q_lines = scan_period_core_lines(period_bars, "Q", "季线", 8, 2)
+    if q_lines:
+        return mark_selection_path(dedupe_lines(q_lines), "quarter_super_core_after_no_year"), period_bars, "quarter_super_core_after_no_year"
+
+    period_bars["M"] = fetch_direct_period_bars_for_core(code, "M", fqt)
+    m_lines = scan_period_core_lines(period_bars, "M", "月线", 10, 1)
+    if m_lines:
+        return mark_selection_path(dedupe_lines(m_lines), "monthly_fallback_after_no_year_quarter"), period_bars, "monthly_fallback_after_no_year_quarter"
+
+    return [], period_bars, "no_core_line"
+
+
 def analyze_one(code: str, name_hint: str = "") -> Dict[str, Any]:
     ref_close, cache_path = cache_reference_close(code)
     adjust_flag, adjust_info = choose_adjust_flag(code, ref_close)
-    daily, period_bars = fetch_all_direct_bars(code, adjust_flag)
 
-    if daily.empty or not period_bars or all(v.empty for v in period_bars.values()):
-        return {"股票代码": code, "状态": "东方财富直接K线为空", "adjust_flag": adjust_flag}
-
-    current_close = sf(daily.iloc[-1]["close"])
+    core_lines, period_bars, core_selection_path = fetch_core_lines_progressive(code, adjust_flag)
     name = name_hint or ("长电科技" if code == "600584" else "")
 
-    core_lines = scan_core_lines(period_bars)
+    if not core_lines:
+        empty_row: Dict[str, Any] = {
+            "股票代码": code,
+            "股票中文名称": name,
+            "最新日期": "",
+            "当前收盘": rd(ref_close) if ref_close > 0 else None,
+            "状态": "完成",
+            "数据源": "东方财富直接月/季/年K；未命中核心线则不拉日线",
+            "年季来源": "直接取东方财富年线/季线/月线，不从日线或月线捏合",
+            "核心线选择路径": core_selection_path,
+            "adjust_flag": adjust_flag,
+            "复权口径": ADJUST_FLAG_NAMES.get(adjust_flag, adjust_flag),
+            "adjust_info": adjust_info,
+            "cache_reference_close": rd(ref_close),
+            "cache_path": cache_path,
+            "正式核心线数量": 0,
+            "突破等级": "无突破",
+            "突破日期": "",
+            "突破说明": "未命中核心线，跳过日线突破扫描",
+            "回踩等级": "无回踩",
+            "回踩日期": "",
+            "回踩说明": "未命中核心线，跳过日线回踩扫描",
+            "最终等级": "无核心线",
+            "破界事件数": 0,
+            "最佳事件分": 0.0,
+            "近端详情": {},
+            "远端详情": {},
+            "事件核心线详情": {},
+            "全部核心线": [],
+            "全部破界事件": [],
+            "突破详情": {"grade": "无突破", "score_rank": 0},
+            "回踩详情": {"grade": "无回踩", "score_rank": 0},
+        }
+        empty_row.update(pack_core("近端", None))
+        empty_row.update(pack_core("远端", None))
+        empty_row.update(pack_core("事件", None))
+        return empty_row
+
+    daily = fetch_daily_direct_for_event(code, adjust_flag)
+    if daily.empty:
+        return {"股票代码": code, "股票中文名称": name, "状态": "东方财富直接日线为空", "adjust_flag": adjust_flag}
+
+    current_close = sf(daily.iloc[-1]["close"])
+
     near, far = select_near_far(core_lines, current_close)
 
     events = build_breakout_events(daily, core_lines, current_close)
@@ -1252,8 +1363,9 @@ def analyze_one(code: str, name_hint: str = "") -> Dict[str, Any]:
         "最新日期": ss(daily.iloc[-1]["date"]),
         "当前收盘": rd(current_close),
         "状态": "完成",
-        "数据源": "东方财富直接日/月/季/年K",
+        "数据源": "东方财富直接日/月/季/年K；渐进拉取",
         "年季来源": "直接取东方财富年线/季线/月线，不从日线或月线捏合",
+        "核心线选择路径": core_selection_path,
         "adjust_flag": adjust_flag,
         "复权口径": ADJUST_FLAG_NAMES.get(adjust_flag, adjust_flag),
         "adjust_info": adjust_info,
@@ -1313,14 +1425,15 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
             f"BOOT={BOOT}",
             f"RUN_MODE={RUN_MODE}",
             "数据：东方财富直接日/月/季/年K；默认前复权；不再用本地日线或月线捏合年季月。",
-            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}",
+            "核心线：年线超级核心线优先；年线无，再季线；季线无，再月线；命中核心线后才拉日线判定突破/回踩。",
+            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}｜扫描上限={MAX_STOCKS if MAX_STOCKS > 0 else '全市场'}",
             "",
         ]
 
         for i, r in enumerate(event_rows[:TOP_PUSH_LIMIT], 1):
             lines.extend([
                 f"{i}. {r.get('股票代码')} {r.get('股票中文名称')}｜{r.get('最终等级')}｜事件分{r.get('最佳事件分')}｜收盘{r.get('当前收盘')}",
-                f"   事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜放量实顶{r.get('事件放量实顶')}｜切实体{r.get('事件切实体')}",
+                f"   事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜放量实顶{r.get('事件放量实顶')}｜切实体{r.get('事件切实体')}｜路径{r.get('核心线选择路径')}",
                 f"   定线：锚点{r.get('事件锚点')}｜主簇{r.get('事件主簇')}｜反应中心{r.get('事件反应中心')}｜粘合分{r.get('事件粘合分')}｜样本{r.get('事件样本')}｜类型{r.get('事件类型')}",
                 f"   突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}；回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
                 "",
@@ -1340,13 +1453,14 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
         "数据：东方财富直接日/月/季/年K；不再用本地日线或月线捏合年季月。",
+        "核心线：年线超级核心线优先；年线无，再季线；季线无，再月线；命中核心线后才拉日线判定突破/回踩。",
         "",
     ]
     for r in rows:
         lines.extend([
             f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}｜事件分{r.get('最佳事件分')}",
             f"数据源：{r.get('数据源')}｜年季来源：{r.get('年季来源')}｜复权：{r.get('复权口径')}({r.get('adjust_flag')})｜缓存参考收盘{r.get('cache_reference_close')}",
-            f"事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜离散{r.get('事件离散共振')}｜外部有效{r.get('事件外部有效')}｜外部影线{r.get('事件外部影线')}｜放量实顶{r.get('事件放量实顶')}｜倍量实顶{r.get('事件倍量实顶')}｜切实体{r.get('事件切实体')}｜距现价{r.get('事件距现价%')}%",
+            f"事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜离散{r.get('事件离散共振')}｜外部有效{r.get('事件外部有效')}｜外部影线{r.get('事件外部影线')}｜放量实顶{r.get('事件放量实顶')}｜倍量实顶{r.get('事件倍量实顶')}｜切实体{r.get('事件切实体')}｜距现价{r.get('事件距现价%')}%｜路径{r.get('核心线选择路径')}",
             f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜有效共振{r.get('近端有效共振')}｜离散{r.get('近端离散共振')}｜外部有效{r.get('近端外部有效')}｜外部影线{r.get('近端外部影线')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
             f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜有效共振{r.get('远端有效共振')}｜离散{r.get('远端离散共振')}｜外部有效{r.get('远端外部有效')}｜外部影线{r.get('远端外部影线')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
             f"事件定线：锚点{r.get('事件锚点')}｜主簇{r.get('事件主簇')}｜反应中心{r.get('事件反应中心')}｜粘合分{r.get('事件粘合分')}｜中心偏离{r.get('事件中心偏离%')}%｜紧密误差{r.get('事件紧密误差%')}%｜样本{r.get('事件样本')}｜类型{r.get('事件类型')}",
@@ -1424,8 +1538,28 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
         for ev in r.get("全部破界事件", []) or []:
             event_rows.append(flatten_event(r, ev))
 
-    pd.DataFrame(core_rows).to_csv(OUTPUT_CORE_MAP, index=False, encoding="utf-8-sig")
-    pd.DataFrame(event_rows).sort_values("event_score", ascending=False).to_csv(OUTPUT_EVENTS, index=False, encoding="utf-8-sig")
+    core_columns = [
+        "code", "name", "current_close", "line", "core_grade", "period_label",
+        "effective_unique_count", "primary_unique_count", "external_effective_count",
+        "external_shadow_count", "volume_bodytop_count", "double_bodytop_count",
+        "cut_count", "anchor_period", "cluster_low", "cluster_high",
+        "reaction_center", "adhesion_score", "center_bias_pct", "compact_error_pct",
+        "sample_periods", "sample_kinds",
+    ]
+    event_columns = core_columns + [
+        "event_score", "recent_breakout", "recent_pullback",
+        "breakout_grade", "breakout_date", "breakout_close",
+        "breakout_distance_pct", "breakout_note",
+        "pullback_grade", "pullback_date", "pullback_note",
+    ]
+
+    core_df = pd.DataFrame(core_rows, columns=core_columns if not core_rows else None)
+    core_df.to_csv(OUTPUT_CORE_MAP, index=False, encoding="utf-8-sig")
+
+    event_df = pd.DataFrame(event_rows, columns=event_columns if not event_rows else None)
+    if "event_score" in event_df.columns and not event_df.empty:
+        event_df = event_df.sort_values("event_score", ascending=False)
+    event_df.to_csv(OUTPUT_EVENTS, index=False, encoding="utf-8-sig")
 
     payload = {
         "boot": BOOT,
@@ -1445,6 +1579,8 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "event_lookback_days": EVENT_LOOKBACK_DAYS,
             "workers": WORKERS,
             "max_stocks": MAX_STOCKS,
+            "core_selection_mode": CORE_SELECTION_MODE,
+            "progressive_period_fetch": True,
         },
         "rows": rows,
     }
@@ -1505,7 +1641,7 @@ def main() -> None:
     print(f"run_full_market={RUN_FULL_MARKET}", flush=True)
     print("target_codes=" + (",".join(TARGET_CODES) if TARGET_CODES else "FULL_MARKET"), flush=True)
     print("data_source=eastmoney_direct_yqm_fullmarket", flush=True)
-    print(f"workers={WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS}", flush=True)
+    print(f"workers={WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS} core_selection_mode={CORE_SELECTION_MODE}", flush=True)
 
     codes, name_map = resolve_run_universe()
     log(f"准备扫描：{len(codes)} 只")
