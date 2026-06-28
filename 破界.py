@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V7
+破界.py｜三号员工｜600584 单票验证版 V8
 
 本版核心修正：
 1）候选线仍然来自实体顶 body_top；
 2）high / body_top / close 是离散主反应点；
 3）上影线穿越不再无条件等于主共振，但会作为“外部影线接受/反应”计入有效共振；
-4）排序先看外部有效反应和总有效共振，再看放量/倍量实顶，最后才看更高实顶；
+4）新增年线/K线粘合性：同一主簇里先选代表性最强、最粘合的实顶，不机械选最高实顶；
 5）最终线必须零切实体；
 6）正式核心线只保留 S-Core / A-Core；
 7）默认只跑 600584 长电科技，不做全市场扫描。
@@ -35,7 +35,7 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_REACTION_SHADOW_BODYTOP_V7_20260628"
+BOOT = "POJIE_SINGLE_600584_ADHESION_BODYTOP_V8_20260628"
 RUN_MODE = "single_stock_only; no_full_market_scan"
 START_TS = time.time()
 
@@ -519,6 +519,65 @@ def shadow_reactions(k: pd.DataFrame, line: float, used_bars: set[int], anchor_b
     return out
 
 
+def weighted_center_of_points(points: List[Dict[str, Any]]) -> float:
+    if not points:
+        return 0.0
+    weights = [max(sf(p.get("weight")), 0.1) for p in points]
+    prices = [sf(p.get("price")) for p in points]
+    try:
+        return float(np.average(prices, weights=weights))
+    except Exception:
+        return float(np.mean(prices)) if prices else 0.0
+
+
+def adhesion_metrics(k: pd.DataFrame, line: float, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    K线粘合性：
+    - 不看单一最高点，而看多根大周期K在同一价格带的实体顶/收盘/高点/影线是否共同认账；
+    - 线越贴近这些离散反应点的加权中心，代表性越强；
+    - 同一簇里两个实顶很接近时，优先选粘合代表性更强、右侧确认更强的实顶，而不是机械选最高。
+    """
+    primary = [p for p in samples if ss(p.get("kind")) in {"high", "body_top", "close"}]
+    bodytops = [p for p in primary if ss(p.get("kind")) == "body_top"]
+    highs = [p for p in primary if ss(p.get("kind")) == "high"]
+    closes = [p for p in primary if ss(p.get("kind")) == "close"]
+    shadows = [p for p in samples if ss(p.get("kind")) == "shadow"]
+
+    center = weighted_center_of_points(primary) or line
+    compact_error = 0.0
+    if primary:
+        compact_error = sum(abs(sf(p["price"]) - line) / max(line, 1e-9) * max(sf(p["weight"]), 0.1) for p in primary) / sum(max(sf(p["weight"]), 0.1) for p in primary)
+
+    center_bias = abs(line - center) / max(center, 1e-9)
+
+    # 右侧确认：同样粘合时，后来的实顶/反应点优先，避免早期孤立高实顶抢线。
+    latest_bar = max([int(p.get("bar_index", -1)) for p in samples] or [-1])
+
+    adhesion_score = (
+        1.25 * len(bodytops)
+        + 1.00 * len(highs)
+        + 0.85 * len(closes)
+        + 0.55 * len(shadows)
+        + 0.35 * sum(1 for p in bodytops if bool(p.get("is_volume_bodytop")))
+        + 0.45 * sum(1 for p in bodytops if bool(p.get("is_double_bodytop")))
+        - 10.0 * compact_error
+        - 6.0 * center_bias
+    )
+
+    return {
+        "adhesion_score": rd(adhesion_score, 4),
+        "bodytop_sticky_count": int(len(bodytops)),
+        "high_sticky_count": int(len(highs)),
+        "close_sticky_count": int(len(closes)),
+        "shadow_sticky_count": int(len(shadows)),
+        "reaction_center": rd(center, 4),
+        "compact_error_pct": rd(compact_error * 100, 4),
+        "center_bias_pct": rd(center_bias * 100, 4),
+        "latest_reaction_bar": int(latest_bar),
+    }
+
+
+
 def validate_bodytop_line(
     k: pd.DataFrame,
     points: List[Dict[str, Any]],
@@ -581,8 +640,9 @@ def validate_bodytop_line(
 
     effective_weight = sum(sf(p["weight"]) for p in effective_samples)
     shadow_periods = [ss(p["period"]) for p in shadows]
+    stick = adhesion_metrics(k, line, effective_samples)
 
-    return {
+    out = {
         "line": rd(line),
         "core_grade": grade,
         "touch_count": len(effective_bar_set),
@@ -603,6 +663,7 @@ def validate_bodytop_line(
         "cluster_primary_weight": rd(cluster["primary_weight"]),
         "anchor_period": ss(bodytop_point["period"]),
         "anchor_end": ss(bodytop_point["end"]),
+        "anchor_bar_index": int(bodytop_point["bar_index"]),
         "anchor_kind": ss(bodytop_point["kind"]),
         "anchor_price": rd(bodytop_point["price"]),
         "sample_periods": ",".join(ss(p["period"]) for p in effective_samples),
@@ -615,6 +676,8 @@ def validate_bodytop_line(
         "shadow_periods": ",".join(shadow_periods),
         "samples": effective_samples,
     }
+    out.update(stick)
+    return out
 
 
 def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
@@ -669,15 +732,24 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effect
         # V7：最高实顶是最后的 tie-breaker；
         # 先看外部有效反应是否足够、有效共振是否够多、外部离散和外部影线是否共同支撑。
         def candidate_rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
+            # V8：避免“同一主簇内机械选最高实顶”。
+            # 先看粘合代表性、外部有效反应、反应中心贴近度和右侧确认；
+            # 价格更高只作为极弱 tie-breaker。
             return (
                 int(x["external_effective_count"]),
                 int(x["effective_unique_count"]),
+                sf(x.get("adhesion_score")),
+                -sf(x.get("center_bias_pct")),
+                -sf(x.get("compact_error_pct")),
+                int(x.get("latest_reaction_bar", -1)),
+                int(x.get("anchor_bar_index", -1)),
                 int(x["external_primary_count"]),
                 int(x["external_shadow_count"]),
                 int(x["double_bodytop_count"]),
                 int(x["volume_bodytop_count"]),
                 sf(x["effective_weight"]),
-                sf(x["line"]),
+                -abs(sf(x["line"]) - sf(x.get("reaction_center", x["line"]))),
+                sf(x["line"]) * 0.000001,
             )
 
         best = max(valid_candidates, key=candidate_rank)
@@ -717,12 +789,16 @@ def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             int(x.get("period_rank", 0)),
             int(x.get("external_effective_count", 0)),
             int(x.get("effective_unique_count", 0)),
+            sf(x.get("adhesion_score")),
+            -sf(x.get("center_bias_pct")),
+            -sf(x.get("compact_error_pct")),
+            int(x.get("latest_reaction_bar", -1)),
             int(x.get("external_primary_count", 0)),
             int(x.get("external_shadow_count", 0)),
             int(x.get("double_bodytop_count", 0)),
             int(x.get("volume_bodytop_count", 0)),
             sf(x.get("effective_weight")),
-            sf(x.get("line")),
+            sf(x.get("line")) * 0.000001,
         )
 
     return sorted([max(g, key=line_rank) for g in groups], key=lambda x: sf(x["line"]))
@@ -1003,6 +1079,10 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"{prefix}样本": "",
             f"{prefix}样本类型": "",
             f"{prefix}簇区间": "",
+            f"{prefix}粘合分": None,
+            f"{prefix}反应中心": None,
+            f"{prefix}中心偏离%": None,
+            f"{prefix}紧密误差%": None,
         }
 
     return {
@@ -1022,6 +1102,10 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         f"{prefix}样本": ss(x.get("sample_periods")),
         f"{prefix}样本类型": ss(x.get("sample_kinds")),
         f"{prefix}簇区间": f"{rd(x.get('cluster_low'))}-{rd(x.get('cluster_high'))}",
+        f"{prefix}粘合分": rd(x.get("adhesion_score")),
+        f"{prefix}反应中心": rd(x.get("reaction_center")),
+        f"{prefix}中心偏离%": rd(x.get("center_bias_pct")),
+        f"{prefix}紧密误差%": rd(x.get("compact_error_pct")),
     }
 
 
@@ -1117,7 +1201,7 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
-        "逻辑：实体顶候选；high/body_top/close 先形成离散种子簇；再用外部影线作为低权重有效反应补足共振；先看外部有效反应和总有效共振，最后才看更高实顶。",
+        "逻辑：实体顶候选；离散种子簇 + 外部影线有效反应；新增年线/K线粘合性，主簇内先选代表性最强的实顶，不机械选最高实顶。",
         "",
     ]
 
@@ -1126,8 +1210,8 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
             f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}",
             f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜有效共振{r.get('近端有效共振')}｜离散{r.get('近端离散共振')}｜外部有效{r.get('近端外部有效')}｜外部影线{r.get('近端外部影线')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
             f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜有效共振{r.get('远端有效共振')}｜离散{r.get('远端离散共振')}｜外部有效{r.get('远端外部有效')}｜外部影线{r.get('远端外部影线')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
-            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端簇区间')}｜样本{r.get('近端样本')}｜类型{r.get('近端样本类型')}",
-            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端簇区间')}｜样本{r.get('远端样本')}｜类型{r.get('远端样本类型')}",
+            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端簇区间')}｜反应中心{r.get('近端反应中心')}｜粘合分{r.get('近端粘合分')}｜中心偏离{r.get('近端中心偏离%')}%｜紧密误差{r.get('近端紧密误差%')}%｜样本{r.get('近端样本')}｜类型{r.get('近端样本类型')}",
+            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端簇区间')}｜反应中心{r.get('远端反应中心')}｜粘合分{r.get('远端粘合分')}｜中心偏离{r.get('远端中心偏离%')}%｜紧密误差{r.get('远端紧密误差%')}%｜样本{r.get('远端样本')}｜类型{r.get('远端样本类型')}",
             f"突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}",
             f"回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
             "",
@@ -1158,6 +1242,7 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "point_tol": POINT_TOL,
             "body_edge_tol": BODY_EDGE_TOL,
             "shadow_reaction_weight": SHADOW_REACTION_WEIGHT,
+            "adhesion_logic": "representative_bodytop_before_highest_bodytop",
             "period_specs": PERIOD_SPECS,
             "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
             "pullback_lookback_after_break": PULLBACK_LOOKBACK_AFTER_BREAK,
