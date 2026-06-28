@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V6
+破界.py｜三号员工｜600584 单票验证版 V7
 
 本版核心修正：
 1）候选线仍然来自实体顶 body_top；
@@ -35,7 +35,7 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_REACTION_SHADOW_BODYTOP_V6_20260628"
+BOOT = "POJIE_SINGLE_600584_REACTION_SHADOW_BODYTOP_V7_20260628"
 RUN_MODE = "single_stock_only; no_full_market_scan"
 START_TS = time.time()
 
@@ -89,11 +89,25 @@ BODY_EDGE_TOL = float(os.getenv("POJIE_BODY_EDGE_TOL", "0.005"))
 SHADOW_REACTION_WEIGHT = float(os.getenv("POJIE_SHADOW_REACTION_WEIGHT", "0.70"))
 
 PERIOD_SPECS = [
-    # period, label, min_primary_unique, period_rank
+    # period, label, min_effective_unique, period_rank
     ("Y", "年线", 4, 3),
     ("Q", "季线", 8, 2),
     ("M", "月线", 10, 1),
 ]
+
+
+def min_seed_discrete_count(min_effective_unique: int) -> int:
+    """
+    V7 修正：
+    主簇种子不能直接要求达到年/季/月完整共振门槛。
+    因为你的逻辑是“实顶 + 其他影线能共振上”，影线也属于有效反应。
+    如果建簇阶段就强制年线离散点>=4，会把“2个离散点 + 2个影线反应”的正确核心线直接杀掉。
+    """
+    if min_effective_unique <= 4:
+        return 2
+    if min_effective_unique <= 8:
+        return 3
+    return 4
 
 BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
 PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
@@ -390,11 +404,11 @@ def choose_best_point_per_bar(points: List[Dict[str, Any]], prefer_line: Optiona
     return sorted(by_bar.values(), key=lambda x: int(x["bar_index"]))
 
 
-def cluster_from_seed(points: List[Dict[str, Any]], seed_price: float, min_primary_unique: int) -> Optional[Dict[str, Any]]:
+def cluster_from_seed(points: List[Dict[str, Any]], seed_price: float, min_seed_unique: int) -> Optional[Dict[str, Any]]:
     raw = points_near(points, seed_price, POINT_TOL)
     uniq = choose_best_point_per_bar(raw, seed_price)
 
-    if len(uniq) < min_primary_unique:
+    if len(uniq) < min_seed_unique:
         return None
 
     bodytops = [p for p in raw if ss(p["kind"]) == "body_top"]
@@ -603,7 +617,7 @@ def validate_bodytop_line(
     }
 
 
-def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_primary_unique: int, period_rank: int) -> List[Dict[str, Any]]:
+def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_effective_unique: int, period_rank: int) -> List[Dict[str, Any]]:
     k = aggregate_period(df, period)
     if k.empty:
         return []
@@ -612,9 +626,13 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_primar
     if not points:
         return []
 
+    # V7：建簇阶段只要求“离散反应种子”够形成区域，不要求直接满足完整共振门槛；
+    # 完整门槛留到 validate_bodytop_line，用“离散点 + 外部影线有效反应”一起验证。
+    seed_need = min_seed_discrete_count(min_effective_unique)
+
     clusters = []
     for p in points:
-        c = cluster_from_seed(points, sf(p["price"]), min_primary_unique)
+        c = cluster_from_seed(points, sf(p["price"]), seed_need)
         if c:
             clusters.append(c)
 
@@ -623,24 +641,34 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_primar
     lines: List[Dict[str, Any]] = []
 
     for cluster in clusters:
+        # V7：候选实顶不只取 cluster raw points 里的 body_top。
+        # 如果某个 body_top 位于主簇容差范围内，也应该参与定线。
+        bodytop_candidates: List[Dict[str, Any]] = []
+        for p in points:
+            if ss(p.get("kind")) != "body_top":
+                continue
+            price = sf(p.get("price"))
+            center = sf(cluster.get("center"))
+            if center > 0 and abs(price - center) / center <= POINT_TOL:
+                bodytop_candidates.append(p)
+
+        # 保留旧 raw bodytops 作为补充。
+        for p in cluster.get("bodytop_candidates", []):
+            if all(int(p["bar_index"]) != int(q["bar_index"]) or abs(sf(p["price"]) - sf(q["price"])) > 1e-9 for q in bodytop_candidates):
+                bodytop_candidates.append(p)
+
         valid_candidates: List[Dict[str, Any]] = []
-        for bodytop in cluster["bodytop_candidates"]:
-            v = validate_bodytop_line(k, points, cluster, bodytop, min_primary_unique)
+        for bodytop in bodytop_candidates:
+            v = validate_bodytop_line(k, points, cluster, bodytop, min_effective_unique)
             if v:
                 valid_candidates.append(v)
 
         if not valid_candidates:
             continue
 
-        # 主簇内部选线：
-        # 1）外部离散反应点更多；
-        # 2）放量/倍量实顶更强；
-        # 3）主簇权重更强；
-        # 4）最后才选更高实顶。
-        #
-        # 这样保留“最高实顶”的思想，但不会让孤立高实顶抢线。
+        # V7：最高实顶是最后的 tie-breaker；
+        # 先看外部有效反应是否足够、有效共振是否够多、外部离散和外部影线是否共同支撑。
         def candidate_rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
-            # V6：最高实顶是最后的 tie-breaker，不再让孤立高实顶抢线。
             return (
                 int(x["external_effective_count"]),
                 int(x["effective_unique_count"]),
@@ -658,7 +686,8 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_primar
             "period_label": label,
             "period_rank": int(period_rank),
             "core_rank": {"S-Core": 3, "A-Core": 2}.get(ss(best["core_grade"]), 0),
-            "min_primary_unique": int(min_primary_unique),
+            "min_primary_unique": int(min_effective_unique),
+            "seed_discrete_need": int(seed_need),
         })
         lines.append(best)
 
@@ -1088,7 +1117,7 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
-        "逻辑：实体顶候选；high/body_top/close 为离散主反应点；上影线穿越作为低权重外部有效反应；先看外部有效反应和总有效共振，最后才看更高实顶。",
+        "逻辑：实体顶候选；high/body_top/close 先形成离散种子簇；再用外部影线作为低权重有效反应补足共振；先看外部有效反应和总有效共振，最后才看更高实顶。",
         "",
     ]
 
