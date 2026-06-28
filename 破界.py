@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V5
+破界.py｜三号员工｜600584 单票验证版 V6
 
 本版核心修正：
-1）不再用“线穿过上影线”直接当主共振；
-2）先用 high / body_top / close 三类离散反应点找主共振簇；
-3）再在主簇内部找最高有效实顶 body_top 定线；
-4）最终线必须零切实体；
-5）正式核心线只保留 S-Core / A-Core；
-6）默认只跑 600584 长电科技，不做全市场扫描。
+1）候选线仍然来自实体顶 body_top；
+2）high / body_top / close 是离散主反应点；
+3）上影线穿越不再无条件等于主共振，但会作为“外部影线接受/反应”计入有效共振；
+4）排序先看外部有效反应和总有效共振，再看放量/倍量实顶，最后才看更高实顶；
+5）最终线必须零切实体；
+6）正式核心线只保留 S-Core / A-Core；
+7）默认只跑 600584 长电科技，不做全市场扫描。
 
 workflow 不需要改，仍然执行：
 python -u 破界.py
@@ -34,7 +35,7 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_REACTION_CLUSTER_BODYTOP_V5_20260628"
+BOOT = "POJIE_SINGLE_600584_REACTION_SHADOW_BODYTOP_V6_20260628"
 RUN_MODE = "single_stock_only; no_full_market_scan"
 START_TS = time.time()
 
@@ -82,8 +83,10 @@ POINT_TOL = float(os.getenv("POJIE_POINT_TOL", "0.005"))
 # 实顶贴线容差。线压在实顶边缘不算切实体。
 BODY_EDGE_TOL = float(os.getenv("POJIE_BODY_EDGE_TOL", "0.005"))
 
-# shadow cover 只用于诊断，不用于核心线成立门槛。
-SHADOW_DIAG_TOL = float(os.getenv("POJIE_SHADOW_DIAG_TOL", "0.005"))
+# 上影线共振不再作为任意穿越直接成立，但可以作为外部有效反应。
+# 影线共振要求：line 在上影线内部，且不是极端长影中随便穿过的孤立位置。
+# 为避免过严，默认允许上影线内部穿越，但排序上低于 high/body_top/close 离散点。
+SHADOW_REACTION_WEIGHT = float(os.getenv("POJIE_SHADOW_REACTION_WEIGHT", "0.70"))
 
 PERIOD_SPECS = [
     # period, label, min_primary_unique, period_rank
@@ -462,26 +465,44 @@ def count_cut_entities(k: pd.DataFrame, line: float) -> int:
     return cuts
 
 
-def count_shadow_diagnostics(k: pd.DataFrame, line: float, primary_bars: set[int]) -> Tuple[int, List[str]]:
-    # 只做诊断，不作为核心线成立门槛。避免“穿过长上影线就算主共振”的旧错误。
-    count = 0
-    periods: List[str] = []
+def shadow_reactions(k: pd.DataFrame, line: float, used_bars: set[int], anchor_bar: int) -> List[Dict[str, Any]]:
+    """
+    外部影线反应：
+    - 只看锚点之外的大周期K；
+    - 如果 line 落在上影线 body_top~high 之间，说明该价位在影线供应区被打到过；
+    - 但它的权重低于 high/body_top/close 离散点；
+    - 同一根K如果已经有 high/body_top/close 离散点命中，不重复计数。
+    """
+    out: List[Dict[str, Any]] = []
 
     for idx, r in k.iterrows():
-        if int(idx) in primary_bars:
+        i = int(idx)
+        if i == int(anchor_bar) or i in used_bars:
             continue
 
         body_top = sf(r["body_top"])
         high = sf(r["high"])
-        if body_top < line < high:
-            # 只统计离高点或实顶不太远的影线覆盖；中间随便穿过长影不算强证据。
-            near_high = abs(high - line) / max(line, 1e-9) <= SHADOW_DIAG_TOL
-            near_body_top = abs(body_top - line) / max(line, 1e-9) <= BODY_EDGE_TOL
-            if near_high or near_body_top:
-                count += 1
-                periods.append(ss(r["period"]))
 
-    return count, periods
+        if body_top < line < high:
+            out.append({
+                "bar_index": i,
+                "period": ss(r["period"]),
+                "end": ss(r["end"]),
+                "kind": "shadow",
+                "price": rd(line, 4),
+                "weight": SHADOW_REACTION_WEIGHT,
+                "is_volume_bodytop": False,
+                "is_double_bodytop": False,
+                "open": rd(r["open"]),
+                "high": rd(r["high"]),
+                "low": rd(r["low"]),
+                "close": rd(r["close"]),
+                "body_top": rd(r["body_top"]),
+                "volume": rd(r["volume"]),
+                "vol_ratio_prev": rd(r["vol_ratio_prev"]),
+            })
+
+    return out
 
 
 def validate_bodytop_line(
@@ -495,24 +516,39 @@ def validate_bodytop_line(
     if line <= 0:
         return None
 
-    # 主共振必须来自 high/body_top/close 离散反应点。
+    # 离散主反应点：high/body_top/close。
     primary_raw = points_near(points, line, POINT_TOL)
     primary = choose_best_point_per_bar(primary_raw, line)
 
-    primary_bar_set = {int(p["bar_index"]) for p in primary}
     anchor_bar = int(bodytop_point["bar_index"])
+    primary_bar_set = {int(p["bar_index"]) for p in primary}
     external_primary = [p for p in primary if int(p["bar_index"]) != anchor_bar]
 
-    if len(primary) < min_primary_unique:
+    # 外部影线反应：允许 line 穿过影线，但低权重，不重复同一根K。
+    shadows = shadow_reactions(k, line, primary_bar_set, anchor_bar)
+
+    effective_samples = sorted(primary + shadows, key=lambda x: int(x["bar_index"]))
+    effective_bar_set = {int(p["bar_index"]) for p in effective_samples}
+    external_effective = [p for p in effective_samples if int(p["bar_index"]) != anchor_bar]
+
+    # 这是 V6 的关键：不是只看离散点，也不是只看影线穿越；
+    # 而是要求“锚点实顶 + 外部离散/影线有效反应”共同达到周期门槛。
+    if len(effective_bar_set) < min_primary_unique:
         return None
 
-    # 年线至少需要锚点之外的 3 个离散反应点；季/月按 min-1。
-    # 这一步专门防止“自己一个高实顶 + 几根长影线内部穿过”冒充主线。
-    if len(external_primary) < max(2, min_primary_unique - 1):
+    if len(external_effective) < max(2, min_primary_unique - 1):
         return None
 
-    # 候选实顶必须确实处在这个主簇内，而不是宽带边缘蹭进去。
-    if not (sf(cluster["low"]) <= line <= sf(cluster["high"])):
+    # 至少要有 2 个 high/body_top/close 离散点，其中一个是锚点实顶。
+    # 这样防止“单个实顶 + 一堆长上影内部穿越”乱成线。
+    if len(primary_bar_set) < 2:
+        return None
+
+    # 候选实顶必须落在离散主簇附近。这里允许略超出 cluster 高低点 0.5%，
+    # 因为主簇可能由 high/close 点形成，而最高实顶刚好在簇边缘。
+    cluster_low = sf(cluster["low"])
+    cluster_high = sf(cluster["high"])
+    if not (cluster_low * (1 - POINT_TOL) <= line <= cluster_high * (1 + POINT_TOL)):
         return None
 
     cut_count = count_cut_entities(k, line)
@@ -527,21 +563,25 @@ def validate_bodytop_line(
     elif volume_bodytop_count >= 1:
         grade = "A-Core"
     else:
-        # 正式核心线只保留 S/A。普通无量反应线不输出。
         return None
 
-    shadow_diag_count, shadow_diag_periods = count_shadow_diagnostics(k, line, primary_bar_set)
+    effective_weight = sum(sf(p["weight"]) for p in effective_samples)
+    shadow_periods = [ss(p["period"]) for p in shadows]
 
     return {
         "line": rd(line),
         "core_grade": grade,
-        "touch_count": len(primary),
-        "primary_unique_count": len(primary),
+        "touch_count": len(effective_bar_set),
+        "primary_unique_count": len(primary_bar_set),
+        "effective_unique_count": len(effective_bar_set),
         "external_primary_count": len(external_primary),
+        "external_shadow_count": len(shadows),
+        "external_effective_count": len(external_effective),
         "volume_bodytop_count": int(volume_bodytop_count),
         "double_bodytop_count": int(double_bodytop_count),
         "cut_count": int(cut_count),
         "primary_weight": rd(sum(sf(p["weight"]) for p in primary)),
+        "effective_weight": rd(effective_weight),
         "cluster_center": rd(cluster["center"]),
         "cluster_low": rd(cluster["low"]),
         "cluster_high": rd(cluster["high"]),
@@ -551,13 +591,15 @@ def validate_bodytop_line(
         "anchor_end": ss(bodytop_point["end"]),
         "anchor_kind": ss(bodytop_point["kind"]),
         "anchor_price": rd(bodytop_point["price"]),
-        "sample_periods": ",".join(ss(p["period"]) for p in primary),
-        "sample_kinds": ",".join(ss(p["kind"]) for p in primary),
-        "external_sample_periods": ",".join(ss(p["period"]) for p in external_primary),
-        "external_sample_kinds": ",".join(ss(p["kind"]) for p in external_primary),
-        "shadow_diag_count": int(shadow_diag_count),
-        "shadow_diag_periods": ",".join(shadow_diag_periods),
-        "samples": primary,
+        "sample_periods": ",".join(ss(p["period"]) for p in effective_samples),
+        "sample_kinds": ",".join(ss(p["kind"]) for p in effective_samples),
+        "primary_sample_periods": ",".join(ss(p["period"]) for p in primary),
+        "primary_sample_kinds": ",".join(ss(p["kind"]) for p in primary),
+        "external_sample_periods": ",".join(ss(p["period"]) for p in external_effective),
+        "external_sample_kinds": ",".join(ss(p["kind"]) for p in external_effective),
+        "shadow_count": int(len(shadows)),
+        "shadow_periods": ",".join(shadow_periods),
+        "samples": effective_samples,
     }
 
 
@@ -598,12 +640,15 @@ def scan_period_core_lines(df: pd.DataFrame, period: str, label: str, min_primar
         #
         # 这样保留“最高实顶”的思想，但不会让孤立高实顶抢线。
         def candidate_rank(x: Dict[str, Any]) -> Tuple[Any, ...]:
+            # V6：最高实顶是最后的 tie-breaker，不再让孤立高实顶抢线。
             return (
+                int(x["external_effective_count"]),
+                int(x["effective_unique_count"]),
                 int(x["external_primary_count"]),
+                int(x["external_shadow_count"]),
                 int(x["double_bodytop_count"]),
                 int(x["volume_bodytop_count"]),
-                sf(x["primary_weight"]),
-                int(x["primary_unique_count"]),
+                sf(x["effective_weight"]),
                 sf(x["line"]),
             )
 
@@ -641,11 +686,13 @@ def dedupe_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return (
             int(x.get("core_rank", 0)),
             int(x.get("period_rank", 0)),
+            int(x.get("external_effective_count", 0)),
+            int(x.get("effective_unique_count", 0)),
             int(x.get("external_primary_count", 0)),
+            int(x.get("external_shadow_count", 0)),
             int(x.get("double_bodytop_count", 0)),
             int(x.get("volume_bodytop_count", 0)),
-            sf(x.get("primary_weight")),
-            int(x.get("primary_unique_count", 0)),
+            sf(x.get("effective_weight")),
             sf(x.get("line")),
         )
 
@@ -914,8 +961,11 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"{prefix}核心线": None,
             f"{prefix}等级": "无",
             f"{prefix}周期": "",
-            f"{prefix}共振": 0,
-            f"{prefix}外部离散反应": 0,
+            f"{prefix}有效共振": 0,
+            f"{prefix}离散共振": 0,
+            f"{prefix}外部有效": 0,
+            f"{prefix}外部离散": 0,
+            f"{prefix}外部影线": 0,
             f"{prefix}放量实顶": 0,
             f"{prefix}倍量实顶": 0,
             f"{prefix}切实体": 0,
@@ -923,7 +973,6 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             f"{prefix}锚点": "",
             f"{prefix}样本": "",
             f"{prefix}样本类型": "",
-            f"{prefix}影线诊断": 0,
             f"{prefix}簇区间": "",
         }
 
@@ -931,8 +980,11 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         f"{prefix}核心线": rd(x.get("line")),
         f"{prefix}等级": ss(x.get("core_grade")),
         f"{prefix}周期": ss(x.get("period_label")),
-        f"{prefix}共振": int(x.get("primary_unique_count", 0)),
-        f"{prefix}外部离散反应": int(x.get("external_primary_count", 0)),
+        f"{prefix}有效共振": int(x.get("effective_unique_count", x.get("primary_unique_count", 0))),
+        f"{prefix}离散共振": int(x.get("primary_unique_count", 0)),
+        f"{prefix}外部有效": int(x.get("external_effective_count", 0)),
+        f"{prefix}外部离散": int(x.get("external_primary_count", 0)),
+        f"{prefix}外部影线": int(x.get("external_shadow_count", 0)),
         f"{prefix}放量实顶": int(x.get("volume_bodytop_count", 0)),
         f"{prefix}倍量实顶": int(x.get("double_bodytop_count", 0)),
         f"{prefix}切实体": int(x.get("cut_count", 0)),
@@ -940,7 +992,6 @@ def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         f"{prefix}锚点": ss(x.get("anchor_period")),
         f"{prefix}样本": ss(x.get("sample_periods")),
         f"{prefix}样本类型": ss(x.get("sample_kinds")),
-        f"{prefix}影线诊断": int(x.get("shadow_diag_count", 0)),
         f"{prefix}簇区间": f"{rd(x.get('cluster_low'))}-{rd(x.get('cluster_high'))}",
     }
 
@@ -1037,17 +1088,17 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
-        "逻辑：先用 high/body_top/close 离散反应点找主共振簇；不再把上影线穿越直接算主共振；再在主簇内取最高有效实顶定线。",
+        "逻辑：实体顶候选；high/body_top/close 为离散主反应点；上影线穿越作为低权重外部有效反应；先看外部有效反应和总有效共振，最后才看更高实顶。",
         "",
     ]
 
     for r in rows:
         lines.extend([
             f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}",
-            f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜共振{r.get('近端共振')}｜外部离散{r.get('近端外部离散反应')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
-            f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜共振{r.get('远端共振')}｜外部离散{r.get('远端外部离散反应')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
-            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端簇区间')}｜样本{r.get('近端样本')}｜类型{r.get('近端样本类型')}｜影线诊断{r.get('近端影线诊断')}",
-            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端簇区间')}｜样本{r.get('远端样本')}｜类型{r.get('远端样本类型')}｜影线诊断{r.get('远端影线诊断')}",
+            f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜有效共振{r.get('近端有效共振')}｜离散{r.get('近端离散共振')}｜外部有效{r.get('近端外部有效')}｜外部影线{r.get('近端外部影线')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
+            f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜有效共振{r.get('远端有效共振')}｜离散{r.get('远端离散共振')}｜外部有效{r.get('远端外部有效')}｜外部影线{r.get('远端外部影线')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
+            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端簇区间')}｜样本{r.get('近端样本')}｜类型{r.get('近端样本类型')}",
+            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端簇区间')}｜样本{r.get('远端样本')}｜类型{r.get('远端样本类型')}",
             f"突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}",
             f"回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
             "",
@@ -1077,7 +1128,7 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
         "config": {
             "point_tol": POINT_TOL,
             "body_edge_tol": BODY_EDGE_TOL,
-            "shadow_diag_tol": SHADOW_DIAG_TOL,
+            "shadow_reaction_weight": SHADOW_REACTION_WEIGHT,
             "period_specs": PERIOD_SPECS,
             "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
             "pullback_lookback_after_break": PULLBACK_LOOKBACK_AFTER_BREAK,
