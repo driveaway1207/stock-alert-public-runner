@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 """
-破界.py｜从零重写版｜年线/季线/月线核心线破界海选
+破界.py｜三号员工｜600584 单票验证版 V4
 
-核心原则：
-1）只找一条真正有交易价值的核心线，不再使用500日触发线；
-2）先找年线：年线有效共振点 >= 4 且不切实体，直接采用年线核心线；
-3）年线没有，再找季线：季线有效共振点 >= 8 且不切实体；
-4）季线没有，再找月线：月线有效共振点 >= 10 且不切实体；
-5）月线仍没有，则该股没有核心线；
-6）同一周期内，共振中若存在大阳线实顶，优先以该大阳线实顶作为核心线；
-7）核心线只负责给出价格、周期、来源和共振证据；近20日破界只是后续交易筛选。
-
-输出：
-- 破界报告/核心线全市场明细.csv
-- 破界报告/核心线破界候选.csv
-- 破界报告/核心线破界报告.md
-- 破界报告/核心线数据.json
+本版只做单票验证，默认只跑 600584 长电科技。
+核心线逻辑：
+1）只从年线 / 季线 / 月线聚合K中找；
+2）候选线必须来自K线实体顶 body_top = max(open, close)，不再让普通高点/影线直接定线；
+3）先用所有实体顶候选线反查影线/高点/实顶/收盘共振；
+4）同一主共振簇内，先锁定外部影线/高点共振最强的簇，再取该簇内最高有效实顶；
+5）切实体=0是硬条件；
+6）正式核心线只保留 S-Core / A-Core；
+7）近端/远端只从正式核心线里按距离当前价选择，最多两条。
 """
 
 import json
@@ -25,7 +20,6 @@ import math
 import os
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,18 +29,18 @@ import pandas as pd
 
 try:
     import requests
-except Exception:  # pragma: no cover
+except Exception:
     requests = None
 
-BOOT = "POJIE_CORE_LINE_REWRITE_YQM_ZERO_CUT_V1_20260627"
+BOOT = "POJIE_SINGLE_600584_MAIN_CLUSTER_BODYTOP_V4_20260628"
+RUN_MODE = "single_stock_only; no_full_market_scan"
 START_TS = time.time()
 ROOT = Path(__file__).resolve().parent
 
 REPORT_DIR = ROOT / "破界报告"
-OUTPUT_MD = REPORT_DIR / "核心线破界报告.md"
-OUTPUT_ALL_CSV = REPORT_DIR / "核心线全市场明细.csv"
-OUTPUT_HIT_CSV = REPORT_DIR / "核心线破界候选.csv"
-OUTPUT_JSON = REPORT_DIR / "核心线数据.json"
+OUTPUT_MD = REPORT_DIR / "核心线突破海选报告.md"
+OUTPUT_CSV = REPORT_DIR / "核心线突破海选明细.csv"
+OUTPUT_JSON = REPORT_DIR / "核心线突破海选数据.json"
 SELF_CHECK_JSON = REPORT_DIR / "破界自检.json"
 
 CACHE_DIRS = [
@@ -69,82 +63,32 @@ TARGET_ENV_KEYS = [
 
 BOT = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
 CHAT = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-ENABLE_TELEGRAM = (os.getenv("POJIE_SEND_TELEGRAM") or os.getenv("ENABLE_TELEGRAM") or "0").strip() in {"1", "true", "True", "YES", "yes", "发送"}
+ENABLE_TELEGRAM = (os.getenv("POJIE_SEND_TELEGRAM") or os.getenv("ENABLE_TELEGRAM") or "0").strip() in {
+    "1", "true", "True", "yes", "YES", "发送"
+}
 
-MAX_STOCKS = int(os.getenv("POJIE_MAX_STOCKS", os.getenv("MAX_STOCKS", "0")))
+TARGET_CODES = [
+    x for x in re.split(r"[,，\s]+", os.getenv("POJIE_TARGET_CODES", "600584"))
+    if re.fullmatch(r"\d{6}", x)
+] or ["600584"]
+
 MIN_DAILY_ROWS = int(os.getenv("POJIE_MIN_DAILY_ROWS", "80"))
-BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "20"))
+TOUCH_TOL = float(os.getenv("POJIE_TOUCH_TOL", "0.005"))
+EDGE_TOL = float(os.getenv("POJIE_EDGE_TOL", "0.005"))
 
-CORE_LINE_TOL = float(os.getenv("POJIE_CORE_LINE_TOL", "0.010"))
-BODY_TOP_EDGE_TOL = float(os.getenv("POJIE_BODY_TOP_EDGE_TOL", "0.005"))
-
-YEAR_MIN_RESONANCE = int(os.getenv("POJIE_YEAR_MIN_RESONANCE", "4"))
-QUARTER_MIN_RESONANCE = int(os.getenv("POJIE_QUARTER_MIN_RESONANCE", "8"))
-MONTH_MIN_RESONANCE = int(os.getenv("POJIE_MONTH_MIN_RESONANCE", "10"))
-
-YEAR_BIG_BULL_BODY_PCT = float(os.getenv("POJIE_YEAR_BIG_BULL_BODY_PCT", "0.20"))
-QUARTER_BIG_BULL_BODY_PCT = float(os.getenv("POJIE_QUARTER_BIG_BULL_BODY_PCT", "0.16"))
-MONTH_BIG_BULL_BODY_PCT = float(os.getenv("POJIE_MONTH_BIG_BULL_BODY_PCT", "0.12"))
-BIG_BULL_BODY_RATIO_MIN = float(os.getenv("POJIE_BIG_BULL_BODY_RATIO_MIN", "0.42"))
-
-BREAK_CLOSE_ABOVE_PCT = float(os.getenv("POJIE_BREAK_CLOSE_ABOVE_PCT", "0.003"))
-BREAK_PREV_BELOW_PCT = float(os.getenv("POJIE_BREAK_PREV_BELOW_PCT", "0.005"))
-BREAK_MIN_PCT_CHG = float(os.getenv("POJIE_BREAK_MIN_PCT_CHG", "1.0"))
-BREAK_MIN_BODY_PCT = float(os.getenv("POJIE_BREAK_MIN_BODY_PCT", "0.005"))
-BREAK_BODY_RATIO_MIN = float(os.getenv("POJIE_BREAK_BODY_RATIO_MIN", "0.28"))
-BREAK_CLOSE_POS_MIN = float(os.getenv("POJIE_BREAK_CLOSE_POS_MIN", "0.66"))
-BREAK_UPPER_SHADOW_MAX = float(os.getenv("POJIE_BREAK_UPPER_SHADOW_MAX", "0.36"))
-BREAK_ENTITY_ABOVE_LINE_MIN = float(os.getenv("POJIE_BREAK_ENTITY_ABOVE_LINE_MIN", "0.32"))
-BREAK_MIN_VOLUME_RATIO = float(os.getenv("POJIE_BREAK_MIN_VOLUME_RATIO", "1.15"))
-
-DEFENSE_BUFFER_PCT = float(os.getenv("POJIE_DEFENSE_BUFFER_PCT", "0.015"))
-MAX_DISTANCE_LINE_PCT = float(os.getenv("POJIE_MAX_DISTANCE_LINE_PCT", "18.0"))
-MAX_RISK_PCT = float(os.getenv("POJIE_MAX_RISK_PCT", "10.5"))
-HOT_20D_PCT = float(os.getenv("POJIE_HOT_20D_PCT", "25.0"))
-MIN_AMOUNT20 = float(os.getenv("POJIE_MIN_AMOUNT20", "50000000"))
-TOP_LIMIT = int(os.getenv("POJIE_TOP_LIMIT", "3"))
-
-PARALLEL = (os.getenv("POJIE_PARALLEL") or "1").strip() not in {"0", "false", "False", "no", "NO"}
-WORKERS = max(1, int(os.getenv("POJIE_WORKERS", str(min(4, max(1, os.cpu_count() or 1))))))
-CACHE_PROGRESS_EVERY = int(os.getenv("POJIE_CACHE_PROGRESS_EVERY", "1000"))
-SCREEN_PROGRESS_EVERY = int(os.getenv("POJIE_SCREEN_PROGRESS_EVERY", "200"))
-HARD_RISK_NAME_KEYWORDS = tuple(x for x in os.getenv("POJIE_HARD_RISK_NAME_KEYWORDS", "ST,*ST,退,退市").split(",") if x)
-
-PERIOD_SPECS = [
-    {"period": "Y", "period_name": "年线", "min_resonance": YEAR_MIN_RESONANCE, "big_bull_body_pct": YEAR_BIG_BULL_BODY_PCT},
-    {"period": "Q", "period_name": "季线", "min_resonance": QUARTER_MIN_RESONANCE, "big_bull_body_pct": QUARTER_BIG_BULL_BODY_PCT},
-    {"period": "M", "period_name": "月线", "min_resonance": MONTH_MIN_RESONANCE, "big_bull_body_pct": MONTH_BIG_BULL_BODY_PCT},
+# 年线 / 季线 / 月线：周期代码、中文名、最低总共振数、最低外部影线/高点共振数、周期权重
+PERIOD_RULES = [
+    ("Y", "年线", 4, 2, 3),
+    ("Q", "季线", 8, 3, 2),
+    ("M", "月线", 10, 4, 1),
 ]
+
+BREAKOUT_LOOKBACK_DAYS = int(os.getenv("POJIE_BREAKOUT_LOOKBACK_DAYS", "260"))
+PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BREAK", "80"))
 
 
 def log(msg: str) -> None:
-    print(f"[破界][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
-
-
-def now_bj() -> datetime:
-    return datetime.now(timezone(timedelta(hours=8)))
-
-
-def previous_workday(d: datetime) -> datetime:
-    x = d
-    while x.weekday() >= 5:
-        x -= timedelta(days=1)
-    return x
-
-
-def target_raw() -> str:
-    for key in TARGET_ENV_KEYS:
-        value = os.getenv(key)
-        if value:
-            return value
-    bj = now_bj()
-    if bj.weekday() >= 5 or bj.hour < 20 or (bj.hour == 20 and bj.minute < 30):
-        bj = previous_workday(bj - timedelta(days=1))
-    return bj.strftime("%Y%m%d")
-
-
-TARGET = re.sub(r"\D", "", target_raw())[:8]
-TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
+    print(f"[破界单票][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -157,7 +101,7 @@ def sf(x: Any, default: float = 0.0) -> float:
             return default
         if isinstance(x, str):
             x = x.replace(",", "").replace("%", "").strip()
-            if x == "":
+            if not x:
                 return default
         v = float(x)
         if math.isnan(v) or math.isinf(v):
@@ -171,20 +115,12 @@ def rd(x: Any, n: int = 3) -> float:
     return round(sf(x), n)
 
 
-def code_of(x: Any) -> str:
-    m = re.search(r"(\d{6})", ss(x))
-    return m.group(1) if m else ""
-
-
-def valid_code(code: Any) -> bool:
-    c = code_of(code)
-    return bool(c) and len(c) == 6 and c[0] in "0368"
+def pct(a: float, b: float) -> float:
+    return (a / b - 1.0) * 100.0 if b else 0.0
 
 
 def norm_date(x: Any) -> str:
     s = ss(x)
-    if not s:
-        return ""
     digits = re.sub(r"\D", "", s)
     if len(digits) >= 8:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
@@ -194,12 +130,31 @@ def norm_date(x: Any) -> str:
         return ""
 
 
-def pct(a: float, b: float) -> float:
-    return (a / b - 1.0) * 100.0 if b else 0.0
+def now_bj() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
 
 
-def safe_div(a: float, b: float, default: float = 0.0) -> float:
-    return a / b if b else default
+def target_raw() -> str:
+    for key in TARGET_ENV_KEYS:
+        v = os.getenv(key)
+        if v:
+            return v
+
+    d = now_bj()
+    if d.weekday() >= 5 or d.hour < 20 or (d.hour == 20 and d.minute < 30):
+        d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
+TARGET = re.sub(r"\D", "", target_raw())[:8]
+TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
+
+
+def code_of(x: Any) -> str:
+    m = re.search(r"(\d{6})", ss(x))
+    return m.group(1) if m else ""
 
 
 def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
@@ -218,6 +173,7 @@ def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
         "成交额": "amount", "amount": "amount",
         "涨跌幅": "pct_chg", "涨幅": "pct_chg", "pct_chg": "pct_chg", "pctChg": "pct_chg",
     }
+
     d = df.rename(columns={c: col_map.get(str(c), col_map.get(str(c).lower(), c)) for c in df.columns}).copy()
     if not {"date", "open", "high", "low", "close"}.issubset(d.columns):
         return pd.DataFrame()
@@ -225,6 +181,7 @@ def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["open", "high", "low", "close", "volume", "amount", "pct_chg"]:
         if col in d.columns:
             d[col] = d[col].map(sf)
+
     for col, default in [("volume", 0.0), ("amount", 0.0), ("code", ""), ("name", "")]:
         if col not in d.columns:
             d[col] = default
@@ -232,756 +189,654 @@ def normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
     d["date"] = d["date"].map(norm_date)
     d["code"] = d["code"].map(code_of)
     d["name"] = d["name"].map(ss)
-    d = d[(d["date"] != "") & (d["open"] > 0) & (d["high"] > 0) & (d["low"] > 0) & (d["close"] > 0)]
-    d = d.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    d = d[
+        (d["date"] != "")
+        & (d["open"] > 0)
+        & (d["high"] > 0)
+        & (d["low"] > 0)
+        & (d["close"] > 0)
+    ].sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
     if TARGET_DASH:
         d = d[d["date"] <= TARGET_DASH].reset_index(drop=True)
+
     if d.empty:
-        return pd.DataFrame()
+        return d
+
     if "pct_chg" not in d.columns or float(d["pct_chg"].abs().sum()) == 0:
         prev = d["close"].shift(1)
         d["pct_chg"] = (d["close"] / prev - 1.0) * 100.0
         d.loc[prev <= 0, "pct_chg"] = 0.0
+
     return d
 
 
-def read_cache_file(path: Path) -> pd.DataFrame:
+def find_cache_file(code: str) -> Optional[Path]:
+    hits: List[Path] = []
+    for root in CACHE_DIRS:
+        if not root.exists():
+            continue
+        hits.extend([p for p in root.glob(f"*{code}*") if p.suffix.lower() in {".csv", ".json"}])
+    return sorted(hits, key=lambda p: len(str(p)))[0] if hits else None
+
+
+def read_cache(path: Path) -> pd.DataFrame:
     try:
         if path.suffix.lower() == ".csv":
             return normalize_hist(pd.read_csv(path))
         obj = json.loads(path.read_text(encoding="utf-8"))
-        rows = obj.get("rows") or obj.get("data") or obj.get("klines") or obj.get("items") or [] if isinstance(obj, dict) else obj
+        rows = (obj.get("rows") or obj.get("data") or obj.get("klines") or obj.get("items") or []) if isinstance(obj, dict) else obj
         return normalize_hist(pd.DataFrame(rows))
     except Exception:
         return pd.DataFrame()
 
 
-def iter_cache_files() -> List[Path]:
-    seen: Dict[str, Path] = {}
-    for directory in CACHE_DIRS:
-        if not directory.exists():
-            continue
-        for p in sorted(directory.glob("*")):
-            if p.suffix.lower() not in {".csv", ".json"}:
-                continue
-            code = code_of(p.name)
-            if valid_code(code) and code not in seen:
-                seen[code] = p
-    files = list(seen.values())
-    if MAX_STOCKS > 0:
-        files = files[:MAX_STOCKS]
-    return files
-
-
-def valid_stock_display_name(code: Any, name: Any) -> bool:
-    c = code_of(code)
-    n = ss(name)
-    if not n:
-        return False
-    bad = {"nan", "none", "null", "--", "-", "名称待补", "名称缺失"}
-    if n.lower() in bad or n in bad:
-        return False
-    if c and n in {c, f"sh.{c}", f"sz.{c}", f"bj.{c}", f"SH.{c}", f"SZ.{c}", f"BJ.{c}"}:
-        return False
-    return True
-
-
-def scan_name_frame(name_map: Dict[str, str], df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        return
-    code_cols = [c for c in ["代码", "股票代码", "证券代码", "code", "symbol", "原始代码"] if c in df.columns]
-    name_cols = [c for c in ["名称", "股票名称", "股票简称", "证券简称", "name", "股票中文名称"] if c in df.columns]
-    for cc in code_cols:
-        for nc in name_cols:
-            for _, r in df[[cc, nc]].dropna(how="all").iterrows():
-                code = code_of(r.get(cc, ""))
-                name = ss(r.get(nc, ""))
-                if valid_code(code) and valid_stock_display_name(code, name) and code not in name_map:
-                    name_map[code] = name
-
-
-def load_name_map() -> Dict[str, str]:
-    name_map: Dict[str, str] = {}
-    search_dirs = [ROOT, ROOT / "outputs", ROOT / "data", ROOT / "cache", ROOT.parent / "outputs"] + CACHE_DIRS
-    seen: set = set()
-    for directory in search_dirs:
-        if not directory.exists():
-            continue
-        files = sorted(list(directory.glob("*.csv")) + list(directory.glob("*.json")), key=lambda x: x.stat().st_mtime, reverse=True)[:80]
-        for p in files:
-            key = str(p.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            low = p.name.lower()
-            if not any(k in low for k in ["universe", "stock", "name", "股票", "status", "map", "usable"]):
-                continue
-            try:
-                if p.suffix.lower() == ".csv":
-                    scan_name_frame(name_map, pd.read_csv(p, dtype=str))
-                else:
-                    obj = json.loads(p.read_text(encoding="utf-8"))
-                    rows: List[Dict[str, Any]] = []
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            if isinstance(v, str):
-                                rows.append({"代码": k, "名称": v})
-                            elif isinstance(v, dict):
-                                vv = dict(v)
-                                vv.setdefault("代码", k)
-                                rows.append(vv)
-                    elif isinstance(obj, list):
-                        rows = obj
-                    scan_name_frame(name_map, pd.DataFrame(rows))
-            except Exception:
-                continue
-    return name_map
-
-
-def load_cache() -> Tuple[Dict[str, pd.DataFrame], Dict[str, str], Dict[str, Any]]:
-    files = iter_cache_files()
-    names = load_name_map()
-    hist: Dict[str, pd.DataFrame] = {}
-    stat = {"cache_files": len(files), "cache_hit": 0, "bad": 0, "short": 0}
-    log(f"开始读取缓存：files={len(files)}")
-    for i, p in enumerate(files, 1):
-        code = code_of(p.name)
-        df = read_cache_file(p)
-        if df.empty:
-            stat["bad"] += 1
-        elif len(df) < MIN_DAILY_ROWS:
-            stat["short"] += 1
-        else:
-            if code and "code" in df.columns:
-                df.loc[df["code"].astype(str).str.len() == 0, "code"] = code
-            if code and code not in names and "name" in df.columns:
-                vals = [ss(x) for x in df["name"].tolist() if valid_stock_display_name(code, x)]
-                if vals:
-                    names[code] = vals[-1]
-            hist[code] = df
-            stat["cache_hit"] += 1
-        if i == 1 or i % CACHE_PROGRESS_EVERY == 0 or i == len(files):
-            log(f"缓存进度 {i}/{len(files)}｜命中{stat['cache_hit']}｜坏{stat['bad']}｜短{stat['short']}｜当前{code}")
-    return hist, names, stat
-
-
-def aggregate_period_bars(df: pd.DataFrame, period: str) -> pd.DataFrame:
+def aggregate_period(df: pd.DataFrame, period_code: str) -> pd.DataFrame:
     d = normalize_hist(df)
     if d.empty:
         return pd.DataFrame()
+
     dt = pd.to_datetime(d["date"], errors="coerce")
     d = d[dt.notna()].copy()
     if d.empty:
         return pd.DataFrame()
 
-    d["_period"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period(period).astype(str)
-    bars: List[Dict[str, Any]] = []
-    for key, g in d.groupby("_period", sort=True):
+    d["_period"] = pd.to_datetime(d["date"]).dt.to_period(period_code).astype(str)
+    rows: List[Dict[str, Any]] = []
+
+    for period, g in d.groupby("_period", sort=True):
         g = g.sort_values("date").reset_index(drop=True)
-        bars.append({
-            "period": ss(key),
+        rows.append({
+            "period": ss(period),
             "start": ss(g.iloc[0]["date"]),
             "end": ss(g.iloc[-1]["date"]),
             "open": sf(g.iloc[0]["open"]),
             "high": sf(g["high"].max()),
             "low": sf(g["low"].min()),
             "close": sf(g.iloc[-1]["close"]),
-            "volume": sf(g["volume"].sum()) if "volume" in g.columns else 0.0,
+            "volume": sf(g["volume"].sum()),
             "amount": sf(g["amount"].sum()) if "amount" in g.columns else 0.0,
         })
-    k = pd.DataFrame(bars).sort_values("end").reset_index(drop=True)
+
+    k = pd.DataFrame(rows).sort_values("end").reset_index(drop=True)
     if k.empty:
         return k
+
     k["body_top"] = k[["open", "close"]].max(axis=1)
     k["body_bottom"] = k[["open", "close"]].min(axis=1)
     rng = (k["high"] - k["low"]).replace(0, np.nan)
-    k["body"] = (k["close"] - k["open"]).abs()
-    k["body_pct"] = k["body"] / k["open"].replace(0, np.nan)
-    k["body_ratio"] = (k["body"] / rng).fillna(0.0)
+    k["body_ratio"] = ((k["close"] - k["open"]).abs() / rng).fillna(0.0)
+    k["close_pos"] = ((k["close"] - k["low"]) / rng).fillna(0.0)
     k["upper_shadow_ratio"] = ((k["high"] - k["body_top"]) / rng).fillna(0.0)
     k["is_bull"] = k["close"] > k["open"]
-    return k
+    k["vol_ratio_prev"] = k["volume"] / k["volume"].shift(1).replace(0, np.nan)
+    k["vol_ratio_prev"] = k["vol_ratio_prev"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # 当前正在形成的大周期K线不参与历史核心线定线，避免未完成K污染。
+    if len(k) <= 1:
+        return pd.DataFrame()
+    return k.iloc[:-1].reset_index(drop=True)
 
 
-def completed_period_bars(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    raw = aggregate_period_bars(df, period)
-    if raw.empty:
-        return raw
-    # 最后一根年/季/月K通常是当前未完成周期，不能参与历史核心线锚定。
-    if len(raw) >= 2:
-        return raw.iloc[:-1].reset_index(drop=True)
-    return pd.DataFrame()
+def is_body_cut(row: Any, line: float) -> bool:
+    body_top = sf(row["body_top"])
+    body_bottom = sf(row["body_bottom"])
+    near_body_top = abs(body_top - line) / line <= EDGE_TOL if line > 0 else False
+    return body_bottom < line < body_top and not near_body_top
 
 
-def is_big_bull_bar(row: pd.Series, big_bull_body_pct: float) -> bool:
-    return bool(
-        sf(row.get("close")) > sf(row.get("open"))
-        and sf(row.get("body_pct")) >= big_bull_body_pct
-        and sf(row.get("body_ratio")) >= BIG_BULL_BODY_RATIO_MIN
+def resonance_flags(row: Any, line: float) -> Dict[str, bool]:
+    high = sf(row["high"])
+    close = sf(row["close"])
+    body_top = sf(row["body_top"])
+
+    near_high = abs(high - line) / line <= TOUCH_TOL if line > 0 else False
+    shadow_cross = body_top <= line <= high if line > 0 else False
+    near_body_top = abs(body_top - line) / line <= EDGE_TOL if line > 0 else False
+    near_close = abs(close - line) / line <= TOUCH_TOL if line > 0 else False
+
+    return {
+        "near_high": bool(near_high),
+        "shadow_cross": bool(shadow_cross),
+        "near_body_top": bool(near_body_top),
+        "near_close": bool(near_close),
+        "high_shadow": bool(near_high or shadow_cross),
+        "touched": bool(near_high or shadow_cross or near_body_top or near_close),
+    }
+
+
+def sample_quality(row: Any, line: float) -> Tuple[str, float, bool, bool]:
+    flags = resonance_flags(row, line)
+    vr = sf(row["vol_ratio_prev"])
+
+    is_good_body_top = (
+        flags["near_body_top"]
+        and bool(row["is_bull"])
+        and sf(row["body_ratio"]) >= 0.35
+        and sf(row["close_pos"]) >= 0.55
     )
 
+    if is_good_body_top and vr > 2.5:
+        return "极端倍量实顶", 2.0, True, True
+    if is_good_body_top and 1.8 <= vr <= 2.5:
+        return "标准倍量实顶", 1.8, True, True
+    if is_good_body_top and 1.6 <= vr < 1.8:
+        return "强放量实顶", 1.6, True, False
+    if is_good_body_top and 1.3 <= vr < 1.6:
+        return "普通放量实顶", 1.4, True, False
+    if flags["near_body_top"]:
+        return "普通实顶", 1.1, False, False
+    return "普通共振", 1.0, False, False
 
-def build_line_candidates(k: pd.DataFrame, period_name: str, big_bull_body_pct: float) -> Dict[float, Dict[str, Any]]:
-    candidates: Dict[float, Dict[str, Any]] = {}
 
-    def add(price: Any, anchor_kind: str, idx: int, r: pd.Series, priority: int) -> None:
-        line = rd(price, 3)
-        if line <= 0:
-            return
-        item = candidates.setdefault(line, {
-            "line": line,
-            "period_name": period_name,
-            "anchor_kinds": set(),
-            "anchors": [],
-            "has_big_bull_body_top_anchor": False,
-            "best_anchor_priority": 0,
-        })
-        item["anchor_kinds"].add(anchor_kind)
-        item["best_anchor_priority"] = max(int(item.get("best_anchor_priority", 0)), priority)
-        big_bull = is_big_bull_bar(r, big_bull_body_pct)
-        if anchor_kind == "大阳线实顶" and big_bull:
-            item["has_big_bull_body_top_anchor"] = True
-        item["anchors"].append({
+def evaluate_bodytop_candidate(k: pd.DataFrame, anchor_idx: int, line: float) -> Dict[str, Any]:
+    cut_count = 0
+    samples: List[Dict[str, Any]] = []
+
+    for idx, row in k.iterrows():
+        flags = resonance_flags(row, line)
+        if is_body_cut(row, line):
+            cut_count += 1
+        if not flags["touched"]:
+            continue
+
+        quality, weight, volume_bodytop, double_bodytop = sample_quality(row, line)
+        samples.append({
             "idx": int(idx),
-            "period": ss(r.get("period")),
-            "start": ss(r.get("start")),
-            "end": ss(r.get("end")),
-            "anchor_kind": anchor_kind,
-            "open": rd(r.get("open")),
-            "high": rd(r.get("high")),
-            "low": rd(r.get("low")),
-            "close": rd(r.get("close")),
-            "body_top": rd(r.get("body_top")),
-            "body_bottom": rd(r.get("body_bottom")),
-            "volume": rd(r.get("volume"), 0),
-            "is_big_bull": bool(big_bull),
+            "period": ss(row["period"]),
+            "end": ss(row["end"]),
+            "quality": quality,
+            "weight": weight,
+            "vol_ratio_prev": rd(row["vol_ratio_prev"]),
+            "near_high": flags["near_high"],
+            "shadow_cross": flags["shadow_cross"],
+            "near_body_top": flags["near_body_top"],
+            "near_close": flags["near_close"],
+            "high_shadow": flags["high_shadow"],
+            "volume_bodytop": volume_bodytop,
+            "double_bodytop": double_bodytop,
+            "open": rd(row["open"]),
+            "high": rd(row["high"]),
+            "low": rd(row["low"]),
+            "close": rd(row["close"]),
+            "body_top": rd(row["body_top"]),
         })
 
-    for idx, r in k.iterrows():
-        if is_big_bull_bar(r, big_bull_body_pct):
-            add(r.get("body_top"), "大阳线实顶", idx, r, 5)
-        else:
-            add(r.get("body_top"), "实体顶", idx, r, 4)
-        add(r.get("high"), "高点/上影线", idx, r, 3)
-    return candidates
+    external_samples = [x for x in samples if x["idx"] != anchor_idx]
+    external_high_shadow = sum(1 for x in external_samples if x["high_shadow"])
+    external_near_high = sum(1 for x in external_samples if x["near_high"])
+    external_shadow_cross = sum(1 for x in external_samples if x["shadow_cross"])
+    bodytop_count = sum(1 for x in samples if x["near_body_top"])
+    close_count = sum(1 for x in samples if x["near_close"])
+    volume_bodytop_count = sum(1 for x in samples if x["volume_bodytop"])
+    double_bodytop_count = sum(1 for x in samples if x["double_bodytop"])
 
-
-def resonance_contribution_by_prev_volume(volume: float, prev_volume: float) -> Tuple[float, str]:
-    ratio = safe_div(volume, prev_volume, 0.0) if prev_volume > 0 else 0.0
-    if ratio >= 3.0:
-        return 2.0, "极端放量共振"
-    if ratio >= 2.0:
-        return 1.8, "标准倍量共振"
-    if ratio >= 1.60:
-        return 1.6, "强放量共振"
-    if ratio >= 1.30:
-        return 1.45, "明显放量共振"
-    if ratio >= 1.15:
-        return 1.30, "轻度放量共振"
-    return 1.0, "普通共振"
-
-
-def score_line(k: pd.DataFrame, line: float, candidate: Dict[str, Any], big_bull_body_pct: float) -> Dict[str, Any]:
-    resonance_count = 0
-    weighted_score = 0.0
-    body_top_touch_count = 0
-    high_touch_count = 0
-    upper_shadow_hit_count = 0
-    close_touch_count = 0
-    big_bull_body_top_resonance_count = 0
-    volume_resonance_count = 0
-    entity_cut_count = 0
-    volume_entity_cut_count = 0
-    entity_accept_count = 0
-    touch_rows: List[Dict[str, Any]] = []
-    cut_rows: List[Dict[str, Any]] = []
-
-    prev_volumes = k["volume"].shift(1).fillna(0.0).tolist() if "volume" in k.columns else [0.0] * len(k)
-
-    for idx, r in k.iterrows():
-        high = sf(r.get("high"))
-        body_top = sf(r.get("body_top"))
-        body_bottom = sf(r.get("body_bottom"))
-        close = sf(r.get("close"))
-        volume = sf(r.get("volume"))
-        prev_volume = sf(prev_volumes[idx]) if idx < len(prev_volumes) else 0.0
-        if line <= 0 or high <= 0 or body_top <= 0 or body_bottom <= 0:
-            continue
-
-        edge_touch = abs(body_top - line) / line <= BODY_TOP_EDGE_TOL
-        entity_cut = body_bottom < line < body_top and not edge_touch
-        entity_accept = body_bottom > line
-
-        if entity_cut:
-            entity_cut_count += 1
-            contribution, volume_tag = resonance_contribution_by_prev_volume(volume, prev_volume)
-            if contribution > 1.0:
-                volume_entity_cut_count += 1
-            cut_rows.append({
-                "period": ss(r.get("period")),
-                "end": ss(r.get("end")),
-                "open": rd(r.get("open")),
-                "close": rd(r.get("close")),
-                "line": rd(line),
-                "volume_tag": volume_tag,
-            })
-            continue
-
-        if entity_accept:
-            entity_accept_count += 1
-
-        body_top_touch = abs(body_top - line) / line <= CORE_LINE_TOL
-        high_touch = abs(high - line) / line <= CORE_LINE_TOL
-        upper_shadow_hit = body_top <= line <= high
-        close_touch = abs(close - line) / line <= CORE_LINE_TOL
-        touched = bool(body_top_touch or high_touch or upper_shadow_hit or close_touch)
-        if not touched:
-            continue
-
-        contribution, volume_tag = resonance_contribution_by_prev_volume(volume, prev_volume)
-        resonance_count += 1
-        weighted_score += contribution
-        if contribution > 1.0:
-            volume_resonance_count += 1
-        if body_top_touch:
-            body_top_touch_count += 1
-        if high_touch:
-            high_touch_count += 1
-        if upper_shadow_hit and not body_top_touch:
-            upper_shadow_hit_count += 1
-        if close_touch:
-            close_touch_count += 1
-        big_bull_top = body_top_touch and is_big_bull_bar(r, big_bull_body_pct)
-        if big_bull_top:
-            big_bull_body_top_resonance_count += 1
-
-        touch_rows.append({
-            "period": ss(r.get("period")),
-            "start": ss(r.get("start")),
-            "end": ss(r.get("end")),
-            "kind": "大阳线实顶" if big_bull_top else ("实体顶" if body_top_touch else ("上影穿线" if upper_shadow_hit else ("高点贴线" if high_touch else "收盘贴线"))),
-            "open": rd(r.get("open")),
-            "high": rd(r.get("high")),
-            "low": rd(r.get("low")),
-            "close": rd(r.get("close")),
-            "body_top": rd(body_top),
-            "volume": rd(volume, 0),
-            "volume_ratio_prev": rd(safe_div(volume, prev_volume, 0.0), 3),
-            "volume_tag": volume_tag,
-            "contribution": contribution,
-        })
-
-    # 切实体只做诊断；正式选择强制要求 entity_cut_count == 0。
-    nonlinear_cut_penalty = 0.0
-    if entity_cut_count > 0:
-        nonlinear_cut_penalty = entity_cut_count * entity_cut_count * 1.20 + volume_entity_cut_count * 1.50
-    net_score = weighted_score - nonlinear_cut_penalty
-
-    anchors = candidate.get("anchors", []) or []
-    best_anchor = sorted(anchors, key=lambda x: (bool(x.get("is_big_bull")), sf(x.get("body_top")), ss(x.get("end"))), reverse=True)[0] if anchors else {}
     return {
         "line": rd(line),
-        "period_name": candidate.get("period_name", ""),
-        "source": "+".join(sorted(candidate.get("anchor_kinds", set()))),
-        "has_big_bull_body_top_anchor": bool(candidate.get("has_big_bull_body_top_anchor")),
-        "best_anchor_priority": int(candidate.get("best_anchor_priority", 0)),
-        "anchor_period": best_anchor.get("period", ""),
-        "anchor_start": best_anchor.get("start", ""),
-        "anchor_end": best_anchor.get("end", ""),
-        "anchor_kind": best_anchor.get("anchor_kind", ""),
-        "anchor_open": best_anchor.get("open"),
-        "anchor_high": best_anchor.get("high"),
-        "anchor_low": best_anchor.get("low"),
-        "anchor_close": best_anchor.get("close"),
-        "resonance_count": int(resonance_count),
-        "weighted_resonance_score": rd(weighted_score, 3),
-        "net_score": rd(net_score, 3),
-        "body_top_touch_count": int(body_top_touch_count),
-        "high_touch_count": int(high_touch_count),
-        "upper_shadow_hit_count": int(upper_shadow_hit_count),
-        "close_touch_count": int(close_touch_count),
-        "big_bull_body_top_resonance_count": int(big_bull_body_top_resonance_count),
-        "volume_resonance_count": int(volume_resonance_count),
-        "entity_cut_count": int(entity_cut_count),
-        "volume_entity_cut_count": int(volume_entity_cut_count),
-        "entity_accept_count": int(entity_accept_count),
-        "touch_rows": touch_rows,
-        "cut_rows": cut_rows,
+        "anchor_idx": int(anchor_idx),
+        "anchor_period": ss(k.iloc[anchor_idx]["period"]),
+        "anchor_end": ss(k.iloc[anchor_idx]["end"]),
+        "anchor_body_top": rd(k.iloc[anchor_idx]["body_top"]),
+        "anchor_high": rd(k.iloc[anchor_idx]["high"]),
+        "anchor_close": rd(k.iloc[anchor_idx]["close"]),
+        "touch_count": len(samples),
+        "cut_count": cut_count,
+        "external_high_shadow_count": int(external_high_shadow),
+        "external_near_high_count": int(external_near_high),
+        "external_shadow_cross_count": int(external_shadow_cross),
+        "bodytop_count": int(bodytop_count),
+        "close_count": int(close_count),
+        "volume_bodytop_count": int(volume_bodytop_count),
+        "double_bodytop_count": int(double_bodytop_count),
+        "weighted_score": rd(sum(sf(x["weight"]) for x in samples)),
+        "sample_periods": ",".join([ss(x["period"]) for x in samples]),
+        "sample_summary": "; ".join([f"{x['period']}:{x['quality']}" for x in samples]),
+        "samples": samples,
     }
 
 
-def choose_period_core_line(df: pd.DataFrame, spec: Dict[str, Any]) -> Dict[str, Any]:
-    period = ss(spec["period"])
-    period_name = ss(spec["period_name"])
-    min_resonance = int(spec["min_resonance"])
-    big_bull_body_pct = sf(spec["big_bull_body_pct"])
-    k = completed_period_bars(df, period)
+def grade_candidate(x: Dict[str, Any], min_touch: int, min_external_shadow: int) -> str:
+    if int(x.get("cut_count", 0)) > 0:
+        return "None"
+    if int(x.get("touch_count", 0)) < min_touch:
+        return "None"
+    if int(x.get("external_high_shadow_count", 0)) < min_external_shadow:
+        return "None"
+
+    volume_bodytop = int(x.get("volume_bodytop_count", 0))
+    double_bodytop = int(x.get("double_bodytop_count", 0))
+
+    # 正式核心线只保留 A/S：必须至少有一个放量/倍量实顶共振。
+    if volume_bodytop <= 0:
+        return "None"
+
+    if volume_bodytop >= 2 and double_bodytop >= 1:
+        return "S-Core"
+    return "A-Core"
+
+
+def dedupe_by_main_cluster(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    同一主共振簇内，不直接选绝对最高价。
+    先找外部影线/高点共振最强的一批，再在这批里取最高有效实顶。
+    这样避免宽带边缘的孤立高实顶抢线。
+    """
+    groups: List[List[Dict[str, Any]]] = []
+
+    for x in sorted(candidates, key=lambda z: sf(z["line"])):
+        placed = False
+        for g in groups:
+            base = np.median([sf(y["line"]) for y in g])
+            if base > 0 and abs(sf(x["line"]) - base) / base <= TOUCH_TOL:
+                g.append(x)
+                placed = True
+                break
+        if not placed:
+            groups.append([x])
+
+    winners: List[Dict[str, Any]] = []
+
+    for g in groups:
+        max_external = max(int(x.get("external_high_shadow_count", 0)) for x in g)
+        main_cluster = [x for x in g if int(x.get("external_high_shadow_count", 0)) == max_external]
+
+        def key(x: Dict[str, Any]) -> Tuple[Any, ...]:
+            return (
+                int(x.get("core_rank", 0)),
+                int(x.get("double_bodytop_count", 0)),
+                int(x.get("volume_bodytop_count", 0)),
+                int(x.get("touch_count", 0)),
+                sf(x.get("weighted_score")),
+                sf(x.get("line")),  # 最后才取主簇内最高有效实顶
+            )
+
+        winners.append(max(main_cluster, key=key))
+
+    return sorted(winners, key=lambda z: sf(z["line"]))
+
+
+def scan_core_lines_for_period(df: pd.DataFrame, period_code: str, label: str, min_touch: int, min_external_shadow: int, period_rank: int) -> List[Dict[str, Any]]:
+    k = aggregate_period(df, period_code)
     if k.empty:
-        return {"found": False, "period_name": period_name, "reason": f"{period_name}已完成K线不足", "candidates": []}
+        return []
 
-    candidates = build_line_candidates(k, period_name, big_bull_body_pct)
-    scored = [score_line(k, line, candidate, big_bull_body_pct) for line, candidate in candidates.items()]
-    valid = [x for x in scored if int(x.get("resonance_count", 0)) >= min_resonance and int(x.get("entity_cut_count", 0)) == 0]
-    if not valid:
-        top_failed = sorted(scored, key=lambda x: (int(x.get("entity_cut_count", 0)) == 0, int(x.get("resonance_count", 0)), sf(x.get("net_score"))), reverse=True)[:5]
-        return {
-            "found": False,
-            "period_name": period_name,
-            "reason": f"{period_name}未出现 共振>={min_resonance} 且零切实体 的核心线",
-            "period_bar_count": int(len(k)),
-            "candidates": top_failed,
-        }
+    raw: List[Dict[str, Any]] = []
 
-    big_bull_valid = [x for x in valid if bool(x.get("has_big_bull_body_top_anchor")) and int(x.get("big_bull_body_top_resonance_count", 0)) > 0]
-    pool = big_bull_valid if big_bull_valid else valid
-    chosen = sorted(
-        pool,
-        key=lambda x: (
-            int(x.get("resonance_count", 0)),
-            sf(x.get("weighted_resonance_score")),
-            int(x.get("volume_resonance_count", 0)),
-            int(x.get("body_top_touch_count", 0)),
-            int(x.get("best_anchor_priority", 0)),
+    # 候选线只来自实体顶，不从 high/close 直接定线。
+    for idx, row in k.iterrows():
+        line = sf(row["body_top"])
+        if line <= 0:
+            continue
+        x = evaluate_bodytop_candidate(k, int(idx), line)
+        g = grade_candidate(x, min_touch, min_external_shadow)
+        if g == "None":
+            continue
+
+        x.update({
+            "period_type": period_code,
+            "period_label": label,
+            "period_rank": period_rank,
+            "core_grade": g,
+            "core_rank": {"S-Core": 3, "A-Core": 2}.get(g, 0),
+            "min_touch": min_touch,
+            "min_external_shadow": min_external_shadow,
+            "line_source": "影线/高点主共振簇内最高有效实顶",
+        })
+        raw.append(x)
+
+    return dedupe_by_main_cluster(raw)
+
+
+def scan_core_lines(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for period_code, label, min_touch, min_external_shadow, period_rank in PERIOD_RULES:
+        out.extend(scan_core_lines_for_period(df, period_code, label, min_touch, min_external_shadow, period_rank))
+
+    # 不同周期之间再做一次合并，保留更高质量的正式核心线。
+    groups: List[List[Dict[str, Any]]] = []
+    for x in sorted(out, key=lambda z: sf(z["line"])):
+        placed = False
+        for g in groups:
+            base = np.median([sf(y["line"]) for y in g])
+            if base > 0 and abs(sf(x["line"]) - base) / base <= TOUCH_TOL:
+                g.append(x)
+                placed = True
+                break
+        if not placed:
+            groups.append([x])
+
+    def key(x: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            int(x.get("core_rank", 0)),
+            int(x.get("period_rank", 0)),
+            int(x.get("external_high_shadow_count", 0)),
+            int(x.get("double_bodytop_count", 0)),
+            int(x.get("volume_bodytop_count", 0)),
+            int(x.get("touch_count", 0)),
+            sf(x.get("weighted_score")),
             sf(x.get("line")),
-        ),
-        reverse=True,
-    )[0]
-    chosen = dict(chosen)
-    chosen.update({
-        "found": True,
-        "period_name": period_name,
-        "min_resonance_required": min_resonance,
-        "period_bar_count": int(len(k)),
-        "selection_reason": "大阳线实顶优先" if big_bull_valid else "零切实体共振最多",
-        "top_candidates": sorted(valid, key=lambda x: (int(x.get("resonance_count", 0)), sf(x.get("weighted_resonance_score"))), reverse=True)[:10],
-    })
-    return chosen
+        )
+
+    return sorted([max(g, key=key) for g in groups], key=lambda z: sf(z["line"]))
 
 
-def choose_core_line(df: pd.DataFrame) -> Dict[str, Any]:
-    attempts: List[Dict[str, Any]] = []
-    for spec in PERIOD_SPECS:
-        result = choose_period_core_line(df, spec)
-        attempts.append({k: v for k, v in result.items() if k not in {"top_candidates", "touch_rows", "cut_rows"}})
-        if result.get("found"):
-            result["attempts"] = attempts
-            return result
-    return {
-        "found": False,
-        "line": None,
-        "period_name": "无核心线",
-        "reason": "年线未达4共振、季线未达8共振、月线未达10共振，或存在切实体",
-        "attempts": attempts,
-    }
+def select_near_far(lines: List[Dict[str, Any]], current_close: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    formal = [dict(x, distance_pct=abs(pct(current_close, sf(x["line"])))) for x in lines if x.get("core_grade") in {"S-Core", "A-Core"}]
+    if not formal:
+        return None, None
+
+    formal = sorted(formal, key=lambda x: sf(x["distance_pct"]))
+    near = formal[0]
+
+    rest = [x for x in formal[1:] if abs(sf(x["line"]) - sf(near["line"])) / max(sf(near["line"]), 1e-9) > TOUCH_TOL]
+    far = rest[0] if rest else None
+    return near, far
 
 
-def kline_features(row: Any, prev_close: float = 0.0, line: float = 0.0) -> Dict[str, float]:
-    open_ = sf(row.get("open"))
-    high = sf(row.get("high"))
-    low = sf(row.get("low"))
-    close = sf(row.get("close"))
-    volume = sf(row.get("volume"))
+def daily_features(row: Any, prev: Any, line: float) -> Dict[str, Any]:
+    open_ = sf(row["open"])
+    high = sf(row["high"])
+    low = sf(row["low"])
+    close = sf(row["close"])
+    volume = sf(row["volume"])
+    prev_close = sf(prev["close"])
+    prev_volume = sf(prev["volume"])
+
     rng = max(high - low, 1e-9)
     body = abs(close - open_)
     body_top = max(open_, close)
     body_bottom = min(open_, close)
-    upper = max(0.0, high - body_top)
-    pct_chg = sf(row.get("pct_chg"))
-    if pct_chg == 0 and prev_close > 0:
-        pct_chg = pct(close, prev_close)
-    entity_above = 0.0
-    if line > 0 and body > 0:
-        entity_above = max(0.0, body_top - max(line, body_bottom)) / body
+
+    upper_shadow = max(0.0, high - body_top)
+    entity_above_line = max(0.0, body_top - max(line, body_bottom)) / max(body, 1e-9)
+
     return {
-        "open": open_, "high": high, "low": low, "close": close, "volume": volume,
-        "body_top": body_top, "body_bottom": body_bottom,
-        "range": rng, "body": body,
-        "body_pct": body / max(open_, 1e-9),
-        "body_ratio": body / rng,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "prev_close": prev_close,
+        "prev_volume": prev_volume,
+        "vol_ratio_prev": volume / prev_volume if prev_volume > 0 else 0.0,
+        "gap_break": open_ >= line * 1.003 and prev_close < line,
         "close_pos": (close - low) / rng,
-        "upper_shadow_ratio": upper / rng,
-        "pct_chg": pct_chg,
-        "entity_above_line_ratio": entity_above,
-        "is_limit_like": pct_chg >= 9.6 and abs(close - high) / max(close, 1e-9) <= 0.003,
+        "body_ratio": body / rng,
+        "upper_shadow_ratio": upper_shadow / rng,
+        "entity_above_line_ratio": entity_above_line,
+        "positive": close > open_,
     }
 
 
-def daily_breakout_quality(df: pd.DataFrame, line: float) -> Dict[str, Any]:
+def classify_breakout(f: Dict[str, Any]) -> Tuple[str, int]:
+    base_ok = (
+        bool(f["positive"])
+        and sf(f["body_ratio"]) >= 0.30
+        and sf(f["close_pos"]) >= 0.65
+        and sf(f["upper_shadow_ratio"]) <= 0.35
+        and sf(f["entity_above_line_ratio"]) >= 0.35
+    )
+
+    if not base_ok:
+        return "C突破", 1
+
+    vr = sf(f["vol_ratio_prev"])
+    if bool(f["gap_break"]) and 1.8 <= vr <= 2.5:
+        return "S突破", 5
+    if 1.8 <= vr <= 2.5:
+        return "A+突破", 4
+    if bool(f["gap_break"]) and vr >= 1.45:
+        return "A突破", 3
+    if vr >= 1.45:
+        return "B突破", 2
+    return "C突破", 1
+
+
+def best_breakout(df: pd.DataFrame, line: float) -> Dict[str, Any]:
     d = normalize_hist(df)
-    if d.empty or line <= 0 or len(d) < 30:
-        return {"is_breakout": False, "reason": "数据不足"}
+    best: Dict[str, Any] = {"grade": "无突破", "score_rank": 0}
+    if d.empty or line <= 0:
+        return best
+
     start = max(1, len(d) - BREAKOUT_LOOKBACK_DAYS)
-    best: Optional[Dict[str, Any]] = None
+
     for idx in range(start, len(d)):
-        r = d.iloc[idx]
+        row = d.iloc[idx]
         prev = d.iloc[idx - 1]
         prev_close = sf(prev["close"])
-        close = sf(r["close"])
-        high = sf(r["high"])
-        open_ = sf(r["open"])
-        if close <= 0 or high <= 0 or prev_close <= 0:
-            continue
-        prev_from_below = prev_close <= line * (1.0 - BREAK_PREV_BELOW_PCT) or (prev_close <= line * 1.002 and sf(prev.get("low")) < line)
-        close_above = close >= line * (1.0 + BREAK_CLOSE_ABOVE_PCT)
-        high_above = high >= line * (1.0 + BREAK_CLOSE_ABOVE_PCT)
-        if not (prev_from_below and close_above and high_above):
+        prev_low = sf(prev["low"])
+        close = sf(row["close"])
+        high = sf(row["high"])
+
+        from_below = prev_close <= line * 1.002 and prev_low < line
+        close_above = close >= line * 1.005
+        high_above = high >= line * 1.005
+
+        if not (from_below and close_above and high_above):
             continue
 
-        f = kline_features(r, prev_close, line)
-        vol_window = d.iloc[max(0, idx - 20):idx]
-        vol_med = sf(vol_window["volume"].median()) if not vol_window.empty else 0.0
-        vol_ratio = safe_div(sf(r.get("volume")), vol_med, 0.0) if vol_med > 0 else 0.0
-        volume_ok = vol_ratio >= BREAK_MIN_VOLUME_RATIO or f["is_limit_like"]
-        hard_ok = (
-            close > open_
-            and f["pct_chg"] >= BREAK_MIN_PCT_CHG
-            and f["body_pct"] >= BREAK_MIN_BODY_PCT
-            and f["body_ratio"] >= BREAK_BODY_RATIO_MIN
-            and f["close_pos"] >= BREAK_CLOSE_POS_MIN
-            and f["upper_shadow_ratio"] <= BREAK_UPPER_SHADOW_MAX
-            and f["entity_above_line_ratio"] >= BREAK_ENTITY_ABOVE_LINE_MIN
-            and volume_ok
-        )
-        if not hard_ok:
-            continue
-        score = 50.0
-        score += min(12.0, max(0.0, f["close_pos"] - BREAK_CLOSE_POS_MIN) * 35.0)
-        score += min(12.0, f["entity_above_line_ratio"] * 12.0)
-        score += min(10.0, max(0.0, f["pct_chg"] - BREAK_MIN_PCT_CHG) * 0.9)
-        score += min(8.0, max(0.0, vol_ratio - BREAK_MIN_VOLUME_RATIO) * 4.0)
-        score -= max(0.0, f["upper_shadow_ratio"] - 0.20) * 10.0
+        f = daily_features(row, prev, line)
+        grade, rank = classify_breakout(f)
+        distance = pct(close, line)
+
+        if distance > 10:
+            note = "突破有效但离线过远，等待回踩"
+        elif distance > 6:
+            note = "突破偏高，谨慎追高"
+        else:
+            note = "突破距离可接受"
+
         obj = {
-            "is_breakout": True,
+            "grade": grade,
+            "score_rank": rank,
+            "date": ss(row["date"]),
             "idx": int(idx),
-            "date": ss(r.get("date")),
-            "line": rd(line),
             "close": rd(close),
-            "pct_chg": rd(f["pct_chg"], 3),
-            "body_ratio": rd(f["body_ratio"], 3),
-            "close_pos": rd(f["close_pos"], 3),
-            "upper_shadow_ratio": rd(f["upper_shadow_ratio"], 3),
-            "entity_above_line_ratio": rd(f["entity_above_line_ratio"], 3),
-            "volume_ratio": rd(vol_ratio, 3),
-            "score": rd(score, 3),
-            "reason": "近20日高质量日线破界",
+            "distance_pct": rd(distance),
+            "note": note,
+            "vol_ratio_prev": rd(f["vol_ratio_prev"]),
+            "gap_break": bool(f["gap_break"]),
+            "body_ratio": rd(f["body_ratio"]),
+            "close_pos": rd(f["close_pos"]),
+            "upper_shadow_ratio": rd(f["upper_shadow_ratio"]),
+            "entity_above_line_ratio": rd(f["entity_above_line_ratio"]),
         }
-        if best is None or (sf(obj.get("score")), int(obj.get("idx"))) > (sf(best.get("score")), int(best.get("idx"))):
+
+        if (int(obj["score_rank"]), -sf(obj["distance_pct"]), int(obj["idx"])) > (
+            int(best.get("score_rank", 0)), -sf(best.get("distance_pct", 999)), int(best.get("idx", 0))
+        ):
             best = obj
-    return best if best is not None else {"is_breakout": False, "reason": "近20日无高质量日线破界"}
+
+    return best
 
 
-def evaluate_acceptance(df: pd.DataFrame, bidx: int, line: float) -> Dict[str, Any]:
+def best_pullback(df: pd.DataFrame, line: float, breakout: Dict[str, Any]) -> Dict[str, Any]:
     d = normalize_hist(df)
-    if d.empty or bidx < 0 or bidx >= len(d) or line <= 0:
-        return {"status": "无接受数据", "score": 0.0, "failed": True}
-    post = d.iloc[bidx:].copy().reset_index(drop=True)
-    last_close = sf(d.iloc[-1]["close"])
-    defense = line * (1.0 - DEFENSE_BUFFER_PCT)
-    close_below_line = int((post["close"] < line * (1.0 - 0.006)).sum())
-    close_below_defense = int((post["close"] < defense).sum())
-    above_days = int((post["close"] >= line * (1.0 + BREAK_CLOSE_ABOVE_PCT)).sum())
-    min_low = sf(post["low"].min())
-    pullback_touched = min_low <= line * 1.025
-    last_above = last_close >= line * (1.0 + BREAK_CLOSE_ABOVE_PCT)
-    score = 4.0
-    if last_above:
-        score += 6.0
-    if above_days >= 2:
-        score += 4.0
-    if above_days >= 4:
-        score += 2.0
-    if pullback_touched and close_below_defense == 0:
-        score += 4.0
-    if close_below_line == 0:
-        score += 3.0
-    if close_below_defense > 0:
-        score -= 8.0
-    if not last_above:
-        score -= 6.0
-    if close_below_defense > 0:
-        status = "跌破交易防守，接受失败"
-        failed = True
-    elif not last_above:
-        status = "突破后未站稳"
-        failed = True
-    elif pullback_touched and close_below_line <= 1:
-        status = "突破后回踩/贴线接受"
-        failed = False
-    else:
-        status = "突破后悬空接受"
-        failed = False
+    best: Dict[str, Any] = {"grade": "无回踩", "score_rank": 0}
+
+    if d.empty or line <= 0 or breakout.get("idx") is None:
+        return best
+
+    bidx = int(breakout["idx"])
+    if bidx < 0 or bidx >= len(d):
+        return best
+
+    breakout_volume = sf(d.iloc[bidx]["volume"])
+    end = min(len(d), bidx + 1 + PULLBACK_LOOKBACK_AFTER_BREAK)
+
+    for idx in range(bidx + 1, end):
+        row = d.iloc[idx]
+        prev = d.iloc[idx - 1]
+
+        low = sf(row["low"])
+        close = sf(row["close"])
+        open_ = sf(row["open"])
+        volume = sf(row["volume"])
+        prev_close = sf(prev["close"])
+
+        if low > line * 1.03:
+            continue
+
+        close_ok = close >= line * 0.995
+        defense_ok = close >= line * 0.985
+        shrink = breakout_volume > 0 and volume <= breakout_volume * 0.75
+        pct_chg = pct(close, prev_close)
+        bad_long_bear = close < open_ and pct_chg <= -3 and breakout_volume > 0 and volume >= breakout_volume * 0.80
+
+        if not defense_ok or bad_long_bear:
+            obj = {
+                "grade": "失败",
+                "score_rank": -1,
+                "date": ss(row["date"]),
+                "note": "跌破防守或放量长阴",
+                "low": rd(low),
+                "close": rd(close),
+                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
+            }
+        elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 4:
+            obj = {
+                "grade": "S回踩",
+                "score_rank": 5,
+                "date": ss(row["date"]),
+                "note": "强突破后的缩量回踩不破",
+                "low": rd(low),
+                "close": rd(close),
+                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
+            }
+        elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 2:
+            obj = {
+                "grade": "A回踩",
+                "score_rank": 4,
+                "date": ss(row["date"]),
+                "note": "有效突破后的缩量回踩不破",
+                "low": rd(low),
+                "close": rd(close),
+                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
+            }
+        elif close_ok:
+            obj = {
+                "grade": "B观察",
+                "score_rank": 2,
+                "date": ss(row["date"]),
+                "note": "回踩不破但量能或前置突破不足",
+                "low": rd(low),
+                "close": rd(close),
+                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
+            }
+        else:
+            obj = {
+                "grade": "弱回踩",
+                "score_rank": 1,
+                "date": ss(row["date"]),
+                "note": "触线但收盘偏弱",
+                "low": rd(low),
+                "close": rd(close),
+                "volume_vs_breakout": rd(volume / breakout_volume) if breakout_volume > 0 else 0.0,
+            }
+
+        if int(obj["score_rank"]) > int(best.get("score_rank", 0)):
+            best = obj
+
+    return best
+
+
+def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not x:
+        return {
+            f"{prefix}核心线": None,
+            f"{prefix}等级": "无",
+            f"{prefix}周期": "",
+            f"{prefix}共振次数": 0,
+            f"{prefix}放量实顶数": 0,
+            f"{prefix}倍量实顶数": 0,
+            f"{prefix}切实体数": 0,
+            f"{prefix}外部影线高点共振": 0,
+            f"{prefix}锚点": "",
+            f"{prefix}样本": "",
+            f"{prefix}距离%": None,
+        }
+
     return {
-        "status": status,
-        "score": rd(max(0.0, min(20.0, score)), 3),
-        "failed": failed,
-        "above_days": above_days,
-        "close_below_line_count": close_below_line,
-        "close_below_defense_count": close_below_defense,
-        "pullback_touched": bool(pullback_touched),
-        "min_post_low": rd(min_low),
+        f"{prefix}核心线": rd(x["line"]),
+        f"{prefix}等级": ss(x["core_grade"]),
+        f"{prefix}周期": ss(x["period_label"]),
+        f"{prefix}共振次数": int(x["touch_count"]),
+        f"{prefix}放量实顶数": int(x["volume_bodytop_count"]),
+        f"{prefix}倍量实顶数": int(x["double_bodytop_count"]),
+        f"{prefix}切实体数": int(x["cut_count"]),
+        f"{prefix}外部影线高点共振": int(x["external_high_shadow_count"]),
+        f"{prefix}锚点": ss(x["anchor_period"]),
+        f"{prefix}样本": ss(x["sample_periods"]),
+        f"{prefix}距离%": rd(x.get("distance_pct")),
     }
 
 
-def amount20(df: pd.DataFrame) -> float:
-    d = normalize_hist(df)
-    if d.empty:
-        return 0.0
-    w = d.tail(20)
-    if "amount" in w.columns and float(w["amount"].sum()) > 0:
-        return sf(w["amount"].mean())
-    return 0.0
+def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullback: Dict[str, Any]) -> str:
+    if not near:
+        return "无正式核心线"
+    near_grade = ss(near.get("core_grade"))
+    if near_grade in {"S-Core", "A-Core"} and pullback.get("grade") in {"S回踩", "A回踩"}:
+        if near_grade == "S-Core" and pullback.get("grade") == "S回踩":
+            return "S"
+        return "A"
+    if breakout.get("grade") in {"S突破", "A+突破", "A突破"}:
+        return "B｜突破有效，等回踩"
+    return "C｜核心线成立，等触发"
 
 
-def build_core_line_row(code: str, name: str, df: pd.DataFrame) -> Dict[str, Any]:
-    d = normalize_hist(df)
-    core = choose_core_line(d)
-    if not core.get("found"):
-        return {
-            "股票代码": code,
-            "股票中文名称": name,
-            "是否有核心线": False,
-            "核心线价格": None,
-            "核心线周期": "无",
-            "核心线来源": core.get("reason", "未识别"),
-            "核心线共振次数": 0,
-            "核心线切实体次数": None,
-            "是否近20日破界": False,
-            "破界日期": "",
-            "破界得分": 0.0,
-            "当前收盘": rd(d.iloc[-1]["close"]) if not d.empty else None,
-            "距核心线%": None,
-            "核心线详情": core,
-        }
+def analyze_one(code: str) -> Dict[str, Any]:
+    path = find_cache_file(code)
+    if not path:
+        return {"股票代码": code, "状态": "未找到缓存"}
 
-    line = sf(core.get("line"))
-    br = daily_breakout_quality(d, line)
-    last_close = sf(d.iloc[-1]["close"]) if not d.empty else 0.0
-    defense = line * (1.0 - DEFENSE_BUFFER_PCT) if line > 0 else 0.0
-    risk_pct = pct(last_close, defense) if defense > 0 else 999.0
-    distance_pct = pct(last_close, line) if line > 0 else 999.0
-    accept = evaluate_acceptance(d, int(br.get("idx", -1)), line) if br.get("is_breakout") else {"status": "未破界", "score": 0.0, "failed": True}
-    amt20 = amount20(d)
-    hot20 = pct(last_close, sf(d.iloc[-21]["close"])) if len(d) >= 21 and sf(d.iloc[-21]["close"]) > 0 else 0.0
-    risk_flags: List[str] = []
-    if any(k and k in name for k in HARD_RISK_NAME_KEYWORDS):
-        risk_flags.append("名称命中ST/退市类硬风险")
-    if amt20 > 0 and amt20 < MIN_AMOUNT20:
-        risk_flags.append(f"20日成交额偏低{rd(amt20 / 100000000, 2)}亿")
-    elif amt20 <= 0:
-        risk_flags.append("成交额字段缺失")
-    if hot20 >= HOT_20D_PCT:
-        risk_flags.append(f"近20日涨幅{rd(hot20, 2)}%，短线过热")
-    if risk_pct > MAX_RISK_PCT:
-        risk_flags.append(f"防守距离{rd(risk_pct, 2)}%，偏大")
-    if distance_pct > MAX_DISTANCE_LINE_PCT:
-        risk_flags.append(f"距核心线{rd(distance_pct, 2)}%，偏远")
+    df = read_cache(path)
+    if df.empty or len(df) < MIN_DAILY_ROWS:
+        return {"股票代码": code, "状态": "缓存无效", "缓存路径": str(path), "行数": len(df)}
 
-    breakout_score = sf(br.get("score")) if br.get("is_breakout") else 0.0
-    line_score = min(50.0, sf(core.get("resonance_count")) * 5.0 + sf(core.get("weighted_resonance_score")) * 1.5 + (8.0 if core.get("has_big_bull_body_top_anchor") else 0.0))
-    accept_score = sf(accept.get("score"))
-    risk_penalty = 0.0
-    if risk_flags:
-        risk_penalty += min(18.0, len(risk_flags) * 4.0)
-    total = max(0.0, min(100.0, line_score + breakout_score * 0.35 + accept_score - risk_penalty))
+    name = "长电科技" if code == "600584" else "名称待补"
+    if "name" in df.columns:
+        vals = [ss(x) for x in df["name"].tolist() if ss(x)]
+        if vals:
+            name = vals[-1]
 
-    return {
+    current_close = sf(df.iloc[-1]["close"])
+    lines = scan_core_lines(df)
+    near, far = select_near_far(lines, current_close)
+
+    breakout = best_breakout(df, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0}
+    pullback = best_pullback(df, sf(near["line"]), breakout) if near else {"grade": "无回踩", "score_rank": 0}
+
+    row: Dict[str, Any] = {
         "股票代码": code,
         "股票中文名称": name,
-        "是否有核心线": True,
-        "核心线价格": rd(line),
-        "核心线周期": core.get("period_name"),
-        "核心线来源": core.get("anchor_kind") or core.get("source"),
-        "核心线选择理由": core.get("selection_reason"),
-        "核心线锚点周期": core.get("anchor_period"),
-        "核心线锚点结束日": core.get("anchor_end"),
-        "核心线锚点开盘": core.get("anchor_open"),
-        "核心线锚点最高": core.get("anchor_high"),
-        "核心线锚点最低": core.get("anchor_low"),
-        "核心线锚点收盘": core.get("anchor_close"),
-        "核心线共振次数": core.get("resonance_count"),
-        "核心线带量共振次数": core.get("volume_resonance_count"),
-        "核心线大阳实顶共振次数": core.get("big_bull_body_top_resonance_count"),
-        "核心线切实体次数": core.get("entity_cut_count"),
-        "核心线加权共振分": core.get("weighted_resonance_score"),
-        "核心线净分": core.get("net_score"),
-        "是否近20日破界": bool(br.get("is_breakout")),
-        "破界日期": br.get("date", "") if br.get("is_breakout") else "",
-        "破界得分": rd(br.get("score")) if br.get("is_breakout") else 0.0,
-        "破界收盘": br.get("close") if br.get("is_breakout") else None,
-        "破界量比": br.get("volume_ratio") if br.get("is_breakout") else None,
-        "接受状态": accept.get("status"),
-        "接受得分": accept.get("score"),
-        "当前收盘": rd(last_close),
-        "距核心线%": rd(distance_pct, 3),
-        "交易防守位": rd(defense),
-        "防守距离%": rd(risk_pct, 3),
-        "20日涨幅%": rd(hot20, 3),
-        "20日成交额均值": rd(amt20, 2),
-        "风险提示": "；".join(risk_flags) if risk_flags else "无明显硬风险提示",
-        "综合得分": rd(total, 2),
-        "核心线详情": core,
-        "破界详情": br,
-        "接受详情": accept,
+        "最新日期": ss(df.iloc[-1]["date"]),
+        "当前收盘": rd(current_close),
+        "状态": "完成",
+        "缓存路径": str(path),
+        "正式核心线数量": len(lines),
+        "突破等级": breakout.get("grade"),
+        "突破日期": breakout.get("date", ""),
+        "突破说明": breakout.get("note", ""),
+        "回踩等级": pullback.get("grade"),
+        "回踩日期": pullback.get("date", ""),
+        "回踩说明": pullback.get("note", ""),
+        "最终等级": final_grade(near, breakout, pullback),
+        "近端详情": near or {},
+        "远端详情": far or {},
+        "突破详情": breakout,
+        "回踩详情": pullback,
     }
-
-
-def _screen_one(args: Tuple[str, str, pd.DataFrame]) -> Dict[str, Any]:
-    code, name, df = args
-    try:
-        return build_core_line_row(code, name, df)
-    except Exception as exc:
-        return {
-            "股票代码": code,
-            "股票中文名称": name,
-            "是否有核心线": False,
-            "核心线价格": None,
-            "核心线周期": "错误",
-            "核心线来源": ss(exc)[:180],
-            "是否近20日破界": False,
-            "综合得分": 0.0,
-        }
-
-
-def screen_all(hist: Dict[str, pd.DataFrame], names: Dict[str, str]) -> List[Dict[str, Any]]:
-    items: List[Tuple[str, str, pd.DataFrame]] = []
-    for code, df in hist.items():
-        name = names.get(code, "")
-        if not name and "name" in df.columns:
-            vals = [ss(x) for x in df["name"].tolist() if valid_stock_display_name(code, x)]
-            name = vals[-1] if vals else "名称待补"
-        items.append((code, name or "名称待补", df))
-
-    rows: List[Dict[str, Any]] = []
-    log(f"开始扫描核心线：stocks={len(items)} parallel={PARALLEL} workers={WORKERS if PARALLEL else 1}")
-    start = time.time()
-    if PARALLEL and len(items) > 50 and WORKERS > 1:
-        with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-            futs = [ex.submit(_screen_one, item) for item in items]
-            for i, fut in enumerate(as_completed(futs), 1):
-                rows.append(fut.result())
-                if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(futs):
-                    speed = i / max(time.time() - start, 1e-9)
-                    hit = sum(1 for r in rows if r.get("是否有核心线"))
-                    brk = sum(1 for r in rows if r.get("是否近20日破界"))
-                    log(f"扫描进度 {i}/{len(futs)}｜核心线{hit}｜破界{brk}｜速度{speed:.2f}只/秒")
-    else:
-        for i, item in enumerate(items, 1):
-            rows.append(_screen_one(item))
-            if i == 1 or i % SCREEN_PROGRESS_EVERY == 0 or i == len(items):
-                speed = i / max(time.time() - start, 1e-9)
-                hit = sum(1 for r in rows if r.get("是否有核心线"))
-                brk = sum(1 for r in rows if r.get("是否近20日破界"))
-                log(f"扫描进度 {i}/{len(items)}｜核心线{hit}｜破界{brk}｜速度{speed:.2f}只/秒｜当前{item[0]}")
-    return rows
+    row.update(pack_core("近端", near))
+    row.update(pack_core("远端", far))
+    return row
 
 
 def json_safe(obj: Any) -> Any:
     if isinstance(obj, dict):
-        return {ss(k): json_safe(v) for k, v in obj.items()}
+        return {str(k): json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [json_safe(x) for x in obj]
-    if isinstance(obj, set):
-        return sorted(list(obj))
+        return [json_safe(v) for v in obj]
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -989,123 +844,117 @@ def json_safe(obj: Any) -> Any:
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     try:
-        if not isinstance(obj, (str, dict, list, tuple, set)) and pd.isna(obj):
+        if pd.isna(obj) and not isinstance(obj, (str, dict, list, tuple)):
             return None
     except Exception:
         pass
     return obj
 
 
-def flat_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in row.items() if not isinstance(v, (dict, list, set))}
-
-
-def build_report(rows: List[Dict[str, Any]], stat: Dict[str, Any]) -> str:
-    core_rows = [r for r in rows if r.get("是否有核心线")]
-    break_rows = [r for r in core_rows if r.get("是否近20日破界")]
-    break_rows.sort(key=lambda r: (sf(r.get("综合得分")), sf(r.get("核心线共振次数")), -abs(sf(r.get("距核心线%")))), reverse=True)
-    top = break_rows[:TOP_LIMIT]
-
-    year_count = sum(1 for r in core_rows if r.get("核心线周期") == "年线")
-    quarter_count = sum(1 for r in core_rows if r.get("核心线周期") == "季线")
-    month_count = sum(1 for r in core_rows if r.get("核心线周期") == "月线")
-
+def build_report(rows: List[Dict[str, Any]]) -> str:
     lines = [
-        f"破界核心线报告｜{TARGET_DASH or TARGET}",
-        f"缓存{stat.get('cache_files', 0)}｜命中{stat.get('cache_hit', 0)}｜有核心线{len(core_rows)}｜年线{year_count}｜季线{quarter_count}｜月线{month_count}｜近20日破界{len(break_rows)}",
-        "口径：先年线>=4零切实体；年线没有再季线>=8零切实体；季线没有再月线>=10零切实体；月线没有则无核心线。已删除500日触发线口径。",
+        f"破界单票验证｜{TARGET_DASH or TARGET}",
+        f"BOOT={BOOT}",
+        f"RUN_MODE={RUN_MODE}",
+        f"目标股票={','.join(TARGET_CODES)}",
+        "逻辑：实体顶候选 → 外部影线/高点主共振簇 → 主簇内最高有效实顶 → 零切实体 → S/A-Core。",
         "",
     ]
-    if not top:
-        lines.append("今日无近20日高质量破界候选。核心线全市场明细见CSV/JSON。")
-        return "\n".join(lines)
 
-    lines.append("【近20日破界Top】")
-    for i, r in enumerate(top, 1):
+    for r in rows:
         lines.extend([
-            f"{i}. {r.get('股票代码')} {r.get('股票中文名称')}｜核心线:{r.get('核心线价格')}｜{r.get('核心线周期')}｜来源:{r.get('核心线来源')}｜共振:{r.get('核心线共振次数')}｜切实体:{r.get('核心线切实体次数')}",
-            f"突破:{r.get('破界日期')}｜收:{r.get('当前收盘')}｜距线:{r.get('距核心线%')}%｜防守:{r.get('交易防守位')}｜风险:{r.get('风险提示')}",
-            f"确认:{r.get('接受状态')}｜综合得分:{r.get('综合得分')}",
+            f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}",
+            f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜共振{r.get('近端共振次数')}｜放量实顶{r.get('近端放量实顶数')}｜倍量实顶{r.get('近端倍量实顶数')}｜外部影线高点{r.get('近端外部影线高点共振')}｜切实体{r.get('近端切实体数')}｜距现价{r.get('近端距离%')}%",
+            f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜共振{r.get('远端共振次数')}｜放量实顶{r.get('远端放量实顶数')}｜倍量实顶{r.get('远端倍量实顶数')}｜外部影线高点{r.get('远端外部影线高点共振')}｜切实体{r.get('远端切实体数')}｜距现价{r.get('远端距离%')}%",
+            f"近端定线：锚点{r.get('近端锚点')}｜样本{r.get('近端样本')}",
+            f"远端定线：锚点{r.get('远端锚点')}｜样本{r.get('远端样本')}",
+            f"突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}",
+            f"回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
+            "",
         ])
-    lines.append("完整明细见 artifact：核心线全市场明细.csv / 核心线破界候选.csv / 核心线数据.json。")
-    report = "\n".join(lines)
-    if len(report) > 3900:
-        report = report[:3850].rstrip() + "\n……\n报告过长，Telegram已压缩；完整明细见CSV/JSON。"
-    return report
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3850].rstrip() + "\n……\n报告过长，完整明细见 artifact。"
+    return text
 
 
-def write_outputs(rows: List[Dict[str, Any]], md: str, stat: Dict[str, Any], self_check: Dict[str, Any]) -> None:
+def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_MD.write_text(md, encoding="utf-8")
-    all_flat = [flat_row(r) for r in rows]
-    hit_flat = [flat_row(r) for r in rows if r.get("是否近20日破界")]
-    pd.DataFrame(all_flat).to_csv(OUTPUT_ALL_CSV, index=False, encoding="utf-8-sig")
-    pd.DataFrame(hit_flat).to_csv(OUTPUT_HIT_CSV, index=False, encoding="utf-8-sig")
+    OUTPUT_MD.write_text(report_text, encoding="utf-8")
+
+    flat_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        flat_rows.append({k: v for k, v in r.items() if not isinstance(v, (dict, list))})
+    pd.DataFrame(flat_rows).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
     payload = {
-        "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+        "boot": BOOT,
+        "run_mode": RUN_MODE,
         "target": TARGET,
         "target_dash": TARGET_DASH,
-        "boot": BOOT,
-        "rules": {
-            "year": f">={YEAR_MIN_RESONANCE} resonance and zero entity cut",
-            "quarter": f">={QUARTER_MIN_RESONANCE} resonance and zero entity cut",
-            "month": f">={MONTH_MIN_RESONANCE} resonance and zero entity cut",
-            "removed": "500日触发线口径已删除",
+        "target_codes": TARGET_CODES,
+        "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+        "config": {
+            "touch_tol": TOUCH_TOL,
+            "edge_tol": EDGE_TOL,
+            "period_rules": PERIOD_RULES,
+            "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
+            "pullback_lookback_after_break": PULLBACK_LOOKBACK_AFTER_BREAK,
         },
-        "stat": stat,
-        "self_check": self_check,
         "rows": rows,
     }
     OUTPUT_JSON.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-    SELF_CHECK_JSON.write_text(json.dumps(json_safe(self_check), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    self_check = {
+        "status": "PASS",
+        "boot": BOOT,
+        "run_mode": RUN_MODE,
+        "target": TARGET,
+        "target_codes": TARGET_CODES,
+        "single_stock_only": True,
+        "full_market_scan": False,
+        "cache_dirs": [str(x) for x in CACHE_DIRS],
+    }
+    SELF_CHECK_JSON.write_text(json.dumps(self_check, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def send_report(md: str) -> None:
+def send_telegram(text: str) -> None:
     if not ENABLE_TELEGRAM or not BOT or not CHAT or requests is None:
         log(f"Telegram跳过 enable={ENABLE_TELEGRAM} token={bool(BOT)} chat={bool(CHAT)} requests={requests is not None}")
-        print(md[:2400], flush=True)
+        print(text, flush=True)
         return
-    url = f"https://api.telegram.org/bot{BOT}/sendMessage"
-    chunks = [md[i:i + 3600] for i in range(0, len(md), 3600)] or [md]
-    for idx, part in enumerate(chunks, 1):
-        try:
-            resp = requests.post(url, json={"chat_id": CHAT, "text": part, "disable_web_page_preview": True}, timeout=30)
-            log(f"Telegram chunk {idx} status={getattr(resp, 'status_code', 'NA')} body={getattr(resp, 'text', '')[:120]}")
-        except Exception as exc:
-            log(f"Telegram发送失败 chunk={idx} err={exc}")
-        time.sleep(0.35)
 
-
-def run_self_check() -> Dict[str, Any]:
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    files = iter_cache_files()
-    result = {
-        "status": "PASS" if files else "WARN",
-        "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
-        "target": TARGET,
-        "target_dash": TARGET_DASH,
-        "boot": BOOT,
-        "cache_dirs": [str(x) for x in CACHE_DIRS],
-        "existing_cache_dirs": [str(x) for x in CACHE_DIRS if x.exists()],
-        "cache_files": len(files),
-        "telegram": {"enabled": ENABLE_TELEGRAM, "token_present": bool(BOT), "chat_present": bool(CHAT), "requests": requests is not None},
-    }
-    SELF_CHECK_JSON.write_text(json.dumps(json_safe(result), ensure_ascii=False, indent=2), encoding="utf-8")
-    return result
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT}/sendMessage",
+            json={"chat_id": CHAT, "text": text, "disable_web_page_preview": True},
+            timeout=30,
+        )
+        log(f"Telegram status={getattr(resp, 'status_code', 'NA')} body={getattr(resp, 'text', '')[:160]}")
+    except Exception as exc:
+        log(f"Telegram发送失败：{exc}")
 
 
 def main() -> None:
     print(BOOT, flush=True)
+    print(f"RUN_MODE={RUN_MODE}", flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
+    print("target_codes=" + ",".join(TARGET_CODES), flush=True)
     print("cache_dirs=" + " | ".join(str(x) for x in CACHE_DIRS), flush=True)
-    self_check = run_self_check()
-    hist, names, stat = load_cache()
-    rows = screen_all(hist, names) if hist else []
-    md = build_report(rows, stat)
-    write_outputs(rows, md, stat, self_check)
-    send_report(md)
-    log(f"done md={OUTPUT_MD} all_csv={OUTPUT_ALL_CSV} hit_csv={OUTPUT_HIT_CSV} json={OUTPUT_JSON}")
+
+    rows: List[Dict[str, Any]] = []
+    for code in TARGET_CODES:
+        log(f"开始单票分析 {code}")
+        row = analyze_one(code)
+        rows.append(row)
+        log(f"完成 {code}｜近端={row.get('近端核心线')}｜远端={row.get('远端核心线')}｜等级={row.get('最终等级')}")
+
+    report_text = build_report(rows)
+    write_outputs(rows, report_text)
+    send_telegram(report_text)
+    log(f"done report={OUTPUT_MD} csv={OUTPUT_CSV} json={OUTPUT_JSON}")
 
 
 if __name__ == "__main__":
