@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-破界.py｜三号员工｜600584 单票验证版 V10.1
+破界.py｜破界｜全市场直接年季月K版 V11
 
 核心修正：
 1）不再用本地缓存日线聚合年/季/月；
@@ -10,7 +10,7 @@ from __future__ import annotations
 3）直接拉东方财富前复权/后复权/不复权的日线、月线、季线、年线 K；
 4）年线/季线/月线全部使用交易端直接多周期 K，不再捏合；
 5）核心线逻辑仍然是：实体顶候选 + 离散反应点 + 外部影线有效反应 + K线粘合代表性；
-6）默认只跑 600584，不扫全市场。
+6）默认全市场扫描；设置 POJIE_TARGET_CODES 时进入单票/多票验证模式。
 
 说明：
 BaoStock 常用接口稳定支持 d/w/m，不稳定直接支持 q/y。
@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -37,8 +38,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_SINGLE_600584_DIRECT_YQM_EASTMONEY_V10_1_20260628"
-RUN_MODE = "single_stock_only; direct_yqm_kline_source; no_full_market_scan"
+BOOT = "POJIE_FULLMARKET_DIRECT_YQM_EASTMONEY_V11_20260628"
+RUN_MODE = "full_market_default; direct_yqm_kline_source; target_codes_optional"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -46,6 +47,8 @@ REPORT_DIR = ROOT / "破界报告"
 OUTPUT_MD = REPORT_DIR / "核心线突破海选报告.md"
 OUTPUT_CSV = REPORT_DIR / "核心线突破海选明细.csv"
 OUTPUT_JSON = REPORT_DIR / "核心线突破海选数据.json"
+OUTPUT_CORE_MAP = REPORT_DIR / "core_line_map.csv"
+OUTPUT_EVENTS = REPORT_DIR / "breakout_events.csv"
 SELF_CHECK_JSON = REPORT_DIR / "破界自检.json"
 
 CACHE_DIRS = [
@@ -72,15 +75,28 @@ SEND_TELEGRAM = (os.getenv("POJIE_SEND_TELEGRAM") or os.getenv("ENABLE_TELEGRAM"
     "1", "true", "True", "yes", "YES", "发送"
 }
 
+TARGET_CODES_RAW = os.getenv("POJIE_TARGET_CODES", "").strip()
 TARGET_CODES = [
-    x for x in re.split(r"[,，\s]+", os.getenv("POJIE_TARGET_CODES", "600584"))
+    x for x in re.split(r"[,，\s]+", TARGET_CODES_RAW)
     if re.fullmatch(r"\d{6}", x)
-] or ["600584"]
+]
+RUN_FULL_MARKET = len(TARGET_CODES) == 0
 
 EASTMONEY_START = os.getenv("POJIE_EASTMONEY_START", "19900101")
 ADJUST_FLAG_ENV = os.getenv("POJIE_ADJUST_FLAG", os.getenv("POJIE_FQT", "1")).strip()
 # Eastmoney fqt: 1=前复权, 2=后复权, 0=不复权。
 ADJUST_FLAG_NAMES = {"1": "前复权", "2": "后复权", "0": "不复权"}
+
+EASTMONEY_CACHE_DIR = ROOT / "kline_cache" / "eastmoney_direct"
+UNIVERSE_CACHE = EASTMONEY_CACHE_DIR / "universe_a_share.csv"
+EASTMONEY_UNIVERSE_FS = os.getenv(
+    "POJIE_EASTMONEY_FS",
+    "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80"
+)
+MAX_STOCKS = int(os.getenv("POJIE_MAX_STOCKS", "0"))
+WORKERS = max(1, int(os.getenv("POJIE_WORKERS", "6")))
+EVENT_LOOKBACK_DAYS = int(os.getenv("POJIE_EVENT_LOOKBACK_DAYS", "20"))
+TOP_PUSH_LIMIT = int(os.getenv("POJIE_TOP_PUSH_LIMIT", "20"))
 
 POINT_TOL = float(os.getenv("POJIE_POINT_TOL", "0.005"))
 BODY_EDGE_TOL = float(os.getenv("POJIE_BODY_EDGE_TOL", "0.005"))
@@ -97,7 +113,7 @@ PULLBACK_LOOKBACK_AFTER_BREAK = int(os.getenv("POJIE_PULLBACK_LOOKBACK_AFTER_BRE
 
 
 def log(msg: str) -> None:
-    print(f"[破界V10.1][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V11][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -276,9 +292,42 @@ def eastmoney_klt(period: str) -> int:
     return {"D": 101, "M": 103, "Q": 104, "Y": 106}[period]
 
 
-def fetch_eastmoney_kline(code: str, period: str, fqt: str, begin: str, end: str) -> pd.DataFrame:
+def eastmoney_cache_path(code: str, period: str, fqt: str) -> Path:
+    return EASTMONEY_CACHE_DIR / f"fqt_{fqt}" / period / f"{code}.csv"
+
+
+def cache_is_fresh(df: pd.DataFrame, period: str) -> bool:
+    d = normalize_hist(df)
+    if d.empty or not TARGET_DASH:
+        return False
+    latest = pd.to_datetime(d["date"], errors="coerce").max()
+    if pd.isna(latest):
+        return False
+
+    target = pd.Timestamp(TARGET_DASH)
+    if period == "D":
+        return latest.date() >= target.date()
+    if period == "M":
+        return latest.to_period("M") >= target.to_period("M")
+    if period == "Q":
+        return latest.to_period("Q") >= target.to_period("Q")
+    if period == "Y":
+        return latest.to_period("Y") >= target.to_period("Y")
+    return False
+
+
+def fetch_eastmoney_kline(code: str, period: str, fqt: str, begin: str, end: str, use_cache: bool = True) -> pd.DataFrame:
     if requests is None:
         raise RuntimeError("requests 不可用，无法拉取东方财富K线")
+
+    cache_path = eastmoney_cache_path(code, period, fqt)
+    if use_cache and cache_path.exists():
+        try:
+            cached = normalize_hist(pd.read_csv(cache_path))
+            if cache_is_fresh(cached, period):
+                return cached
+        except Exception:
+            pass
 
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
@@ -321,6 +370,14 @@ def fetch_eastmoney_kline(code: str, period: str, fqt: str, begin: str, end: str
     d = normalize_hist(pd.DataFrame(rows))
     if d.empty:
         raise RuntimeError(f"东方财富K线为空 code={code} period={period} fqt={fqt}")
+
+    if use_cache:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            d.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
+
     return d
 
 
@@ -338,7 +395,7 @@ def choose_adjust_flag(code: str, reference_close: float) -> Tuple[str, Dict[str
     candidates: List[Dict[str, Any]] = []
     for flag in ["1", "2", "0"]:
         try:
-            d = fetch_eastmoney_kline(code, "D", flag, begin, end)
+            d = fetch_eastmoney_kline(code, "D", flag, begin, end, use_cache=False)
             latest = sf(d.iloc[-1]["close"]) if not d.empty else 0.0
             candidates.append({
                 "flag": flag,
@@ -415,6 +472,99 @@ def fetch_all_direct_bars(code: str, fqt: str) -> Tuple[pd.DataFrame, Dict[str, 
     monthly = prepare_direct_period_bars(fetch_eastmoney_kline(code, "M", fqt, begin, end), "M")
 
     return daily, {"Y": yearly, "Q": quarterly, "M": monthly}
+
+
+def fetch_eastmoney_universe() -> pd.DataFrame:
+    if requests is None:
+        raise RuntimeError("requests 不可用，无法拉取东方财富股票池")
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    all_rows: List[Dict[str, Any]] = []
+    page = 1
+
+    while True:
+        params = {
+            "pn": page,
+            "pz": 5000,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": EASTMONEY_UNIVERSE_FS,
+            "fields": "f12,f14,f2,f3,f4,f5,f6,f8,f20",
+        }
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        obj = resp.json()
+        diff = ((obj.get("data") or {}).get("diff") or [])
+        if not diff:
+            break
+
+        for x in diff:
+            code = code_of(x.get("f12"))
+            name = ss(x.get("f14"))
+            if not re.fullmatch(r"\d{6}", code):
+                continue
+            if not code.startswith(("0", "3", "6")):
+                continue
+            if any(bad in name for bad in ["退市", "退"]):
+                continue
+            all_rows.append({
+                "code": code,
+                "name": name,
+                "last_price": sf(x.get("f2")),
+                "pct_chg": sf(x.get("f3")),
+                "volume": sf(x.get("f5")),
+                "amount": sf(x.get("f6")),
+                "turnover": sf(x.get("f8")),
+                "mkt_cap": sf(x.get("f20")),
+            })
+
+        if len(diff) < 5000:
+            break
+        page += 1
+
+    df = pd.DataFrame(all_rows).drop_duplicates("code").sort_values("code").reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError("东方财富股票池为空")
+
+    try:
+        UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(UNIVERSE_CACHE, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+    return df
+
+
+def load_stock_universe() -> pd.DataFrame:
+    try:
+        return fetch_eastmoney_universe()
+    except Exception as exc:
+        log(f"股票池在线拉取失败，尝试缓存：{exc}")
+        if UNIVERSE_CACHE.exists():
+            try:
+                df = pd.read_csv(UNIVERSE_CACHE)
+                if not df.empty and "code" in df.columns:
+                    df["code"] = df["code"].map(lambda x: str(x).zfill(6)[-6:])
+                    return df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
+            except Exception:
+                pass
+        raise
+
+
+def resolve_run_universe() -> Tuple[List[str], Dict[str, str]]:
+    if TARGET_CODES:
+        return TARGET_CODES, {c: ("长电科技" if c == "600584" else "") for c in TARGET_CODES}
+
+    universe = load_stock_universe()
+    if MAX_STOCKS > 0:
+        universe = universe.head(MAX_STOCKS).copy()
+
+    codes = [code_of(x) for x in universe["code"].tolist() if code_of(x)]
+    names = {code_of(r["code"]): ss(r.get("name", "")) for _, r in universe.iterrows()}
+    return codes, names
 
 
 def min_seed_discrete_count(min_effective_unique: int) -> int:
@@ -960,18 +1110,82 @@ def best_pullback(daily: pd.DataFrame, line: float, breakout: Dict[str, Any]) ->
         shrink = bvol > 0 and vol <= bvol * 0.75
         bad = close < open_ and pct(close, prev_close) <= -3 and bvol > 0 and vol >= bvol * 0.80
         if not defense_ok or bad:
-            obj = {"grade": "失败", "score_rank": -1, "date": ss(row["date"]), "note": "跌破防守或放量长阴", "low": rd(low), "close": rd(close)}
+            obj = {"grade": "失败", "score_rank": -1, "date": ss(row["date"]), "idx": int(idx), "note": "跌破防守或放量长阴", "low": rd(low), "close": rd(close)}
         elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 4:
-            obj = {"grade": "S回踩", "score_rank": 5, "date": ss(row["date"]), "note": "强突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
+            obj = {"grade": "S回踩", "score_rank": 5, "date": ss(row["date"]), "idx": int(idx), "note": "强突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
         elif close_ok and shrink and int(breakout.get("score_rank", 0)) >= 2:
-            obj = {"grade": "A回踩", "score_rank": 4, "date": ss(row["date"]), "note": "有效突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
+            obj = {"grade": "A回踩", "score_rank": 4, "date": ss(row["date"]), "idx": int(idx), "note": "有效突破后的缩量回踩不破", "low": rd(low), "close": rd(close)}
         elif close_ok:
-            obj = {"grade": "B观察", "score_rank": 2, "date": ss(row["date"]), "note": "回踩不破但量能或前置突破不足", "low": rd(low), "close": rd(close)}
+            obj = {"grade": "B观察", "score_rank": 2, "date": ss(row["date"]), "idx": int(idx), "note": "回踩不破但量能或前置突破不足", "low": rd(low), "close": rd(close)}
         else:
-            obj = {"grade": "弱回踩", "score_rank": 1, "date": ss(row["date"]), "note": "触线但收盘偏弱", "low": rd(low), "close": rd(close)}
+            obj = {"grade": "弱回踩", "score_rank": 1, "date": ss(row["date"]), "idx": int(idx), "note": "触线但收盘偏弱", "low": rd(low), "close": rd(close)}
         if int(obj["score_rank"]) > int(best.get("score_rank", 0)):
             best = obj
     return best
+
+
+def is_recent_index(idx: Any, total_len: int, lookback: int = EVENT_LOOKBACK_DAYS) -> bool:
+    try:
+        return int(idx) >= max(0, int(total_len) - int(lookback))
+    except Exception:
+        return False
+
+
+def event_score(core: Dict[str, Any], breakout: Dict[str, Any], pullback: Dict[str, Any], current_close: float) -> float:
+    core_base = 40 if ss(core.get("core_grade")) == "S-Core" else 30
+    period_bonus = {"年线": 10, "季线": 6, "月线": 3}.get(ss(core.get("period_label")), 0)
+    breakout_bonus = int(breakout.get("score_rank", 0)) * 8
+    pullback_bonus = max(0, int(pullback.get("score_rank", 0))) * 6
+    distance = abs(pct(current_close, sf(core.get("line"))))
+    distance_penalty = 0.0
+    if distance > 120:
+        distance_penalty = 8
+    elif distance > 80:
+        distance_penalty = 5
+    elif distance > 50:
+        distance_penalty = 2
+    return round(core_base + period_bonus + breakout_bonus + pullback_bonus + sf(core.get("adhesion_score")) - distance_penalty, 3)
+
+
+def build_breakout_events(daily: pd.DataFrame, core_lines: List[Dict[str, Any]], current_close: float) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    n = len(daily)
+
+    for core in core_lines:
+        line = sf(core.get("line"))
+        if line <= 0:
+            continue
+
+        br = best_breakout(daily, line)
+        pb = best_pullback(daily, line, br)
+
+        recent_break = is_recent_index(br.get("idx"), n)
+        recent_pullback = is_recent_index(pb.get("idx"), n)
+
+        if int(br.get("score_rank", 0)) < 2 and int(pb.get("score_rank", 0)) < 4:
+            continue
+        if not (recent_break or recent_pullback):
+            continue
+
+        ev = {
+            "core": core,
+            "breakout": br,
+            "pullback": pb,
+            "event_score": event_score(core, br, pb, current_close),
+            "recent_breakout": bool(recent_break),
+            "recent_pullback": bool(recent_pullback),
+            "line": rd(line),
+            "core_grade": ss(core.get("core_grade")),
+            "period_label": ss(core.get("period_label")),
+            "breakout_grade": ss(br.get("grade")),
+            "breakout_date": ss(br.get("date")),
+            "pullback_grade": ss(pb.get("grade")),
+            "pullback_date": ss(pb.get("date")),
+        }
+        events.append(ev)
+
+    return sorted(events, key=lambda x: sf(x.get("event_score")), reverse=True)
+
 
 
 def pack_core(prefix: str, x: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1011,7 +1225,7 @@ def final_grade(near: Optional[Dict[str, Any]], breakout: Dict[str, Any], pullba
     return "C｜核心线成立，等触发"
 
 
-def analyze_one(code: str) -> Dict[str, Any]:
+def analyze_one(code: str, name_hint: str = "") -> Dict[str, Any]:
     ref_close, cache_path = cache_reference_close(code)
     adjust_flag, adjust_info = choose_adjust_flag(code, ref_close)
     daily, period_bars = fetch_all_direct_bars(code, adjust_flag)
@@ -1020,13 +1234,17 @@ def analyze_one(code: str) -> Dict[str, Any]:
         return {"股票代码": code, "状态": "东方财富直接K线为空", "adjust_flag": adjust_flag}
 
     current_close = sf(daily.iloc[-1]["close"])
-    name = "长电科技" if code == "600584" else "名称待补"
+    name = name_hint or ("长电科技" if code == "600584" else "")
 
     core_lines = scan_core_lines(period_bars)
     near, far = select_near_far(core_lines, current_close)
 
-    breakout = best_breakout(daily, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0}
-    pullback = best_pullback(daily, sf(near["line"]), breakout) if near else {"grade": "无回踩", "score_rank": 0}
+    events = build_breakout_events(daily, core_lines, current_close)
+    best_event = events[0] if events else None
+    event_core = best_event["core"] if best_event else near
+
+    breakout = best_event["breakout"] if best_event else (best_breakout(daily, sf(near["line"])) if near else {"grade": "无突破", "score_rank": 0})
+    pullback = best_event["pullback"] if best_event else (best_pullback(daily, sf(near["line"]), breakout) if near else {"grade": "无回踩", "score_rank": 0})
 
     row: Dict[str, Any] = {
         "股票代码": code,
@@ -1048,14 +1266,20 @@ def analyze_one(code: str) -> Dict[str, Any]:
         "回踩等级": pullback.get("grade"),
         "回踩日期": pullback.get("date", ""),
         "回踩说明": pullback.get("note", ""),
-        "最终等级": final_grade(near, breakout, pullback),
+        "最终等级": final_grade(event_core, breakout, pullback),
+        "破界事件数": len(events),
+        "最佳事件分": sf(best_event.get("event_score")) if best_event else 0.0,
         "近端详情": near or {},
         "远端详情": far or {},
+        "事件核心线详情": event_core or {},
+        "全部核心线": core_lines,
+        "全部破界事件": events,
         "突破详情": breakout,
         "回踩详情": pullback,
     }
     row.update(pack_core("近端", near))
     row.update(pack_core("远端", far))
+    row.update(pack_core("事件", event_core))
     return row
 
 
@@ -1079,8 +1303,39 @@ def json_safe(obj: Any) -> Any:
 
 
 def build_report(rows: List[Dict[str, Any]]) -> str:
+    completed = [r for r in rows if ss(r.get("状态")) == "完成"]
+    event_rows = [r for r in completed if int(r.get("破界事件数", 0)) > 0]
+    event_rows = sorted(event_rows, key=lambda r: sf(r.get("最佳事件分")), reverse=True)
+
+    if RUN_FULL_MARKET:
+        lines = [
+            f"破界全市场海选｜{TARGET_DASH or TARGET}",
+            f"BOOT={BOOT}",
+            f"RUN_MODE={RUN_MODE}",
+            "数据：东方财富直接日/月/季/年K；默认前复权；不再用本地日线或月线捏合年季月。",
+            f"扫描：{len(rows)} 只｜完成：{len(completed)} 只｜破界事件：{len(event_rows)} 只｜推送Top{TOP_PUSH_LIMIT}",
+            "",
+        ]
+
+        for i, r in enumerate(event_rows[:TOP_PUSH_LIMIT], 1):
+            lines.extend([
+                f"{i}. {r.get('股票代码')} {r.get('股票中文名称')}｜{r.get('最终等级')}｜事件分{r.get('最佳事件分')}｜收盘{r.get('当前收盘')}",
+                f"   事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜放量实顶{r.get('事件放量实顶')}｜切实体{r.get('事件切实体')}",
+                f"   定线：锚点{r.get('事件锚点')}｜主簇{r.get('事件主簇')}｜反应中心{r.get('事件反应中心')}｜粘合分{r.get('事件粘合分')}｜样本{r.get('事件样本')}｜类型{r.get('事件类型')}",
+                f"   突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}；回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
+                "",
+            ])
+
+        if not event_rows:
+            lines.append("今日未筛出最近窗口内的高质量破界事件。")
+
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3850].rstrip() + "\n……\n报告过长，完整明细见 artifact。"
+        return text
+
     lines = [
-        f"破界单票验证｜{TARGET_DASH or TARGET}",
+        f"破界单票/多票验证｜{TARGET_DASH or TARGET}",
         f"BOOT={BOOT}",
         f"RUN_MODE={RUN_MODE}",
         f"目标股票={','.join(TARGET_CODES)}",
@@ -1089,12 +1344,12 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
     ]
     for r in rows:
         lines.extend([
-            f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}",
+            f"{r.get('股票代码')} {r.get('股票中文名称')}｜收盘 {r.get('当前收盘')}｜{r.get('最终等级')}｜事件分{r.get('最佳事件分')}",
             f"数据源：{r.get('数据源')}｜年季来源：{r.get('年季来源')}｜复权：{r.get('复权口径')}({r.get('adjust_flag')})｜缓存参考收盘{r.get('cache_reference_close')}",
+            f"事件核心线：{r.get('事件核心线')}｜{r.get('事件等级')}｜{r.get('事件周期')}｜有效共振{r.get('事件有效共振')}｜离散{r.get('事件离散共振')}｜外部有效{r.get('事件外部有效')}｜外部影线{r.get('事件外部影线')}｜放量实顶{r.get('事件放量实顶')}｜倍量实顶{r.get('事件倍量实顶')}｜切实体{r.get('事件切实体')}｜距现价{r.get('事件距现价%')}%",
             f"近端核心线：{r.get('近端核心线')}｜{r.get('近端等级')}｜{r.get('近端周期')}｜有效共振{r.get('近端有效共振')}｜离散{r.get('近端离散共振')}｜外部有效{r.get('近端外部有效')}｜外部影线{r.get('近端外部影线')}｜放量实顶{r.get('近端放量实顶')}｜倍量实顶{r.get('近端倍量实顶')}｜切实体{r.get('近端切实体')}｜距现价{r.get('近端距现价%')}%",
             f"远端核心线：{r.get('远端核心线')}｜{r.get('远端等级')}｜{r.get('远端周期')}｜有效共振{r.get('远端有效共振')}｜离散{r.get('远端离散共振')}｜外部有效{r.get('远端外部有效')}｜外部影线{r.get('远端外部影线')}｜放量实顶{r.get('远端放量实顶')}｜倍量实顶{r.get('远端倍量实顶')}｜切实体{r.get('远端切实体')}｜距现价{r.get('远端距现价%')}%",
-            f"近端定线：锚点{r.get('近端锚点')}｜主簇{r.get('近端主簇')}｜反应中心{r.get('近端反应中心')}｜粘合分{r.get('近端粘合分')}｜中心偏离{r.get('近端中心偏离%')}%｜紧密误差{r.get('近端紧密误差%')}%｜样本{r.get('近端样本')}｜类型{r.get('近端类型')}",
-            f"远端定线：锚点{r.get('远端锚点')}｜主簇{r.get('远端主簇')}｜反应中心{r.get('远端反应中心')}｜粘合分{r.get('远端粘合分')}｜中心偏离{r.get('远端中心偏离%')}%｜紧密误差{r.get('远端紧密误差%')}%｜样本{r.get('远端样本')}｜类型{r.get('远端类型')}",
+            f"事件定线：锚点{r.get('事件锚点')}｜主簇{r.get('事件主簇')}｜反应中心{r.get('事件反应中心')}｜粘合分{r.get('事件粘合分')}｜中心偏离{r.get('事件中心偏离%')}%｜紧密误差{r.get('事件紧密误差%')}%｜样本{r.get('事件样本')}｜类型{r.get('事件类型')}",
             f"突破：{r.get('突破等级')}｜{r.get('突破日期')}｜{r.get('突破说明')}",
             f"回踩：{r.get('回踩等级')}｜{r.get('回踩日期')}｜{r.get('回踩说明')}",
             "",
@@ -1105,14 +1360,77 @@ def build_report(rows: List[Dict[str, Any]]) -> str:
     return text
 
 
+def flatten_core_line(row: Dict[str, Any], core: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "code": row.get("股票代码"),
+        "name": row.get("股票中文名称"),
+        "current_close": row.get("当前收盘"),
+        "line": rd(core.get("line")),
+        "core_grade": ss(core.get("core_grade")),
+        "period_label": ss(core.get("period_label")),
+        "effective_unique_count": int(core.get("effective_unique_count", 0)),
+        "primary_unique_count": int(core.get("primary_unique_count", 0)),
+        "external_effective_count": int(core.get("external_effective_count", 0)),
+        "external_shadow_count": int(core.get("external_shadow_count", 0)),
+        "volume_bodytop_count": int(core.get("volume_bodytop_count", 0)),
+        "double_bodytop_count": int(core.get("double_bodytop_count", 0)),
+        "cut_count": int(core.get("cut_count", 0)),
+        "anchor_period": ss(core.get("anchor_period")),
+        "cluster_low": rd(core.get("cluster_low")),
+        "cluster_high": rd(core.get("cluster_high")),
+        "reaction_center": rd(core.get("reaction_center")),
+        "adhesion_score": rd(core.get("adhesion_score")),
+        "center_bias_pct": rd(core.get("center_bias_pct")),
+        "compact_error_pct": rd(core.get("compact_error_pct")),
+        "sample_periods": ss(core.get("sample_periods")),
+        "sample_kinds": ss(core.get("sample_kinds")),
+    }
+
+
+def flatten_event(row: Dict[str, Any], ev: Dict[str, Any]) -> Dict[str, Any]:
+    core = ev.get("core") or {}
+    br = ev.get("breakout") or {}
+    pb = ev.get("pullback") or {}
+    out = flatten_core_line(row, core)
+    out.update({
+        "event_score": rd(ev.get("event_score")),
+        "recent_breakout": bool(ev.get("recent_breakout")),
+        "recent_pullback": bool(ev.get("recent_pullback")),
+        "breakout_grade": ss(br.get("grade")),
+        "breakout_date": ss(br.get("date")),
+        "breakout_close": rd(br.get("close")),
+        "breakout_distance_pct": rd(br.get("distance_pct")),
+        "breakout_note": ss(br.get("note")),
+        "pullback_grade": ss(pb.get("grade")),
+        "pullback_date": ss(pb.get("date")),
+        "pullback_note": ss(pb.get("note")),
+    })
+    return out
+
+
 def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_MD.write_text(report_text, encoding="utf-8")
+
     flat_rows = [{k: v for k, v in r.items() if not isinstance(v, (dict, list))} for r in rows]
     pd.DataFrame(flat_rows).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    core_rows: List[Dict[str, Any]] = []
+    event_rows: List[Dict[str, Any]] = []
+
+    for r in rows:
+        for core in r.get("全部核心线", []) or []:
+            core_rows.append(flatten_core_line(r, core))
+        for ev in r.get("全部破界事件", []) or []:
+            event_rows.append(flatten_event(r, ev))
+
+    pd.DataFrame(core_rows).to_csv(OUTPUT_CORE_MAP, index=False, encoding="utf-8-sig")
+    pd.DataFrame(event_rows).sort_values("event_score", ascending=False).to_csv(OUTPUT_EVENTS, index=False, encoding="utf-8-sig")
+
     payload = {
         "boot": BOOT,
         "run_mode": RUN_MODE,
+        "full_market": RUN_FULL_MARKET,
         "target": TARGET,
         "target_dash": TARGET_DASH,
         "target_codes": TARGET_CODES,
@@ -1124,15 +1442,26 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
             "point_tol": POINT_TOL,
             "body_edge_tol": BODY_EDGE_TOL,
             "shadow_reaction_weight": SHADOW_REACTION_WEIGHT,
+            "event_lookback_days": EVENT_LOOKBACK_DAYS,
+            "workers": WORKERS,
+            "max_stocks": MAX_STOCKS,
         },
         "rows": rows,
     }
     OUTPUT_JSON.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+
     SELF_CHECK_JSON.write_text(json.dumps({
         "status": "PASS",
         "boot": BOOT,
         "run_mode": RUN_MODE,
+        "full_market": RUN_FULL_MARKET,
         "target_codes": TARGET_CODES,
+        "outputs": {
+            "report": str(OUTPUT_MD),
+            "detail": str(OUTPUT_CSV),
+            "core_line_map": str(OUTPUT_CORE_MAP),
+            "breakout_events": str(OUTPUT_EVENTS),
+        },
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -1153,35 +1482,57 @@ def send_telegram(text: str) -> None:
         log(f"Telegram发送失败：{exc}")
 
 
+def safe_analyze(code: str, name_hint: str) -> Dict[str, Any]:
+    try:
+        return analyze_one(code, name_hint)
+    except Exception as exc:
+        return {
+            "股票代码": code,
+            "股票中文名称": name_hint,
+            "当前收盘": None,
+            "状态": f"失败：{exc}",
+            "最终等级": "失败",
+            "破界事件数": 0,
+            "最佳事件分": 0.0,
+        }
+
+
 def main() -> None:
     print(BOOT, flush=True)
     print(f"RUN_MODE={RUN_MODE}", flush=True)
     print(f"file={Path(__file__).resolve()}", flush=True)
     print(f"target={TARGET} target_dash={TARGET_DASH}", flush=True)
-    print("target_codes=" + ",".join(TARGET_CODES), flush=True)
-    print("data_source=eastmoney_direct_yqm_fixed", flush=True)
+    print(f"run_full_market={RUN_FULL_MARKET}", flush=True)
+    print("target_codes=" + (",".join(TARGET_CODES) if TARGET_CODES else "FULL_MARKET"), flush=True)
+    print("data_source=eastmoney_direct_yqm_fullmarket", flush=True)
+    print(f"workers={WORKERS} max_stocks={MAX_STOCKS} event_lookback={EVENT_LOOKBACK_DAYS}", flush=True)
+
+    codes, name_map = resolve_run_universe()
+    log(f"准备扫描：{len(codes)} 只")
 
     rows: List[Dict[str, Any]] = []
 
-    try:
-        for code in TARGET_CODES:
-            log(f"开始单票分析 {code}")
-            row = analyze_one(code)
+    if RUN_FULL_MARKET and WORKERS > 1:
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(safe_analyze, code, name_map.get(code, "")): code for code in codes}
+            done = 0
+            for fut in as_completed(futs):
+                row = fut.result()
+                rows.append(row)
+                done += 1
+                if done % 50 == 0 or done == len(codes):
+                    event_count = sum(1 for r in rows if int(r.get("破界事件数", 0)) > 0)
+                    log(f"进度 {done}/{len(codes)}｜事件 {event_count}")
+    else:
+        for idx, code in enumerate(codes, 1):
+            row = safe_analyze(code, name_map.get(code, ""))
             rows.append(row)
-            log(f"完成 {code}｜近端={row.get('近端核心线')}｜远端={row.get('远端核心线')}｜复权={row.get('复权口径')}｜等级={row.get('最终等级')}")
-    except Exception as exc:
-        rows.append({
-            "股票代码": ",".join(TARGET_CODES),
-            "股票中文名称": "",
-            "当前收盘": None,
-            "最终等级": "运行失败",
-            "状态": f"失败：{exc}",
-        })
-        log(f"运行失败：{exc}")
+            log(f"完成 {idx}/{len(codes)} {code}｜事件={row.get('破界事件数')}｜近端={row.get('近端核心线')}｜等级={row.get('最终等级')}")
+
     report_text = build_report(rows)
     write_outputs(rows, report_text)
     send_telegram(report_text)
-    log(f"done report={OUTPUT_MD} csv={OUTPUT_CSV} json={OUTPUT_JSON}")
+    log(f"done report={OUTPUT_MD} detail={OUTPUT_CSV} core_map={OUTPUT_CORE_MAP} events={OUTPUT_EVENTS}")
 
 
 if __name__ == "__main__":
