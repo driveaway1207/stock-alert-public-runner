@@ -42,6 +42,14 @@ run-name: 破界
           - "⬜ 否｜只读公共缓存"
           - "🟧 是｜允许补拉最近K线"
 
+  push:
+    branches:
+      - main
+    paths:
+      - "破界.py"
+      - ".github/workflows/破界.yml"
+      - ".github/pojie-run-trigger.txt"
+
   schedule:
     - cron: "10 12 * * 1-5"
 
@@ -218,16 +226,3 @@ jobs:
             employee3_reports/
           if-no-files-found: warn
           retention-days: 30
-
-      - name: upload cache visibility snapshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pojie-cache-visibility-snapshot
-          path: |
-            kline_cache/
-            employee5_kline_cache/
-            data/kline_cache/
-            cache/kline_cache/
-          if-no-files-found: ignore
-          retention-days: 3
