@@ -25,8 +25,8 @@ except Exception:
     requests = None
 
 
-BOOT = "POJIE_FULLMARKET_DIRECT_YEAR_CORE_EASTMONEY_V12_7_4_YEAR_ONLY_LOGIC_RECHECK_20260702"
-RUN_MODE = "full_market_default; direct_year_core_kline_source; target_codes_optional; year_core_only; fixed_universe_pagination; steady_http; resume_checkpoint; logic_clean_v9; invalid_indicator_clean; source_clean; logic_recheck; breakout_first; refined_breakout_quality; close_core_candidate; event_dedupe; today_breakout_priority; pullback_segment; chinese_trade_report; failed_retry_pass; completion_guard"
+BOOT = "POJIE_FULLMARKET_DIRECT_YEAR_CORE_EASTMONEY_V12_7_5_YEAR_ONLY_UNIVERSE_RESILIENT_20260702"
+RUN_MODE = "full_market_default; direct_year_core_kline_source; target_codes_optional; year_core_only; fixed_universe_pagination; steady_http; resume_checkpoint; logic_clean_v9; invalid_indicator_clean; source_clean; logic_recheck; breakout_first; refined_breakout_quality; close_core_candidate; event_dedupe; today_breakout_priority; pullback_segment; chinese_trade_report; failed_retry_pass; completion_guard; universe_page_retry; partial_universe_cache; cache_fallback"
 START_TS = time.time()
 
 ROOT = Path(__file__).resolve().parent
@@ -79,6 +79,10 @@ EASTMONEY_UNIVERSE_FS = os.getenv(
     "POJIE_EASTMONEY_FS",
     "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80"
 )
+UNIVERSE_PAGE_SIZE = max(50, min(500, int(os.getenv("POJIE_UNIVERSE_PAGE_SIZE", "100"))))
+UNIVERSE_MIN_PARTIAL_ROWS = max(500, int(os.getenv("POJIE_UNIVERSE_MIN_PARTIAL_ROWS", "3000")))
+UNIVERSE_MAX_FAILED_PAGES = max(1, int(os.getenv("POJIE_UNIVERSE_MAX_FAILED_PAGES", "12")))
+UNIVERSE_PARTIAL_CACHE_EVERY = max(1, int(os.getenv("POJIE_UNIVERSE_PARTIAL_CACHE_EVERY", "20")))
 MAX_STOCKS = int(os.getenv("POJIE_MAX_STOCKS", "0"))
 REQUESTED_WORKERS = max(1, int(os.getenv("POJIE_WORKERS", "6")))
 STABLE_FULLMARKET_WORKERS = max(1, int(os.getenv("POJIE_STABLE_FULLMARKET_WORKERS", "16")))
@@ -130,7 +134,7 @@ _THREAD_LOCAL = threading.local()
 
 
 def log(msg: str) -> None:
-    print(f"[破界V12.7.4][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
+    print(f"[破界V12.7.5][{time.time() - START_TS:7.1f}s] {msg}", flush=True)
 
 
 def ss(x: Any) -> str:
@@ -204,7 +208,7 @@ def resolve_target_raw() -> str:
 TARGET = re.sub(r"\D", "", resolve_target_raw())[:8]
 TARGET_DASH = f"{TARGET[:4]}-{TARGET[4:6]}-{TARGET[6:8]}" if len(TARGET) == 8 else ""
 TARGET_TS = pd.Timestamp(TARGET_DASH) if TARGET_DASH else pd.Timestamp.today()
-PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_7_4_year_only.jsonl"
+PROGRESS_JSONL = PROGRESS_DIR / f"progress_{TARGET or 'unknown'}_{ADJUST_FLAG_ENV}_{CORE_SELECTION_MODE}_v12_7_5_year_only.jsonl"
 
 
 def get_http_session() -> Any:
@@ -469,14 +473,76 @@ def fetch_event_daily(code: str, fqt: str) -> pd.DataFrame:
     return fetch_eastmoney_kline(code, "D", fqt, begin, TARGET.replace("-", ""))
 
 
+def normalize_universe_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["code", "name", "last_price", "pct_chg", "volume", "amount", "turnover", "mkt_cap"])
+    df = pd.DataFrame(rows)
+    if "code" not in df.columns:
+        return pd.DataFrame(columns=["code", "name", "last_price", "pct_chg", "volume", "amount", "turnover", "mkt_cap"])
+    df["code"] = df["code"].map(lambda x: str(x).zfill(6)[-6:])
+    if "name" not in df.columns:
+        df["name"] = ""
+    return df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
+
+
+def write_universe_cache(df: pd.DataFrame, reason: str = "") -> None:
+    if df is None or df.empty:
+        return
+    try:
+        UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(UNIVERSE_CACHE, index=False, encoding="utf-8-sig")
+        if reason:
+            log(f"股票池缓存已更新：{len(df)}只｜{reason}")
+    except Exception as exc:
+        log(f"股票池缓存写入失败：{exc}")
+
+
+def read_universe_cache() -> pd.DataFrame:
+    if not UNIVERSE_CACHE.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(UNIVERSE_CACHE)
+        if df.empty or "code" not in df.columns:
+            return pd.DataFrame()
+        df["code"] = df["code"].map(lambda x: str(x).zfill(6)[-6:])
+        if "name" not in df.columns:
+            df["name"] = ""
+        return df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
+    except Exception as exc:
+        log(f"股票池缓存读取失败：{exc}")
+        return pd.DataFrame()
+
+
+def discover_universe_from_kline_cache() -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in CACHE_DIRS + [EASTMONEY_CACHE_DIR]:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.suffix.lower() not in {".csv", ".json"}:
+                continue
+            code = code_of(path.name)
+            if not re.fullmatch(r"\d{6}", code):
+                continue
+            if not code.startswith(("0", "3", "6")):
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            rows.append({"code": code, "name": "", "last_price": 0.0, "pct_chg": 0.0, "volume": 0.0, "amount": 0.0, "turnover": 0.0, "mkt_cap": 0.0})
+    return normalize_universe_df(rows)
+
+
 def fetch_eastmoney_universe() -> pd.DataFrame:
     if requests is None:
         raise RuntimeError("requests 不可用，无法拉取东方财富股票池")
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     all_rows: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    failed_pages: List[str] = []
     page = 1
-    page_size = 100
+    page_size = UNIVERSE_PAGE_SIZE
     total = 0
     while True:
         params = {
@@ -484,7 +550,22 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
             "fs": EASTMONEY_UNIVERSE_FS,
             "fields": "f12,f14,f2,f3,f4,f5,f6,f8,f20",
         }
-        obj = http_get_json(url, params=params, timeout=max(REQUEST_TIMEOUT, 20))
+        try:
+            obj = http_get_json(url, params=params, timeout=max(REQUEST_TIMEOUT, 20))
+        except Exception as exc:
+            failed_pages.append(f"{page}:{str(exc)[:80]}")
+            log(f"股票池第{page}页拉取失败，跳过该页继续：{exc}")
+            if len(failed_pages) >= UNIVERSE_MAX_FAILED_PAGES:
+                if len(all_rows) >= UNIVERSE_MIN_PARTIAL_ROWS:
+                    log(f"股票池失败页达到上限，使用已拉取股票池：{len(all_rows)}只｜失败页={';'.join(failed_pages[:6])}")
+                    break
+                raise RuntimeError(f"股票池分页失败过多，且有效股票不足：rows={len(all_rows)} failed={';'.join(failed_pages[:6])}")
+            page += 1
+            if total > 0 and page * page_size >= total + page_size:
+                break
+            if page > 300:
+                break
+            continue
         data = obj.get("data") or {}
         diff = data.get("diff") or []
         total = int(sf(data.get("total"), total))
@@ -508,6 +589,8 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
                 "code": code, "name": name, "last_price": sf(x.get("f2")), "pct_chg": sf(x.get("f3")),
                 "volume": sf(x.get("f5")), "amount": sf(x.get("f6")), "turnover": sf(x.get("f8")), "mkt_cap": sf(x.get("f20")),
             })
+        if page % UNIVERSE_PARTIAL_CACHE_EVERY == 0 and len(all_rows) >= UNIVERSE_MIN_PARTIAL_ROWS:
+            write_universe_cache(normalize_universe_df(all_rows), reason=f"分页中间缓存 page={page}")
         if total > 0 and page * page_size >= total:
             break
         if len(diff) < page_size and total <= 0:
@@ -517,15 +600,13 @@ def fetch_eastmoney_universe() -> pd.DataFrame:
         page += 1
         if page > 300:
             break
-    df = pd.DataFrame(all_rows).drop_duplicates("code").sort_values("code").reset_index(drop=True)
+    df = normalize_universe_df(all_rows)
     if df.empty:
         raise RuntimeError("东方财富股票池为空")
-    try:
-        UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(UNIVERSE_CACHE, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
-    log(f"股票池拉取完成：{len(df)}只｜page_size={page_size}｜pages={page}｜total={total}")
+    if failed_pages and len(df) < UNIVERSE_MIN_PARTIAL_ROWS:
+        raise RuntimeError(f"股票池不完整且低于最低可用数量：rows={len(df)} failed={';'.join(failed_pages[:6])}")
+    write_universe_cache(df, reason="在线股票池完成" + (f"｜跳过失败页{len(failed_pages)}个" if failed_pages else ""))
+    log(f"股票池拉取完成：{len(df)}只｜page_size={page_size}｜pages={page}｜total={total}｜failed_pages={len(failed_pages)}")
     return df
 
 
@@ -534,16 +615,15 @@ def load_stock_universe() -> pd.DataFrame:
         return fetch_eastmoney_universe()
     except Exception as exc:
         log(f"股票池在线拉取失败，尝试缓存：{exc}")
-        if UNIVERSE_CACHE.exists():
-            try:
-                df = pd.read_csv(UNIVERSE_CACHE)
-                if not df.empty and "code" in df.columns:
-                    df["code"] = df["code"].map(lambda x: str(x).zfill(6)[-6:])
-                    return df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
-            except Exception:
-                pass
+        cached = read_universe_cache()
+        if not cached.empty:
+            log(f"使用股票池缓存：{len(cached)}只")
+            return cached
+        discovered = discover_universe_from_kline_cache()
+        if not discovered.empty:
+            log(f"使用K线缓存目录反推股票池：{len(discovered)}只")
+            return discovered
         raise
-
 
 def resolve_run_universe() -> Tuple[List[str], Dict[str, str]]:
     if TARGET_CODES:
@@ -1641,7 +1721,7 @@ def write_outputs(rows: List[Dict[str, Any]], report_text: str) -> None:
         event_df["_type_priority"] = event_df["event_type"].map(type_priority).fillna(0).astype(int)
         event_df = event_df.sort_values(["_type_priority", "event_score"], ascending=[False, False]).drop(columns=["_type_priority"])
     event_df.to_csv(OUTPUT_EVENTS, index=False, encoding="utf-8-sig")
-    payload = {"boot": BOOT, "run_mode": RUN_MODE, "full_market": RUN_FULL_MARKET, "target": TARGET, "target_dash": TARGET_DASH, "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"), "completion": {"total": len(rows), "completed": sum(1 for r in rows if ss(r.get("状态")) == "完成"), "completion_rate": sum(1 for r in rows if ss(r.get("状态")) == "完成") / len(rows) if rows else 0.0, "failure_summary": failure_summary(rows)}, "config": {"source": "eastmoney_direct_kline", "klt": {"D": 101, "Y": 106}, "adjust_flag_env": ADJUST_FLAG_ENV, "point_tol": POINT_TOL, "body_edge_tol": BODY_EDGE_TOL, "shadow_reaction_weight": SHADOW_REACTION_WEIGHT, "event_lookback_days": EVENT_LOOKBACK_DAYS, "workers": WORKERS, "request_timeout": REQUEST_TIMEOUT, "request_retries": REQUEST_RETRIES, "max_stocks": MAX_STOCKS, "core_selection_mode": CORE_SELECTION_MODE, "retry_failed_pass": RETRY_FAILED_PASS, "failed_retry_workers": FAILED_RETRY_WORKERS, "min_completion_rate": MIN_COMPLETION_RATE, "core_scope": "year_only", "year_core_allow_one_cut_strong": YEAR_CORE_ALLOW_ONE_CUT_STRONG, "recent_break_min_close_above_line": RECENT_BREAK_MIN_CLOSE_ABOVE_LINE, "recent_break_max_distance": RECENT_BREAK_MAX_DISTANCE, "reclaim_context_lookback_days": RECLAIM_CONTEXT_LOOKBACK_DAYS, "reclaim_context_touch_days": RECLAIM_CONTEXT_TOUCH_DAYS}, "rows": rows}
+    payload = {"boot": BOOT, "run_mode": RUN_MODE, "full_market": RUN_FULL_MARKET, "target": TARGET, "target_dash": TARGET_DASH, "generated_at_bj": now_bj().strftime("%Y-%m-%d %H:%M:%S"), "completion": {"total": len(rows), "completed": sum(1 for r in rows if ss(r.get("状态")) == "完成"), "completion_rate": sum(1 for r in rows if ss(r.get("状态")) == "完成") / len(rows) if rows else 0.0, "failure_summary": failure_summary(rows)}, "config": {"source": "eastmoney_direct_kline", "klt": {"D": 101, "Y": 106}, "adjust_flag_env": ADJUST_FLAG_ENV, "point_tol": POINT_TOL, "body_edge_tol": BODY_EDGE_TOL, "shadow_reaction_weight": SHADOW_REACTION_WEIGHT, "event_lookback_days": EVENT_LOOKBACK_DAYS, "workers": WORKERS, "request_timeout": REQUEST_TIMEOUT, "request_retries": REQUEST_RETRIES, "max_stocks": MAX_STOCKS, "core_selection_mode": CORE_SELECTION_MODE, "retry_failed_pass": RETRY_FAILED_PASS, "failed_retry_workers": FAILED_RETRY_WORKERS, "min_completion_rate": MIN_COMPLETION_RATE, "universe_page_size": UNIVERSE_PAGE_SIZE, "universe_min_partial_rows": UNIVERSE_MIN_PARTIAL_ROWS, "universe_max_failed_pages": UNIVERSE_MAX_FAILED_PAGES, "core_scope": "year_only", "year_core_allow_one_cut_strong": YEAR_CORE_ALLOW_ONE_CUT_STRONG, "recent_break_min_close_above_line": RECENT_BREAK_MIN_CLOSE_ABOVE_LINE, "recent_break_max_distance": RECENT_BREAK_MAX_DISTANCE, "reclaim_context_lookback_days": RECLAIM_CONTEXT_LOOKBACK_DAYS, "reclaim_context_touch_days": RECLAIM_CONTEXT_TOUCH_DAYS}, "rows": rows}
     OUTPUT_JSON.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
     SELF_CHECK_JSON.write_text(json.dumps({"status": "PASS", "boot": BOOT, "run_mode": RUN_MODE, "full_market": RUN_FULL_MARKET, "outputs": {"report": str(OUTPUT_MD), "detail": str(OUTPUT_CSV), "core_line_map": str(OUTPUT_CORE_MAP), "breakout_events": str(OUTPUT_EVENTS)}}, ensure_ascii=False, indent=2), encoding="utf-8")
 
