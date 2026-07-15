@@ -31,9 +31,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install YAML validator
-        run: python -m pip install --upgrade pyyaml
-
       - name: Consolidate schedules and harden employee3
         shell: bash
         run: |
@@ -42,110 +39,121 @@ jobs:
 
           import re
           from pathlib import Path
-          import yaml
 
           ROOT = Path('.github/workflows')
           EMPLOYEE3 = ROOT / 'employee3_runner.yml'
           SELF = ROOT / '_one_time_employee3_only.yml'
+          DISABLE = [
+              ROOT / 'stock_alert.yml',
+              ROOT / 'qingtian.yml',
+              ROOT / '灵动.yml',
+              ROOT / '破界.yml',
+              ROOT / '潮汐.yml',
+              ROOT / 'zangfeng.yml',
+              ROOT / 'daily_overlap_report.yml',
+              ROOT / 'export_neckline_candidates.yml',
+          ]
 
-          def indent(line: str) -> int:
+          def indentation(line: str) -> int:
               return len(line) - len(line.lstrip(' '))
 
-          def is_on(line: str) -> bool:
-              return indent(line) == 0 and line.strip() in {'on:', '"on":', "'on':"}
+          def top_on(line: str) -> bool:
+              return indentation(line) == 0 and line.strip() in {'on:', '"on":', "'on':"}
 
-          def schedules(text: str) -> list[str]:
-              lines = text.splitlines()
-              inside = False
-              found: list[str] = []
-              i = 0
-              while i < len(lines):
-                  line = lines[i]
-                  s = line.strip()
-                  if is_on(line):
-                      inside = True
-                      i += 1
-                      continue
-                  if inside and indent(line) == 0 and s and not s.startswith('#'):
-                      inside = False
-                  if inside and indent(line) == 2 and s == 'schedule:':
-                      i += 1
-                      while i < len(lines):
-                          row = lines[i]
-                          rs = row.strip()
-                          if rs and indent(row) <= 2:
-                              break
-                          m = re.search(r"cron:\s*['\"]?([^'\"]+)['\"]?", rs)
-                          if m:
-                              found.append(m.group(1).strip())
-                          i += 1
-                      continue
-                  i += 1
-              return found
-
-          def remove_schedule(text: str) -> tuple[str, bool]:
+          def strip_top_schedule(text: str) -> tuple[str, bool]:
               lines = text.splitlines(keepends=True)
-              out: list[str] = []
-              inside = False
+              output: list[str] = []
+              inside_on = False
               removed = False
               i = 0
               while i < len(lines):
                   line = lines[i]
-                  s = line.strip()
-                  if is_on(line):
-                      inside = True
-                      out.append(line)
+                  stripped = line.strip()
+                  if top_on(line):
+                      inside_on = True
+                      output.append(line)
                       i += 1
                       continue
-                  if inside and indent(line) == 0 and s and not s.startswith('#'):
-                      inside = False
-                  if inside and indent(line) == 2 and s == 'schedule:':
+                  if inside_on and indentation(line) == 0 and stripped and not stripped.startswith('#'):
+                      inside_on = False
+                  if inside_on and indentation(line) == 2 and stripped == 'schedule:':
                       removed = True
-                      while out and (not out[-1].strip() or (indent(out[-1]) == 2 and out[-1].strip().startswith('#'))):
-                          out.pop()
                       i += 1
                       while i < len(lines):
-                          row = lines[i]
-                          if row.strip() and indent(row) <= 2:
+                          candidate = lines[i]
+                          if candidate.strip() and indentation(candidate) <= 2:
                               break
                           i += 1
                       continue
-                  out.append(line)
+                  output.append(line)
                   i += 1
-              result = ''.join(out)
+              result = ''.join(output)
               if removed and '自动定时运行已关闭' not in result:
                   rows = result.splitlines(keepends=True)
-                  for n, row in enumerate(rows):
-                      if is_on(row):
-                          rows.insert(n + 1, '  # 自动定时运行已关闭；仅保留手动或事件触发。\n')
+                  for index, row in enumerate(rows):
+                      if top_on(row):
+                          rows.insert(index + 1, '  # 自动定时运行已关闭；保留原有手动或事件触发。\n')
                           break
                   result = ''.join(rows)
               return result, removed
 
-          def expression(name: str) -> str:
+          def find_top_schedules(text: str) -> list[str]:
+              lines = text.splitlines()
+              inside_on = False
+              values: list[str] = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  if top_on(line):
+                      inside_on = True
+                      i += 1
+                      continue
+                  if inside_on and indentation(line) == 0 and stripped and not stripped.startswith('#'):
+                      inside_on = False
+                  if inside_on and indentation(line) == 2 and stripped == 'schedule:':
+                      i += 1
+                      while i < len(lines):
+                          candidate = lines[i]
+                          candidate_text = candidate.strip()
+                          if candidate_text and indentation(candidate) <= 2:
+                              break
+                          match = re.search(r"cron:\s*['\"]?([^'\"]+)['\"]?", candidate_text)
+                          if match:
+                              values.append(match.group(1).strip())
+                          i += 1
+                      continue
+                  i += 1
+              return values
+
+          def gh_expression(name: str) -> str:
               return '$' + '{{ ' + name + ' }}'
 
           def patch_employee3(text: str) -> str:
               text = text.replace('北京时间20:10', '北京时间21:10')
-              text, count = re.subn(
+              text, replacements = re.subn(
                   r'(?m)^(\s*-\s*cron:\s*)["\']10 12 \* \* 1-5["\']\s*$',
                   r'\1"10 13 * * 1-5"',
                   text,
                   count=1,
               )
-              if count != 1 and '10 13 * * 1-5' not in text:
-                  raise SystemExit('employee3 cron was not found')
+              if replacements == 0 and '10 13 * * 1-5' not in text:
+                  raise RuntimeError('三号员工原定时表达式未找到')
 
-              native = '      - name: run employee3 native engine\n'
-              if native not in text:
-                  raise SystemExit('employee3 engine marker missing')
+              engine_marker = '      - name: run employee3 native engine\n'
+              if engine_marker not in text:
+                  raise RuntimeError('三号员工引擎步骤未找到')
 
-              old_date = expression('steps.config.outputs.target_date')
-              effective_date = expression('steps.cache_state.outputs.effective_target_date')
-              ref_name = expression('github.ref_name')
-              run_id = expression('github.run_id')
+              requested_date = gh_expression('steps.config.outputs.target_date')
+              effective_date = gh_expression('steps.cache_state.outputs.effective_target_date')
+              cache_key = (
+                  'a-kline-cache-'
+                  + gh_expression('github.ref_name')
+                  + '-employee3-'
+                  + gh_expression('github.run_id')
+              )
 
-              block = f'''      - name: refresh shared kline cache for employee3
+              cache_steps = f'''      - name: refresh shared kline cache for employee3
                 env:
                   PYTHONUNBUFFERED: 1
                   MAX_RUNTIME_MINUTES: "45"
@@ -160,19 +168,20 @@ jobs:
                 id: cache_state
                 shell: bash
                 env:
-                  REQUESTED_TARGET_DATE: {old_date}
+                  REQUESTED_TARGET_DATE: {requested_date}
                 run: |
                   python - <<'PY' >> "$GITHUB_OUTPUT"
                   import json
                   from pathlib import Path
-                  path = Path("outputs/daily_kline_update_state.json")
-                  if not path.exists():
+                  state_file = Path("outputs/daily_kline_update_state.json")
+                  if not state_file.exists():
                       raise SystemExit("missing cache refresh state")
-                  state = json.loads(path.read_text(encoding="utf-8"))
+                  state = json.loads(state_file.read_text(encoding="utf-8"))
                   effective = str(state.get("目标交易日") or "").strip()
                   coverage = float(state.get("fresh_coverage") or 0.0)
-                  if not effective or not bool(state.get("should_run_stock_alert")):
-                      raise SystemExit(f"cache freshness gate failed: effective={{effective}} coverage={{coverage:.6f}}")
+                  allowed = bool(state.get("should_run_stock_alert"))
+                  if not effective or not allowed:
+                      raise SystemExit(f"cache gate failed: effective={{effective}} coverage={{coverage:.6f}}")
                   print(f"effective_target_date={{effective}}")
                   print(f"fresh_coverage={{coverage:.6f}}")
                   PY
@@ -181,7 +190,7 @@ jobs:
                 uses: actions/cache/save@v4
                 with:
                   path: kline_cache
-                  key: a-kline-cache-{ref_name}-employee3-{run_id}
+                  key: {cache_key}
 
               - name: upload employee3 cache refresh report
                 if: always()
@@ -198,63 +207,59 @@ jobs:
           '''
 
               if 'refresh shared kline cache for employee3' not in text:
-                  before, after = text.split(native, 1)
-                  text = before + block + native + after
+                  before, after = text.split(engine_marker, 1)
+                  text = before + cache_steps + engine_marker + after
 
-              marker = text.index(native)
-              text = text[:marker] + text[marker:].replace(old_date, effective_date)
+              engine_position = text.index(engine_marker)
+              text = text[:engine_position] + text[engine_position:].replace(requested_date, effective_date)
               return text
 
-          changed: list[str] = []
-          removed_from: list[str] = []
-          for path in sorted(ROOT.glob('*.y*ml')):
+          for path in DISABLE:
+              if not path.exists():
+                  raise RuntimeError(f'需要关闭定时的工作流不存在: {path}')
               original = path.read_text(encoding='utf-8')
-              updated = original
-              if path == EMPLOYEE3:
-                  updated = patch_employee3(original)
-              elif path != SELF:
-                  updated, did_remove = remove_schedule(original)
-                  if did_remove:
-                      removed_from.append(path.name)
-              if updated != original:
-                  path.write_text(updated, encoding='utf-8')
-                  changed.append(path.name)
+              updated, removed = strip_top_schedule(original)
+              if not removed and find_top_schedules(original):
+                  raise RuntimeError(f'未能关闭定时: {path}')
+              path.write_text(updated, encoding='utf-8')
 
-          scan = {p.name: schedules(p.read_text(encoding='utf-8')) for p in ROOT.glob('*.y*ml') if p != SELF}
-          bad = {k: v for k, v in scan.items() if k != EMPLOYEE3.name and v}
-          assert not bad, f'non-employee3 schedules remain: {bad}'
-          assert scan.get(EMPLOYEE3.name) == ['10 13 * * 1-5'], scan.get(EMPLOYEE3.name)
+          original_employee3 = EMPLOYEE3.read_text(encoding='utf-8')
+          EMPLOYEE3.write_text(patch_employee3(original_employee3), encoding='utf-8')
+
+          # 自检一：八条非三号链路均无 schedule，三号保留唯一日程。
+          for path in DISABLE:
+              assert find_top_schedules(path.read_text(encoding='utf-8')) == [], path
+          assert find_top_schedules(EMPLOYEE3.read_text(encoding='utf-8')) == ['10 13 * * 1-5']
           print('SELF-CHECK-1 PASS')
 
-          parsed = {}
-          for path in ROOT.glob('*.y*ml'):
-              if path == SELF:
-                  continue
-              obj = yaml.load(path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
-              assert isinstance(obj, dict), path.name
-              on_obj = obj.get('on')
-              parsed[path.name] = on_obj.get('schedule') if isinstance(on_obj, dict) else None
-          assert not {k: v for k, v in parsed.items() if k != EMPLOYEE3.name and v}, parsed
-          assert parsed.get(EMPLOYEE3.name), parsed.get(EMPLOYEE3.name)
+          # 自检二：全仓库扫描，不允许任何遗漏的非三号定时触发。
+          all_schedules = {
+              path.name: find_top_schedules(path.read_text(encoding='utf-8'))
+              for path in ROOT.glob('*.y*ml')
+              if path != SELF
+          }
+          offenders = {name: value for name, value in all_schedules.items() if name != EMPLOYEE3.name and value}
+          assert offenders == {}, offenders
           print('SELF-CHECK-2 PASS')
 
-          e3 = EMPLOYEE3.read_text(encoding='utf-8')
+          # 自检三：三号生产链路关键标记必须全部存在。
+          employee3_text = EMPLOYEE3.read_text(encoding='utf-8')
           required = [
               'python -u tools/update_kline_cache_daily.py',
               'id: cache_state',
               'actions/cache/save@v4',
-              effective_date,
+              gh_expression('steps.cache_state.outputs.effective_target_date'),
               'python -u employee3_runner.py',
               'python -u employee3_report_guard.py',
               'TELEGRAM_BOT_TOKEN',
+              'TELEGRAM_CHAT_ID',
               'DATA_GATE_TARGET_DATE',
+              'restore shared kline cache',
           ]
-          missing = [x for x in required if x not in e3]
-          assert not missing, missing
-          assert 'python -u stock_alert.py' not in e3
+          missing = [marker for marker in required if marker not in employee3_text]
+          assert missing == [], missing
+          assert 'python -u stock_alert.py' not in employee3_text
           print('SELF-CHECK-3 PASS')
-          print('changed=', ','.join(changed))
-          print('schedule_removed=', ','.join(removed_from))
           PYCODE
 
       - name: Commit final configuration and remove this workflow
