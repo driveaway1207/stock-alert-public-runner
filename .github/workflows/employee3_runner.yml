@@ -188,7 +188,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
+      - name: bootstrap shared cache when restore is empty
+        id: bootstrap_cache
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+          FULL_REBUILD: "1"
+          MIN_CACHE_FILES_REQUIRED: "3000"
+          MAX_RUNTIME_MINUTES: "210"
+          SOFT_STOP_BUFFER_MINUTES: "15"
+          RUN_ROUND: "1"
+          MAX_AUTO_ROUNDS: "1"
+          AUTO_CONTINUE: "0"
+          EASTMONEY_TIMEOUT: "20"
+          AKSHARE_TIMEOUT: "35"
+          BAOSTOCK_TIMEOUT: "45"
+          SOURCE_FAIL_THRESHOLD: "5"
+          SOURCE_COOLDOWN_SECONDS: "900"
+        shell: bash
+        run: |
+          mkdir -p outputs kline_cache
+          COUNT_BEFORE=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "cache_count_before=$COUNT_BEFORE" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT_BEFORE" -lt 3000 ]; then
+            echo "共享缓存不足3000只，启动三号员工冷启动建库。"
+            python -u tools/export_neckline_candidates.py
+          else
+            echo "共享缓存已有 $COUNT_BEFORE 只，跳过冷启动建库。"
+          fi
+          COUNT_AFTER=$(find kline_cache -type f -name "*.csv" ! -name "_*.csv" | wc -l)
+          echo "cache_count_after=$COUNT_AFTER" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT_AFTER" -lt 3000 ]; then
+            echo "冷启动后缓存仍不足3000只，本轮不允许正式选股；已保留本轮缓存供下次续建。"
+            exit 1
+          fi
+
       - name: refresh shared kline cache for employee3
+        id: refresh_cache
+        if: always()
+        continue-on-error: true
         env:
           PYTHONUNBUFFERED: 1
           MAX_RUNTIME_MINUTES: "45"
@@ -201,6 +239,8 @@ jobs:
 
       - name: validate refreshed cache and resolve effective trade date
         id: cache_state
+        if: always()
+        continue-on-error: true
         shell: bash
         env:
           REQUESTED_TARGET_DATE: ${{ steps.config.outputs.target_date }}
@@ -211,23 +251,34 @@ jobs:
           import os
           from pathlib import Path
           state_file = Path("outputs/daily_kline_update_state.json")
+          requested = str(os.environ.get("REQUESTED_TARGET_DATE") or "").strip()
+          event_name = str(os.environ.get("EVENT_NAME") or "").strip()
+          cache_files = len([p for p in Path("kline_cache").rglob("*.csv") if not p.name.startswith("_")])
           if not state_file.exists():
+              print(f"effective_target_date={requested}")
+              print("cache_latest_trade_date=")
+              print("fresh_coverage=0.000000")
+              print(f"cache_files={cache_files}")
+              print("cache_ready=false")
               raise SystemExit("missing cache refresh state")
           state = json.loads(state_file.read_text(encoding="utf-8"))
           effective = str(state.get("目标交易日") or "").strip()
-          requested = str(os.environ.get("REQUESTED_TARGET_DATE") or "").strip()
-          event_name = str(os.environ.get("EVENT_NAME") or "").strip()
           coverage = float(state.get("fresh_coverage") or 0.0)
           allowed = bool(state.get("should_run_stock_alert"))
-          if not effective or not allowed:
-              raise SystemExit(f"cache gate failed: effective={effective} coverage={coverage:.6f}")
           resolved = requested if event_name == "workflow_dispatch" and requested else effective
+          ready = bool(effective and allowed and cache_files >= 3000)
           print(f"effective_target_date={resolved}")
           print(f"cache_latest_trade_date={effective}")
           print(f"fresh_coverage={coverage:.6f}")
+          print(f"cache_files={cache_files}")
+          print(f"cache_ready={str(ready).lower()}")
+          if not ready:
+              raise SystemExit(f"cache gate failed: effective={effective} coverage={coverage:.6f} cache_files={cache_files}")
           PY
 
       - name: save refreshed shared kline cache
+        if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: kline_cache
@@ -246,6 +297,9 @@ jobs:
           retention-days: 14
 
       - name: run employee3 native engine
+        id: employee3_engine
+        if: steps.cache_state.outcome == 'success'
+        continue-on-error: true
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -264,18 +318,27 @@ jobs:
         run: python -u employee3_runner.py
 
       - name: guard report and send employee3 telegram
+        id: report_guard
         if: always()
+        continue-on-error: true
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMPLOYEE3_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
-          SELECTION_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
-          TARGET_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
-          DATA_GATE_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          EMPLOYEE3_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date || steps.config.outputs.target_date }}
+          SELECTION_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date || steps.config.outputs.target_date }}
+          TARGET_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date || steps.config.outputs.target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date || steps.config.outputs.target_date }}
           ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
           EMPLOYEE3_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
+          EMPLOYEE3_BOOTSTRAP_OUTCOME: ${{ steps.bootstrap_cache.outcome }}
+          EMPLOYEE3_REFRESH_OUTCOME: ${{ steps.refresh_cache.outcome }}
+          EMPLOYEE3_CACHE_GATE_OUTCOME: ${{ steps.cache_state.outcome }}
+          EMPLOYEE3_ENGINE_OUTCOME: ${{ steps.employee3_engine.outcome }}
+          EMPLOYEE3_CACHE_READY: ${{ steps.cache_state.outputs.cache_ready }}
+          EMPLOYEE3_CACHE_FILES: ${{ steps.cache_state.outputs.cache_files }}
+          EMPLOYEE3_FRESH_COVERAGE: ${{ steps.cache_state.outputs.fresh_coverage }}
         run: python -u employee3_report_guard.py
 
       - name: upload reports
@@ -299,3 +362,26 @@ jobs:
             cache/kline_cache/
           if-no-files-found: ignore
           retention-days: 3
+
+      - name: enforce employee3 pipeline result
+        if: always()
+        shell: bash
+        env:
+          CACHE_READY: ${{ steps.cache_state.outputs.cache_ready }}
+          CACHE_GATE_OUTCOME: ${{ steps.cache_state.outcome }}
+          ENGINE_OUTCOME: ${{ steps.employee3_engine.outcome }}
+          GUARD_OUTCOME: ${{ steps.report_guard.outcome }}
+        run: |
+          echo "cache_ready=$CACHE_READY cache_gate=$CACHE_GATE_OUTCOME engine=$ENGINE_OUTCOME guard=$GUARD_OUTCOME"
+          if [ "$CACHE_READY" != "true" ] || [ "$CACHE_GATE_OUTCOME" != "success" ]; then
+            echo "三号员工缓存门控失败。"
+            exit 1
+          fi
+          if [ "$ENGINE_OUTCOME" != "success" ]; then
+            echo "三号员工主引擎未成功产出报告。"
+            exit 1
+          fi
+          if [ "$GUARD_OUTCOME" != "success" ]; then
+            echo "三号员工报告守门失败。"
+            exit 1
+          fi

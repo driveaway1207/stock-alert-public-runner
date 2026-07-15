@@ -18,6 +18,8 @@ REPORT_DIR = ROOT / "employee3_reports"
 OUTPUT_MD = REPORT_DIR / "core_line_breakout_screen.md"
 OUTPUT_JSON = REPORT_DIR / "core_line_breakout_screen.json"
 GUARD_JSON = REPORT_DIR / "employee3_report_guard.json"
+CACHE_STATE_JSON = ROOT / "outputs" / "daily_kline_update_state.json"
+SELF_CHECK_JSON = REPORT_DIR / "employee3_self_check.json"
 
 BOT = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID")
@@ -61,13 +63,58 @@ def norm_date(x: Any) -> str:
     return ""
 
 
+def load_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def pipeline_diagnostic(reason: str) -> Dict[str, Any]:
+    cache_state = load_json_file(CACHE_STATE_JSON)
+    self_check = load_json_file(SELF_CHECK_JSON)
+    cache_files = int(sf(os.getenv("EMPLOYEE3_CACHE_FILES") or cache_state.get("缓存股票数"), 0))
+    coverage = sf(os.getenv("EMPLOYEE3_FRESH_COVERAGE") or cache_state.get("fresh_coverage"), 0.0)
+    details = [
+        reason,
+        f"bootstrap={ss(os.getenv('EMPLOYEE3_BOOTSTRAP_OUTCOME')) or 'unknown'}",
+        f"refresh={ss(os.getenv('EMPLOYEE3_REFRESH_OUTCOME')) or 'unknown'}",
+        f"cache_gate={ss(os.getenv('EMPLOYEE3_CACHE_GATE_OUTCOME')) or 'unknown'}",
+        f"cache_ready={ss(os.getenv('EMPLOYEE3_CACHE_READY')) or 'false'}",
+        f"engine={ss(os.getenv('EMPLOYEE3_ENGINE_OUTCOME')) or 'unknown'}",
+        f"cache_files={cache_files}",
+        f"fresh_coverage={coverage:.4f}",
+    ]
+    if self_check:
+        details.append(f"self_check={ss(self_check.get('status')) or 'unknown'}")
+        hard_errors = self_check.get("hard_errors") if isinstance(self_check.get("hard_errors"), list) else []
+        if hard_errors:
+            first = hard_errors[0] if isinstance(hard_errors[0], dict) else {}
+            details.append(f"self_check_error={ss(first.get('detail'))[:180]}")
+    return {
+        "rows": [],
+        "stat": {
+            "cache_files": cache_files,
+            "cache_hit": int(round(cache_files * coverage)) if cache_files else 0,
+            "bad": int(sf(cache_state.get("failed_失败数"), 0)),
+            "short": int(sf(cache_state.get("no_cache_无缓存数"), 0)),
+            "fresh_coverage": coverage,
+        },
+        "target_dash": os.getenv("EMPLOYEE3_TARGET_DATE") or os.getenv("TARGET_TRADE_DATE") or "",
+        "load_error": "；".join(x for x in details if x),
+    }
+
+
 def load_payload() -> Dict[str, Any]:
     if not OUTPUT_JSON.exists():
-        return {"rows": [], "stat": {}, "target_dash": "", "load_error": f"missing {OUTPUT_JSON}"}
+        return pipeline_diagnostic(f"missing {OUTPUT_JSON}")
     try:
         return json.loads(OUTPUT_JSON.read_text(encoding="utf-8"))
     except Exception as exc:
-        return {"rows": [], "stat": {}, "target_dash": "", "load_error": f"json_load_error: {exc}"}
+        return pipeline_diagnostic(f"json_load_error: {exc}")
 
 
 def get_row_date(row: Dict[str, Any]) -> str:
@@ -265,10 +312,14 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         lines += ["", "结论：缓存总量充足，不是缓存不足；旧日期股票不算今日突破命中，已单独跳过。", "动作：今天只看目标日数据里的Top5/观察池；若要清洗旧日期，可允许 BaoStock 补拉后重跑。"]
     elif guard_status == "ALL_HARD_REJECTED":
         lines += ["", "结论：目标日有深度命中，但全部被硬闸门挡住；按上方今日状态分布复盘。"]
-    elif raw_total == 0:
+    elif raw_total == 0 and not load_error:
         lines += ["", "结论：今日没有识别到最近20日高质量突破核心线的深度命中。"]
     if load_error:
-        lines.append(f"读取错误:{load_error}")
+        lines += [
+            "",
+            "结论：这不是‘今日无票’，而是三号员工上游缓存或主引擎未成功产出正式JSON。",
+            f"流水线诊断:{load_error}",
+        ]
 
     display = top_rows(target_pool, 5)
     if display:
