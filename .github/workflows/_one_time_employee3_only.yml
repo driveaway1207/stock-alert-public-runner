@@ -26,6 +26,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -48,6 +49,7 @@ jobs:
           git add .github/workflows
           git diff --cached --check
           git commit -m "Only run employee3 daily and harden cache chain"
+          git config --local --unset-all http.https://github.com/.extraheader || true
           TOKEN="${ACTIONS_PAT:-$FALLBACK_TOKEN}"
           git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin HEAD:main
