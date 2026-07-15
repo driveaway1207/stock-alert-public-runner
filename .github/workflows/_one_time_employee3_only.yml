@@ -1,12 +1,12 @@
 name: One-time employee3-only schedule consolidation
 
 on:
-  push:
+  workflow_dispatch:
+  pull_request:
     branches:
       - main
     paths:
-      - ".github/workflows/_one_time_employee3_only.yml"
-  workflow_dispatch:
+      - ".github/employee3-only-trigger.txt"
 
 permissions:
   contents: write
@@ -24,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -219,14 +220,12 @@ jobs:
                   path.write_text(updated, encoding='utf-8')
                   changed.append(path.name)
 
-          # 自检一：文本扫描定时触发归属。
           scan = {p.name: schedules(p.read_text(encoding='utf-8')) for p in ROOT.glob('*.y*ml') if p != SELF}
           bad = {k: v for k, v in scan.items() if k != EMPLOYEE3.name and v}
           assert not bad, f'non-employee3 schedules remain: {bad}'
           assert scan.get(EMPLOYEE3.name) == ['10 13 * * 1-5'], scan.get(EMPLOYEE3.name)
           print('SELF-CHECK-1 PASS')
 
-          # 自检二：所有工作流均可解析，且只有三号有 schedule。
           parsed = {}
           for path in ROOT.glob('*.y*ml'):
               if path == SELF:
@@ -239,7 +238,6 @@ jobs:
           assert parsed.get(EMPLOYEE3.name), parsed.get(EMPLOYEE3.name)
           print('SELF-CHECK-2 PASS')
 
-          # 自检三：缓存、数据门控、引擎、报告与推送链路完整。
           e3 = EMPLOYEE3.read_text(encoding='utf-8')
           required = [
               'python -u tools/update_kline_cache_daily.py',
