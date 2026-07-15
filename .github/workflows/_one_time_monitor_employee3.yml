@@ -1,0 +1,75 @@
+name: One-time monitor employee3 rerun
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/employee3-monitor-trigger.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: one-time-monitor-employee3-rerun
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Watch latest employee3 manual run
+        id: watch
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          RUN_ID=$(gh run list --repo "$REPO" --workflow employee3_runner.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "run_id=" >> "$GITHUB_OUTPUT"
+            echo "result=not_found" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Monitoring employee3 run $RUN_ID"
+          gh run watch "$RUN_ID" --repo "$REPO" --interval 30 --exit-status
+          RC=$?
+          if [ "$RC" -eq 0 ]; then
+            RESULT=success
+          else
+            RESULT=failure
+            gh run view "$RUN_ID" --repo "$REPO" --log-failed || true
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          gh run view "$RUN_ID" --repo "$REPO" --json databaseId,status,conclusion,url,createdAt,updatedAt,headSha
+          exit 0
+
+      - name: Remove monitor and record result in commit message
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.watch.outputs.run_id }}
+          RESULT: ${{ steps.watch.outputs.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/_one_time_monitor_employee3.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Employee3 rerun ${RESULT} run ${RUN_ID}"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          TOKEN="${ACTIONS_PAT:-$FALLBACK_TOKEN}"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
