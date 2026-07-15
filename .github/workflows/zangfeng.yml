@@ -2,6 +2,7 @@ name: 藏锋
 run-name: 藏锋
 
 "on":
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       target_date:
@@ -28,9 +29,6 @@ run-name: 藏锋
         description: "调试扫描数量，0=全市场"
         required: false
         default: "0"
-  schedule:
-    - cron: "45 12 * * 1-5"
-
 permissions:
   contents: read
   actions: read

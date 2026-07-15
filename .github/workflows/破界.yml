@@ -2,6 +2,7 @@ name: 破界
 run-name: 破界
 
 "on":
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       pojie_date_choice:
@@ -49,9 +50,6 @@ run-name: 破界
       - "破界.py"
       - ".github/workflows/破界.yml"
       - ".github/pojie-run-trigger.txt"
-
-  schedule:
-    - cron: "10 12 * * 1-5"
 
 concurrency:
   group: pojie-singleton-main

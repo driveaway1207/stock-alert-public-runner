@@ -2,6 +2,7 @@ name: 潮汐
 run-name: 潮汐
 
 "on":
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       chaoxi_target_date:
@@ -24,9 +25,6 @@ run-name: 潮汐
         options:
           - "🟩 按建议过滤"
           - "⬜ 全A不额外过滤"
-
-  schedule:
-    - cron: "25 12 * * 1-5"
 
 concurrency:
   group: 潮汐-singleton-main

@@ -1,12 +1,7 @@
 name: A Stock Full Kline Cache Auto Backfill
 
 on:
-  schedule:
-    # GitHub Actions 使用 UTC 时间
-    # 北京时间 18:00 = UTC 10:00
-    # 周一到周五自动运行；周六周日不跑
-    - cron: '0 10 * * 1-5'
-
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       round:

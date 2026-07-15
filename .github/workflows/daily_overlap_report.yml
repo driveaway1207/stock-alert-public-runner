@@ -1,6 +1,7 @@
 name: Daily overlap stock report
 
 on:
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       target_date:
@@ -15,11 +16,6 @@ on:
         options:
           - "0"
           - "1"
-  schedule:
-    - cron: "0 15 * * 1-5"
-    - cron: "0 16 * * 1-5"
-    - cron: "0 17 * * 1-5"
-
 concurrency:
   group: daily-overlap-stock-report-main
   cancel-in-progress: false

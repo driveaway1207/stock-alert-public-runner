@@ -2,6 +2,7 @@ name: 擎天
 run-name: 擎天
 
 "on":
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   workflow_dispatch:
     inputs:
       qingtian_date_choice:
@@ -34,9 +35,6 @@ run-name: 擎天
         description: "🔎 调试扫描数量｜0=全市场"
         required: false
         default: "0"
-
-  schedule:
-    - cron: "25 12 * * 1-5"
 
 concurrency:
   group: qingtian-singleton-main

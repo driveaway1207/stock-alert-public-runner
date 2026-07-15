@@ -1,11 +1,9 @@
 name: 一号员工
 
 on:
+  # 自动定时运行已关闭；保留原有手动或事件触发。
   # BaoStock 日线全市场数据通常要等到晚间才稳定。
   # 北京时间 20:50 = UTC 12:50；只在周一到周五自动运行。
-  schedule:
-    - cron: '50 12 * * 1-5'
-
   workflow_dispatch:
     inputs:
       mode:

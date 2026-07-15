@@ -43,8 +43,7 @@ run-name: 三号员工
           - "🟧 是｜允许补拉最近K线"
 
   schedule:
-    - cron: "10 12 * * 1-5"
-
+    - cron: "10 13 * * 1-5"
 concurrency:
   group: third-employee-singleton-main
   cancel-in-progress: true
@@ -125,7 +124,7 @@ jobs:
               '上七个交易日': 7,
           }
 
-          # 三号员工定时任务在北京时间20:10运行，默认必须扫描当天完整日K；
+          # 三号员工定时任务在北京时间21:10运行，默认必须扫描当天完整日K；
           # 只有用户手动选择“上一个交易日”等回看选项时，才向前偏移。
           offset = 0
           for key, value in choice_map.items():
@@ -189,16 +188,67 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests akshare baostock openpyxl lxml beautifulsoup4 html5lib tqdm
 
+      - name: refresh shared kline cache for employee3
+        env:
+          PYTHONUNBUFFERED: 1
+          MAX_RUNTIME_MINUTES: "45"
+          SOFT_STOP_BUFFER_MINUTES: "5"
+          MIN_FRESH_COVERAGE: "0.965"
+          ALLOW_STOCK_ALERT_IF_STALE_ONLY: "1"
+        run: |
+          mkdir -p outputs kline_cache
+          python -u tools/update_kline_cache_daily.py
+
+      - name: validate refreshed cache and resolve effective trade date
+        id: cache_state
+        shell: bash
+        env:
+          REQUESTED_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          state_file = Path("outputs/daily_kline_update_state.json")
+          if not state_file.exists():
+              raise SystemExit("missing cache refresh state")
+          state = json.loads(state_file.read_text(encoding="utf-8"))
+          effective = str(state.get("目标交易日") or "").strip()
+          coverage = float(state.get("fresh_coverage") or 0.0)
+          allowed = bool(state.get("should_run_stock_alert"))
+          if not effective or not allowed:
+              raise SystemExit(f"cache gate failed: effective={effective} coverage={coverage:.6f}")
+          print(f"effective_target_date={effective}")
+          print(f"fresh_coverage={coverage:.6f}")
+          PY
+
+      - name: save refreshed shared kline cache
+        uses: actions/cache/save@v4
+        with:
+          path: kline_cache
+          key: a-kline-cache-${{ github.ref_name }}-employee3-${{ github.run_id }}
+
+      - name: upload employee3 cache refresh report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: employee3-cache-refresh-report
+          path: |
+            outputs/daily_kline_update_report_*.csv
+            outputs/daily_kline_update_summary_*.csv
+            outputs/daily_kline_update_state.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: run employee3 native engine
         env:
           PYTHONUNBUFFERED: 1
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMPLOYEE3_TARGET_DATE: ${{ steps.config.outputs.target_date }}
-          SELECTION_TRADE_DATE: ${{ steps.config.outputs.target_date }}
-          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
-          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          EMPLOYEE3_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          SELECTION_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          TARGET_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
           ENABLE_TELEGRAM: "0"
           EMPLOYEE3_SEND_TELEGRAM: "0"
           EMPLOYEE3_ALLOW_BAOSTOCK_FALLBACK: ${{ steps.config.outputs.baostock_fallback }}
@@ -214,10 +264,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMPLOYEE3_TARGET_DATE: ${{ steps.config.outputs.target_date }}
-          SELECTION_TRADE_DATE: ${{ steps.config.outputs.target_date }}
-          TARGET_TRADE_DATE: ${{ steps.config.outputs.target_date }}
-          DATA_GATE_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          EMPLOYEE3_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          SELECTION_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          TARGET_TRADE_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
+          DATA_GATE_TARGET_DATE: ${{ steps.cache_state.outputs.effective_target_date }}
           ENABLE_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
           EMPLOYEE3_SEND_TELEGRAM: ${{ steps.config.outputs.send_telegram }}
         run: python -u employee3_report_guard.py
