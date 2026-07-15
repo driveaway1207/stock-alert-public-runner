@@ -1,1 +1,1 @@
-Trigger the hardened one-time employee3-only schedule consolidation workflow.
+Trigger the standalone one-time employee3-only schedule consolidation workflow.
