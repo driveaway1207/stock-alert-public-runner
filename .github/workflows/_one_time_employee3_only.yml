@@ -1,4 +1,5 @@
 name: One-time employee3-only schedule consolidation
+# Retrigger existing workflow after it is present on the default branch.
 
 on:
   push:
@@ -77,7 +78,6 @@ jobs:
                       inside_on = False
 
                   if inside_on and indent == 2 and stripped == 'schedule:':
-                      # Remove immediately preceding schedule-only comments, while preserving unrelated comments.
                       while out:
                           prev = out[-1]
                           prev_s = prev.strip()
@@ -259,7 +259,6 @@ jobs:
                   path.write_text(updated, encoding='utf-8')
                   changed.append(path.name)
 
-          # Self-check 1: independent text-level trigger scan.
           text_scan = {}
           for path in sorted(WORKFLOW_DIR.glob('*.y*ml')):
               if path == SELF:
@@ -272,7 +271,6 @@ jobs:
               raise SystemExit(f'SELF-CHECK-1 failed: employee3 schedule={text_scan.get(EMPLOYEE3.name)}')
           print('SELF-CHECK-1 PASS: only employee3 has a weekday schedule')
 
-          # Self-check 2: parse every workflow with YAML BaseLoader and inspect top-level on.schedule.
           yaml_schedules = {}
           for path in sorted(WORKFLOW_DIR.glob('*.y*ml')):
               if path == SELF:
@@ -290,7 +288,6 @@ jobs:
               raise SystemExit('SELF-CHECK-2 failed: employee3 parsed schedule missing')
           print('SELF-CHECK-2 PASS: all workflow YAML parses and schedule ownership is correct')
 
-          # Self-check 3: semantic production-chain assertions.
           employee3_text = EMPLOYEE3.read_text(encoding='utf-8')
           required_markers = [
               'python -u tools/update_kline_cache_daily.py',
