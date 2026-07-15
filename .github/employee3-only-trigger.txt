@@ -1,1 +1,1 @@
-Trigger the standalone one-time employee3-only schedule consolidation workflow.
+Trigger the employee3-only consolidation workflow with corrected PAT authentication.
