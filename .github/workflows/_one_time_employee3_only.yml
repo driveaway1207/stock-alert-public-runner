@@ -1,0 +1,332 @@
+name: One-time employee3-only schedule consolidation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/_one_time_employee3_only.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: one-time-employee3-only-schedule-consolidation
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install validation dependency
+        run: python -m pip install --upgrade pyyaml
+
+      - name: Keep only employee3 scheduled and harden its cache chain
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          from __future__ import annotations
+
+          import re
+          from pathlib import Path
+          import yaml
+
+          WORKFLOW_DIR = Path('.github/workflows')
+          EMPLOYEE3 = WORKFLOW_DIR / 'employee3_runner.yml'
+          SELF = WORKFLOW_DIR / '_one_time_employee3_only.yml'
+
+          def indent_of(line: str) -> int:
+              return len(line) - len(line.lstrip(' '))
+
+          def is_on_line(line: str) -> bool:
+              stripped = line.strip()
+              return indent_of(line) == 0 and stripped in {'on:', '"on":', "'on':"}
+
+          def remove_top_level_schedule(text: str) -> tuple[str, bool]:
+              lines = text.splitlines(keepends=True)
+              out: list[str] = []
+              i = 0
+              inside_on = False
+              removed = False
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  indent = indent_of(line)
+
+                  if is_on_line(line):
+                      inside_on = True
+                      out.append(line)
+                      i += 1
+                      continue
+
+                  if inside_on and indent == 0 and stripped and not stripped.startswith('#'):
+                      inside_on = False
+
+                  if inside_on and indent == 2 and stripped == 'schedule:':
+                      # Remove immediately preceding schedule-only comments, while preserving unrelated comments.
+                      while out:
+                          prev = out[-1]
+                          prev_s = prev.strip()
+                          if not prev_s:
+                              out.pop()
+                              continue
+                          if indent_of(prev) == 2 and prev_s.startswith('#') and any(
+                              key in prev_s.lower()
+                              for key in ('自动', '定时', 'utc', '北京时间', 'cron', 'schedule', '周一到周五', '周末')
+                          ):
+                              out.pop()
+                              continue
+                          break
+
+                      removed = True
+                      i += 1
+                      while i < len(lines):
+                          nxt = lines[i]
+                          nxt_s = nxt.strip()
+                          if not nxt_s:
+                              i += 1
+                              continue
+                          if indent_of(nxt) <= 2:
+                              break
+                          i += 1
+                      continue
+
+                  out.append(line)
+                  i += 1
+
+              new_text = ''.join(out)
+              if removed and '自动定时运行已关闭' not in new_text:
+                  new_lines = new_text.splitlines(keepends=True)
+                  for idx, line in enumerate(new_lines):
+                      if is_on_line(line):
+                          new_lines.insert(idx + 1, '  # 自动定时运行已关闭；保留手动、push、workflow_run 等非定时触发。\n')
+                          break
+                  new_text = ''.join(new_lines)
+              return new_text, removed
+
+          def top_level_schedules(text: str) -> list[str]:
+              lines = text.splitlines()
+              inside_on = False
+              crons: list[str] = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  stripped = line.strip()
+                  indent = indent_of(line)
+                  if is_on_line(line):
+                      inside_on = True
+                      i += 1
+                      continue
+                  if inside_on and indent == 0 and stripped and not stripped.startswith('#'):
+                      inside_on = False
+                  if inside_on and indent == 2 and stripped == 'schedule:':
+                      i += 1
+                      while i < len(lines):
+                          nxt = lines[i]
+                          nxt_s = nxt.strip()
+                          if nxt_s and indent_of(nxt) <= 2:
+                              break
+                          m = re.search(r"cron:\s*['\"]?([^'\"]+)['\"]?", nxt_s)
+                          if m:
+                              crons.append(m.group(1).strip())
+                          i += 1
+                      continue
+                  i += 1
+              return crons
+
+          def patch_employee3(text: str) -> str:
+              text = text.replace('北京时间20:10', '北京时间21:10')
+              text = re.sub(
+                  r'(?m)^(\s*-\s*cron:\s*)["\']10 12 \* \* 1-5["\']\s*$',
+                  r'\1"10 13 * * 1-5"',
+                  text,
+                  count=1,
+              )
+
+              native_marker = '      - name: run employee3 native engine\n'
+              if native_marker not in text:
+                  raise SystemExit('employee3 native engine marker not found')
+
+              cache_block = '''      - name: refresh shared kline cache for employee3
+                env:
+                  PYTHONUNBUFFERED: 1
+                  MAX_RUNTIME_MINUTES: "45"
+                  SOFT_STOP_BUFFER_MINUTES: "5"
+                  MIN_FRESH_COVERAGE: "0.965"
+                  ALLOW_STOCK_ALERT_IF_STALE_ONLY: "1"
+                run: |
+                  mkdir -p outputs kline_cache
+                  python -u tools/update_kline_cache_daily.py
+
+              - name: validate refreshed cache and resolve effective trade date
+                id: cache_state
+                shell: bash
+                env:
+                  REQUESTED_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+                run: |
+                  python - <<'PY' >> "$GITHUB_OUTPUT"
+                  import json
+                  import os
+                  from pathlib import Path
+
+                  state_path = Path("outputs/daily_kline_update_state.json")
+                  if not state_path.exists():
+                      raise SystemExit("missing outputs/daily_kline_update_state.json")
+
+                  state = json.loads(state_path.read_text(encoding="utf-8"))
+                  effective = str(state.get("目标交易日") or "").strip()
+                  coverage = float(state.get("fresh_coverage") or 0.0)
+                  should_run = bool(state.get("should_run_stock_alert"))
+                  if not effective:
+                      raise SystemExit("cache refresh did not resolve an effective trade date")
+                  if not should_run:
+                      raise SystemExit(f"cache freshness gate failed: coverage={coverage:.6f}")
+
+                  print(f"effective_target_date={effective}")
+                  print(f"fresh_coverage={coverage:.6f}")
+                  print(f"requested_target_date={os.environ.get('REQUESTED_TARGET_DATE', '')}")
+                  PY
+
+              - name: save refreshed shared kline cache
+                uses: actions/cache/save@v4
+                with:
+                  path: kline_cache
+                  key: a-kline-cache-${{ github.ref_name }}-employee3-${{ github.run_id }}
+
+              - name: upload employee3 cache refresh report
+                if: always()
+                uses: actions/upload-artifact@v4
+                with:
+                  name: employee3-cache-refresh-report
+                  path: |
+                    outputs/daily_kline_update_report_*.csv
+                    outputs/daily_kline_update_summary_*.csv
+                    outputs/daily_kline_update_state.json
+                  if-no-files-found: warn
+                  retention-days: 14
+
+          '''
+
+              if 'refresh shared kline cache for employee3' not in text:
+                  prefix, suffix = text.split(native_marker, 1)
+                  suffix = native_marker + suffix
+                  suffix = suffix.replace(
+                      '${{ steps.config.outputs.target_date }}',
+                      '${{ steps.cache_state.outputs.effective_target_date }}',
+                  )
+                  text = prefix + cache_block + suffix
+              else:
+                  marker_index = text.index(native_marker)
+                  prefix = text[:marker_index]
+                  suffix = text[marker_index:].replace(
+                      '${{ steps.config.outputs.target_date }}',
+                      '${{ steps.cache_state.outputs.effective_target_date }}',
+                  )
+                  text = prefix + suffix
+
+              return text
+
+          if not EMPLOYEE3.exists():
+              raise SystemExit('missing .github/workflows/employee3_runner.yml')
+
+          changed: list[str] = []
+          schedule_removed: list[str] = []
+
+          for path in sorted(WORKFLOW_DIR.glob('*.y*ml')):
+              original = path.read_text(encoding='utf-8')
+              updated = original
+              if path == EMPLOYEE3:
+                  updated = patch_employee3(original)
+              elif path != SELF:
+                  updated, removed = remove_top_level_schedule(original)
+                  if removed:
+                      schedule_removed.append(path.name)
+              if updated != original:
+                  path.write_text(updated, encoding='utf-8')
+                  changed.append(path.name)
+
+          # Self-check 1: independent text-level trigger scan.
+          text_scan = {}
+          for path in sorted(WORKFLOW_DIR.glob('*.y*ml')):
+              if path == SELF:
+                  continue
+              text_scan[path.name] = top_level_schedules(path.read_text(encoding='utf-8'))
+          offenders = {name: crons for name, crons in text_scan.items() if name != EMPLOYEE3.name and crons}
+          if offenders:
+              raise SystemExit(f'SELF-CHECK-1 failed: non-employee3 schedules remain: {offenders}')
+          if text_scan.get(EMPLOYEE3.name) != ['10 13 * * 1-5']:
+              raise SystemExit(f'SELF-CHECK-1 failed: employee3 schedule={text_scan.get(EMPLOYEE3.name)}')
+          print('SELF-CHECK-1 PASS: only employee3 has a weekday schedule')
+
+          # Self-check 2: parse every workflow with YAML BaseLoader and inspect top-level on.schedule.
+          yaml_schedules = {}
+          for path in sorted(WORKFLOW_DIR.glob('*.y*ml')):
+              if path == SELF:
+                  continue
+              obj = yaml.load(path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+              if not isinstance(obj, dict):
+                  raise SystemExit(f'SELF-CHECK-2 failed: invalid YAML root in {path.name}')
+              on_obj = obj.get('on')
+              schedule = on_obj.get('schedule') if isinstance(on_obj, dict) else None
+              yaml_schedules[path.name] = schedule
+          yaml_offenders = {name: value for name, value in yaml_schedules.items() if name != EMPLOYEE3.name and value}
+          if yaml_offenders:
+              raise SystemExit(f'SELF-CHECK-2 failed: parsed schedules remain: {yaml_offenders}')
+          if not yaml_schedules.get(EMPLOYEE3.name):
+              raise SystemExit('SELF-CHECK-2 failed: employee3 parsed schedule missing')
+          print('SELF-CHECK-2 PASS: all workflow YAML parses and schedule ownership is correct')
+
+          # Self-check 3: semantic production-chain assertions.
+          employee3_text = EMPLOYEE3.read_text(encoding='utf-8')
+          required_markers = [
+              'python -u tools/update_kline_cache_daily.py',
+              'id: cache_state',
+              'actions/cache/save@v4',
+              'a-kline-cache-${{ github.ref_name }}-employee3-${{ github.run_id }}',
+              '${{ steps.cache_state.outputs.effective_target_date }}',
+              'python -u employee3_runner.py',
+              'python -u employee3_report_guard.py',
+              'TELEGRAM_BOT_TOKEN',
+              'DATA_GATE_TARGET_DATE',
+          ]
+          missing = [marker for marker in required_markers if marker not in employee3_text]
+          if missing:
+              raise SystemExit(f'SELF-CHECK-3 failed: missing employee3 markers: {missing}')
+          if 'stock_alert.py' in employee3_text:
+              raise SystemExit('SELF-CHECK-3 failed: employee3 workflow must not invoke stock_alert.py')
+          print('SELF-CHECK-3 PASS: employee3 cache, gate, engine, report and Telegram chain are intact')
+
+          print('Changed workflows:', ', '.join(changed) if changed else '(none)')
+          print('Schedules removed:', ', '.join(schedule_removed) if schedule_removed else '(none)')
+          PYCODE
+
+      - name: Remove one-time workflow, commit and push
+        shell: bash
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/_one_time_employee3_only.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows
+          git diff --cached --check
+          git commit -m "Only run employee3 daily and harden cache chain"
+          TOKEN="${ACTIONS_PAT:-$FALLBACK_TOKEN}"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
