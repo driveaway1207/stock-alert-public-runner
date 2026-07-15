@@ -204,20 +204,26 @@ jobs:
         shell: bash
         env:
           REQUESTED_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
+          import os
           from pathlib import Path
           state_file = Path("outputs/daily_kline_update_state.json")
           if not state_file.exists():
               raise SystemExit("missing cache refresh state")
           state = json.loads(state_file.read_text(encoding="utf-8"))
           effective = str(state.get("目标交易日") or "").strip()
+          requested = str(os.environ.get("REQUESTED_TARGET_DATE") or "").strip()
+          event_name = str(os.environ.get("EVENT_NAME") or "").strip()
           coverage = float(state.get("fresh_coverage") or 0.0)
           allowed = bool(state.get("should_run_stock_alert"))
           if not effective or not allowed:
               raise SystemExit(f"cache gate failed: effective={effective} coverage={coverage:.6f}")
-          print(f"effective_target_date={effective}")
+          resolved = requested if event_name == "workflow_dispatch" and requested else effective
+          print(f"effective_target_date={resolved}")
+          print(f"cache_latest_trade_date={effective}")
           print(f"fresh_coverage={coverage:.6f}")
           PY
 
