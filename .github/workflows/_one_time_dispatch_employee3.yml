@@ -1,0 +1,62 @@
+name: One-time dispatch employee3 rerun
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/employee3-rerun-trigger.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: one-time-dispatch-employee3-rerun
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Dispatch employee3 and print child run id
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run employee3_runner.yml --repo "$REPO" --ref main
+          sleep 10
+          RUN_ID=$(gh run list --repo "$REPO" --workflow employee3_runner.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "未找到刚触发的三号员工运行ID。"
+            exit 1
+          fi
+          echo "EMPLOYEE3_CHILD_RUN_ID=$RUN_ID"
+          gh run view "$RUN_ID" --repo "$REPO" --json databaseId,status,conclusion,url,createdAt,headSha
+
+      - name: Remove one-time dispatcher
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/_one_time_dispatch_employee3.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Remove one-time employee3 rerun dispatcher"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          TOKEN="${ACTIONS_PAT:-$FALLBACK_TOKEN}"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
