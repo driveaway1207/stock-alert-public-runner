@@ -233,9 +233,60 @@ jobs:
           SOFT_STOP_BUFFER_MINUTES: "5"
           MIN_FRESH_COVERAGE: "0.965"
           ALLOW_STOCK_ALERT_IF_STALE_ONLY: "1"
+          EMPLOYEE3_MAX_REFRESH_ROUNDS: "3"
+        shell: bash
         run: |
+          set +e
           mkdir -p outputs kline_cache
-          python -u tools/update_kline_cache_daily.py
+          MAX_ROUNDS="${EMPLOYEE3_MAX_REFRESH_ROUNDS:-3}"
+          ROUNDS_USED=0
+          FINAL_READY=false
+          FINAL_COVERAGE=0
+
+          for ROUND in $(seq 1 "$MAX_ROUNDS"); do
+            ROUNDS_USED="$ROUND"
+            echo "========== 三号员工缓存增量续刷：第 ${ROUND}/${MAX_ROUNDS} 轮 =========="
+            python -u tools/update_kline_cache_daily.py
+            UPDATE_EXIT=$?
+            echo "第 ${ROUND} 轮更新程序退出码: ${UPDATE_EXIT}"
+
+            STATE=$(python - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("outputs/daily_kline_update_state.json")
+          if not path.exists():
+              print("false|0.000000|missing_state")
+          else:
+              try:
+                  state = json.loads(path.read_text(encoding="utf-8"))
+                  ready = bool(state.get("should_run_stock_alert"))
+                  coverage = float(state.get("fresh_coverage") or 0.0)
+                  target = str(state.get("目标交易日") or "")
+                  print(f"{str(ready).lower()}|{coverage:.6f}|{target}")
+              except Exception as exc:
+                  print(f"false|0.000000|state_error:{exc}")
+          PY
+          )
+            IFS='|' read -r ROUND_READY ROUND_COVERAGE ROUND_TARGET <<< "$STATE"
+            FINAL_READY="$ROUND_READY"
+            FINAL_COVERAGE="$ROUND_COVERAGE"
+            echo "第 ${ROUND} 轮结果: ready=${ROUND_READY} coverage=${ROUND_COVERAGE} target=${ROUND_TARGET}"
+
+            if [ "$ROUND_READY" = "true" ]; then
+              echo "缓存覆盖率已经达到正式选股门槛，停止续刷。"
+              break
+            fi
+
+            if [ "$ROUND" -lt "$MAX_ROUNDS" ]; then
+              echo "缓存覆盖率尚未达标；下一轮只处理剩余旧日期股票。"
+              sleep 5
+            fi
+          done
+
+          echo "rounds_used=${ROUNDS_USED}" >> "$GITHUB_OUTPUT"
+          echo "final_ready=${FINAL_READY}" >> "$GITHUB_OUTPUT"
+          echo "final_coverage=${FINAL_COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "缓存续刷完成: rounds=${ROUNDS_USED} ready=${FINAL_READY} coverage=${FINAL_COVERAGE}"
 
       - name: validate refreshed cache and resolve effective trade date
         id: cache_state
