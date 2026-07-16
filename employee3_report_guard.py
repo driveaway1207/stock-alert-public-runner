@@ -268,6 +268,15 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     load_error = ss(payload.get("load_error"))
     cache_count = cache_file_count(stat)
     target_pool = [r for r in rows if is_target_row(r, target)]
+    prefilter_total = int(sf(stat.get("prefilter_total_cache_stocks"), 0))
+    prefilter_checked = int(sf(stat.get("prefilter_target_fresh_checked"), 0))
+    prefilter_stale = int(sf(stat.get("prefilter_stale_skipped"), 0))
+    date_gate_blocked_all = (
+        raw_total == 0
+        and prefilter_total > 0
+        and prefilter_checked == 0
+        and prefilter_stale >= prefilter_total
+    )
 
     guard_status = "PASS"
     guard_action = "正常展示目标日三号员工结果"
@@ -276,6 +285,10 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         guard_status = "FAIL"
         guard_action = "报告JSON读取失败，停止正式推送"
         title = f"三号员工数据异常｜停止选股｜{target or ''}"
+    elif date_gate_blocked_all:
+        guard_status = "DATA_STALE"
+        guard_action = "目标日与缓存最新交易日不一致，全部股票在日期门控前被跳过"
+        title = f"三号员工数据日期错位｜停止选股｜{target or ''}"
     elif raw_total == 0:
         guard_status = "WARN"
         guard_action = "今日无核心线突破深度命中"
@@ -303,10 +316,19 @@ def build_guard_report(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         f"今日有效命中{target_total}只｜旧日期跳过{stale_total}只｜原始扫描命中{raw_total}只｜目标日覆盖率{coverage:.1%}",
         f"今日硬剔除{hard_target}只｜今日可继续观察/评估{usable_target}只",
         f"缓存文件{stat.get('cache_files', '未知')}｜有效缓存{stat.get('cache_hit', '未知')}｜坏缓存{stat.get('bad', 0)}｜短缓存{stat.get('short', 0)}",
+        f"日期门控检查{prefilter_checked}/{prefilter_total}只｜日期错位跳过{prefilter_stale}只",
         f"今日状态分布:{format_counts(summary['reason_counts_target'])}",
         f"全部数据日期分布:{format_dates(summary['date_counts'])}",
     ]
-    if guard_status == "DATA_STALE":
+    if date_gate_blocked_all:
+        stale_dates = ss(stat.get("prefilter_stale_date_counts_text")) or "未知"
+        lines += [
+            "",
+            "结论：本轮没有进入核心线扫描，不是市场无票；目标日早于/晚于缓存实际交易日，全部股票被日期门控挡住。",
+            f"缓存实际日期分布:{stale_dates}",
+            "动作：使用缓存刷新程序确认的实际交易日重跑；默认‘当前交易日’不得覆盖缓存有效交易日。",
+        ]
+    elif guard_status == "DATA_STALE":
         lines += ["", "结论：目标日有效候选不足，当前结果按数据异常处理，不按‘市场无票’处理。", "动作：先更新公共K线缓存，或手动允许三号员工 BaoStock 补拉最近K线后重跑。"]
     elif guard_status == "PARTIAL_STALE":
         lines += ["", "结论：缓存总量充足，不是缓存不足；旧日期股票不算今日突破命中，已单独跳过。", "动作：今天只看目标日数据里的Top5/观察池；若要清洗旧日期，可允许 BaoStock 补拉后重跑。"]

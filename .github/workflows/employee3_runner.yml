@@ -244,6 +244,7 @@ jobs:
         shell: bash
         env:
           REQUESTED_TARGET_DATE: ${{ steps.config.outputs.target_date }}
+          REQUESTED_TARGET_REASON: ${{ steps.config.outputs.target_reason }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
@@ -252,6 +253,7 @@ jobs:
           from pathlib import Path
           state_file = Path("outputs/daily_kline_update_state.json")
           requested = str(os.environ.get("REQUESTED_TARGET_DATE") or "").strip()
+          requested_reason = str(os.environ.get("REQUESTED_TARGET_REASON") or "").strip()
           event_name = str(os.environ.get("EVENT_NAME") or "").strip()
           cache_files = len([p for p in Path("kline_cache").rglob("*.csv") if not p.name.startswith("_")])
           if not state_file.exists():
@@ -265,9 +267,13 @@ jobs:
           effective = str(state.get("目标交易日") or "").strip()
           coverage = float(state.get("fresh_coverage") or 0.0)
           allowed = bool(state.get("should_run_stock_alert"))
-          resolved = requested if event_name == "workflow_dispatch" and requested else effective
+          preserve_requested = requested_reason == "manual_date" or (
+              requested_reason.startswith("dropdown_offset_") and requested_reason != "dropdown_offset_0"
+          )
+          resolved = requested if event_name == "workflow_dispatch" and preserve_requested and requested else effective
           ready = bool(effective and allowed and cache_files >= 3000)
           print(f"effective_target_date={resolved}")
+          print(f"target_resolution_reason={'requested_history' if preserve_requested else 'cache_effective'}")
           print(f"cache_latest_trade_date={effective}")
           print(f"fresh_coverage={coverage:.6f}")
           print(f"cache_files={cache_files}")
@@ -275,6 +281,15 @@ jobs:
           if not ready:
               raise SystemExit(f"cache gate failed: effective={effective} coverage={coverage:.6f} cache_files={cache_files}")
           PY
+
+      - name: inspect resolved employee3 trade date
+        if: always()
+        run: |
+          echo "requested target: ${{ steps.config.outputs.target_date }}"
+          echo "requested reason: ${{ steps.config.outputs.target_reason }}"
+          echo "cache latest trade date: ${{ steps.cache_state.outputs.cache_latest_trade_date }}"
+          echo "effective target: ${{ steps.cache_state.outputs.effective_target_date }}"
+          echo "target resolution: ${{ steps.cache_state.outputs.target_resolution_reason }}"
 
       - name: save refreshed shared kline cache
         if: always()
