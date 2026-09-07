@@ -66,5 +66,32 @@ class RRTest(unittest.TestCase):
     def test_original_pure_self_check(self):
         self.assertTrue(m.self_check()["ok"])
 
+    def test_flat_history_does_not_invent_six_percent_stop(self):
+        d = history()
+        d[["open", "high", "low", "close"]] = 10.
+        r = m.estimate_lines(d)
+        self.assertEqual(r["support"], 0.)
+        self.assertEqual(r["support_info"]["source"], "unknown")
+        self.assertEqual(r["support_info"]["resonance"], 0)
+        result = m.calculate_zangfeng(d, r)
+        self.assertFalse(result["eligible"])
+        self.assertIn("防守位未知，无法核验RR", result["reject_reasons"])
+
+    def test_unknown_support_metadata_cannot_make_positive_rr(self):
+        r = lines()
+        r["support_info"]["source"] = "unknown"
+        result = m.calculate_zangfeng(history(), r)
+        self.assertEqual(result["metrics"]["rr_status"], "unknown_support")
+        self.assertEqual(result["metrics"]["rr_ratio"], 0.)
+        self.assertFalse(result["eligible"])
+
+    def test_real_twenty_day_low_is_preserved(self):
+        d = history()
+        d[["open", "high", "low", "close"]] = 10.
+        d.loc[len(d)-2, "low"] = 9.9
+        r = m.estimate_lines(d)
+        self.assertEqual(r["support"], 9.9)
+        self.assertEqual(r["support_info"]["source"], "observed_low20")
+
 if __name__=="__main__":
     unittest.main()
