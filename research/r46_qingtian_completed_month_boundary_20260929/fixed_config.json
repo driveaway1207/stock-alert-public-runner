@@ -1,0 +1,30 @@
+{
+  "audit_id": "E3-R46-QINGTIAN-COMPLETED-MONTH-BOUNDARY-20260929-0350-BJ",
+  "start_bj": "2026-09-29 03:50",
+  "freeze_bj": "2026-09-29 03:56",
+  "cutoff_bj": "2026-09-29 03:59",
+  "source_commit": "c80a8e1fc7db633d1a60f3311744bf6e11e76d35",
+  "qingtian_version": "擎天-v9-confirm-window-runup-filter",
+  "original_formulas": {
+    "qingtian": "target day >= calendar month last day; otherwise drop last same-month BaoStock monthly bar",
+    "employee3": "aggregate daily bars by natural month, then unconditionally drop raw_k last row"
+  },
+  "failure_target": "已完成交易月K在月末周末/休市边界被当作未完成，以及两路径对同一边界口径不一致",
+  "fixed_parameters": {
+    "boundary_window": "2025-01 through 2025-05",
+    "dates": [
+      "2025-01-27",
+      "2025-02-28",
+      "2025-03-31",
+      "2025-04-30",
+      "2025-05-30"
+    ],
+    "no_parameter_search": true
+  },
+  "comparison_denominator": "5个预先枚举的交易月最后交易日",
+  "observation_window": "边界当日收盘；不读取边界后的价格用于完成性判定",
+  "main_acceptance": "先通过公式一致性；再以R41固定事件面板同日期同股票同名额重放，Top1 >= +2 three-plus, delete 0, four-plus no drop, paired p <= 0.05, Top5 no degradation",
+  "acceptable_error_change": "不得因修正新增误删三板/四板；候选覆盖变化必须完整披露",
+  "rollback": "任一门槛失败，保持main与擎天源码不变",
+  "production_lock": true
+}

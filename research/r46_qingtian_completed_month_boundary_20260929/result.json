@@ -1,0 +1,139 @@
+{
+  "audit_id": "E3-R46-QINGTIAN-COMPLETED-MONTH-BOUNDARY-20260929-0350-BJ",
+  "status": "completed_formula_audit_model_gate_not_passed",
+  "source": {
+    "main_commit": "c80a8e1fc7db633d1a60f3311744bf6e11e76d35",
+    "employee3_blob_sha": "3dda348695e88284c4f7478a70a373b53827170c",
+    "qingtian_blob_sha": "9f0ccda8f11b1d9871f8a69e722ace8685e40c23",
+    "qingtian_version": "擎天-v9-confirm-window-runup-filter"
+  },
+  "sample_identity": "2025-01至2025-05五个已完成交易月边界；日历/交易时效审计，不是股票结果样本",
+  "rows": [
+    {
+      "target": "2025-01-27",
+      "expected_complete": true,
+      "basis": "SSE 2025春节休市自01-28开始，故01-27为当月最后交易日",
+      "source": "https://www.sse.com.cn/disclosure/announcement/general/c/c_20250123_10770570.shtml",
+      "qingtian_keeps_latest": false,
+      "employee3_keeps_latest": false,
+      "qingtian_false_exclusion": true,
+      "employee3_false_exclusion": true,
+      "paths_disagree": false
+    },
+    {
+      "target": "2025-02-28",
+      "expected_complete": true,
+      "basis": "自然月末且为交易日",
+      "source": "calendar",
+      "qingtian_keeps_latest": true,
+      "employee3_keeps_latest": false,
+      "qingtian_false_exclusion": false,
+      "employee3_false_exclusion": true,
+      "paths_disagree": true
+    },
+    {
+      "target": "2025-03-31",
+      "expected_complete": true,
+      "basis": "自然月末且为交易日",
+      "source": "calendar",
+      "qingtian_keeps_latest": true,
+      "employee3_keeps_latest": false,
+      "qingtian_false_exclusion": false,
+      "employee3_false_exclusion": true,
+      "paths_disagree": true
+    },
+    {
+      "target": "2025-04-30",
+      "expected_complete": true,
+      "basis": "自然月末；SSE劳动节休市自05-01开始",
+      "source": "https://www.sse.com.cn/disclosure/announcement/general/c/c_20250424_10777645.shtml",
+      "qingtian_keeps_latest": true,
+      "employee3_keeps_latest": false,
+      "qingtian_false_exclusion": false,
+      "employee3_false_exclusion": true,
+      "paths_disagree": true
+    },
+    {
+      "target": "2025-05-30",
+      "expected_complete": true,
+      "basis": "05-31为周六且SSE端午节休市05-31至06-02，故05-30为当月最后交易日",
+      "source": "https://www.sse.com.cn/disclosure/announcement/general/c/c_20241223_10767108.shtml",
+      "qingtian_keeps_latest": false,
+      "employee3_keeps_latest": false,
+      "qingtian_false_exclusion": true,
+      "employee3_false_exclusion": true,
+      "paths_disagree": false
+    }
+  ],
+  "metrics": {
+    "boundary_dates": 5,
+    "qingtian_false_exclusions": 2,
+    "qingtian_false_exclusion_rate": 0.4,
+    "qingtian_wilson95": [
+      0.11762077423264783,
+      0.769275718723987
+    ],
+    "employee3_false_exclusions": 5,
+    "employee3_false_exclusion_rate": 1,
+    "employee3_wilson95": [
+      0.5655175352168251,
+      1
+    ],
+    "path_disagreements": 3,
+    "path_disagreement_rate": 0.6
+  },
+  "assertions": {
+    "passed": 8,
+    "total": 8,
+    "items": [
+      {
+        "name": "sample_count",
+        "ok": true
+      },
+      {
+        "name": "all_expected_complete",
+        "ok": true
+      },
+      {
+        "name": "qingtian_false_exclusion_count",
+        "ok": true
+      },
+      {
+        "name": "employee3_false_exclusion_count",
+        "ok": true
+      },
+      {
+        "name": "path_disagreement_count",
+        "ok": true
+      },
+      {
+        "name": "jan27_qingtian_drop",
+        "ok": true
+      },
+      {
+        "name": "may30_qingtian_drop",
+        "ok": true
+      },
+      {
+        "name": "no_model_gate",
+        "ok": true
+      }
+    ]
+  },
+  "stock_outcome_metrics": {
+    "independent_first_board_events": "not_evaluated",
+    "independent_three_plus_events": "not_evaluated",
+    "independent_four_plus_events": "not_evaluated",
+    "top1": "inherit_R41_baseline_only: 97 slots, 10 three-plus, 5 four-plus, 87 false positives, recall 3.17%, FN 305",
+    "top5": "inherit_R41_baseline_only: 485 slots, 40 three-plus, 27 four-plus, 445 false positives, recall 12.70%, FN 275",
+    "unfinished_observations": 0,
+    "note": "本轮没有形成排序候选，不把日期边界断言冒充连板提升"
+  },
+  "gate": {
+    "formula_consistency_gate": false,
+    "source_change_gate": false,
+    "model_advantage_gate": false,
+    "acceptance": "完成月边界应有单一可解释口径；随后在R41逐事件固定面板做同日等名额Top1/Top5回归。Top1至少新增2个独立三板、误删0、四板不降、配对p<=0.05且Top5不退化，否则回退。",
+    "blocker": "当前执行工作区不可用，R41 ZIP虽可定位但不能解压运行逐事件回归；因此不修改源码"
+  }
+}

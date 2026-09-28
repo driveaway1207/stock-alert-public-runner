@@ -1,0 +1,6 @@
+target,expected_complete,basis,source,qingtian_keeps_latest,employee3_keeps_latest,qingtian_false_exclusion,employee3_false_exclusion,paths_disagree
+2025-01-27,true,"SSE 2025春节休市自01-28开始，故01-27为当月最后交易日",https://www.sse.com.cn/disclosure/announcement/general/c/c_20250123_10770570.shtml,false,false,true,true,false
+2025-02-28,true,"自然月末且为交易日",calendar,true,false,false,true,true
+2025-03-31,true,"自然月末且为交易日",calendar,true,false,false,true,true
+2025-04-30,true,"自然月末；SSE劳动节休市自05-01开始",https://www.sse.com.cn/disclosure/announcement/general/c/c_20250424_10777645.shtml,true,false,false,true,true
+2025-05-30,true,"05-31为周六且SSE端午节休市05-31至06-02，故05-30为当月最后交易日",https://www.sse.com.cn/disclosure/announcement/general/c/c_20241223_10767108.shtml,false,false,true,true,false
