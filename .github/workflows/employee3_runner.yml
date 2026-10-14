@@ -163,6 +163,7 @@ jobs:
           path: kline_cache
           key: a-kline-cache-${{ github.ref_name }}-employee3-check-${{ github.run_id }}
           restore-keys: |
+            a-kline-cache-${{ github.ref_name }}-employee3-
             a-kline-cache-${{ github.ref_name }}-
             a-kline-cache-
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
