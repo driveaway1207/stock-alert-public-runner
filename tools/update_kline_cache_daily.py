@@ -455,6 +455,17 @@ def main():
 
     cache_rows = scan_cache_last_dates(codes)
     target_date, target_method, cache_majority, cache_max = determine_target_trade_date(cache_rows)
+    history_target_raw = os.getenv("EMPLOYEE3_HISTORY_TARGET_DATE", "").strip()
+    if history_target_raw:
+        try:
+            history_target = datetime.strptime(history_target_raw, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError(f"历史补跑日期格式不合法: {history_target_raw}") from exc
+        if history_target > datetime.now().date():
+            raise ValueError(f"历史补跑日期不能是未来日期: {history_target_raw}")
+        target_date = history_target
+        target_method = "explicit_employee3_history_target"
+        log(f"[历史补跑日期锁定] {target_date}; 禁止自动切换到其他交易日")
 
     old_map = {r["code"]: r for r in cache_rows}
     already_fresh = [c for c in codes if old_map.get(c, {}).get("last_date") and old_map[c]["last_date"] >= target_date]
