@@ -235,6 +235,7 @@ jobs:
           MIN_FRESH_COVERAGE: "0.965"
           ALLOW_STOCK_ALERT_IF_STALE_ONLY: "1"
           EMPLOYEE3_MAX_REFRESH_ROUNDS: "3"
+          EMPLOYEE3_HISTORY_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && steps.config.outputs.target_reason == 'manual_date' && steps.config.outputs.target_date || '' }}
         shell: bash
         run: |
           set +e
