@@ -362,7 +362,12 @@ def determine_target_trade_date(cache_last_rows):
 
 
 def build_snapshot_map(target_date):
-    """用AkShare东方财富快照一次性拿全市场当天OHLCV。失败返回空。"""
+    """仅在北京时间当天收盘后使用实时快照，禁止历史日期错标。"""
+    from datetime import timezone
+    china_now = datetime.now(timezone(timedelta(hours=8)))
+    if target_date != china_now.date() or china_now.weekday() >= 5 or china_now.hour < 15:
+        log(f"[快照安全门控] target={target_date} china_today={china_now.date()} time={china_now:%H:%M}; 不使用实时快照补历史/非收盘日期")
+        return {}
     if ak is None:
         log("[快照] akshare不可用，跳过快照通道。")
         return {}
