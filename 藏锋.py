@@ -31,7 +31,7 @@ except Exception:
     bs = None
 
 BOOT = "ZANGFENG_ROOT_SCRIPT_V3_STRICT_20260626"
-VERSION = "藏锋-v3-root-strict"
+VERSION = "藏锋-v3-root-strict-rr-research2"
 ROOT = Path(__file__).resolve().parent
 ARTIFACT_DIR = ROOT / "artifacts"
 MAIN_CACHE_DIR = ROOT / "kline_cache"
@@ -442,17 +442,27 @@ def estimate_lines(df: pd.DataFrame) -> Dict[str, Any]:
     support_candidates.sort(key=lambda x: (x["score"], -x["distance"]), reverse=True)
     if support_candidates:
         support_info = support_candidates[0]
+        support_info["source"] = "historical_resonance_candidate"
         support = sf(support_info["line"])
     else:
         support = float(low.tail(20).min())
-        if not (0 < support < last):
-            support = last * 0.94
-        support_info = {"line": round(support, 4), "score": 0.0, "resonance": 1, "weighted_resonance": 1.0, "cut": 0, "volume_hits": 0, "distance": round(div(last - support, last, 0.0), 4), "fallback": True}
+        observed_support = math.isfinite(support) and 0 < support < last
+        if not observed_support:
+            # No historical defense below entry: do not invent a 6% stop.
+            support = 0.0
+        support_info = {"line": round(support, 4), "score": 0.0, "resonance": 1 if observed_support else 0, "weighted_resonance": 1.0 if observed_support else 0.0, "cut": 0, "volume_hits": 0, "distance": round(div(last - support, last, 0.0), 4), "fallback": True, "source": "observed_low20" if observed_support else "unknown"}
     above = [sf(x) for x in high.tail(260).tolist() if sf(x) > max(last, pressure) * 1.025]
-    next_pressure = min(above) if above else max(float(high.tail(min(len(high), 260)).max()), last * 1.15)
-    if next_pressure <= last * 1.03:
-        next_pressure = last * 1.15
-    return {"pressure": round(pressure, 4), "support": round(support, 4), "trigger": round(pressure, 4), "next_pressure": round(next_pressure, 4), "pressure_info": pressure_info, "support_info": support_info}
+    # Keep the nearest candidate under the existing 2.5% separation rule.
+    # A historical high is a candidate, not a confirmed resistance/price target.
+    # Numeric zero preserves output compatibility; metadata marks it unknown.
+    next_pressure = min(above) if above else 0.0
+    next_pressure_info = {
+        "source": "historical_high_candidate" if above else "unknown",
+        "line": round(next_pressure, 4),
+        "quality": score_line(df, next_pressure, "pressure") if above else None,
+        "quality_is_diagnostic": True,
+    }
+    return {"pressure": round(pressure, 4), "support": round(support, 4), "trigger": round(pressure, 4), "next_pressure": round(next_pressure, 4), "pressure_info": pressure_info, "support_info": support_info, "next_pressure_info": next_pressure_info}
 
 
 def mean_tail(s: pd.Series, n: int) -> float:
@@ -547,7 +557,22 @@ def calculate_zangfeng(df: pd.DataFrame, lines: Optional[Dict[str, Any]] = None)
     sinfo = lines.get("support_info", {}) or {}
     trigger_dist = div(trigger - last, last, 9.99)
     defense_dist = div(last - support, last, 9.99) if support > 0 else 9.99
-    rr = div(next_pressure - last, last - support, 0.0) if next_pressure > last and 0 < support < last else 0.0
+    # A pending trigger cannot be evaluated as if entry occurred at last.
+    # Preserve the existing close-based defense/distance gates and their limits.
+    rr_entry = max(last, trigger) if math.isfinite(trigger) and trigger > 0 else last
+    ninfo = lines.get("next_pressure_info", {}) or {}
+    if not math.isfinite(next_pressure) or next_pressure <= 0 or ninfo.get("source") == "unknown":
+        rr_status = "unknown_pressure"
+    elif sinfo.get("source") == "unknown":
+        rr_status = "unknown_support"
+    elif not (0 < support < last):
+        rr_status = "invalid_support"
+    elif next_pressure <= rr_entry:
+        rr_status = "no_space_above_entry"
+    else:
+        rr_status = "candidate_estimate" if ninfo.get("source") == "historical_high_candidate" else "provided_estimate"
+    rr_available = rr_status in ("candidate_estimate", "provided_estimate")
+    rr = div(next_pressure - rr_entry, rr_entry - support, 0.0) if rr_available else 0.0
     ret20 = ret(close, 20)
     structure_score = high_score(pinfo.get("resonance", 0), 5, 2, 6.0) + high_score(pinfo.get("weighted_resonance", 0), 7.5, 2.0, 5.0) + low_score(pinfo.get("cut", 99), 0, 5, 4.0) + band_score(trigger_dist, -MAX_TRIGGER_BROKEN, MAX_TRIGGER_ABOVE, 4.0, 0.06) + band_score(defense_dist, MIN_DEFENSE_DIST, MAX_DEFENSE_DIST, 3.5, 0.06) + high_score(sinfo.get("resonance", 0), 4, 1, 2.5)
     structure_score = clamp(structure_score, 0.0, 25.0)
@@ -572,6 +597,10 @@ def calculate_zangfeng(df: pd.DataFrame, lines: Optional[Dict[str, Any]] = None)
         reject.append("已明显突破触发线，不再按藏锋前夜推送")
     if not (MIN_DEFENSE_DIST <= defense_dist <= MAX_DEFENSE_DIST):
         reject.append("真实防守距离不舒服")
+    if rr_status == "unknown_pressure":
+        reject.append("上方压力未知，无法核验RR")
+    if sinfo.get("source") == "unknown":
+        reject.append("防守位未知，无法核验RR")
     if rr < MIN_RR:
         reject.append("上方空间/RR不足")
     if width20 > MAX_WIDTH20 and width30 > MAX_WIDTH30:
@@ -608,6 +637,7 @@ def calculate_zangfeng(df: pd.DataFrame, lines: Optional[Dict[str, Any]] = None)
         bias = "不推送：" + "；".join(reject[:5]) if reject else "观察：分数未达阈值。"
     dimensions = {"锋势": round(price_score, 2), "锋气": round(volume_score, 2), "锋骨": round(structure_score, 2), "交易约束": round(trade_score, 2), "出鞘准备": round(trigger_score, 2)}
     metrics = {"rows": int(len(d)), "last_close": round(last, 4), "amount20": round(amount20, 2), "range_contract_ratio": round(sf(range_ratio), 4), "atr_contract_ratio": round(sf(atr_ratio), 4), "body_contract_ratio": round(sf(body_ratio), 4), "close_std_pct_10d": round(sf(close_std10), 4), "low_slope_20d": round(sf(low_slope20), 6), "center_slope_20d": round(sf(center_slope20), 6), "volume_cv_contract_ratio": round(sf(cv_ratio), 4), "flat_volume_ratio_10d": round(sf(flat_ratio), 4), "vol_level_ratio": round(sf(vol_level), 4), "down_up_vol_ratio": round(sf(down_up_ratio), 4), "pullback_shrink_ratio": round(sf(pb_shrink), 4), "platform_width_20d": round(sf(width20), 4), "platform_width_30d": round(sf(width30), 4), "destructive_count_20d": destructive, "long_upper_count_20d": long_upper, "trigger_distance": round(sf(trigger_dist), 4), "defense_distance": round(sf(defense_dist), 4), "rr_ratio": round(sf(rr), 4), "return_20d": round(sf(ret20), 4), "pressure_line_quality": pinfo, "support_line_quality": sinfo}
+    metrics.update({"rr_entry_price": round(rr_entry, 4), "rr_status": rr_status, "rr_available": rr_available, "next_pressure_quality": ninfo, "support_source": sinfo.get("source", "provided_estimate")})
     return {"indicator": "藏锋", "version": VERSION, "ok": True, "eligible": eligible, "score": round(score, 2), "grade": grade, "action_bias": bias, "dimensions": dimensions, "flags": list(dict.fromkeys(flags)), "reject_reasons": list(dict.fromkeys(reject)), "metrics": metrics}
 
 
