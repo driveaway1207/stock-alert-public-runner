@@ -71,9 +71,9 @@ jobs:
                   print("Employee3 daily schedule detected within the last 18 hours")
                   raise SystemExit(0)
               message = (
-                  "【三号员工每日运行缺失｜请检查】\\n"
-                  "过去18小时未发现三号员工正式schedule运行记录。\\n"
-                  f"北京时间：{timestamp}\\n"
+                  "【三号员工每日运行缺失｜请检查】\n"
+                  "过去18小时未发现三号员工正式schedule运行记录。\n"
+                  f"北京时间：{timestamp}\n"
                   "链接：https://github.com/" + repo + "/actions/workflows/employee3_runner.yml"
               )
           elif os.getenv("WATCH_EVENT") == "push":
