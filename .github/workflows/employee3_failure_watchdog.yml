@@ -7,13 +7,16 @@ run-name: Employee3 failure watchdog
       - "三号员工"
     types:
       - completed
+  schedule:
+    - cron: "20 23 * * 1-5"
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   notify-failure:
-    if: ${{ github.event.workflow_run.conclusion != 'success' }}
+    if: ${{ github.event_name == 'schedule' || github.event.workflow_run.conclusion != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -24,6 +27,8 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCH_EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          GITHUB_API_TOKEN: ${{ github.token }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           SOURCE_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
           SOURCE_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
@@ -40,7 +45,38 @@ jobs:
           if not token or not chat_id:
               raise SystemExit("Employee3 watchdog: Telegram credentials not configured; no alert sent")
           timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-          if os.getenv("WATCH_EVENT") == "push":
+          if os.getenv("WATCH_EVENT") == "schedule":
+              repo = os.getenv("REPOSITORY") or ""
+              api_token = os.getenv("GITHUB_API_TOKEN") or ""
+              url = "https://api.github.com/repos/" + repo + "/actions/workflows/employee3_runner.yml/runs?event=schedule&per_page=5"
+              request = urllib.request.Request(
+                  url, headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": "Bearer " + api_token,
+                      "User-Agent": "Employee3-watchdog"
+                  }
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      runs = json.load(response).get("workflow_runs", [])
+              except Exception as exc:
+                  print("Employee3 watchdog schedule status check failed: " + type(exc).__name__)
+                  raise SystemExit(1)
+              now_utc = datetime.now(timezone.utc)
+              recent = any(
+                  (now_utc - datetime.fromisoformat(x["created_at"].replace("Z", "+00:00"))).total_seconds() < 18 * 3600
+                  for x in runs if x.get("created_at")
+              )
+              if recent:
+                  print("Employee3 daily schedule detected within the last 18 hours")
+                  raise SystemExit(0)
+              message = (
+                  "【三号员工每日运行缺失｜请检查】\\n"
+                  "过去18小时未发现三号员工正式schedule运行记录。\\n"
+                  f"北京时间：{timestamp}\\n"
+                  "链接：https://github.com/" + repo + "/actions/workflows/employee3_runner.yml"
+              )
+          elif os.getenv("WATCH_EVENT") == "push":
               message = (
                   "【三号员工监控测试】\n"
                   "独立异常告警链路正在校验，不代表三号员工运行失败。\n"
