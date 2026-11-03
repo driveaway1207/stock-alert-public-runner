@@ -76,12 +76,6 @@ jobs:
                   f"北京时间：{timestamp}\n"
                   "链接：https://github.com/" + repo + "/actions/workflows/employee3_runner.yml"
               )
-          elif os.getenv("WATCH_EVENT") == "push":
-              message = (
-                  "【三号员工监控测试】\n"
-                  "独立异常告警链路正在校验，不代表三号员工运行失败。\n"
-                  f"北京时间：{timestamp}"
-              )
           else:
               number = os.getenv("SOURCE_RUN_NUMBER") or "unknown"
               conclusion = os.getenv("SOURCE_RUN_CONCLUSION") or "unknown"
