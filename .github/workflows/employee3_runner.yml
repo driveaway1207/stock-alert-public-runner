@@ -170,9 +170,6 @@ jobs:
             full-kline-cache-${{ runner.os }}-
             full-kline-cache-
             a-stock-kline-cache-v1-
-            a-stock-full-kline-cache-
-            employee5-kline-cache-
-            kline-cache-
 
       - name: inspect cache before employee3
         run: |
