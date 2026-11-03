@@ -1,0 +1,59 @@
+name: Employee3 one-time recovery continuation
+run-name: Employee3 one-time continuation
+
+"on":
+  workflow_run:
+    workflows:
+      - "三号员工"
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  continue-recovery:
+    if: >-
+      ${{ github.event.workflow_run.event == 'workflow_dispatch' &&
+          github.event.workflow_run.run_number >= 149 &&
+          github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check Nov 2 recovery and continue only if needed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMPLETED_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          COMPLETED_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          echo "Recovery run $COMPLETED_RUN_ID conclusion: $COMPLETED_CONCLUSION"
+          attempts=$(gh run list --repo "$GH_REPO" --workflow employee3_runner.yml \
+            --event workflow_dispatch --limit 30 --json createdAt \
+            --jq '[.[] | select(.createdAt >= "2026-11-03T00:00:00Z")] | length')
+          echo "Historical recovery workflow dispatch attempts since 2026-11-03: $attempts"
+          finish=false
+          if [ "$COMPLETED_CONCLUSION" = "success" ]; then
+            echo "Employee3 finished successfully; Telegram delivery is handled by original report guard."
+            finish=true
+          elif [ "$attempts" -lt 3 ]; then
+            echo "Recovery did not pass gate; starting next attempt to reuse its saved nonempty cache."
+            gh workflow run employee3_runner.yml \
+              --repo "$GH_REPO" --ref main \
+              -f employee3_target_date=2026-11-02 \
+              -f employee3_send_telegram='🟩 是｜发送Telegram' \
+              -f employee3_baostock_fallback='🟧 是｜允许补拉最近K线'
+          else
+            echo "Recovery attempt limit reached; do not lower data gate or manufacture results."
+            finish=true
+          fi
+          if [ "$finish" = true ]; then
+            path=".github/workflows/employee3_recovery_watch_20261103.yml"
+            sha=$(gh api "/repos/$GH_REPO/contents/$path" --jq '.sha')
+            gh api --method DELETE "/repos/$GH_REPO/contents/$path" \
+              -f message="Clean up one-time employee3 recovery continuation" \
+              -f sha="$sha" -f branch=main
+          fi
