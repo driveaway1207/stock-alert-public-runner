@@ -1,0 +1,86 @@
+name: Employee3 failure watchdog
+run-name: Employee3 failure watchdog
+
+"on":
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/employee3_failure_watchdog.yml"
+  workflow_run:
+    workflows:
+      - "三号员工"
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  notify-failure:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Telegram employee3 failure alert independent of production dependencies
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCH_EVENT: ${{ github.event_name }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SOURCE_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          SOURCE_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_RUN_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+          chat_id = os.getenv("TELEGRAM_CHAT_ID")
+          if not token or not chat_id:
+              raise SystemExit("Employee3 watchdog: Telegram credentials not configured; no alert sent")
+          timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+          if os.getenv("WATCH_EVENT") == "push":
+              message = (
+                  "【三号员工监控测试】\n"
+                  "独立异常告警链路正在校验，不代表三号员工运行失败。\n"
+                  f"北京时间：{timestamp}"
+              )
+          else:
+              number = os.getenv("SOURCE_RUN_NUMBER") or "unknown"
+              conclusion = os.getenv("SOURCE_RUN_CONCLUSION") or "unknown"
+              run_event = os.getenv("SOURCE_RUN_EVENT") or "unknown"
+              url = os.getenv("SOURCE_RUN_URL") or "GitHub Actions"
+              message = (
+                  "【三号员工运行异常｜请检查】\n"
+                  f"流水线 #{number}｜状态：{conclusion}\n"
+                  f"触发：{run_event}｜北京时间：{timestamp}\n"
+                  "本次正式选股/Telegram报告不应视为正常完成。\n"
+                  f"日志：{url}"
+              )
+          body = json.dumps({
+              "chat_id": chat_id,
+              "text": message,
+              "disable_web_page_preview": True
+          }, ensure_ascii=False).encode("utf-8")
+          request = urllib.request.Request(
+              "https://api.telegram.org/bot" + token + "/sendMessage",
+              data=body,
+              headers={"Content-Type": "application/json; charset=utf-8"},
+              method="POST"
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  result = json.load(response)
+                  if not result.get("ok"):
+                      raise RuntimeError("Telegram rejected watchdog alert")
+          except Exception as exc:
+              print("Employee3 watchdog Telegram failure: " + type(exc).__name__)
+              raise SystemExit(1)
+          print("Employee3 watchdog alert delivered")
+          PY
