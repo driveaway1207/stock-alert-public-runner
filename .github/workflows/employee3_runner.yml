@@ -161,11 +161,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-employee3-check-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-employee3-data-check-${{ github.run_id }}
           restore-keys: |
-            a-kline-cache-${{ github.ref_name }}-employee3-
-            a-kline-cache-${{ github.ref_name }}-
-            a-kline-cache-
+            a-kline-cache-${{ github.ref_name }}-employee3-data-
+            a-kline-cache-${{ github.ref_name }}-employee3-38457911585
+            a-kline-cache-${{ github.ref_name }}-employee3-37975404911
             full-kline-cache-${{ runner.os }}-${{ github.ref_name }}-
             full-kline-cache-${{ runner.os }}-
             full-kline-cache-
@@ -342,12 +342,12 @@ jobs:
           echo "target resolution: ${{ steps.cache_state.outputs.target_resolution_reason }}"
 
       - name: save refreshed shared kline cache
-        if: always()
+        if: always() && steps.cache_state.outputs.cache_files != '' && fromJSON(steps.cache_state.outputs.cache_files) > 0
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: kline_cache
-          key: a-kline-cache-${{ github.ref_name }}-employee3-${{ github.run_id }}
+          key: a-kline-cache-${{ github.ref_name }}-employee3-data-${{ github.run_id }}
 
       - name: upload employee3 cache refresh report
         if: always()
